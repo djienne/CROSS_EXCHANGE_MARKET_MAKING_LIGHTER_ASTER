@@ -13,6 +13,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use futures_util::future::FutureExt;
 use rust_decimal::Decimal;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -765,7 +766,7 @@ fn evaluate_side_with_hl_sources(
 
 /// Per-market immutable context resolved at startup.
 struct MarketCtx {
-    spec: MarketSpec,
+    spec: Arc<MarketSpec>,
     scale: MarketScale,
     /// false ⇒ not eligible for live trading under the partial policy (never quoted).
     eligible: bool,
@@ -883,6 +884,9 @@ pub struct Strategy {
     gen_slots: Vec<GenSlot>,
     /// Phase 4 hot-integer precheck config (built from Config at startup).
     precheck_cfg: super::precheck::HotPrecheckConfig,
+    /// Per-market HL mid mark cache, refreshed once per wake/tick batch to avoid O(N²)
+    /// book loads in `positions_reconciled` (called per-market inside `reprice_market`).
+    mark_cache: HashMap<MarketId, Decimal>,
 }
 
 impl Strategy {
@@ -906,7 +910,7 @@ impl Strategy {
                 (
                     s.market_id.clone(),
                     MarketCtx {
-                        spec: s.clone(),
+                        spec: Arc::new(s.clone()),
                         scale: MarketScale::from_spec(s),
                         eligible: *eligibility.get(&s.market_id).unwrap_or(&false),
                     },
@@ -965,6 +969,7 @@ impl Strategy {
             dirty: None,
             gen_slots: (0..num_markets).map(|_| GenSlot { last_aster_gen: 0, last_hl_gen: 0 }).collect(),
             precheck_cfg,
+            mark_cache: HashMap::new(),
         }
     }
 
@@ -1746,6 +1751,22 @@ impl Strategy {
         }
     }
 
+    /// Refresh the per-market HL mid mark cache. Called once per wake/tick batch to avoid
+    /// O(N²) book loads in `positions_reconciled` (which is called per-market inside
+    /// `reprice_market`, and iterates all markets internally).
+    fn refresh_mark_cache(&mut self) {
+        self.mark_cache.clear();
+        for m in &self.markets {
+            let mark = self
+                .book(m, VenueTag::Hyperliquid)
+                .and_then(|b| b.mid())
+                .unwrap_or(Decimal::ZERO);
+            if mark > Decimal::ZERO {
+                self.mark_cache.insert(m.clone(), mark);
+            }
+        }
+    }
+
     /// True when every market's predicted position agrees with the exchange-reported snapshot
     /// within `max_position_mismatch_usd` (invariant 6). A single mismatch ⇒ freeze (returns
     /// false). Only meaningful in live mode (paper has no exchange snapshot).
@@ -1753,10 +1774,7 @@ impl Strategy {
         let snap = self.account.load();
         let tol = self.cfg.live.max_position_mismatch_usd;
         for m in &self.markets {
-            let mark = self
-                .book(m, VenueTag::Hyperliquid)
-                .and_then(|b| b.mid())
-                .unwrap_or(Decimal::ZERO);
+            let mark = self.mark_cache.get(m).copied().unwrap_or(Decimal::ZERO);
             if mark <= Decimal::ZERO {
                 continue; // no mark ⇒ can't judge; don't spuriously freeze on a missing book
             }
@@ -3303,6 +3321,7 @@ pub async fn run_strategy(
             }
             _ = tick.tick() => {
                 let now_ns = mono_now_ns();
+                strat.refresh_mark_cache();
                 strat.on_tick(now_ns).await;
                 // Throttled quote diagnostic (~every 20s): proves the loop is alive and explains any
                 // no-quote (gate closed vs compute_desired_quote reject vs already resting).
@@ -3329,10 +3348,19 @@ pub async fn run_strategy(
                 }
                 // Reprice on every tick too, so a gate close / cooldown expiry is acted on
                 // promptly even without a book change (§9.1 cancel-all on gate close).
+                // If a book-change wake is pending, consume it and use force=false (the
+                // generation gate skips unchanged markets — cheaper than force=true, and
+                // the pending wake's dirty markets get processed now instead of waiting
+                // for the next select iteration). If no wake is pending, use force=true
+                // to catch gate-close / cooldown-expiry that wouldn't otherwise trigger.
+                let wake_pending = wake.notified().now_or_never().is_some();
+                let force = !wake_pending;
                 let t0_tick = mono_now_ns();
-                let (now, markets) = (Utc::now(), strat.markets.clone());
-                for m in &markets {
-                    strat.reprice_market(m, now, now_ns, true).await;
+                let now = Utc::now();
+                let n_markets = strat.markets.len();
+                for i in 0..n_markets {
+                    let m = strat.markets[i].clone();
+                    strat.reprice_market(&m, now, now_ns, force).await;
                     drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
                 }
                 crate::metrics::TICK_REPRICE.record((mono_now_ns() - t0_tick) as u64);
@@ -3340,12 +3368,14 @@ pub async fn run_strategy(
             _ = wake.notified() => {
                 let (now, now_ns) = (Utc::now(), mono_now_ns());
                 let t0_wake = now_ns;
+                strat.refresh_mark_cache();
                 match &strat.dirty {
                     Some(dirty) => {
                         if dirty.take_reprice_all() {
-                            let markets = strat.markets.clone();
-                            for m in &markets {
-                                strat.reprice_market(m, now, now_ns, false).await;
+                            let n_markets = strat.markets.len();
+                            for i in 0..n_markets {
+                                let m = strat.markets[i].clone();
+                                strat.reprice_market(&m, now, now_ns, false).await;
                                 drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
                             }
                         } else {
@@ -3363,9 +3393,10 @@ pub async fn run_strategy(
                         }
                     }
                     None => {
-                        let markets = strat.markets.clone();
-                        for m in &markets {
-                            strat.reprice_market(m, now, now_ns, false).await;
+                        let n_markets = strat.markets.len();
+                        for i in 0..n_markets {
+                            let m = strat.markets[i].clone();
+                            strat.reprice_market(&m, now, now_ns, false).await;
                             drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
                         }
                     }

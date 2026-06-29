@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
@@ -215,17 +216,26 @@ class BotProcess:
             self._close_log()
             return {"name": self.name, "running": False, "exit_code": code}
         result: dict[str, Any] = {"name": self.name, "pid": proc.pid, "signal": "SIGINT"}
-        os.killpg(proc.pid, signal.SIGINT)
+        try:
+            os.killpg(proc.pid, signal.SIGINT)
+        except ProcessLookupError:
+            pass
         try:
             result["exit_code"] = proc.wait(timeout=grace_sec)
         except subprocess.TimeoutExpired:
             result["signal"] = "SIGTERM"
-            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
             try:
                 result["exit_code"] = proc.wait(timeout=max(3, grace_sec // 2))
             except subprocess.TimeoutExpired:
                 result["signal"] = "SIGKILL"
-                os.killpg(proc.pid, signal.SIGKILL)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 result["exit_code"] = proc.wait(timeout=5)
         self._close_log()
         return result
@@ -436,11 +446,20 @@ class TradeTracker:
 
     @staticmethod
     def taker_key(row: dict[str, Any]) -> str:
-        return f"taker:{row.get('aster_order_id')}:{row.get('lighter_client_order_index')}"
+        aster_id = row.get("aster_order_id")
+        lighter_idx = row.get("lighter_client_order_index")
+        if aster_id is not None or lighter_idx is not None:
+            return f"taker:{aster_id}:{lighter_idx}"
+        raw = json.dumps(row, default=str, sort_keys=True)
+        return f"taker:fallback:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
 
     @staticmethod
     def xemm_key(row: dict[str, Any]) -> str:
-        return f"xemm:{row.get('cloid')}"
+        cloid = row.get("cloid")
+        if cloid is not None:
+            return f"xemm:{cloid}"
+        raw = json.dumps(row, default=str, sort_keys=True)
+        return f"xemm:fallback:{hashlib.sha256(raw.encode()).hexdigest()[:16]}"
 
     @staticmethod
     def row_ts(row: dict[str, Any]) -> datetime | None:
@@ -464,12 +483,15 @@ class PnlTracker:
         self.args = args
         self.since = since
         self.samples_path = args.state_dir / f"orchestrator_pnl_{args.market}.jsonl"
+        self.baseline_path = args.state_dir / f"orchestrator_baseline_{args.market}.json"
         self.baseline_equity: Decimal | None = None
         self.baseline_ts: datetime | None = None
         self.last_equity: Decimal | None = None
         self.last_sample: dict[str, Any] | None = None
         if args.pnl_since.lower() not in {"startup", "now"}:
             self.load_baseline()
+        elif args.pnl_since.lower() == "startup":
+            self.load_persisted_baseline()
 
     def load_baseline(self) -> None:
         if not self.samples_path.exists():
@@ -487,6 +509,31 @@ class PnlTracker:
                 self.baseline_equity = equity
                 break
 
+    def load_persisted_baseline(self) -> None:
+        if not self.baseline_path.exists():
+            return
+        try:
+            row = json.loads(self.baseline_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        equity = parse_decimal(row.get("baseline_equity_usd"))
+        ts = TradeTracker.parse_ts(row.get("baseline_ts"))
+        if equity is not None and ts is not None:
+            self.baseline_equity = equity
+            self.baseline_ts = ts
+
+    def persist_baseline(self) -> None:
+        if self.baseline_equity is None or self.baseline_ts is None:
+            return
+        write_json_atomic(
+            self.baseline_path,
+            {
+                "market": self.args.market,
+                "baseline_equity_usd": dec_to_json(self.baseline_equity),
+                "baseline_ts": iso(self.baseline_ts),
+            },
+        )
+
     def record(self, status: dict[str, Any] | None, active_bot: str | None) -> dict[str, Any] | None:
         if not status:
             return None
@@ -498,6 +545,7 @@ class PnlTracker:
         if self.baseline_equity is None:
             self.baseline_equity = total_equity
             self.baseline_ts = now
+            self.persist_baseline()
         self.last_equity = total_equity
         row = {
             "timestamp": iso(now),
@@ -571,6 +619,7 @@ class Orchestrator:
         self.status_failures = 0
         self.status_backoff_until: dict[str, float] = {TAKER_BOT: 0.0, XEMM_BOT: 0.0}
         self.shutdown_requested = False
+        self.breaker_starvation_warned = False
         self.events_path = args.state_dir / f"orchestrator_events_{args.market}.jsonl"
         self.state_path = args.state_dir / f"orchestrator_state_{args.market}.json"
         self.stats_path = args.state_dir / f"orchestrator_stats_{args.market}.json"
@@ -647,6 +696,9 @@ class Orchestrator:
 
     def fast_tick(self) -> None:
         if not self.args.live or self.shutdown_requested:
+            return
+        self.check_child_exits()
+        if self.shutdown_requested:
             return
         signal_row = self.read_reduce_signal()
         if signal_row and self.active_bot == TAKER_BOT and self.active_taker_mode == "reduce":
@@ -820,8 +872,17 @@ class Orchestrator:
         pnl_sample = self.pnl.record(pnl_source, self.active_bot)
         breaker = self.pnl.breaker_reason(stats)
         if breaker:
-            self.safe_halt("pnl_breaker", reason=breaker, pnl_sample=pnl_sample)
+            self.safe_halt("pnl_breaker", breaker_reason=breaker, pnl_sample=pnl_sample)
             return
+        if (
+            not self.breaker_starvation_warned
+            and stats.get("trades", 0) == 0
+            and (utc_now() - self.start_time).total_seconds() > 60
+        ):
+            self.event("breaker_data_starvation", active_bot=self.active_bot, uptime_sec=int((utc_now() - self.start_time).total_seconds()))
+            self.breaker_starvation_warned = True
+        elif stats.get("trades", 0) > 0:
+            self.breaker_starvation_warned = False
 
         decision = self.decide(taker_status, xemm_status)
         if decision["target"] == "SAFE_HALT":
@@ -1308,8 +1369,12 @@ class Orchestrator:
             executable = Path(argv[0]).name
             subcommand_args = f" {' '.join(argv[1:])} "
             if executable == "lighter_aster_taker_arb" and " run " in subcommand_args:
+                if not process_matches_market(argv, self.args.market):
+                    continue
                 processes.append({"pid": pid, "pgid": pgid, "bot": TAKER_BOT, "args": args})
             elif executable == "xemm_lighter_aster" and " livebot " in subcommand_args:
+                if not process_matches_market(argv, self.args.market):
+                    continue
                 processes.append({"pid": pid, "pgid": pgid, "bot": XEMM_BOT, "args": args})
         return processes
 
@@ -1429,10 +1494,26 @@ def inferred_xemm_journal(db: Path) -> Path:
     return db.parent / f"{stem}-journal.jsonl"
 
 
+def process_matches_market(argv: list[str], market: str) -> bool:
+    for i, arg in enumerate(argv):
+        if arg == "--markets" and i + 1 < len(argv):
+            return argv[i + 1].upper() == market.upper()
+        if arg.startswith("--markets="):
+            return arg.split("=", 1)[1].upper() == market.upper()
+    return True
+
+
 def positive_decimal(raw: str) -> Decimal:
     value = Decimal(raw)
     if value < 0:
         raise argparse.ArgumentTypeError("must be >= 0")
+    return value
+
+
+def strictly_positive_decimal(raw: str) -> Decimal:
+    value = Decimal(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
     return value
 
 
@@ -1477,7 +1558,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--switch-headroom-clips", type=positive_decimal, default=Decimal("2"))
     parser.add_argument("--switch-margin-clips", type=positive_decimal, default=Decimal("2"))
     parser.add_argument("--pnl-since", default="startup", help='RFC3339 timestamp, "startup", or "now".')
-    parser.add_argument("--max-loss-usdc", type=positive_decimal, default=Decimal("5"))
+    parser.add_argument("--max-loss-usdc", type=strictly_positive_decimal, default=Decimal("5"))
+    parser.add_argument("--reset-breaker-baseline", action="store_true", help="Delete the persisted PnL baseline on startup so the equity-drawdown breaker re-anchors to current equity.")
     parser.add_argument("--backfill-existing-trades", action="store_true")
     parser.add_argument("--state-dir", type=existing_file_or_path, default=stack_root / "runs")
     parser.add_argument("--taker-repo", type=existing_file_or_path, default=taker_root)
@@ -1496,6 +1578,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xemm-arg", action="append", default=[], help="Extra arg appended to the XEMM livebot command. Repeat for multiple args.")
     args = parser.parse_args()
     args.state_dir.mkdir(parents=True, exist_ok=True)
+    if args.reset_breaker_baseline:
+        baseline_path = args.state_dir / f"orchestrator_baseline_{args.market}.json"
+        baseline_path.unlink(missing_ok=True)
     if args.taker_trades is None:
         args.taker_trades = (taker_root / f"runs/trades_{args.market}.jsonl").resolve()
     if args.xemm_db is None:

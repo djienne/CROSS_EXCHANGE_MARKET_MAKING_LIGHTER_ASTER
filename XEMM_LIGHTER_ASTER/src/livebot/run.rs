@@ -310,7 +310,24 @@ pub async fn run(
     if let Some(ls) = stream_liveness {
         strat.set_user_stream(ls); // freeze quoting if the Aster fill stream silently dies
     }
-    let strat_task = tokio::spawn(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, shutdown.clone()));
+    // --- strategy ---
+    // Spawned on a DEDICATED OS thread with its own single-threaded tokio runtime, so the
+    // strategy loop's latency-critical wake/reprice/fill→hedge path is isolated from the
+    // reconciler, user stream, journal writer, and exec workers on the main runtime. Core-
+    // pinned to the next available core after the ingest threads.
+    let strat_core_hint = core_hint;
+    let strat_shutdown = shutdown.clone();
+    let strat_handle = thread::Builder::new()
+        .name("livebot-strategy".into())
+        .spawn(move || {
+            crate::hotpath::maybe_pin_core(Some(strat_core_hint));
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("strategy runtime");
+            rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown));
+        })
+        .expect("spawn strategy thread");
 
     // --- cold research plane: record the tape + drive the SimEngine -> SQLite (append) ---
     // Runs on a DEDICATED OS thread so JSONL/SimEngine I/O cannot steal tokio timeslices
@@ -418,7 +435,7 @@ pub async fn run(
             return Err(anyhow::anyhow!("cold recorder panicked: {msg}"));
         }
     }
-    let _ = strat_task.await;
+    let _ = strat_handle.join();
     let _ = worker_task.await;
     for h in aux_tasks {
         let _ = h.await;

@@ -1,10 +1,11 @@
-# Dedicated config for the LIVE HYPE near-touch smoke run using Aster + Lighter. Kept SEPARATE from
-# config.toml so the always-on multi-pair paper dry run (a different process, different config)
-# is completely unaffected. Small clips, generous timing for the slow dev network.
+# Dedicated PAPER config for the HYPE near-touch run using Aster + Lighter. Kept SEPARATE from
+# config-live-lighter.toml so the always-on multi-pair paper dry run (a different process,
+# different config) is completely unaffected. Small clips, generous timing for the slow dev network.
+# mode = "paper" below: this config PLACES NO REAL ORDERS even if invoked without --mode.
 #
 # Run with:
-#   xemm_lighter_aster --config config-live-lighter.toml livebot --mode live --markets HYPE \
-#       --db runs/livebot-live.sqlite --out runs/livebot-live.jsonl.zst --secs <N>
+#   xemm_lighter_aster --config config-paper-lighter.toml livebot --mode paper --markets HYPE \
+#       --db runs/livebot-paper.sqlite --out runs/livebot-paper.jsonl.zst --secs <N>
 
 [edge]
 # Post-test default: conservative enough to avoid accidentally reusing the aggressive
@@ -72,7 +73,7 @@ depth_limit          = 20
 
 [live]
 enabled                       = true
-mode                          = "live"       # this config is FOR the live run (CLI also passes --mode live)
+mode                          = "paper"      # PAPER: places NO real orders even if --mode is omitted
 post_trade_cooldown_ms        = 3000         # short cooldown so the 4 sequences don't take forever
 cooldown_scope                = "per_market"
 startup_cancel_all            = true

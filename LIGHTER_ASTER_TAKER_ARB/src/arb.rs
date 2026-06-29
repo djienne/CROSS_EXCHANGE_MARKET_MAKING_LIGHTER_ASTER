@@ -1126,7 +1126,6 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             reduce_only,
         )
         .await;
-        account_refresh_paused.store(false, Ordering::Release);
         match execution_result {
             Ok(report) => {
                 account = AccountSnapshot {
@@ -1137,6 +1136,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     refreshed_at: tokio::time::Instant::now(),
                 };
                 let _ = account_tx.send(account);
+                account_refresh_paused.store(false, Ordering::Release);
                 trades_executed += 1;
                 info!(
                     "trade report count={} expected_net=${} actual_gross=${} actual_fees=${} actual_net=${} actual_net_bps={} fill_qty_mismatch={} aster_fill_qty={} aster_vwap={} aster_notional=${} aster_fee=${} lighter_fill_qty={} lighter_vwap={} lighter_notional=${} lighter_fee=${} available_margin_delta=${} available_before=${} available_after=${} aster_available_before=${} aster_available_after=${} lighter_available_before=${} lighter_available_after=${} final_aster_pos={} final_lighter_pos={} final_net_pos={}",
@@ -1226,6 +1226,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     };
                     cooldown_until =
                         tokio::time::Instant::now() + Duration::from_millis(cooldown_ms);
+                    account_refresh_paused.store(false, Ordering::Release);
                     continue;
                 }
                 let needs_recovery = e.needs_recovery();
@@ -1242,12 +1243,12 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     };
                     cooldown_until =
                         tokio::time::Instant::now() + Duration::from_millis(cooldown_ms);
+                    account_refresh_paused.store(false, Ordering::Release);
                     continue;
                 }
                 account_refresh_paused.store(true, Ordering::Release);
                 let recovery_result =
                     recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins).await;
-                account_refresh_paused.store(false, Ordering::Release);
                 let recovery = recovery_result?;
                 info!(
                     "rescue check complete action_taken={} estimated_loss=${} final_aster_pos={} final_lighter_pos={} lighter_ws={:?} aster_open_orders={} lighter_open_orders={} available_after=${}",
@@ -1270,6 +1271,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     refreshed_at: tokio::time::Instant::now(),
                 };
                 let _ = account_tx.send(account);
+                account_refresh_paused.store(false, Ordering::Release);
                 if recovery.action_taken {
                     if let Some(reason) =
                         recovered_failures.record(recovery.estimated_loss_usdc, &cfg)
@@ -2945,8 +2947,13 @@ async fn recover_if_needed(
         } else {
             Side::Buy
         };
+        let bound = if matches!(side, Side::Buy) {
+            mark * (Decimal::ONE + bps_to_rate(cfg.arb.emergency_slippage_bps))
+        } else {
+            mark * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps))
+        };
         let res = aster
-            .submit_market_order(&spec.market_id, side, pos.aster_qty.abs(), true)
+            .submit_ioc_order(&spec.market_id, side, pos.aster_qty.abs(), bound, true)
             .await;
         warn!("Aster reduce-only recovery result: {res:?}");
         action_taken = true;

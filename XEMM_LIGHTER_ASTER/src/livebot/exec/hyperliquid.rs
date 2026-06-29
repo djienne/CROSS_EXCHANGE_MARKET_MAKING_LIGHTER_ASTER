@@ -75,7 +75,7 @@ impl FillTracker {
         let (tx, rx) = mpsc::unbounded_channel();
         self.pending
             .lock()
-            .expect("fill tracker poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(client_order_index, tx);
         rx
     }
@@ -83,13 +83,13 @@ impl FillTracker {
     fn unregister(&self, client_order_index: i64) {
         self.pending
             .lock()
-            .expect("fill tracker poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&client_order_index);
     }
 
     fn on_trade(&self, trade: TradePayload) {
         let ids = [trade.ask_client_id, trade.bid_client_id];
-        let pending = self.pending.lock().expect("fill tracker poisoned");
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for id in ids.into_iter().flatten() {
             if let Some(tx) = pending.get(&id) {
                 let _ = tx.send(trade.clone());
@@ -113,7 +113,7 @@ impl AccountFeedState {
     fn set_position(&self, market_id: u32, qty: Decimal, entry_px: Decimal) {
         self.positions
             .lock()
-            .expect("account positions poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .insert(market_id, (qty, entry_px));
     }
 
@@ -127,7 +127,7 @@ impl AccountFeedState {
         }
         self.positions
             .lock()
-            .expect("account positions poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&market_id)
             .copied()
     }
@@ -139,7 +139,7 @@ impl AccountFeedState {
         Some(
             self.positions
                 .lock()
-                .expect("account positions poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         )
     }
@@ -148,11 +148,11 @@ impl AccountFeedState {
         *self
             .available_balance
             .lock()
-            .expect("available balance poisoned") = available;
+            .unwrap_or_else(|e| e.into_inner()) = available;
         *self
             .portfolio_value
             .lock()
-            .expect("portfolio value poisoned") = portfolio;
+            .unwrap_or_else(|e| e.into_inner()) = portfolio;
         self.user_stats_ready.store(true, Ordering::Release);
     }
 
@@ -161,11 +161,11 @@ impl AccountFeedState {
             *self
                 .available_balance
                 .lock()
-                .expect("available balance poisoned"),
+                .unwrap_or_else(|e| e.into_inner()),
             *self
                 .portfolio_value
                 .lock()
-                .expect("portfolio value poisoned"),
+                .unwrap_or_else(|e| e.into_inner()),
         )
     }
 
@@ -189,7 +189,7 @@ impl AccountFeedState {
                 .unwrap_or_default();
             out.insert(*market_id, rows);
         }
-        *self.open_orders.lock().expect("open orders poisoned") = out;
+        *self.open_orders.lock().unwrap_or_else(|e| e.into_inner()) = out;
         self.open_orders_ready.store(true, Ordering::Release);
     }
 
@@ -200,7 +200,7 @@ impl AccountFeedState {
         Some(
             self.open_orders
                 .lock()
-                .expect("open orders poisoned")
+                .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         )
     }
@@ -217,7 +217,7 @@ struct BookFeedState {
 
 impl BookFeedState {
     fn apply(&self, market_id: u32, msg: &OrderBookMsg) -> bool {
-        let mut books = self.books.lock().expect("Lighter book state poisoned");
+        let mut books = self.books.lock().unwrap_or_else(|e| e.into_inner());
         let book = books.entry(market_id).or_default();
         book.apply(msg)
     }
@@ -225,14 +225,14 @@ impl BookFeedState {
     fn reset(&self, market_id: u32) {
         self.books
             .lock()
-            .expect("Lighter book state poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .remove(&market_id);
     }
 
     fn order_book(&self, market_id: u32) -> Option<OrderBook> {
         self.books
             .lock()
-            .expect("Lighter book state poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .get(&market_id)
             .and_then(LighterBook::to_order_book)
     }
@@ -625,6 +625,8 @@ impl HlExchange {
         mut rx: mpsc::UnboundedReceiver<TradePayload>,
     ) -> Option<LighterFill> {
         let deadline = tokio::time::Instant::now() + self.fill_timeout;
+        let grace_after_first = Duration::from_millis(200);
+        let mut grace_deadline: Option<tokio::time::Instant> = None;
         let mut qty = Decimal::ZERO;
         let mut notional = Decimal::ZERO;
         let mut fee_usd = Decimal::ZERO;
@@ -633,7 +635,16 @@ impl HlExchange {
             if now >= deadline {
                 break;
             }
-            match tokio::time::timeout_at(deadline, rx.recv()).await {
+            if let Some(gd) = grace_deadline {
+                if now >= gd {
+                    break;
+                }
+            }
+            let wait_until = match grace_deadline {
+                Some(gd) if gd < deadline => gd,
+                _ => deadline,
+            };
+            match tokio::time::timeout_at(wait_until, rx.recv()).await {
                 Ok(Some(tr)) => {
                     let q = tr
                         .size
@@ -649,7 +660,9 @@ impl HlExchange {
                         qty += q;
                         notional += q * p;
                         fee_usd += trade_fee_usd(&tr);
-                        break;
+                        if grace_deadline.is_none() {
+                            grace_deadline = Some(tokio::time::Instant::now() + grace_after_first);
+                        }
                     }
                 }
                 _ => break,

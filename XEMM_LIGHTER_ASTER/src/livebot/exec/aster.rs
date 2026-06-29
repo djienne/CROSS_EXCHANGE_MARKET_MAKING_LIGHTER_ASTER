@@ -697,7 +697,6 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 }
             }
             ExecCommand::CancelMarket { market } => {
-                limiter.acquire().await;
                 if let Err(e) = rest.cancel_all_symbol(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {
@@ -708,7 +707,6 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
             }
             ExecCommand::CancelAllBot => {
                 for market in rest.markets.keys().cloned().collect::<Vec<_>>() {
-                    limiter.acquire().await;
                     if let Err(e) = rest.cancel_all_symbol(&market).await {
                         let reason = e.to_string();
                         if is_aster_rate_limit_reason(&reason) {
@@ -721,7 +719,6 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 }
             }
             ExecCommand::FlattenAster { market, side, qty } => {
-                limiter.acquire().await;
                 let ev = match rest.flatten(&market, side, qty).await {
                     Ok(()) => {
                         info!("aster flatten sent: {side:?} {qty} {market}");
@@ -738,7 +735,6 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 let _ = tx.send(ev).await;
             }
             ExecCommand::RefreshDeadman { market } => {
-                limiter.acquire().await;
                 if let Err(e) = rest.refresh_deadman(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {

@@ -25,6 +25,8 @@ hotpath = [
     "dep:arc-swap",
     "dep:tokio-util",
     "dep:async-trait",
+    # Core pinning for ingest/strategy threads — tail-latency determinism for live trading.
+    "dep:core_affinity",
     # --- live-trading cryptographic signing (Aster EIP-191 plus legacy hedge helpers) ---
     # Only the live `livebot` workers need these; the deterministic record/replay core
     # never signs, so they stay optional and `--no-default-features` pulls in none of them.
@@ -33,10 +35,9 @@ hotpath = [
     "dep:rmp-serde",
     "dep:hex",
 ]
-# Optional core pinning for the per-venue ingest threads. Off by default: it buys
-# tail-latency determinism that only matters once real orders are placed, and on
-# Windows can make jitter worse. Wire-only until the live bot.
-core-pin = ["dep:core_affinity"]
+# Core pinning is now always enabled with `hotpath` (which includes `core_affinity`).
+# This alias is kept for backward compatibility with any `--features core-pin` invocations.
+core-pin = ["hotpath"]
 
 [dependencies]
 arrayvec = "0.7"

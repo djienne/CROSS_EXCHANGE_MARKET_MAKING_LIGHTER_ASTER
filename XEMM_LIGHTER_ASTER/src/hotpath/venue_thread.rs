@@ -81,13 +81,9 @@ async fn run_reader(
     }
 }
 
-/// Pin the current thread to a core (index modulo available cores) when the
-/// `core-pin` feature is on; a no-op otherwise. Default-off: core pinning buys
-/// tail-latency determinism that only matters once real orders are placed, and on
-/// Windows it can interact poorly with the scheduler. The plumbing is here so the
-/// future live bot enables it with a feature flag, not a refactor.
-#[cfg(feature = "core-pin")]
-fn maybe_pin_core(hint: Option<usize>) {
+/// Pin the current thread to a core (index modulo available cores). Enabled
+/// whenever the `hotpath` feature is on (which includes `core_affinity`).
+pub fn maybe_pin_core(hint: Option<usize>) {
     if let Some(idx) = hint {
         if let Some(ids) = core_affinity::get_core_ids() {
             if !ids.is_empty() {
@@ -96,6 +92,3 @@ fn maybe_pin_core(hint: Option<usize>) {
         }
     }
 }
-
-#[cfg(not(feature = "core-pin"))]
-fn maybe_pin_core(_hint: Option<usize>) {}

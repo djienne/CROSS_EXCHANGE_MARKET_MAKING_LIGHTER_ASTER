@@ -205,13 +205,14 @@ def summarize_xemm_journal(path: Path, market: str, aster_fee_rate: Decimal, lig
             continue
         aster_fee = fill["qty"] * fill["aster_px"] * aster_fee_rate
         lighter_fee = hedge["notional"] * lighter_fee_rate
-        net = gross - aster_fee - lighter_fee
+        callback_fee = hedge["fee_usd"]
+        net = gross - aster_fee - lighter_fee - callback_fee
         out["trades"] += 1
         out["gross_pnl_usdc"] += gross
         out["aster_fees_usdc"] += aster_fee
         out["lighter_fees_usdc"] += lighter_fee
-        out["lighter_callback_fees_usdc"] += hedge["fee_usd"]
-        out["fees_usdc"] += aster_fee + lighter_fee
+        out["lighter_callback_fees_usdc"] += callback_fee
+        out["fees_usdc"] += aster_fee + lighter_fee + callback_fee
         out["net_pnl_usdc"] += net
     return out
 
@@ -356,7 +357,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "capital_source": capital_source,
         "notes": [
             "PnL is realized completed-trade PnL only; unrealized mark-to-market is excluded.",
-            "XEMM net uses configured fee bps from the XEMM config, not Lighter callback fee fields.",
+            "XEMM net includes configured Aster maker bps, configured Lighter taker bps, AND actual Lighter callback fees from the journal.",
             "By default XEMM includes only production live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
         ],
     }
@@ -410,7 +411,7 @@ def print_human(result: dict[str, Any]) -> None:
 
     print_table(
         "PnL",
-        ["Source", "Trades", "Gross USDC", "Config Fees", "Net USDC", "Ignored Callback Fees"],
+        ["Source", "Trades", "Gross USDC", "Config Fees", "Net USDC", "Lighter Callback Fees"],
         [
             [
                 "TAKER",
@@ -520,18 +521,16 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    result = combine(parse_args())
-    if result["projection"]["projected_cagr_pct"] is None and result["projection"]["capital_usdc"] is None:
-        print("warn: projected CAGR unavailable because capital could not be inferred", file=sys.stderr)
-    if result.get("json"):
-        pass
-    return 0
-
-
-if __name__ == "__main__":
     args = parse_args()
     result = combine(args)
+    if result["projection"]["projected_cagr_pct"] is None and result["projection"]["capital_usdc"] is None:
+        print("warn: projected CAGR unavailable because capital could not be inferred", file=sys.stderr)
     if args.json:
         print(json.dumps(result, default=json_default, indent=2))
     else:
         print_human(result)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

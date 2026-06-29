@@ -40,7 +40,7 @@ modes before any live run.
 │   └── README.md
 └── XEMM_LIGHTER_ASTER/
     ├── config-live-lighter.toml
-    ├── config-live-lighter-smoke.toml
+    ├── config-paper-lighter.toml
     ├── src/
     ├── DOCKER_DEPLOY.md
     └── LIVE_RUNBOOK.md
