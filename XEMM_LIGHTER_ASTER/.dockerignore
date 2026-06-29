@@ -1,0 +1,30 @@
+# Keep the build context tiny and — critically — keep SECRETS out of it.
+# The Dockerfile COPYs selectively (Cargo.*, src, config), but this is defense in depth:
+# *.env must never reach the daemon or land in an image layer.
+
+# Real-key credentials (gitignored secrets)
+*.env
+
+# Build outputs (all isolated target dirs + the runs/ data)
+target
+target-*
+target_*
+runs
+
+# VCS / generated / tooling
+.git
+.gitignore
+code_bundle.md
+__pycache__
+*.pyc
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.jsonl
+*.jsonl.zst
+
+# Docs / analysis tooling not needed to build the binary
+docs
+tests
+*.md
+USED_PROMPTS.txt

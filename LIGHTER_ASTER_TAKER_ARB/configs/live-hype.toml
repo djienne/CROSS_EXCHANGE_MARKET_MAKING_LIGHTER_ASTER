@@ -1,0 +1,73 @@
+[arb]
+desired_notional = "13"
+margin_bps = "2.0"
+aster_taker_fee_bps = "4.0"
+lighter_taker_fee_bps = "0.0"
+max_aster_slippage_bps = "30.0"
+max_lighter_slippage_bps = "30.0"
+emergency_slippage_bps = "25.0"
+hedge_retry_slippage_bps = "30.0"
+hedge_retry_timeout_ms = 5000
+max_hedge_retry_attempts = 1
+cooldown_ms = 60000
+startup_warmup_ms = 15000
+poll_interval_ms = 10
+max_book_staleness_ms = 2000
+max_recovered_failures_per_hour = 3
+max_recovered_loss_usdc_per_hour = "0.25"
+
+[arb.depth_guard]
+enabled = true
+liquidity_multiple = "10"
+max_levels = 20
+
+[arb.book_sanity]
+enabled = true
+interval_ms = 10000
+max_top_bps = "8.0"
+max_vwap_bps = "8.0"
+required_failures = 2
+required_successes = 2
+block_cooldown_ms = 15000
+rest_depth_levels = 20
+liquidity_multiple = "10"
+
+[arb.entry_gate]
+enabled = true
+mode = "enforce"
+history_window_hours = 72
+sample_interval_ms = 1000
+min_history_samples = 500
+entry_percentile = "90"
+min_extra_bps = "0.5"
+
+[pnl]
+enabled = true
+persist_dir = "runs"
+since = "2026-06-23T23:00:00Z"
+max_loss_usdc = "5"
+
+[live]
+enabled = true
+mode = "live"
+max_account_snapshot_age_ms = 30000
+
+[venues]
+aster_base_url = "https://fapi.asterdex.com"
+lighter_base_url = "https://mainnet.zklighter.elliot.ai"
+signers_dir = "signers"
+
+[risk]
+max_abs_position_notional_usd = "200"
+max_position_mismatch_usd = "3"
+margin_buffer_usd = "25"
+min_reconcile_interval_ms = 500
+
+[[markets]]
+market_id = "HYPE"
+aster_symbol = "HYPEUSDT"
+lighter_symbol = "HYPE"
+lighter_market_index = 24
+lighter_size_decimals = 2
+lighter_price_decimals = 4
+lighter_min_notional = "10"

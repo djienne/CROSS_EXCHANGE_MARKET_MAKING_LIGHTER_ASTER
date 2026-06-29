@@ -1,0 +1,57 @@
+# XEMM live bot — Aster post-only maker -> Lighter IOC hedge (delta-neutral).
+#
+# ONE image, supplied a command per run. Secrets are MOUNTED read-only (never baked).
+# The runs/ dir (sqlite + journal + tape) is a persistent bind mount.
+#
+# ---- Typical commands (run from this dir on the VPS) -------------------------------
+#
+# No-risk credential / connectivity check (signed reads, places NO orders):
+#   docker compose run --rm xemm probe aster-balance
+#   docker compose run --rm xemm probe lighter-balance
+#   docker compose run --rm xemm probe lighter-open-orders
+#   docker compose run --rm xemm probe lighter-order-dry-run
+#   docker compose run --rm xemm probe aster-open-orders
+#
+# Paper smoke (reads live market data, places NO real orders):
+#   docker compose run --rm xemm --config config-live-lighter.toml livebot \
+#     --mode paper --markets HYPE --secs 30
+#
+# LIVE single-coin test (real money). Leaves the hedged position OPEN & delta-neutral
+# on graceful stop — shutdown only cancels resting ORDERS, never flattens:
+#   docker compose run --rm --name xemm-hype xemm \
+#     --config config-live-lighter.toml livebot --mode live --markets HYPE \
+#     --secs 900 \
+#     --db runs/live-hype.sqlite --out runs/live-hype.jsonl.zst
+#
+# Stop a running session early but gracefully (cancels orders, KEEPS the position):
+#   docker kill --signal=SIGINT xemm-hype
+#
+# Repeat with --markets BNB / --markets ETH (one coin at a time; live filters by
+# --markets, and a coin not selected is invisible to the reconciler, so prior
+# coins' open positions are left untouched).
+# -----------------------------------------------------------------------------------
+
+services:
+  xemm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xemm_lighter_aster:live
+    working_dir: /app
+    volumes:
+      # Mount the WHOLE deploy dir read-only at the working dir, so ANY config
+      # (config-live-lighter.toml, config-quick.toml, …), signer binaries, and
+      # the secret env files (aster.env / lighter.env, read from CWD) are present — no
+      # per-file mounts to keep in sync. The binary lives in /usr/local/bin, so
+      # this never shadows it; secrets are still mount-only (never in the image).
+      - .:/app:ro
+      # Persistent + WRITABLE outputs (sqlite + journal + tape + trip latch); this
+      # nested mount overrides the read-only parent for the runs/ subtree only.
+      - ./runs:/app/runs
+    # Graceful drain on SIGINT (the only signal the bot wires). Positions stay OPEN.
+    stop_signal: SIGINT
+    stop_grace_period: 40s
+    # The test drives runs manually via `docker compose run`; don't auto-restart.
+    restart: "no"
+    # Default = print help and exit; real runs override the command per invocation.
+    command: ["--help"]

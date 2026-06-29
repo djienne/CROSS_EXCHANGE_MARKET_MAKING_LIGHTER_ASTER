@@ -1,0 +1,21 @@
+# Secrets — NEVER commit (mounted at runtime, per Dockerfile/compose)
+*.env
+aster.env
+lighter.env
+
+# Rust build output
+/target
+
+# Runtime outputs: sqlite DBs, journals, tapes, reports, trip latches
+/runs
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Harness state (not project code)
+.claude/

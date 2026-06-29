@@ -1,0 +1,34 @@
+# Secrets and local credentials
+*.env
+.env
+*.pem
+
+# Runtime outputs
+runs/
+**/runs/
+*.sqlite
+*.sqlite-*
+*.db
+*.log
+*.pid
+*.logpath
+*.jsonl
+*.jsonl.zst
+*.zst
+
+# Build outputs
+target/
+**/target/
+
+# Python caches
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Editor / OS cruft
+*.swp
+.DS_Store
+
+# Local harness state
+.claude/
+**/codex-help.md

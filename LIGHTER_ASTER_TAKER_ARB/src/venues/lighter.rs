@@ -1,0 +1,1615 @@
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::{Decimal, RoundingStrategy};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+
+use crate::aster::creds::LighterCreds;
+use crate::book::{OrderBook, MAX_BOOK_LEVELS};
+use crate::lighter::auth::generate_ws_auth_token;
+use crate::lighter::messages::{
+    AccountAllMsg, AccountAllPositionsMsg, OrderBookMsg, PriceLevel, RemoteOrder, TradePayload,
+    UserStatsMsg,
+};
+use crate::lighter::nonce::NonceManager;
+use crate::lighter::rest::RestClient;
+use crate::lighter::signer::{
+    Signer, DEFAULT_IOC_EXPIRY, NIL_TRIGGER_PRICE, ORDER_TYPE_MARKET, TIF_IMMEDIATE_OR_CANCEL,
+};
+use crate::lighter::tx_ws::TxWebSocket;
+use crate::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions};
+use crate::markets::MarketSpec;
+use crate::types::{FillSummary, MarketId, Side, TxSendStatus};
+
+const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
+static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
+
+#[derive(Debug, Clone)]
+pub enum SubmitOutcome {
+    Accepted {
+        raw: String,
+        client_order_index: i64,
+        fill: Option<FillSummary>,
+    },
+    Rejected {
+        reason: String,
+    },
+    RejectedNonceStale {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+    },
+}
+
+#[derive(Clone)]
+struct Wire {
+    market_index: i32,
+    size_decimals: u32,
+    price_decimals: u32,
+}
+
+#[derive(Default)]
+struct FillTracker {
+    pending: Mutex<HashMap<i64, mpsc::UnboundedSender<TradePayload>>>,
+    registered: AtomicU64,
+    trades_seen: AtomicU64,
+    matched_trades: AtomicU64,
+    unmatched_trades: AtomicU64,
+    duplicate_trades: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FillTrackerStats {
+    pub registered: u64,
+    pub trades_seen: u64,
+    pub matched_trades: u64,
+    pub unmatched_trades: u64,
+    pub duplicate_trades: u64,
+    pub timeouts: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LighterAccountSnapshot {
+    pub position_qty: Decimal,
+    pub available_usdc: Decimal,
+    pub account_value_usdc: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LighterFillStatus {
+    Filled,
+    PartialFill,
+    ExpiredNoFill,
+    LiveOrUnknown,
+}
+
+impl LighterFillStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LighterFillStatus::Filled => "filled",
+            LighterFillStatus::PartialFill => "partial_fill",
+            LighterFillStatus::ExpiredNoFill => "expired_no_fill",
+            LighterFillStatus::LiveOrUnknown => "live_or_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LighterFillConfirmation {
+    pub fill: Option<FillSummary>,
+    pub status: LighterFillStatus,
+    pub terminal_order: Option<RemoteOrder>,
+    pub matched_trades_seen: u64,
+    pub filled_qty: Decimal,
+}
+
+impl FillTracker {
+    fn register(&self, client_order_index: i64) -> mpsc::UnboundedReceiver<TradePayload> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.registered.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .expect("Lighter fill tracker poisoned")
+            .insert(client_order_index, tx);
+        rx
+    }
+
+    fn unregister(&self, client_order_index: i64) {
+        self.pending
+            .lock()
+            .expect("Lighter fill tracker poisoned")
+            .remove(&client_order_index);
+    }
+
+    fn on_trade(&self, trade: TradePayload) {
+        self.trades_seen.fetch_add(1, Ordering::Relaxed);
+        let ids = [trade.ask_client_id, trade.bid_client_id];
+        let senders: Vec<_> = {
+            let pending = self.pending.lock().expect("Lighter fill tracker poisoned");
+            ids.into_iter()
+                .flatten()
+                .filter_map(|id| pending.get(&id).cloned())
+                .collect()
+        };
+        if senders.is_empty() {
+            self.unmatched_trades.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.matched_trades
+                .fetch_add(senders.len() as u64, Ordering::Relaxed);
+        }
+        for tx in senders {
+            let _ = tx.send(trade.clone());
+        }
+    }
+
+    fn record_duplicate(&self) {
+        self.duplicate_trades.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_timeout(&self) {
+        self.timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn stats(&self) -> FillTrackerStats {
+        FillTrackerStats {
+            registered: self.registered.load(Ordering::Relaxed),
+            trades_seen: self.trades_seen.load(Ordering::Relaxed),
+            matched_trades: self.matched_trades.load(Ordering::Relaxed),
+            unmatched_trades: self.unmatched_trades.load(Ordering::Relaxed),
+            duplicate_trades: self.duplicate_trades.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+        }
+    }
+}
+
+pub struct PendingFill {
+    fills: Arc<FillTracker>,
+    account_feed: Arc<AccountFeedState>,
+    market_id: u32,
+    client_order_index: i64,
+    side: Side,
+    expected_qty: Decimal,
+    rx: mpsc::UnboundedReceiver<TradePayload>,
+}
+
+impl PendingFill {
+    pub async fn wait(self, timeout: Duration) -> Option<FillSummary> {
+        self.wait_confirmed(timeout).await.fill
+    }
+
+    pub async fn wait_confirmed(mut self, timeout: Duration) -> LighterFillConfirmation {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let min_expected = self.expected_qty * Decimal::from(999u32) / Decimal::from(1000u32);
+        let mut seen = HashSet::new();
+        let mut qty = Decimal::ZERO;
+        let mut notional = Decimal::ZERO;
+        let mut fee = Decimal::ZERO;
+        let mut matched_seen = 0u64;
+        loop {
+            if qty >= min_expected {
+                break;
+            }
+            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+                Ok(Some(trade)) => {
+                    let key = fill_identity(&trade);
+                    if !seen.insert(key) {
+                        self.fills.record_duplicate();
+                        continue;
+                    }
+                    if !trade_matches_side(&trade, self.client_order_index, self.side) {
+                        continue;
+                    }
+                    matched_seen += 1;
+                    let q = trade
+                        .size
+                        .as_deref()
+                        .and_then(|s| s.parse::<Decimal>().ok())
+                        .unwrap_or(Decimal::ZERO)
+                        .abs();
+                    let p = trade
+                        .price
+                        .as_deref()
+                        .and_then(|s| s.parse::<Decimal>().ok())
+                        .unwrap_or(Decimal::ZERO);
+                    if q <= Decimal::ZERO || p <= Decimal::ZERO {
+                        continue;
+                    }
+                    let quote = trade
+                        .usd_amount
+                        .as_deref()
+                        .and_then(|s| s.parse::<Decimal>().ok())
+                        .unwrap_or(Decimal::ZERO)
+                        .abs();
+                    qty += q;
+                    notional += if quote > Decimal::ZERO { quote } else { q * p };
+                    fee += trade_fee_usd(&trade);
+                }
+                _ => break,
+            }
+        }
+        self.fills.unregister(self.client_order_index);
+        let terminal_order = self.account_feed.order_by_client(self.client_order_index);
+        let terminal_filled_qty = terminal_order
+            .as_ref()
+            .and_then(remote_order_filled_qty)
+            .unwrap_or(Decimal::ZERO);
+        let effective_filled_qty = qty.max(terminal_filled_qty);
+        let status = if effective_filled_qty >= min_expected {
+            LighterFillStatus::Filled
+        } else if effective_filled_qty > Decimal::ZERO {
+            LighterFillStatus::PartialFill
+        } else if terminal_order
+            .as_ref()
+            .is_some_and(|order| !order.is_live())
+        {
+            LighterFillStatus::ExpiredNoFill
+        } else {
+            LighterFillStatus::LiveOrUnknown
+        };
+        if qty < min_expected {
+            self.fills.record_timeout();
+            tracing::warn!(
+                "Lighter fill wait incomplete client_order_index={} market_id={} side={} expected_qty={} min_expected_qty={} filled_qty={} terminal_filled_qty={} status={} terminal_status={:?} matched_trades_seen={} tracker_stats={:?}",
+                self.client_order_index,
+                self.market_id,
+                self.side,
+                self.expected_qty,
+                min_expected,
+                qty,
+                terminal_filled_qty,
+                status.as_str(),
+                terminal_order.as_ref().and_then(|order| order.status.as_deref()),
+                matched_seen,
+                self.fills.stats()
+            );
+        } else {
+            tracing::debug!(
+                "Lighter fill wait complete client_order_index={} market_id={} side={} expected_qty={} filled_qty={} status={} matched_trades_seen={} tracker_stats={:?}",
+                self.client_order_index,
+                self.market_id,
+                self.side,
+                self.expected_qty,
+                qty,
+                status.as_str(),
+                matched_seen,
+                self.fills.stats()
+            );
+        }
+        LighterFillConfirmation {
+            fill: FillSummary::from_qty_notional(qty, notional, fee),
+            status,
+            terminal_order,
+            matched_trades_seen: matched_seen,
+            filled_qty: effective_filled_qty,
+        }
+    }
+}
+
+impl Drop for PendingFill {
+    fn drop(&mut self) {
+        self.fills.unregister(self.client_order_index);
+    }
+}
+
+#[derive(Default)]
+struct AccountFeedState {
+    positions: Mutex<HashMap<u32, Decimal>>,
+    available_balance: Mutex<Option<Decimal>>,
+    portfolio_value: Mutex<Option<Decimal>>,
+    open_orders: Mutex<HashMap<u32, usize>>,
+    client_orders: Mutex<HashMap<i64, RemoteOrder>>,
+    account_all_ready: AtomicBool,
+    user_stats_ready: AtomicBool,
+    all_orders_ready: AtomicBool,
+}
+
+impl AccountFeedState {
+    fn set_position(&self, market_id: u32, qty: Decimal) {
+        self.positions
+            .lock()
+            .expect("Lighter positions state poisoned")
+            .insert(market_id, qty);
+    }
+
+    fn mark_account_all_ready(&self) {
+        self.account_all_ready.store(true, Ordering::Release);
+    }
+
+    fn position(&self, market_id: u32) -> Option<Decimal> {
+        if !self.account_all_ready.load(Ordering::Acquire) {
+            return None;
+        }
+        self.positions
+            .lock()
+            .expect("Lighter positions state poisoned")
+            .get(&market_id)
+            .copied()
+    }
+
+    fn set_user_stats(&self, available_balance: Option<Decimal>, portfolio_value: Option<Decimal>) {
+        if let Some(value) = available_balance {
+            *self
+                .available_balance
+                .lock()
+                .expect("Lighter available balance poisoned") = Some(value);
+        }
+        if let Some(value) = portfolio_value {
+            *self
+                .portfolio_value
+                .lock()
+                .expect("Lighter portfolio value poisoned") = Some(value);
+        }
+        if available_balance.is_some() || portfolio_value.is_some() {
+            self.user_stats_ready.store(true, Ordering::Release);
+        }
+    }
+
+    fn available_balance(&self) -> Option<Decimal> {
+        if !self.user_stats_ready.load(Ordering::Acquire) {
+            return None;
+        }
+        *self
+            .available_balance
+            .lock()
+            .expect("Lighter available balance poisoned")
+    }
+
+    fn portfolio_value(&self) -> Option<Decimal> {
+        if !self.user_stats_ready.load(Ordering::Acquire) {
+            return None;
+        }
+        *self
+            .portfolio_value
+            .lock()
+            .expect("Lighter portfolio value poisoned")
+    }
+
+    fn set_open_orders_for_markets(&self, known_markets: &[u32], orders: &serde_json::Value) {
+        let mut counts = HashMap::new();
+        let mut seen_live_client_ids = HashSet::new();
+        let mut parsed_orders = Vec::new();
+        let order_obj = orders.as_object();
+        for market_id in known_markets {
+            let count = order_obj
+                .and_then(|obj| obj.get(&market_id.to_string()))
+                .and_then(|v| v.as_array())
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| serde_json::from_value::<RemoteOrder>(row.clone()).ok())
+                        .map(|order| {
+                            if let Some(client_order_index) = order.client_order_index {
+                                if order.is_live() {
+                                    seen_live_client_ids.insert(client_order_index);
+                                }
+                                parsed_orders.push(order.clone());
+                            }
+                            order
+                        })
+                        .filter(RemoteOrder::is_live)
+                        .count()
+                })
+                .unwrap_or(0);
+            counts.insert(*market_id, count);
+        }
+        *self
+            .open_orders
+            .lock()
+            .expect("Lighter open orders state poisoned") = counts;
+        let mut client_orders = self
+            .client_orders
+            .lock()
+            .expect("Lighter client orders state poisoned");
+        client_orders.retain(|client_order_index, order| {
+            !order.is_live() || seen_live_client_ids.contains(client_order_index)
+        });
+        for order in parsed_orders {
+            if let Some(client_order_index) = order.client_order_index {
+                client_orders.insert(client_order_index, order);
+            }
+        }
+        self.all_orders_ready.store(true, Ordering::Release);
+    }
+
+    fn open_orders_count(&self, market_id: u32) -> Option<usize> {
+        if !self.all_orders_ready.load(Ordering::Acquire) {
+            return None;
+        }
+        Some(
+            *self
+                .open_orders
+                .lock()
+                .expect("Lighter open orders state poisoned")
+                .get(&market_id)
+                .unwrap_or(&0),
+            )
+    }
+
+    fn order_by_client(&self, client_order_index: i64) -> Option<RemoteOrder> {
+        if !self.all_orders_ready.load(Ordering::Acquire) {
+            return None;
+        }
+        self.client_orders
+            .lock()
+            .expect("Lighter client orders state poisoned")
+            .get(&client_order_index)
+            .cloned()
+    }
+}
+
+#[derive(Default)]
+struct BookFeedState {
+    books: Mutex<HashMap<u32, LighterBook>>,
+    reconnects: Mutex<HashMap<u32, Arc<Notify>>>,
+}
+
+impl BookFeedState {
+    fn register_reconnect(&self, market_id: u32, reconnect: Arc<Notify>) {
+        self.reconnects
+            .lock()
+            .expect("Lighter book reconnect state poisoned")
+            .insert(market_id, reconnect);
+    }
+
+    fn apply(&self, market_id: u32, msg: &OrderBookMsg) -> bool {
+        let mut books = self.books.lock().expect("Lighter book state poisoned");
+        let book = books.entry(market_id).or_default();
+        book.apply(msg)
+    }
+
+    fn reset(&self, market_id: u32) {
+        self.books
+            .lock()
+            .expect("Lighter book state poisoned")
+            .remove(&market_id);
+    }
+
+    fn order_book(&self, market_id: u32) -> Option<OrderBook> {
+        self.books
+            .lock()
+            .expect("Lighter book state poisoned")
+            .get(&market_id)
+            .and_then(LighterBook::to_order_book)
+    }
+
+    fn request_reconnect(&self, market_id: u32) {
+        self.reset(market_id);
+        if let Some(reconnect) = self
+            .reconnects
+            .lock()
+            .expect("Lighter book reconnect state poisoned")
+            .get(&market_id)
+            .cloned()
+        {
+            reconnect.notify_one();
+        }
+    }
+}
+
+#[derive(Default)]
+struct LighterBook {
+    bids: BTreeMap<Decimal, Decimal>,
+    asks: BTreeMap<Decimal, Decimal>,
+    initialized: bool,
+    updated_at: Option<DateTime<Utc>>,
+    last_nonce: Option<i64>,
+}
+
+impl LighterBook {
+    fn apply(&mut self, msg: &OrderBookMsg) -> bool {
+        if self.initialized && !msg.is_snapshot() {
+            if let (Some(begin_nonce), Some(last_nonce)) =
+                (msg.order_book.begin_nonce, self.last_nonce)
+            {
+                if begin_nonce != last_nonce {
+                    return false;
+                }
+            }
+        }
+        if msg.is_snapshot() || !self.initialized {
+            self.bids.clear();
+            self.asks.clear();
+            self.initialized = true;
+        }
+        apply_levels(&mut self.bids, &msg.order_book.bids);
+        apply_levels(&mut self.asks, &msg.order_book.asks);
+        self.updated_at = Some(Utc::now());
+        self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
+        true
+    }
+
+    fn to_order_book(&self) -> Option<OrderBook> {
+        if !self.initialized {
+            return None;
+        }
+        let ts = self.updated_at?;
+        let bids = self
+            .bids
+            .iter()
+            .rev()
+            .take(MAX_BOOK_LEVELS)
+            .map(|(p, q)| (*p, *q));
+        let asks = self
+            .asks
+            .iter()
+            .take(MAX_BOOK_LEVELS)
+            .map(|(p, q)| (*p, *q));
+        Some(OrderBook::from_levels(bids, asks, ts, ts))
+    }
+}
+
+pub struct LighterVenue {
+    rest: RestClient,
+    tx_ws: Arc<TxWebSocket>,
+    signer: Arc<Signer>,
+    nonce: Arc<NonceManager>,
+    account_index: i64,
+    api_key_index: i32,
+    markets: std::collections::HashMap<MarketId, Wire>,
+    fills: Arc<FillTracker>,
+    account_feed: Arc<AccountFeedState>,
+    book_feed: Arc<BookFeedState>,
+    write_lock: AsyncMutex<()>,
+}
+
+impl LighterVenue {
+    pub async fn new(
+        base_url: &str,
+        signers_dir: &Path,
+        creds: LighterCreds,
+        specs: &[MarketSpec],
+    ) -> Result<Self> {
+        let rest = RestClient::new(base_url)?;
+        let signer = Arc::new(Signer::load(
+            signers_dir,
+            base_url,
+            &creds.api_private_key,
+            creds.api_key_index,
+            creds.account_index,
+        )?);
+        signer.check_client(creds.api_key_index)?;
+        let nonce =
+            Arc::new(NonceManager::init(&rest, creds.account_index, creds.api_key_index).await?);
+        let ws_url = lighter_ws_url(base_url);
+        let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
+        tx_ws
+            .connect()
+            .await
+            .with_context(|| format!("preconnect Lighter tx websocket {ws_url}"))?;
+        let fills = Arc::new(FillTracker::default());
+        let account_feed = Arc::new(AccountFeedState::default());
+        let book_feed = Arc::new(BookFeedState::default());
+        let known_markets: Vec<u32> = specs.iter().map(|s| s.lighter_market_id).collect();
+        spawn_order_book_stream(ws_url.clone(), specs, book_feed.clone());
+        spawn_account_all_positions_stream(
+            ws_url.clone(),
+            creds.account_index,
+            known_markets.clone(),
+            account_feed.clone(),
+        );
+        spawn_account_all_stream(
+            ws_url.clone(),
+            signer.clone(),
+            creds.api_key_index,
+            creds.account_index,
+            fills.clone(),
+        );
+        spawn_user_stats_stream(ws_url.clone(), creds.account_index, account_feed.clone());
+        spawn_account_all_orders_stream(
+            ws_url.clone(),
+            signer.clone(),
+            creds.api_key_index,
+            creds.account_index,
+            known_markets,
+            account_feed.clone(),
+        );
+
+        let markets = specs
+            .iter()
+            .map(|s| {
+                (
+                    s.market_id.clone(),
+                    Wire {
+                        market_index: s.lighter_market_id as i32,
+                        size_decimals: s.lighter_size_decimals,
+                        price_decimals: s.lighter_price_decimals,
+                    },
+                )
+            })
+            .collect();
+        Ok(LighterVenue {
+            rest,
+            tx_ws,
+            signer,
+            nonce,
+            account_index: creds.account_index,
+            api_key_index: creds.api_key_index,
+            markets,
+            fills,
+            account_feed,
+            book_feed,
+            write_lock: AsyncMutex::new(()),
+        })
+    }
+
+    fn wire(&self, market: &MarketId) -> Result<&Wire> {
+        self.markets
+            .get(market)
+            .ok_or_else(|| anyhow!("no Lighter wire context for {market}"))
+    }
+
+    pub async fn wait_ready(&self, market: &MarketId, timeout: Duration) -> Result<()> {
+        let wire = self.wire(market)?.clone();
+        let market_id = wire.market_index as u32;
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let book_ready = self.book_feed.order_book(market_id).is_some();
+            let position_ready = self.account_feed.position(market_id).is_some();
+            let balance_ready = self.account_feed.available_balance().is_some();
+            let orders_ready = self.account_feed.open_orders_count(market_id).is_some();
+            if book_ready && position_ready && balance_ready && orders_ready {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                bail!(
+                    "Lighter websocket state not ready for {market}: book={} position={} user_stats={} all_orders={}",
+                    book_ready,
+                    position_ready,
+                    balance_ready,
+                    orders_ready
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    pub fn order_book(&self, market: &MarketId) -> Result<OrderBook> {
+        let wire = self.wire(market)?;
+        self.book_feed
+            .order_book(wire.market_index as u32)
+            .ok_or_else(|| anyhow!("Lighter order_book websocket not ready for {market}"))
+    }
+
+    pub fn request_order_book_reconnect(&self, market: &MarketId) -> Result<()> {
+        let wire = self.wire(market)?;
+        self.book_feed.request_reconnect(wire.market_index as u32);
+        Ok(())
+    }
+
+    pub async fn submit_market_order(
+        &self,
+        market: &MarketId,
+        side: Side,
+        qty: Decimal,
+        price_bound: Decimal,
+        reduce_only: bool,
+    ) -> SubmitOutcome {
+        let (outcome, pending_fill) = self
+            .submit_market_order_deferred_fill(market, side, qty, price_bound, reduce_only)
+            .await;
+        match (outcome, pending_fill) {
+            (
+                SubmitOutcome::Accepted {
+                    raw,
+                    client_order_index,
+                    ..
+                },
+                Some(pending_fill),
+            ) => {
+                let fill = pending_fill.wait(Duration::from_secs(10)).await;
+                SubmitOutcome::Accepted {
+                    raw,
+                    client_order_index,
+                    fill,
+                }
+            }
+            (outcome, _) => outcome,
+        }
+    }
+
+    pub async fn submit_market_order_deferred_fill(
+        &self,
+        market: &MarketId,
+        side: Side,
+        qty: Decimal,
+        price_bound: Decimal,
+        reduce_only: bool,
+    ) -> (SubmitOutcome, Option<PendingFill>) {
+        let wire = match self.wire(market) {
+            Ok(w) => w.clone(),
+            Err(e) => {
+                return (
+                    SubmitOutcome::Rejected {
+                        reason: e.to_string(),
+                    },
+                    None,
+                );
+            }
+        };
+        let client_order_index = random_client_order_index(market, side);
+        let fill_rx = self.fills.register(client_order_index);
+        let base_amount = match raw_amount(qty, wire.size_decimals) {
+            Ok(v) => v,
+            Err(e) => {
+                self.fills.unregister(client_order_index);
+                return (
+                    SubmitOutcome::Rejected {
+                        reason: e.to_string(),
+                    },
+                    None,
+                );
+            }
+        };
+        let price = match raw_price(price_bound, wire.price_decimals, side) {
+            Ok(v) => v,
+            Err(e) => {
+                self.fills.unregister(client_order_index);
+                return (
+                    SubmitOutcome::Rejected {
+                        reason: e.to_string(),
+                    },
+                    None,
+                );
+            }
+        };
+        let result = {
+            // Keep nonce reservation, native signing and websocket write in the same critical
+            // section. Lighter nonces are consumed in send order; allowing two callers to sign
+            // concurrently can invert nonce order before they reach `TxWebSocket::send_batch`.
+            let _write_guard = self.write_lock.lock().await;
+            let nonce = self.nonce.next();
+            let signed = match self.signer.sign_create_order(
+                wire.market_index,
+                client_order_index,
+                base_amount,
+                price,
+                matches!(side, Side::Sell),
+                ORDER_TYPE_MARKET,
+                TIF_IMMEDIATE_OR_CANCEL,
+                reduce_only,
+                NIL_TRIGGER_PRICE,
+                DEFAULT_IOC_EXPIRY,
+                nonce,
+                self.api_key_index,
+            ) {
+                Ok(tx) => tx,
+                Err(e) => {
+                    self.nonce.acknowledge_failure();
+                    self.fills.unregister(client_order_index);
+                    return (
+                        SubmitOutcome::Rejected {
+                            reason: e.to_string(),
+                        },
+                        None,
+                    );
+                }
+            };
+            let result = self
+                .tx_ws
+                .send_batch(&[signed.tx_type], &[signed.tx_info])
+                .await;
+            match result.status {
+                TxSendStatus::NotSent => self.nonce.rollback(1),
+                TxSendStatus::Unknown => {
+                    let _ = self.nonce.hard_refresh(&self.rest).await;
+                }
+                TxSendStatus::Rejected if lighter_nonce_reject(result.code, &result.message) => {
+                    let _ = self.nonce.hard_refresh(&self.rest).await;
+                }
+                TxSendStatus::Ok | TxSendStatus::Rejected => {}
+            }
+            result
+        };
+        match result.status {
+            TxSendStatus::Ok => {
+                let pending_fill = PendingFill {
+                    fills: self.fills.clone(),
+                    account_feed: self.account_feed.clone(),
+                    market_id: wire.market_index as u32,
+                    client_order_index,
+                    side,
+                    expected_qty: qty,
+                    rx: fill_rx,
+                };
+                (
+                    SubmitOutcome::Accepted {
+                        raw: serde_json::json!({
+                            "code": result.code,
+                            "message": result.message,
+                            "client_order_index": client_order_index,
+                            "quota_remaining": result.quota_remaining,
+                        })
+                        .to_string(),
+                        client_order_index,
+                        fill: None,
+                    },
+                    Some(pending_fill),
+                )
+            }
+            TxSendStatus::Rejected => {
+                self.fills.unregister(client_order_index);
+                let reason = format!("Lighter reject code={} {}", result.code, result.message);
+                if lighter_nonce_reject(result.code, &result.message) {
+                    (SubmitOutcome::RejectedNonceStale { reason }, None)
+                } else {
+                    (SubmitOutcome::Rejected { reason }, None)
+                }
+            }
+            TxSendStatus::NotSent => {
+                self.fills.unregister(client_order_index);
+                (
+                    SubmitOutcome::Rejected {
+                        reason: format!("Lighter tx not sent: {}", result.message),
+                    },
+                    None,
+                )
+            }
+            TxSendStatus::Unknown => {
+                self.fills.unregister(client_order_index);
+                (
+                    SubmitOutcome::Unknown {
+                        reason: format!("Lighter tx unknown: {}", result.message),
+                    },
+                    None,
+                )
+            }
+        }
+    }
+
+    pub async fn position_qty(&self, market: &MarketId) -> Result<Decimal> {
+        self.rest_position_qty(market).await
+    }
+
+    pub async fn rest_position_qty(&self, market: &MarketId) -> Result<Decimal> {
+        Ok(self.account_snapshot(market).await?.position_qty)
+    }
+
+    pub async fn account_snapshot(&self, market: &MarketId) -> Result<LighterAccountSnapshot> {
+        let wire = self.wire(market)?;
+        let raw = self.rest.account_raw(self.account_index).await?;
+        let account = account_root(&raw);
+        Ok(LighterAccountSnapshot {
+            position_qty: account_position_qty(account, wire.market_index as u32),
+            available_usdc: account_available_usdc(account),
+            account_value_usdc: account_value_usdc(account),
+        })
+    }
+
+    pub fn ws_position_qty(&self, market: &MarketId) -> Result<Decimal> {
+        let wire = self.wire(market)?;
+        self.account_feed
+            .position(wire.market_index as u32)
+            .ok_or_else(|| {
+                anyhow!("Lighter account_all_positions websocket position not ready for {market}")
+            })
+    }
+
+    pub async fn available_usdc(&self) -> Result<Decimal> {
+        self.rest_available_usdc().await
+    }
+
+    pub async fn rest_available_usdc(&self) -> Result<Decimal> {
+        let raw = self.rest.account_raw(self.account_index).await?;
+        let account = account_root(&raw);
+        Ok(account_available_usdc(account))
+    }
+
+    pub fn ws_available_usdc(&self) -> Result<Decimal> {
+        self.account_feed
+            .available_balance()
+            .ok_or_else(|| anyhow!("Lighter user_stats websocket available balance not ready"))
+    }
+
+    pub async fn account_value_usdc(&self) -> Result<Option<Decimal>> {
+        self.rest_account_value_usdc().await
+    }
+
+    pub async fn rest_account_value_usdc(&self) -> Result<Option<Decimal>> {
+        let raw = self.rest.account_raw(self.account_index).await?;
+        let account = account_root(&raw);
+        Ok(account_value_usdc(account))
+    }
+
+    pub fn ws_account_value_usdc(&self) -> Result<Option<Decimal>> {
+        if !self.account_feed.user_stats_ready.load(Ordering::Acquire) {
+            bail!("Lighter user_stats websocket not ready")
+        }
+        Ok(self.account_feed.portfolio_value())
+    }
+
+    pub async fn open_orders_count(&self, market: &MarketId) -> Result<usize> {
+        self.rest_open_orders_count(market).await
+    }
+
+    pub async fn rest_open_orders_count(&self, market: &MarketId) -> Result<usize> {
+        let wire = self.wire(market)?;
+        let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;
+        let orders = self
+            .rest
+            .account_active_orders(self.account_index, wire.market_index as u32, &auth)
+            .await?;
+        Ok(orders.into_iter().filter(RemoteOrder::is_live).count())
+    }
+
+    pub fn ws_open_orders_count(&self, market: &MarketId) -> Result<usize> {
+        let wire = self.wire(market)?;
+        self.account_feed
+            .open_orders_count(wire.market_index as u32)
+            .ok_or_else(|| anyhow!("Lighter account_all_orders websocket not ready for {market}"))
+    }
+
+    pub async fn refresh_nonce(&self) -> Result<()> {
+        let _write_guard = self.write_lock.lock().await;
+        self.nonce.hard_refresh(&self.rest).await
+    }
+}
+
+fn lighter_nonce_reject(code: i64, message: &str) -> bool {
+    code == 21104 || message.to_ascii_lowercase().contains("invalid nonce")
+}
+
+fn account_root(raw: &serde_json::Value) -> &serde_json::Value {
+    raw.get("accounts")
+        .and_then(|a| a.as_array())
+        .and_then(|a| a.first())
+        .unwrap_or(raw)
+}
+
+fn account_position_qty(account: &serde_json::Value, market_id: u32) -> Decimal {
+    if let Some(poss) = account.get("positions").and_then(|p| p.as_array()) {
+        for p in poss {
+            if p.get("market_id").and_then(|m| m.as_u64()) == Some(market_id as u64) {
+                let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
+                return signed_position_json_dec(p.get("position"), sign);
+            }
+        }
+    }
+    Decimal::ZERO
+}
+
+fn account_available_usdc(account: &serde_json::Value) -> Decimal {
+    value_dec(account.get("available_capital"))
+        .or_else(|| value_dec(account.get("available_balance")))
+        .or_else(|| value_dec(account.get("available")))
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn account_value_usdc(account: &serde_json::Value) -> Option<Decimal> {
+    value_dec(account.get("portfolio_value"))
+        .or_else(|| value_dec(account.get("account_value")))
+        .or_else(|| value_dec(account.get("total_account_value")))
+        .or_else(|| value_dec(account.get("total_collateral_value")))
+        .or_else(|| value_dec(account.get("collateral")))
+        .or_else(|| value_dec(account.get("total_collateral")))
+        .or_else(|| value_dec(account.get("equity")))
+        .or_else(|| value_dec(account.get("balance")))
+}
+
+fn apply_account_all_positions(
+    account_feed: &AccountFeedState,
+    known_markets: &[u32],
+    msg: &AccountAllPositionsMsg,
+) {
+    let mut seen = HashSet::new();
+
+    // Lighter's position updates are sparse: a market absent from an update means unchanged,
+    // not flat. Only the explicitly tagged subscription snapshot is authoritative enough to
+    // initialize missing configured markets to zero.
+    for (market, position) in &msg.positions {
+        if let Ok(market_id) = market.parse::<u32>() {
+            seen.insert(market_id);
+            account_feed.set_position(market_id, signed_position_payload_dec(position));
+        }
+    }
+
+    if msg.is_snapshot() {
+        for market_id in known_markets {
+            if !seen.contains(market_id) {
+                account_feed.set_position(*market_id, Decimal::ZERO);
+            }
+        }
+        account_feed.mark_account_all_ready();
+    }
+}
+
+fn spawn_account_all_positions_stream(
+    ws_url: String,
+    account_index: i64,
+    known_markets: Vec<u32>,
+    account_feed: Arc<AccountFeedState>,
+) {
+    let channel = format!("account_all_positions/{account_index}");
+    let mut opts = SubscribeOptions::new("lighter-account-all-positions", vec![channel]);
+    opts.url = ws_url;
+    opts.data_timeout = None;
+    opts.frame_timeout = 90.0;
+    tokio::spawn(async move {
+        subscribe_loop(
+            opts,
+            None,
+            move |data| {
+                if let Ok(msg) = serde_json::from_value::<AccountAllPositionsMsg>(data.clone()) {
+                    apply_account_all_positions(&account_feed, &known_markets, &msg);
+                }
+            },
+            || {},
+        )
+        .await;
+    });
+}
+
+fn spawn_account_all_stream(
+    ws_url: String,
+    signer: Arc<Signer>,
+    api_key_index: i32,
+    account_index: i64,
+    fills: Arc<FillTracker>,
+) {
+    let channel = format!("account_all/{account_index}");
+    let auth_channel = channel.clone();
+    let mut opts = SubscribeOptions::new("lighter-account-all", vec![channel]);
+    opts.url = ws_url;
+    opts.data_timeout = None;
+    opts.frame_timeout = 90.0;
+    tokio::spawn(async move {
+        subscribe_loop_authed(
+            opts,
+            move || match generate_ws_auth_token(&signer, api_key_index) {
+                Ok(token) => HashMap::from([(auth_channel.clone(), token)]),
+                Err(e) => {
+                    tracing::warn!("lighter-account-all auth token generation failed: {e:#}");
+                    HashMap::new()
+                }
+            },
+            move |data| {
+                if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data.clone()) {
+                    for trades in msg.trades.values() {
+                        for trade in trades {
+                            fills.on_trade(trade.clone());
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+    });
+}
+
+fn spawn_user_stats_stream(
+    ws_url: String,
+    account_index: i64,
+    account_feed: Arc<AccountFeedState>,
+) {
+    let channel = format!("user_stats/{account_index}");
+    let mut opts = SubscribeOptions::new("lighter-user-stats", vec![channel]);
+    opts.url = ws_url;
+    opts.data_timeout = None;
+    opts.frame_timeout = 90.0;
+    tokio::spawn(async move {
+        subscribe_loop(
+            opts,
+            None,
+            move |data| {
+                if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data.clone()) {
+                    account_feed.set_user_stats(
+                        value_dec(msg.stats.available_balance.as_ref()),
+                        value_dec(msg.stats.portfolio_value.as_ref()),
+                    );
+                }
+            },
+            || {},
+        )
+        .await;
+    });
+}
+
+fn spawn_account_all_orders_stream(
+    ws_url: String,
+    signer: Arc<Signer>,
+    api_key_index: i32,
+    account_index: i64,
+    known_markets: Vec<u32>,
+    account_feed: Arc<AccountFeedState>,
+) {
+    let channel = format!("account_all_orders/{account_index}");
+    let auth_channel = channel.clone();
+    let mut opts = SubscribeOptions::new("lighter-account-all-orders", vec![channel]);
+    opts.url = ws_url;
+    opts.data_timeout = None;
+    opts.frame_timeout = 90.0;
+    tokio::spawn(async move {
+        subscribe_loop_authed(
+            opts,
+            move || match generate_ws_auth_token(&signer, api_key_index) {
+                Ok(token) => HashMap::from([(auth_channel.clone(), token)]),
+                Err(e) => {
+                    tracing::warn!(
+                        "lighter-account-all-orders auth token generation failed: {e:#}"
+                    );
+                    HashMap::new()
+                }
+            },
+            move |data| {
+                let orders = data.get("orders").unwrap_or(&serde_json::Value::Null);
+                account_feed.set_open_orders_for_markets(&known_markets, orders);
+            },
+        )
+        .await;
+    });
+}
+
+fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<BookFeedState>) {
+    for spec in specs.iter().cloned() {
+        let market_id = spec.lighter_market_id;
+        let channel = format!("order_book/{market_id}");
+        let mut opts =
+            SubscribeOptions::new(&format!("lighter-order-book-{market_id}"), vec![channel]);
+        opts.url = ws_url.clone();
+        let books = book_feed.clone();
+        let books_for_disconnect = book_feed.clone();
+        let reconnect = Arc::new(Notify::new());
+        book_feed.register_reconnect(market_id, reconnect.clone());
+        let reconnect_on_gap = reconnect.clone();
+        tokio::spawn(async move {
+            subscribe_loop(
+                opts,
+                Some(reconnect),
+                move |data| {
+                    if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data.clone()) {
+                        if !books.apply(market_id, &msg) {
+                            tracing::warn!(
+                                "Lighter order_book nonce gap for market {}; reconnecting for fresh snapshot",
+                                market_id
+                            );
+                            books.reset(market_id);
+                            reconnect_on_gap.notify_one();
+                        }
+                    }
+                },
+                move || {
+                    books_for_disconnect.reset(market_id);
+                },
+            )
+            .await;
+        });
+    }
+}
+
+fn value_dec(v: Option<&serde_json::Value>) -> Option<Decimal> {
+    match v? {
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Number(n) => n.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+fn remote_order_filled_qty(order: &RemoteOrder) -> Option<Decimal> {
+    order
+        .filled_base_amount
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .map(|qty| qty.abs())
+}
+
+fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevel]) {
+    for level in levels {
+        let Some(px) = level.price.parse::<Decimal>().ok() else {
+            continue;
+        };
+        let Some(qty) = level.size.parse::<Decimal>().ok() else {
+            continue;
+        };
+        if px <= Decimal::ZERO {
+            continue;
+        }
+        if qty <= Decimal::ZERO {
+            side.remove(&px);
+        } else {
+            side.insert(px, qty);
+        }
+    }
+}
+
+fn signed_position_payload_dec(p: &crate::lighter::messages::PositionPayload) -> Decimal {
+    let mag = p
+        .position
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO)
+        .abs();
+    if p.sign.is_some_and(|sign| sign < 0) {
+        -mag
+    } else {
+        mag
+    }
+}
+
+fn signed_position_json_dec(position: Option<&serde_json::Value>, sign: i64) -> Decimal {
+    let mag = value_dec(position).unwrap_or(Decimal::ZERO).abs();
+    if sign < 0 {
+        -mag
+    } else {
+        mag
+    }
+}
+
+fn lighter_ws_url(base_url: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}/stream")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}/stream")
+    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
+        format!("{trimmed}/stream")
+    } else {
+        format!("wss://{trimmed}/stream")
+    }
+}
+
+fn trade_matches_side(trade: &TradePayload, client_order_index: i64, side: Side) -> bool {
+    match side {
+        Side::Sell => trade.ask_client_id == Some(client_order_index),
+        Side::Buy => trade.bid_client_id == Some(client_order_index),
+    }
+}
+
+fn fill_identity(trade: &TradePayload) -> String {
+    if let Some(id) = trade.trade_id {
+        return format!("id:{id}");
+    }
+    format!(
+        "fallback:{}:{}:{}:{}",
+        trade.ask_client_id.unwrap_or_default(),
+        trade.bid_client_id.unwrap_or_default(),
+        trade.price.as_deref().unwrap_or_default(),
+        trade.size.as_deref().unwrap_or_default()
+    )
+}
+
+fn trade_fee_usd(trade: &TradePayload) -> Decimal {
+    value_dec(trade.taker_fee.as_ref())
+        .or_else(|| value_dec(trade.maker_fee.as_ref()))
+        .map(|v| v / Decimal::from(1_000_000u64))
+        .unwrap_or(Decimal::ZERO)
+        .abs()
+}
+
+fn raw_amount(qty: Decimal, decimals: u32) -> Result<i64> {
+    if qty <= Decimal::ZERO {
+        bail!("quantity must be positive");
+    }
+    let scale = Decimal::from(10u64.pow(decimals));
+    let raw = (qty * scale)
+        .round_dp_with_strategy(0, RoundingStrategy::ToZero)
+        .to_i64()
+        .ok_or_else(|| anyhow!("quantity raw amount overflow"))?;
+    if raw <= 0 {
+        bail!("quantity rounds to zero at {decimals} decimals");
+    }
+    Ok(raw)
+}
+
+fn raw_price(px: Decimal, decimals: u32, side: Side) -> Result<i32> {
+    if px <= Decimal::ZERO {
+        bail!("price must be positive");
+    }
+    let scale = Decimal::from(10u64.pow(decimals));
+    let strat = match side {
+        Side::Buy => RoundingStrategy::ToPositiveInfinity,
+        Side::Sell => RoundingStrategy::ToNegativeInfinity,
+    };
+    let raw = (px * scale)
+        .round_dp_with_strategy(0, strat)
+        .to_i32()
+        .ok_or_else(|| anyhow!("price raw amount overflow"))?;
+    if raw <= 0 {
+        bail!("price rounds to zero at {decimals} decimals");
+    }
+    Ok(raw)
+}
+
+fn random_client_order_index(_market: &MarketId, side: Side) -> i64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let side_bit = if matches!(side, Side::Sell) { 1 } else { 0 };
+    let counter = CLIENT_ORDER_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x7f;
+    let idx = ((millis & 0x00ff_ffff_ffff) << 8) | (counter << 1) | side_bit;
+    idx.min(MAX_CLIENT_ORDER_INDEX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_order_index_stays_in_lighter_range() {
+        for _ in 0..128 {
+            let idx = random_client_order_index(&MarketId("HYPE".to_string()), Side::Buy);
+            assert!(idx >= 0);
+            assert!(idx <= MAX_CLIENT_ORDER_INDEX);
+        }
+    }
+
+    #[test]
+    fn lighter_ws_url_tracks_configured_rest_base() {
+        assert_eq!(
+            lighter_ws_url("https://mainnet.zklighter.elliot.ai"),
+            "wss://mainnet.zklighter.elliot.ai/stream"
+        );
+        assert_eq!(
+            lighter_ws_url("http://localhost:8080/"),
+            "ws://localhost:8080/stream"
+        );
+    }
+
+    #[test]
+    fn lighter_book_initial_update_and_delta_remove_level() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "nonce":100,
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let remove_bid: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "begin_nonce":100,
+                    "nonce":101,
+                    "bids":[{"price":"10.00","size":"0"}],
+                    "asks":[{"price":"10.05","size":"3.00"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        let out = book.to_order_book().unwrap();
+        assert_eq!(out.best_bid().unwrap().px, Decimal::new(1000, 2));
+        assert_eq!(out.best_ask().unwrap().px, Decimal::new(1010, 2));
+        assert!(book.apply(&remove_bid));
+        let out = book.to_order_book().unwrap();
+        assert!(out.best_bid().is_none());
+        assert_eq!(out.best_ask().unwrap().px, Decimal::new(1005, 2));
+    }
+
+    #[test]
+    fn lighter_book_rejects_nonce_gap_delta() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "nonce":100,
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let gap: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "begin_nonce":99,
+                    "nonce":101,
+                    "bids":[{"price":"10.01","size":"2.00"}],
+                    "asks":[]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        assert!(!book.apply(&gap));
+        let out = book.to_order_book().unwrap();
+        assert_eq!(out.best_bid().unwrap().px, Decimal::new(1000, 2));
+    }
+
+    #[test]
+    fn lighter_book_publishes_multiple_depth_levels() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "nonce":100,
+                    "bids":[{"price":"10.00","size":"2.50"},{"price":"9.95","size":"1.00"}],
+                    "asks":[{"price":"10.10","size":"1.25"},{"price":"10.15","size":"2.00"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        let out = book.to_order_book().unwrap();
+        assert_eq!(out.bids.len(), 2);
+        assert_eq!(out.asks.len(), 2);
+        assert_eq!(out.bids[0].px, Decimal::new(1000, 2));
+        assert_eq!(out.bids[1].px, Decimal::new(995, 2));
+        assert_eq!(out.asks[0].px, Decimal::new(1010, 2));
+        assert_eq!(out.asks[1].px, Decimal::new(1015, 2));
+    }
+
+    #[test]
+    fn signed_position_payload_uses_decimal_not_float() {
+        let position = crate::lighter::messages::PositionPayload {
+            position: Some("0.8499999999999999777955395072".to_string()),
+            sign: Some(-1),
+            avg_entry_price: None,
+        };
+        assert_eq!(
+            signed_position_payload_dec(&position),
+            "-0.8499999999999999777955395072"
+                .parse::<Decimal>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn account_snapshot_helpers_parse_one_account_payload() {
+        let raw = serde_json::json!({
+            "accounts": [{
+                "available_capital": "123.45",
+                "portfolio_value": "234.56",
+                "positions": [
+                    {"market_id": 23, "position": "9.99", "sign": 1},
+                    {"market_id": 24, "position": "0.42", "sign": -1}
+                ]
+            }]
+        });
+        let account = account_root(&raw);
+
+        assert_eq!(
+            account_position_qty(account, 24),
+            "-0.42".parse::<Decimal>().unwrap()
+        );
+        assert_eq!(account_position_qty(account, 99), Decimal::ZERO);
+        assert_eq!(
+            account_available_usdc(account),
+            "123.45".parse::<Decimal>().unwrap()
+        );
+        assert_eq!(
+            account_value_usdc(account),
+            Some("234.56".parse::<Decimal>().unwrap())
+        );
+    }
+
+    #[test]
+    fn account_all_positions_partial_empty_update_does_not_zero_existing_position() {
+        let state = AccountFeedState::default();
+        let known_markets = [24u32];
+        let initial: AccountAllPositionsMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/account_all_positions",
+            "positions": {
+                "24": {"position": "1.42", "sign": 1}
+            }
+        }))
+        .unwrap();
+        apply_account_all_positions(&state, &known_markets, &initial);
+        assert_eq!(state.position(24), Some("1.42".parse::<Decimal>().unwrap()));
+
+        let empty_partial: AccountAllPositionsMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/account_all_positions",
+            "positions": {}
+        }))
+        .unwrap();
+        apply_account_all_positions(&state, &known_markets, &empty_partial);
+        assert_eq!(state.position(24), Some("1.42".parse::<Decimal>().unwrap()));
+
+        let missing_hype_partial: AccountAllPositionsMsg =
+            serde_json::from_value(serde_json::json!({
+                "type": "update/account_all_positions",
+                "positions": {
+                    "25": {"position": "0.5", "sign": -1}
+                }
+            }))
+            .unwrap();
+        apply_account_all_positions(&state, &[24u32, 25u32], &missing_hype_partial);
+        assert_eq!(state.position(24), Some("1.42".parse::<Decimal>().unwrap()));
+        assert_eq!(state.position(25), Some("-0.5".parse::<Decimal>().unwrap()));
+    }
+
+    #[test]
+    fn account_all_positions_full_snapshot_missing_known_market_initializes_zero() {
+        let state = AccountFeedState::default();
+        let snapshot: AccountAllPositionsMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/account_all_positions",
+            "positions": {}
+        }))
+        .unwrap();
+        apply_account_all_positions(&state, &[24u32], &snapshot);
+        assert_eq!(state.position(24), Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn account_feed_counts_live_open_orders_by_known_market() {
+        let state = AccountFeedState::default();
+        let orders = serde_json::json!({
+            "24": [
+                {"status": "open", "client_order_index": 1},
+                {"status": "filled", "client_order_index": 2, "filled_base_amount": "0.20"},
+                {"client_order_index": 3}
+            ],
+            "25": [
+                {"status": "cancelled", "client_order_index": 4}
+            ]
+        });
+        state.set_open_orders_for_markets(&[24, 25, 26], &orders);
+        assert_eq!(state.open_orders_count(24), Some(2));
+        assert_eq!(state.open_orders_count(25), Some(0));
+        assert_eq!(state.open_orders_count(26), Some(0));
+        assert_eq!(
+            state
+                .order_by_client(2)
+                .and_then(|order| order.filled_base_amount),
+            Some("0.20".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_fill_matches_side_and_reports_partial_timeout() {
+        let fills = Arc::new(FillTracker::default());
+        let client_order_index = 42;
+        let rx = fills.register(client_order_index);
+        let pending = PendingFill {
+            fills: fills.clone(),
+            account_feed: Arc::new(AccountFeedState::default()),
+            market_id: 24,
+            client_order_index,
+            side: Side::Buy,
+            expected_qty: Decimal::new(200, 2),
+            rx,
+        };
+
+        fills.on_trade(TradePayload {
+            trade_id: Some(1),
+            ask_client_id: Some(client_order_index),
+            bid_client_id: None,
+            price: Some("10".to_string()),
+            size: Some("1".to_string()),
+            usd_amount: Some("10".to_string()),
+            ..Default::default()
+        });
+        fills.on_trade(TradePayload {
+            trade_id: Some(2),
+            ask_client_id: None,
+            bid_client_id: Some(client_order_index),
+            price: Some("10".to_string()),
+            size: Some("1".to_string()),
+            usd_amount: Some("10".to_string()),
+            ..Default::default()
+        });
+        fills.on_trade(TradePayload {
+            trade_id: Some(2),
+            ask_client_id: None,
+            bid_client_id: Some(client_order_index),
+            price: Some("10".to_string()),
+            size: Some("1".to_string()),
+            usd_amount: Some("10".to_string()),
+            ..Default::default()
+        });
+
+        let summary = pending.wait(Duration::from_millis(20)).await.unwrap();
+        assert_eq!(summary.qty, Decimal::ONE);
+        assert_eq!(summary.notional, Decimal::TEN);
+        let stats = fills.stats();
+        assert_eq!(stats.registered, 1);
+        assert_eq!(stats.trades_seen, 3);
+        assert_eq!(stats.matched_trades, 3);
+        assert_eq!(stats.duplicate_trades, 1);
+        assert_eq!(stats.timeouts, 1);
+    }
+}

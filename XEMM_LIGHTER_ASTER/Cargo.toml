@@ -1,0 +1,84 @@
+[package]
+name = "xemm_lighter_aster"
+version = "0.1.0"
+edition = "2021"
+# MSRV: uses Option::is_none_or (1.82) and {integer}::is_multiple_of (1.87).
+rust-version = "1.87"
+default-run = "xemm_lighter_aster"
+description = "XEMM Aster<->Lighter maker/taker dry-run evaluator"
+
+[lib]
+name = "xemm_lighter_aster"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xemm_lighter_aster"
+path = "src/main.rs"
+
+[features]
+# `hotpath` is the lock-free real-time substrate (latest-book cell, stream
+# watchdog, execution seam) used by `live` and a future real bot. It is default-on
+# but `record`/`replay` never touch it, so the deterministic core builds and runs
+# bit-identically under `--no-default-features`.
+default = ["hotpath"]
+hotpath = [
+    "dep:arc-swap",
+    "dep:tokio-util",
+    "dep:async-trait",
+    # --- live-trading cryptographic signing (Aster EIP-191 plus legacy hedge helpers) ---
+    # Only the live `livebot` workers need these; the deterministic record/replay core
+    # never signs, so they stay optional and `--no-default-features` pulls in none of them.
+    "dep:k256",
+    "dep:tiny-keccak",
+    "dep:rmp-serde",
+    "dep:hex",
+]
+# Optional core pinning for the per-venue ingest threads. Off by default: it buys
+# tail-latency determinism that only matters once real orders are placed, and on
+# Windows can make jitter worse. Wire-only until the live bot.
+core-pin = ["dep:core_affinity"]
+
+[dependencies]
+arrayvec = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.8"
+rust_decimal = { version = "1", features = ["serde-str"] }
+rust_decimal_macros = "1"
+chrono = { version = "0.4", features = ["clock", "serde"] }
+uuid = { version = "1", features = ["v4"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Streaming compression for the run log. Cold-path (record/replay) only, so it is a
+# core dep (not behind `hotpath`); the deterministic core still builds under
+# `--no-default-features`. zstd-sys compiles via `cc`, already required by rusqlite's
+# `bundled` feature, so this adds no new toolchain dependency.
+zstd = "0.13"
+anyhow = "1"
+thiserror = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1.3"
+fast-float = "0.2"
+libc = "0.2"
+libloading = "0.8"
+# --- hotpath (optional, lock-free real-time substrate) ---
+arc-swap = { version = "1", optional = true }
+tokio-util = { version = "0.7", optional = true }
+async-trait = { version = "0.1", optional = true }
+core_affinity = { version = "0.8", optional = true }
+# --- live signing (optional, pulled in by `hotpath`) ---
+# secp256k1 ECDSA with recoverable signatures (EIP-191 / EIP-712 'v'); keccak256;
+# msgpack for legacy hedge signing tests/helpers; hex for r/s serialization.
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+tiny-keccak = { version = "2", features = ["keccak"], optional = true }
+rmp-serde = { version = "1", optional = true }
+hex = { version = "0.4", optional = true }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

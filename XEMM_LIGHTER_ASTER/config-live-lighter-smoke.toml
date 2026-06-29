@@ -1,0 +1,177 @@
+# Dedicated config for the LIVE HYPE near-touch smoke run using Aster + Lighter. Kept SEPARATE from
+# config.toml so the always-on multi-pair paper dry run (a different process, different config)
+# is completely unaffected. Small clips, generous timing for the slow dev network.
+#
+# Run with:
+#   xemm_lighter_aster --config config-live-lighter.toml livebot --mode live --markets HYPE \
+#       --db runs/livebot-live.sqlite --out runs/livebot-live.jsonl.zst --secs <N>
+
+[edge]
+# Post-test default: conservative enough to avoid accidentally reusing the aggressive
+# zero-touch smoke settings. This remains separate from the production live config.
+min_net_profit_bps   = "14.0"
+slippage_buffer_bps  = "1.5"
+latency_buffer_bps   = "2.0"
+basis_buffer_bps     = "1.0"
+funding_buffer_bps   = "0.0"
+aster_maker_fee_bps        = "0.0"
+taker_fee_bps              = "0.0"
+
+[quote]
+# ~$12 per side: > Lighter's min and the $5 Aster min, <= the $15 small-risk cap.
+desired_notional             = "13"
+max_quote_distance_bps       = "50"
+min_aster_touch_distance_bps = "10.0"
+min_aster_touch_hysteresis_bps = "1.0"
+max_aster_touch_hysteresis_ms = 300000
+depth_liquidity_multiple           = "10.0"
+max_hedge_slippage_bps       = "5.0"
+min_requote_interval_ms      = 20
+price_change_ticks_to_requote = 1
+clamp_to_min_lot             = true
+# Per-side requote deadband: skip a cancel/replace while the new desired price is within this many
+# bps of the resting quote (even if marginally unprofitable). Suppresses sub-bps requote churn.
+min_requote_bps              = "2.0"
+
+[simulation]
+simulated_aster_place_latency_ms  = 25
+simulated_aster_cancel_latency_ms = 25
+quote_ttl_ms                      = 500
+hedge_latency_buckets_ms          = [50, 100, 250, 500, 1000]
+max_book_staleness_ms             = 10000
+halt_trading_on_stale_feed        = true
+
+[partials]
+strict_all_partials_must_be_hedgeable = false
+accumulate_sub_min_fills              = true
+lighter_min_notional              = "10"
+max_pending_inventory_notional        = "25"
+max_pending_inventory_age_ms          = 1000
+mark_pending_inventory_to_market      = true
+
+[capital]
+aster_capital_usd       = "200"
+lighter_capital_usd = "200"
+leverage                = "1"
+enforce_position_cap    = true
+
+[queue_model]
+models                 = ["optimistic", "visible_queue", "conservative"]
+hidden_queue_multiplier = "1.0"
+
+[runtime]
+record_path = "runs"
+db_path     = "runs/eval.sqlite"
+
+[book_check]
+enabled              = true
+interval_secs        = 30
+tolerance_bps        = "50"
+consecutive_breaches = 3
+depth_limit          = 20
+
+[live]
+enabled                       = true
+mode                          = "live"       # this config is FOR the live run (CLI also passes --mode live)
+post_trade_cooldown_ms        = 3000         # short cooldown so the 4 sequences don't take forever
+cooldown_scope                = "per_market"
+startup_cancel_all            = true
+shutdown_cancel_all           = true
+require_clean_start           = true
+max_unhedged_notional_usd     = "15"         # allow one ~$12 clip in flight before freezing NEW quotes
+max_unhedged_age_ms           = 8000         # generous: a slow-network hedge RTT must not false-freeze
+max_position_mismatch_usd     = "3"
+max_account_snapshot_age_ms   = 4000
+max_user_stream_staleness_ms  = 15000        # slow dev network
+cancel_all_on_gate_close      = true
+cancel_all_on_user_stream_stale = true
+
+[live.quote]
+use_hot_integer_math               = true
+# Inventory-unwind mode: when flat, quote both sides; once cross-venue inventory exists, only post
+# the Aster maker side whose paired Lighter hedge reduces it. Set false for normal two-sided XEMM.
+reduce_position_only               = true
+replace_immediately_if_unprofitable = true
+min_requote_interval_ms            = 50
+price_change_ticks_to_requote      = 1
+# Live safety cap for per-symbol replace churn. The separate Aster command budget below protects
+# the global REST write path and reserves room for cancels/sweeps.
+max_replaces_per_minute_per_symbol = 100
+
+[live.partials]
+# accumulate_sub_min: admits Class-B pairs like HYPE (full ~$12 clip is Lighter-hedgeable, but a
+# tiny partial could be sub-$10). Sub-min partials are NOT orphaned — they're flattened
+# reduce-only on Aster in the hot path, and the cold reconciler backstop neutralizes any
+# residual. The common case is a single full fill that hedges immediately on Lighter.
+# A pending sub-min residual flushes to a hedge as soon as the next fill pushes it past $10, so
+# it rarely lingers. These bounds only trigger the exceptional flatten if it genuinely sticks:
+# allow it to grow to ~$15 (just over one clip) and live ~6s while accumulating before we give up
+# and flatten it reduce-only on Aster.
+policy                  = "accumulate_sub_min"
+max_pending_notional_usd = "15"
+max_pending_age_ms       = 6000
+max_pending_count        = 3
+
+[live.aster]
+base_url             = "https://fapi.asterdex.com"
+deadman_enabled      = true
+deadman_countdown_ms = 10000
+deadman_refresh_ms   = 2000
+prefer_modify_order  = true
+max_rest_requests_per_minute      = 1200
+optional_rest_reserve_per_minute  = 120
+cancel_retry_backoff_ms           = 1000
+safety_sweep_retry_ms             = 2000
+rate_limit_backoff_ms             = 5000
+
+[live.lighter]
+base_url              = "https://mainnet.zklighter.elliot.ai"
+signers_dir           = "signers"
+hedge_order_type      = "aggressive_ioc"
+# 2026-06-16: widened the FIRST-try IOC buffer so the hedge crosses immediately and avoids the
+# ~1s reject->retry path. Still ~26x tighter than Lighter's own 8% market-order default; the IOC limit
+# is a ceiling, not the fill price (small hedges fill at the touch), so the wider cap rarely costs
+# extra. emergency is the escalation for an extreme adverse move and should now seldom trigger.
+normal_slippage_bps   = "60"
+emergency_slippage_bps = "90"
+expires_after_ms      = 60000
+fill_timeout_ms       = 2000
+
+[live.margin_guard]
+# Proactive Aster margin cap. The position cap fed to the quote engine is dynamically lowered to
+# min(aster_capital_usd, (real_collateral - aster_safety_buffer_usd) * leverage), so the
+# position-INCREASING side stops quoting before Aster rejects with -2019 ("Margin is insufficient").
+# Real collateral ~= the deposited USDC (~$124), NOT the $200 aster_capital_usd soft cap. The buffer
+# (~2x the $13 clip) absorbs one in-flight/stale quote + mark movement over the reconcile cadence.
+# Requires capital.leverage = 1 and enforce_position_cap = true (validated at startup).
+# NOTE: the cap is account-aware (other CONFIGURED markets' Aster notional is deducted), but the buffer
+# size and the ~2s forced-tick application latency are tuned for the single-market (--markets HYPE) run;
+# raise the buffer if ever running multiple Aster markets live simultaneously. IMPORTANT: only Aster
+# positions in symbols mapped from the SELECTED specs are deducted, so run this on an account DEDICATED
+# to the configured markets — unrelated Aster exposure would consume collateral without being counted.
+enabled                 = true
+aster_safety_buffer_usd = "26"
+
+[live.circuit_breaker]
+# Unattended-run safety stop. Measures TOTAL cross-venue account equity (Aster wallet+unrealized + Lighter
+# accountValue) vs a baseline captured at startup; if the drawdown exceeds the limit the bot cancels
+# orders, LEAVES the delta-neutral position open, writes runs/<db-stem>.trip.json, and halts. It then
+# REFUSES to restart until the latch is cleared:  python scripts/reset_breaker.py
+enabled                  = true
+max_cumulative_loss_usdc = "5"
+
+[[markets]]
+aster_symbol = "HYPEUSDT"
+lighter_symbol      = "HYPE"
+
+[[markets]]
+aster_symbol = "BNBUSDT"
+lighter_symbol      = "BNB"
+
+# ETH added for the docker live test. desired_notional=13 (global) -> ~0.007 ETH
+# (step 0.001) ~= $12.90/leg at ETH~$1842: clears Lighter's $10 floor (margin ~$2.90;
+# >=$11.14 even under adverse rounding) and Aster's $5. Specs: Aster tick 0.01 /
+# step 0.001 / minQty 0.001 / MIN_NOTIONAL $5. Select with --markets ETH.
+[[markets]]
+aster_symbol = "ETHUSDT"
+lighter_symbol      = "ETH"
