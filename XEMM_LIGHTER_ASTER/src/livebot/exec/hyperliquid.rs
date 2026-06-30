@@ -98,6 +98,57 @@ impl FillTracker {
     }
 }
 
+fn lighter_trade_key(trade: &TradePayload) -> String {
+    if let Some(id) = trade.trade_id {
+        return format!("id:{id}");
+    }
+    format!(
+        "fallback:{:?}",
+        (
+            trade.ask_id,
+            trade.bid_id,
+            trade.ask_client_id,
+            trade.bid_client_id,
+            trade.price.as_deref(),
+            trade.size.as_deref(),
+            trade.usd_amount.as_deref(),
+            trade.timestamp,
+            trade.transaction_time,
+            &trade.maker_fee,
+            &trade.taker_fee,
+        )
+    )
+}
+
+fn record_lighter_fill_trade(
+    trade: &TradePayload,
+    seen: &mut HashSet<String>,
+    qty: &mut Decimal,
+    notional: &mut Decimal,
+    fee_usd: &mut Decimal,
+) -> bool {
+    if !seen.insert(lighter_trade_key(trade)) {
+        return false;
+    }
+    let q = trade
+        .size
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO);
+    let p = trade
+        .price
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO);
+    if q > Decimal::ZERO && p > Decimal::ZERO {
+        *qty += q;
+        *notional += q * p;
+        *fee_usd += trade_fee_usd(trade);
+        return true;
+    }
+    false
+}
+
 #[derive(Default)]
 struct AccountFeedState {
     positions: Mutex<HashMap<u32, (Decimal, Decimal)>>,
@@ -627,6 +678,7 @@ impl HlExchange {
         let deadline = tokio::time::Instant::now() + self.fill_timeout;
         let grace_after_first = Duration::from_millis(200);
         let mut grace_deadline: Option<tokio::time::Instant> = None;
+        let mut seen = HashSet::new();
         let mut qty = Decimal::ZERO;
         let mut notional = Decimal::ZERO;
         let mut fee_usd = Decimal::ZERO;
@@ -646,20 +698,7 @@ impl HlExchange {
             };
             match tokio::time::timeout_at(wait_until, rx.recv()).await {
                 Ok(Some(tr)) => {
-                    let q = tr
-                        .size
-                        .as_deref()
-                        .and_then(|s| s.parse::<Decimal>().ok())
-                        .unwrap_or(Decimal::ZERO);
-                    let p = tr
-                        .price
-                        .as_deref()
-                        .and_then(|s| s.parse::<Decimal>().ok())
-                        .unwrap_or(Decimal::ZERO);
-                    if q > Decimal::ZERO && p > Decimal::ZERO {
-                        qty += q;
-                        notional += q * p;
-                        fee_usd += trade_fee_usd(&tr);
+                    if record_lighter_fill_trade(&tr, &mut seen, &mut qty, &mut notional, &mut fee_usd) {
                         if grace_deadline.is_none() {
                             grace_deadline = Some(tokio::time::Instant::now() + grace_after_first);
                         }
@@ -1420,6 +1459,40 @@ mod tests {
             ..TradePayload::default()
         };
         assert_eq!(trade_fee_usd(&tr), dec!(0.012345));
+    }
+
+    #[test]
+    fn lighter_fill_trade_dedupes_replayed_messages() {
+        let mut seen = HashSet::new();
+        let mut qty = Decimal::ZERO;
+        let mut notional = Decimal::ZERO;
+        let mut fee_usd = Decimal::ZERO;
+        let trade = TradePayload {
+            trade_id: Some(42),
+            bid_client_id: Some(77),
+            price: Some("10".into()),
+            size: Some("0.5".into()),
+            taker_fee: Some(serde_json::json!(1000000)),
+            ..TradePayload::default()
+        };
+
+        assert!(record_lighter_fill_trade(&trade, &mut seen, &mut qty, &mut notional, &mut fee_usd));
+        assert!(!record_lighter_fill_trade(&trade, &mut seen, &mut qty, &mut notional, &mut fee_usd));
+        assert_eq!(qty, dec!(0.5));
+        assert_eq!(notional, dec!(5.0));
+        assert_eq!(fee_usd, dec!(1));
+
+        let fallback = TradePayload {
+            bid_client_id: Some(77),
+            price: Some("10".into()),
+            size: Some("0.25".into()),
+            timestamp: Some(123),
+            ..TradePayload::default()
+        };
+        assert!(record_lighter_fill_trade(&fallback, &mut seen, &mut qty, &mut notional, &mut fee_usd));
+        assert!(!record_lighter_fill_trade(&fallback, &mut seen, &mut qty, &mut notional, &mut fee_usd));
+        assert_eq!(qty, dec!(0.75));
+        assert_eq!(notional, dec!(7.50));
     }
 
     #[test]

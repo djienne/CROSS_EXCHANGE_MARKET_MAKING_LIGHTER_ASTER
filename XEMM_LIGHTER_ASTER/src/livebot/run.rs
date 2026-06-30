@@ -18,7 +18,7 @@ use std::thread;
 
 use anyhow::{bail, Result};
 use chrono::{DateTime, Utc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Notify;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -71,6 +71,14 @@ async fn send_hedge_safety(tx: &mpsc::Sender<HedgeCommand>, cmd: HedgeCommand, l
         Ok(Err(e)) => warn!("hedge safety send failed ({label}): receiver closed: {e}"),
         Err(_) => warn!("hedge safety send timed out ({label})"),
     }
+}
+
+fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string())
 }
 
 /// Entry point for the `livebot` command.
@@ -317,15 +325,20 @@ pub async fn run(
     // pinned to the next available core after the ingest threads.
     let strat_core_hint = core_hint;
     let strat_shutdown = shutdown.clone();
+    let (strat_done_tx, mut strat_done_rx) = oneshot::channel::<std::result::Result<(), String>>();
     let strat_handle = thread::Builder::new()
         .name("livebot-strategy".into())
         .spawn(move || {
-            crate::hotpath::maybe_pin_core(Some(strat_core_hint));
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("strategy runtime");
-            rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                crate::hotpath::maybe_pin_core(Some(strat_core_hint));
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("strategy runtime");
+                rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown));
+            }))
+            .map_err(|panic| panic_payload_message(panic.as_ref()));
+            let _ = strat_done_tx.send(result);
         })
         .expect("spawn strategy thread");
 
@@ -381,9 +394,32 @@ pub async fn run(
 
     // --- main orchestrator: wait for ctrl-c, deadline, or an internal safety halt ---
     let deadline = secs.map(|s| Instant::now() + Duration::from_secs(s));
+    let mut strategy_done_seen = false;
+    let mut strategy_error: Option<anyhow::Error> = None;
     tokio::select! {
         _ = shutdown.cancelled() => {
             warn!("internal shutdown requested: coordinating safety shutdown");
+        }
+        strat_result = &mut strat_done_rx => {
+            strategy_done_seen = true;
+            match strat_result {
+                Ok(Ok(())) if shutdown.is_cancelled() => {}
+                Ok(Ok(())) => {
+                    warn!("strategy thread exited unexpectedly; coordinating safety shutdown");
+                    strategy_error = Some(anyhow::anyhow!("strategy thread exited unexpectedly"));
+                    shutdown.cancel();
+                }
+                Ok(Err(msg)) => {
+                    warn!("strategy thread panicked: {msg}; coordinating safety shutdown");
+                    strategy_error = Some(anyhow::anyhow!("strategy thread panicked: {msg}"));
+                    shutdown.cancel();
+                }
+                Err(_) => {
+                    warn!("strategy thread supervision channel closed; coordinating safety shutdown");
+                    strategy_error = Some(anyhow::anyhow!("strategy thread supervision channel closed"));
+                    shutdown.cancel();
+                }
+            }
         }
         _ = async {
             match deadline {
@@ -435,7 +471,30 @@ pub async fn run(
             return Err(anyhow::anyhow!("cold recorder panicked: {msg}"));
         }
     }
-    let _ = strat_handle.join();
+    if let Err(panic) = strat_handle.join() {
+        let msg = panic_payload_message(panic.as_ref());
+        warn!("strategy thread panicked outside supervisor: {msg}");
+        if strategy_error.is_none() {
+            strategy_error = Some(anyhow::anyhow!("strategy thread panicked: {msg}"));
+        }
+    }
+    if !strategy_done_seen {
+        match strat_done_rx.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(msg)) => {
+                warn!("strategy thread panicked: {msg}");
+                if strategy_error.is_none() {
+                    strategy_error = Some(anyhow::anyhow!("strategy thread panicked: {msg}"));
+                }
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => {
+                if strategy_error.is_none() {
+                    strategy_error = Some(anyhow::anyhow!("strategy thread supervision channel closed"));
+                }
+            }
+        }
+    }
     let _ = worker_task.await;
     for h in aux_tasks {
         let _ = h.await;
@@ -443,6 +502,10 @@ pub async fn run(
     drop(journal);
     if let Some(j) = journal_task {
         let _ = j.await;
+    }
+
+    if let Some(e) = strategy_error {
+        return Err(e);
     }
 
     info!("livebot stopped. research tape -> {} ; results db -> {}", tape_path.display(), db_path.display());
