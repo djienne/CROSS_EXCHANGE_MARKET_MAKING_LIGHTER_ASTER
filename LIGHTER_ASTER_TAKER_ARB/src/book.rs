@@ -1,5 +1,6 @@
 use arrayvec::ArrayVec;
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::types::Side;
@@ -22,6 +23,50 @@ pub struct DepthQuote {
     pub best_px: Decimal,
     pub best_qty: Decimal,
     pub levels_used: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DepthQuoteF64 {
+    pub side: Side,
+    pub target_qty: f64,
+    pub available_qty: f64,
+    pub vwap_px: f64,
+    pub worst_px: f64,
+    pub best_px: f64,
+    pub best_qty: f64,
+    pub levels_used: usize,
+}
+
+impl DepthQuoteF64 {
+    pub fn to_decimal_quote(self) -> DepthQuote {
+        DepthQuote {
+            side: self.side,
+            target_qty: f64_to_decimal(self.target_qty),
+            available_qty: f64_to_decimal(self.available_qty),
+            vwap_px: f64_to_decimal(self.vwap_px),
+            worst_px: f64_to_decimal(self.worst_px),
+            best_px: f64_to_decimal(self.best_px),
+            best_qty: f64_to_decimal(self.best_qty),
+            levels_used: self.levels_used,
+        }
+    }
+}
+
+fn f64_to_decimal(v: f64) -> Decimal {
+    Decimal::from_f64_retain(v).unwrap_or(Decimal::ZERO)
+}
+
+fn decimal_to_f64(value: Decimal) -> Option<f64> {
+    let out = value.to_f64()?;
+    out.is_finite().then_some(out)
+}
+
+fn level_to_f64(level: &Level) -> Option<(f64, f64)> {
+    Some((decimal_to_f64(level.px)?, decimal_to_f64(level.qty)?))
+}
+
+fn f64_qty_tol(qty: f64) -> f64 {
+    (qty.abs() * f64::EPSILON * 64.0).max(f64::EPSILON)
 }
 
 #[derive(Debug, Clone)]
@@ -128,6 +173,77 @@ impl OrderBook {
             levels_used,
         })
     }
+
+    pub fn mid_f64(&self) -> Option<f64> {
+        let bid = self.best_bid()?;
+        let ask = self.best_ask()?;
+        let mid = (decimal_to_f64(bid.px)? + decimal_to_f64(ask.px)?) / 2.0;
+        mid.is_finite().then_some(mid)
+    }
+
+    pub fn best_bid_f64(&self) -> Option<(f64, f64)> {
+        self.bids.first().and_then(level_to_f64)
+    }
+
+    pub fn best_ask_f64(&self) -> Option<(f64, f64)> {
+        self.asks.first().and_then(level_to_f64)
+    }
+
+    pub fn cumulative_qty_f64(&self, side: Side, max_levels: usize) -> Option<f64> {
+        self.side_levels(side)
+            .iter()
+            .take(max_levels.min(MAX_BOOK_LEVELS))
+            .try_fold(0.0, |acc, level| Some(acc + decimal_to_f64(level.qty)?))
+    }
+
+    pub fn depth_vwap_f64(
+        &self,
+        side: Side,
+        target_qty: f64,
+        max_levels: usize,
+    ) -> Option<DepthQuoteF64> {
+        if target_qty <= 0.0 || !target_qty.is_finite() || max_levels == 0 {
+            return None;
+        }
+        let levels = self.side_levels(side);
+        let best = levels.first().copied()?;
+        let mut remaining = target_qty;
+        let mut filled = 0.0;
+        let mut notional = 0.0;
+        let mut available = 0.0;
+        let mut worst_px = decimal_to_f64(best.px)?;
+        let best_px = worst_px;
+        let best_qty = decimal_to_f64(best.qty)?;
+        let mut levels_used = 0usize;
+        for level in levels.iter().take(max_levels.min(MAX_BOOK_LEVELS)) {
+            let px = decimal_to_f64(level.px)?;
+            let qty = decimal_to_f64(level.qty)?;
+            available += qty;
+            if remaining > 0.0 {
+                let take = qty.min(remaining);
+                if take > 0.0 {
+                    filled += take;
+                    notional += take * px;
+                    remaining -= take;
+                    worst_px = px;
+                    levels_used += 1;
+                }
+            }
+        }
+        if filled + f64_qty_tol(target_qty) < target_qty {
+            return None;
+        }
+        Some(DepthQuoteF64 {
+            side,
+            target_qty,
+            available_qty: available,
+            vwap_px: notional / target_qty,
+            worst_px,
+            best_px,
+            best_qty,
+            levels_used,
+        })
+    }
 }
 
 fn build_side(
@@ -194,5 +310,14 @@ mod tests {
             now,
         );
         assert!(book.depth_vwap(Side::Sell, dec!(2), 20).is_none());
+    }
+
+    #[test]
+    fn depth_vwap_f64_accepts_decimal_depth_sum_noise() {
+        let now = Utc::now();
+        let asks = (0..10).map(|i| (dec!(10.00) + Decimal::from(i) / Decimal::from(100), dec!(0.1)));
+        let book = OrderBook::from_levels([(dec!(9.90), dec!(1))], asks, now, now);
+        let quote = book.depth_vwap_f64(Side::Buy, 1.0, 20).unwrap();
+        assert_eq!(quote.levels_used, 10);
     }
 }

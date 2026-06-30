@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+arc-swap = "1"
 arrayvec = "0.7"
 chrono = { version = "0.4", features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }
@@ -26,7 +27,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 rmp-serde = "1"
 rust_decimal = { version = "1", features = ["serde-str"] }
 rust_decimal_macros = "1"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "1"
 tiny-keccak = { version = "2", features = ["keccak"] }
@@ -39,3 +40,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

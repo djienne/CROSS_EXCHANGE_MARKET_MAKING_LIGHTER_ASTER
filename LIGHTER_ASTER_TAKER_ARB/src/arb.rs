@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::signal;
@@ -65,6 +66,7 @@ impl Direction {
 struct Opportunity {
     direction: Direction,
     qty: Decimal,
+    qty_f64: f64,
     gross_edge_bps: Decimal,
     expected_net_margin_bps: Decimal,
     sell_px: Decimal,
@@ -120,6 +122,100 @@ impl PositionSnapshot {
 struct MarginSnapshot {
     aster_available_usd: Decimal,
     lighter_available_usd: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PositionF64 {
+    aster_qty: f64,
+    lighter_qty: f64,
+}
+
+impl PositionF64 {
+    fn from_snapshot(pos: PositionSnapshot) -> Option<Self> {
+        Some(Self {
+            aster_qty: decimal_to_f64(pos.aster_qty)?,
+            lighter_qty: decimal_to_f64(pos.lighter_qty)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarginF64 {
+    aster_available_usd: f64,
+    lighter_available_usd: f64,
+}
+
+impl MarginF64 {
+    fn from_snapshot(margins: MarginSnapshot) -> Option<Self> {
+        Some(Self {
+            aster_available_usd: decimal_to_f64(margins.aster_available_usd)?,
+            lighter_available_usd: decimal_to_f64(margins.lighter_available_usd)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarketMathF64 {
+    common_qty_step: f64,
+    qty_decimal_places: u32,
+    qty_tol_cap: f64,
+    aster_min_qty: f64,
+    aster_min_notional: f64,
+    lighter_min_notional: f64,
+    desired_notional: f64,
+    aster_taker_fee_rate: f64,
+    lighter_taker_fee_rate: f64,
+    margin_rate: f64,
+    max_abs_position_notional_usd: f64,
+    margin_buffer_usd: f64,
+    depth_liquidity_multiple: f64,
+}
+
+impl MarketMathF64 {
+    fn from_config_spec(cfg: &Config, spec: &MarketSpec) -> Result<Self> {
+        let common_step_dec = common_qty_step_dec(spec.step, spec.lighter_qty_step)?;
+        let common_qty_step = positive_decimal_to_f64(common_step_dec)
+            .context("common quantity step is not representable as finite f64")?;
+        let qty_decimal_places = common_step_dec.normalize().scale();
+        Ok(Self {
+            common_qty_step,
+            qty_decimal_places,
+            qty_tol_cap: (common_qty_step * 1e-6).max(f64::EPSILON * 16.0),
+            aster_min_qty: positive_decimal_to_f64(spec.aster_min_qty)
+                .context("Aster min qty is not representable as finite positive f64")?,
+            aster_min_notional: positive_decimal_to_f64(spec.aster_min_notional)
+                .context("Aster min notional is not representable as finite positive f64")?,
+            lighter_min_notional: positive_decimal_to_f64(spec.lighter_min_notional)
+                .context("Lighter min notional is not representable as finite positive f64")?,
+            desired_notional: positive_decimal_to_f64(cfg.arb.desired_notional)
+                .context("desired notional is not representable as finite positive f64")?,
+            aster_taker_fee_rate: non_negative_decimal_to_f64(cfg.arb.aster_taker_fee_bps)
+                .context("Aster taker fee is not representable as finite f64")?
+                / 10_000.0,
+            lighter_taker_fee_rate: non_negative_decimal_to_f64(cfg.arb.lighter_taker_fee_bps)
+                .context("Lighter taker fee is not representable as finite f64")?
+                / 10_000.0,
+            margin_rate: non_negative_decimal_to_f64(cfg.arb.margin_bps)
+                .context("margin bps is not representable as finite f64")?
+                / 10_000.0,
+            max_abs_position_notional_usd: positive_decimal_to_f64(
+                cfg.risk.max_abs_position_notional_usd,
+            )
+            .context("max abs position notional is not representable as finite positive f64")?,
+            margin_buffer_usd: non_negative_decimal_to_f64(cfg.risk.margin_buffer_usd)
+                .context("margin buffer is not representable as finite f64")?,
+            depth_liquidity_multiple: positive_decimal_to_f64(cfg.arb.depth_guard.liquidity_multiple)
+                .context("depth liquidity multiple is not representable as finite positive f64")?,
+        })
+    }
+
+    fn liquidity_multiple(self, depth_guard_enabled: bool) -> f64 {
+        if depth_guard_enabled {
+            self.depth_liquidity_multiple
+        } else {
+            1.0
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -420,6 +516,7 @@ fn execution_lease_enabled(
     (lease.is_some(), lease)
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 struct SizingDecision {
     qty: Decimal,
@@ -443,6 +540,150 @@ struct SizingDecision {
     buy_best_qty: Decimal,
     headroom_qty: Decimal,
     margin_room_qty: Decimal,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SizingDecisionF64 {
+    qty: f64,
+    desired_qty: f64,
+    min_qty: f64,
+    top_depth_qty: f64,
+    depth_guard_enabled: bool,
+    liquidity_multiple: f64,
+    depth_supported_qty: f64,
+    sell_depth_target_qty: f64,
+    buy_depth_target_qty: f64,
+    sell_depth_available_qty: f64,
+    buy_depth_available_qty: f64,
+    sell_depth_worst_px: f64,
+    buy_depth_worst_px: f64,
+    sell_depth_levels_used: usize,
+    buy_depth_levels_used: usize,
+    sell_best_px: f64,
+    buy_best_px: f64,
+    sell_best_qty: f64,
+    buy_best_qty: f64,
+    headroom_qty: f64,
+    margin_room_qty: f64,
+}
+
+#[inline]
+fn f64_to_dec(v: f64) -> Decimal {
+    Decimal::from_f64_retain(v)
+        .unwrap_or(Decimal::ZERO)
+        .round_dp(12)
+}
+
+fn qty_f64_to_dec(math: &MarketMathF64, v: f64) -> Decimal {
+    Decimal::from_f64_retain(round_qty_to_scale_f64(v, math))
+        .unwrap_or(Decimal::ZERO)
+        .round_dp(math.qty_decimal_places)
+}
+
+fn decimal_to_f64(value: Decimal) -> Option<f64> {
+    let out = value.to_f64()?;
+    out.is_finite().then_some(out)
+}
+
+fn positive_decimal_to_f64(value: Decimal) -> Option<f64> {
+    let out = decimal_to_f64(value)?;
+    (out > 0.0).then_some(out)
+}
+
+fn non_negative_decimal_to_f64(value: Decimal) -> Option<f64> {
+    let out = decimal_to_f64(value)?;
+    (out >= 0.0).then_some(out)
+}
+
+fn common_qty_step_dec(aster_step: Decimal, lighter_step: Decimal) -> Result<Decimal> {
+    let (a_units, a_scale) = decimal_step_units(aster_step)?;
+    let (l_units, l_scale) = decimal_step_units(lighter_step)?;
+    let scale = a_scale.max(l_scale);
+    let a = a_units
+        .checked_mul(pow10_u128(scale - a_scale)?)
+        .context("Aster quantity step scale overflow")?;
+    let l = l_units
+        .checked_mul(pow10_u128(scale - l_scale)?)
+        .context("Lighter quantity step scale overflow")?;
+    let common = lcm_u128(a, l).context("common quantity step overflow")?;
+    let common_i128 = i128::try_from(common).context("common quantity step too large")?;
+    Ok(Decimal::from_i128_with_scale(common_i128, scale).normalize())
+}
+
+fn decimal_step_units(step: Decimal) -> Result<(u128, u32)> {
+    if step <= Decimal::ZERO {
+        bail!("quantity step must be positive");
+    }
+    let normalized = step.normalize();
+    let mantissa = normalized.mantissa().abs();
+    if mantissa == 0 {
+        bail!("quantity step must be positive");
+    }
+    let units = u128::try_from(mantissa).context("quantity step mantissa overflow")?;
+    Ok((units, normalized.scale()))
+}
+
+fn pow10_u128(exp: u32) -> Result<u128> {
+    let mut out = 1u128;
+    for _ in 0..exp {
+        out = out.checked_mul(10).context("decimal scale overflow")?;
+    }
+    Ok(out)
+}
+
+fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
+fn lcm_u128(a: u128, b: u128) -> Option<u128> {
+    let gcd = gcd_u128(a, b);
+    a.checked_div(gcd)?.checked_mul(b)
+}
+
+fn unit_snap_tol(units: f64) -> f64 {
+    (units.abs() * f64::EPSILON * 64.0).max(1e-12)
+}
+
+fn snap_step_units(units: f64) -> f64 {
+    let nearest = units.round();
+    if (units - nearest).abs() <= unit_snap_tol(units) {
+        nearest
+    } else {
+        units
+    }
+}
+
+fn round_qty_to_scale_f64(qty: f64, math: &MarketMathF64) -> f64 {
+    if !qty.is_finite() || qty <= 0.0 {
+        return 0.0;
+    }
+    let scale = 10f64.powi(math.qty_decimal_places as i32);
+    if !scale.is_finite() || scale <= 0.0 {
+        return qty;
+    }
+    (qty * scale).round() / scale
+}
+
+fn qty_cmp_tol(math: &MarketMathF64, a: f64, b: f64) -> f64 {
+    let raw = a.abs().max(b.abs()) * f64::EPSILON * 64.0;
+    raw.max(f64::EPSILON).min(math.qty_tol_cap)
+}
+
+fn qty_le(a: f64, b: f64, math: &MarketMathF64) -> bool {
+    a <= b + qty_cmp_tol(math, a, b)
+}
+
+fn qty_ge(a: f64, b: f64, math: &MarketMathF64) -> bool {
+    a + qty_cmp_tol(math, a, b) >= b
+}
+
+fn qty_gt(a: f64, b: f64, math: &MarketMathF64) -> bool {
+    a > b + qty_cmp_tol(math, a, b)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -639,8 +880,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     )
     .await?;
     let spec = specs.first().context("no resolved market spec")?.clone();
+    let math = MarketMathF64::from_config_spec(&cfg, &spec)?;
     info!(
-        "resolved market {}: Aster {} step={} min_notional={} | Lighter {} market_id={} qty_step={} min_notional={}",
+        "resolved market {}: Aster {} step={} min_notional={} | Lighter {} market_id={} qty_step={} min_notional={} common_qty_step={}",
         spec.market_id,
         spec.aster_symbol,
         spec.step,
@@ -648,7 +890,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         spec.lighter_symbol,
         spec.lighter_market_id,
         spec.lighter_qty_step,
-        spec.lighter_min_notional
+        spec.lighter_min_notional,
+        math.common_qty_step
     );
 
     let bot_start = Utc::now();
@@ -877,9 +1120,15 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         last_stale_account_log_at = None;
 
         let pos = account.position;
-        if net_mismatch_notional(pos, &aster_book, &lighter_book)
-            > cfg.risk.max_position_mismatch_usd
-        {
+        let Some(mismatch_notional) = net_mismatch_notional(pos, &aster_book, &lighter_book) else {
+            warn!(
+                "position mismatch check unavailable due to f64 conversion failure: aster={} lighter={}",
+                pos.aster_qty, pos.lighter_qty
+            );
+            tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms)).await;
+            continue;
+        };
+        if mismatch_notional > cfg.risk.max_position_mismatch_usd {
             warn!(
                 "position mismatch too large: aster={} lighter={} net={}; pausing",
                 pos.aster_qty,
@@ -911,6 +1160,22 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             }
         }
         let margins = account.margins;
+        let Some(pos_f) = PositionF64::from_snapshot(pos) else {
+            warn!(
+                "position f64 conversion failed; skipping scan iteration: aster={} lighter={}",
+                pos.aster_qty, pos.lighter_qty
+            );
+            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            continue;
+        };
+        let Some(margins_f) = MarginF64::from_snapshot(margins) else {
+            warn!(
+                "margin f64 conversion failed; skipping scan iteration: aster_available={} lighter_available={}",
+                margins.aster_available_usd, margins.lighter_available_usd
+            );
+            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            continue;
+        };
         if tracing::enabled!(Level::DEBUG) {
             log_scan_state(&cfg, &spec, &aster_book, &lighter_book, pos, margins);
         }
@@ -938,10 +1203,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         let Some(opp) = best_opportunity(
             &cfg,
             &spec,
+            &math,
             &aster_book,
             &lighter_book,
-            pos,
-            margins,
+            pos_f,
+            margins_f,
             options.min_size,
             options.exposure_filter,
         ) else {
@@ -949,7 +1215,14 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         };
         if let Some(sanity) = book_sanity.entry_block() {
-            if exposure_effect(pos, opp.direction, opp.qty) != ExposureEffect::Reduce {
+            if exposure_effect_f64(
+                pos_f.aster_qty,
+                pos_f.lighter_qty,
+                opp.direction,
+                opp.qty_f64,
+                &math,
+            ) != ExposureEffect::Reduce
+            {
                 let log_now = match last_book_sanity_block_log_at {
                     Some(ts) => ts.elapsed() >= Duration::from_secs(5),
                     None => true,
@@ -1052,7 +1325,14 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
             continue;
         }
-        if exposure_effect(pos, opp.direction, opp.qty) == ExposureEffect::Reduce {
+        if exposure_effect_f64(
+            pos_f.aster_qty,
+            pos_f.lighter_qty,
+            opp.direction,
+            opp.qty_f64,
+            &math,
+        ) == ExposureEffect::Reduce
+        {
             reduce_signal_tracker.observe(&spec, &opp, &gate, now);
         }
         if !execution_enabled {
@@ -1074,7 +1354,15 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         }
         let reduce_only = options.exposure_filter == ExposureFilter::Reduce;
-        if reduce_only && exposure_effect(pos, opp.direction, opp.qty) != ExposureEffect::Reduce {
+        if reduce_only
+            && exposure_effect_f64(
+                pos_f.aster_qty,
+                pos_f.lighter_qty,
+                opp.direction,
+                opp.qty_f64,
+                &math,
+            ) != ExposureEffect::Reduce
+        {
             warn!(
                 "reduce-only execution guard skipped non-reducing opportunity market={} direction={} qty={} pos_aster={} pos_lighter={}",
                 spec.market_id,
@@ -1335,10 +1623,11 @@ fn book_ok(book: &OrderBook, now: chrono::DateTime<Utc>, max_age_ms: i64) -> boo
 fn best_opportunity(
     cfg: &Config,
     spec: &MarketSpec,
+    math: &MarketMathF64,
     aster: &OrderBook,
     lighter: &OrderBook,
-    pos: PositionSnapshot,
-    margins: MarginSnapshot,
+    pos: PositionF64,
+    margins: MarginF64,
     min_size: bool,
     exposure_filter: ExposureFilter,
 ) -> Option<Opportunity> {
@@ -1350,14 +1639,14 @@ fn best_opportunity(
         Direction::SellLighterBuyAster,
     ] {
         let Some(opp) =
-            depth_priced_opportunity(cfg, spec, direction, aster, lighter, pos, margins, min_size)
+            depth_priced_opportunity(cfg, spec, math, direction, aster, lighter, pos, margins, min_size)
         else {
             continue;
         };
         if opp.gross_edge_bps < required {
             continue;
         }
-        if opportunity_allowed_by_exposure_filter(pos, &opp, exposure_filter) {
+        if opportunity_allowed_by_exposure_filter(pos, &opp, exposure_filter, math) {
             best = Some(choose_better_opportunity(best, opp));
         }
     }
@@ -1366,14 +1655,21 @@ fn best_opportunity(
 }
 
 fn opportunity_allowed_by_exposure_filter(
-    pos: PositionSnapshot,
+    pos: PositionF64,
     opp: &Opportunity,
     exposure_filter: ExposureFilter,
+    math: &MarketMathF64,
 ) -> bool {
     match exposure_filter {
         ExposureFilter::Any => true,
         ExposureFilter::Reduce => {
-            exposure_effect(pos, opp.direction, opp.qty) == ExposureEffect::Reduce
+            exposure_effect_f64(
+                pos.aster_qty,
+                pos.lighter_qty,
+                opp.direction,
+                opp.qty_f64,
+                math,
+            ) == ExposureEffect::Reduce
         }
     }
 }
@@ -1401,6 +1697,36 @@ fn exposure_effect(pos: PositionSnapshot, direction: Direction, qty: Decimal) ->
     }
 }
 
+fn exposure_effect_f64(
+    aster_qty: f64,
+    lighter_qty: f64,
+    direction: Direction,
+    qty: f64,
+    math: &MarketMathF64,
+) -> ExposureEffect {
+    if qty <= 0.0 || !qty.is_finite() || !aster_qty.is_finite() || !lighter_qty.is_finite() {
+        return ExposureEffect::Unknown;
+    }
+    let a_sign = if matches!(direction.aster_side(), Side::Buy) {
+        1.0
+    } else {
+        -1.0
+    };
+    let l_sign = -a_sign;
+    let before = aster_qty.abs().max(lighter_qty.abs());
+    let after_a = aster_qty + a_sign * qty;
+    let after_l = lighter_qty + l_sign * qty;
+    let after = after_a.abs().max(after_l.abs());
+    let tol = qty_cmp_tol(math, before.max(qty), after);
+    if after + tol < before {
+        ExposureEffect::Reduce
+    } else if after > before + tol {
+        ExposureEffect::Increase
+    } else {
+        ExposureEffect::Flat
+    }
+}
+
 fn choose_better_opportunity(current: Option<Opportunity>, candidate: Opportunity) -> Opportunity {
     match current {
         None => candidate,
@@ -1417,156 +1743,172 @@ fn choose_better_opportunity(current: Option<Opportunity>, candidate: Opportunit
     }
 }
 
-fn build_opportunity(
+fn build_opportunity_f64(
     cfg: &Config,
+    math: &MarketMathF64,
     direction: Direction,
-    sizing: SizingDecision,
-    sell_px: Decimal,
-    buy_px: Decimal,
-    ref_px: Decimal,
+    sizing: SizingDecisionF64,
+    sell_px_f: f64,
+    buy_px_f: f64,
+    ref_px_f: f64,
 ) -> Opportunity {
-    let gross_edge_bps = (sell_px - buy_px) / ref_px * Decimal::from(10_000);
-    let aster_px = if matches!(direction.aster_side(), Side::Sell) {
-        sell_px
+    let gross_edge_bps_f = (sell_px_f - buy_px_f) / ref_px_f * 10_000.0;
+    let aster_px_f = if matches!(direction.aster_side(), Side::Sell) {
+        sell_px_f
     } else {
-        buy_px
+        buy_px_f
     };
-    let lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
-        sell_px
+    let lighter_px_f = if matches!(direction.lighter_side(), Side::Sell) {
+        sell_px_f
     } else {
-        buy_px
+        buy_px_f
     };
-    let gross_usd = sizing.qty * (sell_px - buy_px);
-    let fee_usd = sizing.qty
-        * (aster_px * bps_to_rate(cfg.arb.aster_taker_fee_bps)
-            + lighter_px * bps_to_rate(cfg.arb.lighter_taker_fee_bps));
-    let required_margin_usd = sizing.qty * ref_px * bps_to_rate(cfg.arb.margin_bps);
+    let gross_usd_f = sizing.qty * (sell_px_f - buy_px_f);
+    let fee_usd_f = sizing.qty
+        * (aster_px_f * math.aster_taker_fee_rate
+            + lighter_px_f * math.lighter_taker_fee_rate);
+    let required_margin_usd_f = sizing.qty * ref_px_f * math.margin_rate;
+    let sell_px = f64_to_dec(sell_px_f);
+    let buy_px = f64_to_dec(buy_px_f);
+    let ref_px = f64_to_dec(ref_px_f);
+    let gross_edge_bps = f64_to_dec(gross_edge_bps_f);
+    let gross_usd = f64_to_dec(gross_usd_f);
+    let fee_usd = f64_to_dec(fee_usd_f);
     Opportunity {
         direction,
-        qty: sizing.qty,
+        qty: qty_f64_to_dec(math, sizing.qty),
+        qty_f64: sizing.qty,
         gross_edge_bps,
         expected_net_margin_bps: gross_edge_bps - cfg.arb.required_gross_edge_bps(),
         sell_px,
         buy_px,
         ref_px,
-        top_depth_qty: sizing.top_depth_qty,
+        top_depth_qty: f64_to_dec(sizing.top_depth_qty),
         depth_guard_enabled: sizing.depth_guard_enabled,
-        liquidity_multiple: sizing.liquidity_multiple,
-        depth_supported_qty: sizing.depth_supported_qty,
-        sell_depth_target_qty: sizing.sell_depth_target_qty,
-        buy_depth_target_qty: sizing.buy_depth_target_qty,
-        sell_depth_available_qty: sizing.sell_depth_available_qty,
-        buy_depth_available_qty: sizing.buy_depth_available_qty,
-        sell_depth_worst_px: sizing.sell_depth_worst_px,
-        buy_depth_worst_px: sizing.buy_depth_worst_px,
+        liquidity_multiple: f64_to_dec(sizing.liquidity_multiple),
+        depth_supported_qty: f64_to_dec(sizing.depth_supported_qty),
+        sell_depth_target_qty: f64_to_dec(sizing.sell_depth_target_qty),
+        buy_depth_target_qty: f64_to_dec(sizing.buy_depth_target_qty),
+        sell_depth_available_qty: f64_to_dec(sizing.sell_depth_available_qty),
+        buy_depth_available_qty: f64_to_dec(sizing.buy_depth_available_qty),
+        sell_depth_worst_px: f64_to_dec(sizing.sell_depth_worst_px),
+        buy_depth_worst_px: f64_to_dec(sizing.buy_depth_worst_px),
         sell_depth_levels_used: sizing.sell_depth_levels_used,
         buy_depth_levels_used: sizing.buy_depth_levels_used,
-        sell_best_px: sizing.sell_best_px,
-        buy_best_px: sizing.buy_best_px,
-        sell_best_qty: sizing.sell_best_qty,
-        buy_best_qty: sizing.buy_best_qty,
-        desired_qty: sizing.desired_qty,
-        min_qty: sizing.min_qty,
-        headroom_qty: sizing.headroom_qty,
-        margin_room_qty: sizing.margin_room_qty,
+        sell_best_px: f64_to_dec(sizing.sell_best_px),
+        buy_best_px: f64_to_dec(sizing.buy_best_px),
+        sell_best_qty: f64_to_dec(sizing.sell_best_qty),
+        buy_best_qty: f64_to_dec(sizing.buy_best_qty),
+        desired_qty: f64_to_dec(sizing.desired_qty),
+        min_qty: f64_to_dec(sizing.min_qty),
+        headroom_qty: f64_to_dec(sizing.headroom_qty),
+        margin_room_qty: f64_to_dec(sizing.margin_room_qty),
         expected_gross_usd: gross_usd,
         expected_fee_usd: fee_usd,
         expected_net_usd: gross_usd - fee_usd,
-        required_margin_usd,
+        required_margin_usd: f64_to_dec(required_margin_usd_f),
     }
 }
 
 fn depth_priced_opportunity(
     cfg: &Config,
     spec: &MarketSpec,
+    math: &MarketMathF64,
     direction: Direction,
     aster: &OrderBook,
     lighter: &OrderBook,
-    pos: PositionSnapshot,
-    margins: MarginSnapshot,
+    pos: PositionF64,
+    margins: MarginF64,
     min_size: bool,
 ) -> Option<Opportunity> {
-    let ref_px = aster.mid().or_else(|| lighter.mid())?;
-    if ref_px <= Decimal::ZERO {
+    let ref_px_f = aster.mid_f64().or_else(|| lighter.mid_f64())?;
+    if ref_px_f <= 0.0 {
         return None;
     }
     let (sell_book, buy_book) = match direction {
         Direction::SellAsterBuyLighter => (aster, lighter),
         Direction::SellLighterBuyAster => (lighter, aster),
     };
-    let sell_top = sell_book.side_levels(Side::Sell).first().copied()?;
-    let buy_top = buy_book.side_levels(Side::Buy).first().copied()?;
-    let top_depth_qty = sell_top.qty.min(buy_top.qty);
-    let desired = cfg.arb.desired_notional / ref_px;
+    let sell_top = sell_book.best_bid_f64()?;
+    let buy_top = buy_book.best_ask_f64()?;
+    let top_depth_qty_f = sell_top.1.min(buy_top.1);
+    let desired_f = math.desired_notional / ref_px_f;
     let est_aster_px = if matches!(direction.aster_side(), Side::Sell) {
-        sell_top.px
+        sell_top.0
     } else {
-        buy_top.px
+        buy_top.0
     };
     let est_lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
-        sell_top.px
+        sell_top.0
     } else {
-        buy_top.px
+        buy_top.0
     };
-    let est_min_qty = min_trade_qty(spec, est_aster_px, est_lighter_px)?;
+    let est_min_qty = min_trade_qty_f64(math, est_aster_px, est_lighter_px)?;
     let a_delta_sign = if matches!(direction.aster_side(), Side::Buy) {
-        Decimal::ONE
+        1.0
     } else {
-        -Decimal::ONE
+        -1.0
     };
     let l_delta_sign = -a_delta_sign;
-    let headroom = max_qty_by_headroom(
-        cfg.risk.max_abs_position_notional_usd / ref_px,
-        pos,
+    let max_abs_qty_f = math.max_abs_position_notional_usd / ref_px_f;
+    let headroom = max_qty_by_headroom_f64(
+        max_abs_qty_f,
+        pos.aster_qty,
+        pos.lighter_qty,
         a_delta_sign,
         l_delta_sign,
     );
-    let margin_room =
-        max_qty_by_available_margin(cfg, ref_px, pos, margins, a_delta_sign, l_delta_sign);
+    let margin_room = max_qty_by_available_margin_f64(
+        ref_px_f,
+        pos.aster_qty,
+        pos.lighter_qty,
+        a_delta_sign,
+        l_delta_sign,
+        margins.aster_available_usd,
+        margins.lighter_available_usd,
+        math.margin_buffer_usd,
+    );
 
     let depth_guard_enabled = cfg.arb.depth_guard.enabled;
-    let liquidity_multiple = if depth_guard_enabled {
-        cfg.arb.depth_guard.liquidity_multiple
-    } else {
-        Decimal::ONE
-    };
+    let liquidity_multiple = math.liquidity_multiple(depth_guard_enabled);
     let max_levels = if depth_guard_enabled {
         cfg.arb.depth_guard.max_levels
     } else {
         1
     };
-    let sell_available = sell_book.cumulative_qty(Side::Sell, max_levels);
-    let buy_available = buy_book.cumulative_qty(Side::Buy, max_levels);
+    let sell_available = sell_book.cumulative_qty_f64(Side::Sell, max_levels)?;
+    let buy_available = buy_book.cumulative_qty_f64(Side::Buy, max_levels)?;
     let depth_supported_qty = sell_available.min(buy_available) / liquidity_multiple;
     let max_qty = depth_supported_qty.min(headroom).min(margin_room);
-    if max_qty <= Decimal::ZERO {
+    if max_qty <= 0.0 {
         return None;
     }
 
     let initial_qty = if min_size {
-        let q = ceil_to_common_step(est_min_qty, spec.step, spec.lighter_qty_step);
-        if q <= max_qty {
+        let q = ceil_to_common_step_f64(est_min_qty, math);
+        if qty_le(q, max_qty, math) {
             q
         } else {
             return None;
         }
     } else {
-        let q = floor_to_common_step(desired.min(max_qty), spec.step, spec.lighter_qty_step);
-        if q >= est_min_qty {
+        let q = floor_to_common_step_f64(desired_f.min(max_qty), math);
+        if qty_ge(q, est_min_qty, math) {
             q
         } else {
             return None;
         }
     };
 
-    let (sizing, sell_px, buy_px) = depth_price_sized_qty(
+    let (sizing, sell_px, buy_px) = depth_price_sized_qty_f64(
         spec,
+        math,
         direction,
         sell_book,
         buy_book,
         initial_qty,
-        desired,
-        top_depth_qty,
+        desired_f,
+        top_depth_qty_f,
         headroom,
         margin_room,
         depth_guard_enabled,
@@ -1575,35 +1917,36 @@ fn depth_priced_opportunity(
         depth_supported_qty,
         min_size,
     )?;
-    Some(build_opportunity(
-        cfg, direction, sizing, sell_px, buy_px, ref_px,
+    Some(build_opportunity_f64(
+        cfg, math, direction, sizing, sell_px, buy_px, ref_px_f,
     ))
 }
 
-fn depth_price_sized_qty(
-    spec: &MarketSpec,
+fn depth_price_sized_qty_f64(
+    _spec: &MarketSpec,
+    math: &MarketMathF64,
     direction: Direction,
     sell_book: &OrderBook,
     buy_book: &OrderBook,
-    initial_qty: Decimal,
-    desired_qty: Decimal,
-    top_depth_qty: Decimal,
-    headroom_qty: Decimal,
-    margin_room_qty: Decimal,
+    initial_qty: f64,
+    desired_qty: f64,
+    top_depth_qty: f64,
+    headroom_qty: f64,
+    margin_room_qty: f64,
     depth_guard_enabled: bool,
-    liquidity_multiple: Decimal,
+    liquidity_multiple: f64,
     max_levels: usize,
-    depth_supported_qty: Decimal,
+    depth_supported_qty: f64,
     min_size: bool,
-) -> Option<(SizingDecision, Decimal, Decimal)> {
+) -> Option<(SizingDecisionF64, f64, f64)> {
     let mut qty = initial_qty;
     for _ in 0..3 {
-        if qty <= Decimal::ZERO || qty > depth_supported_qty {
+        if qty <= 0.0 || !qty.is_finite() || qty_gt(qty, depth_supported_qty, math) {
             return None;
         }
         let depth_target = qty * liquidity_multiple;
-        let sell_quote = sell_book.depth_vwap(Side::Sell, depth_target, max_levels)?;
-        let buy_quote = buy_book.depth_vwap(Side::Buy, depth_target, max_levels)?;
+        let sell_quote = sell_book.depth_vwap_f64(Side::Sell, depth_target, max_levels)?;
+        let buy_quote = buy_book.depth_vwap_f64(Side::Buy, depth_target, max_levels)?;
         let sell_px = sell_quote.vwap_px;
         let buy_px = buy_quote.vwap_px;
         let aster_px = if matches!(direction.aster_side(), Side::Sell) {
@@ -1616,24 +1959,24 @@ fn depth_price_sized_qty(
         } else {
             buy_px
         };
-        let min_qty = min_trade_qty(spec, aster_px, lighter_px)?;
+        let min_qty = min_trade_qty_f64(math, aster_px, lighter_px)?;
         if min_size {
-            let min_step_qty = ceil_to_common_step(min_qty, spec.step, spec.lighter_qty_step);
-            if min_step_qty > qty {
-                if min_step_qty > depth_supported_qty
-                    || min_step_qty > headroom_qty
-                    || min_step_qty > margin_room_qty
+            let min_step_qty = ceil_to_common_step_f64(min_qty, math);
+            if qty_gt(min_step_qty, qty, math) {
+                if qty_gt(min_step_qty, depth_supported_qty, math)
+                    || qty_gt(min_step_qty, headroom_qty, math)
+                    || qty_gt(min_step_qty, margin_room_qty, math)
                 {
                     return None;
                 }
                 qty = min_step_qty;
                 continue;
             }
-        } else if qty < min_qty {
+        } else if !qty_ge(qty, min_qty, math) {
             return None;
         }
         return Some((
-            SizingDecision {
+            SizingDecisionF64 {
                 qty,
                 desired_qty,
                 min_qty,
@@ -1663,6 +2006,82 @@ fn depth_price_sized_qty(
     None
 }
 
+fn min_trade_qty_f64(math: &MarketMathF64, aster_px: f64, lighter_px: f64) -> Option<f64> {
+    if aster_px <= 0.0 || lighter_px <= 0.0 || !aster_px.is_finite() || !lighter_px.is_finite() {
+        return None;
+    }
+    Some(
+        math.aster_min_qty
+            .max(math.aster_min_notional / aster_px)
+            .max(math.lighter_min_notional / lighter_px),
+    )
+}
+
+fn max_qty_by_headroom_f64(
+    max_abs_qty: f64,
+    aster_qty: f64,
+    lighter_qty: f64,
+    a_sign: f64,
+    l_sign: f64,
+) -> f64 {
+    fn leg(max_abs_qty: f64, current: f64, sign: f64) -> f64 {
+        let same_direction = current == 0.0
+            || (current > 0.0 && sign > 0.0)
+            || (current < 0.0 && sign < 0.0);
+        if same_direction {
+            (max_abs_qty - current.abs()).max(0.0)
+        } else {
+            current.abs() + max_abs_qty
+        }
+    }
+    leg(max_abs_qty, aster_qty, a_sign).min(leg(max_abs_qty, lighter_qty, l_sign))
+}
+
+fn max_qty_by_available_margin_f64(
+    ref_px: f64,
+    aster_qty: f64,
+    lighter_qty: f64,
+    a_sign: f64,
+    l_sign: f64,
+    aster_available: f64,
+    lighter_available: f64,
+    buffer: f64,
+) -> f64 {
+    fn leg(ref_px: f64, current: f64, sign: f64, available: f64, buffer: f64) -> f64 {
+        let increases_abs = current == 0.0
+            || (current > 0.0 && sign > 0.0)
+            || (current < 0.0 && sign < 0.0);
+        if !increases_abs {
+            return f64::MAX;
+        }
+        let usable = available - buffer;
+        if usable <= 0.0 || ref_px <= 0.0 {
+            0.0
+        } else {
+            usable / ref_px
+        }
+    }
+    leg(ref_px, aster_qty, a_sign, aster_available, buffer)
+        .min(leg(ref_px, lighter_qty, l_sign, lighter_available, buffer))
+}
+
+fn floor_to_common_step_f64(qty: f64, math: &MarketMathF64) -> f64 {
+    if qty <= 0.0 || !qty.is_finite() {
+        return 0.0;
+    }
+    let units = snap_step_units(qty / math.common_qty_step).floor();
+    round_qty_to_scale_f64(units * math.common_qty_step, math)
+}
+
+fn ceil_to_common_step_f64(qty: f64, math: &MarketMathF64) -> f64 {
+    if qty <= 0.0 || !qty.is_finite() {
+        return 0.0;
+    }
+    let units = snap_step_units(qty / math.common_qty_step).ceil();
+    round_qty_to_scale_f64(units * math.common_qty_step, math)
+}
+
+#[cfg(test)]
 fn min_trade_qty(
     spec: &MarketSpec,
     aster_px: Decimal,
@@ -1678,6 +2097,7 @@ fn min_trade_qty(
     )
 }
 
+#[cfg(test)]
 fn max_qty_by_headroom(
     max_abs_qty: Decimal,
     pos: PositionSnapshot,
@@ -1697,6 +2117,7 @@ fn max_qty_by_headroom(
     leg(max_abs_qty, pos.aster_qty, a_sign).min(leg(max_abs_qty, pos.lighter_qty, l_sign))
 }
 
+#[cfg(test)]
 fn max_qty_by_available_margin(
     cfg: &Config,
     ref_px: Decimal,
@@ -1763,12 +2184,14 @@ fn execution_log_path(cfg: &Config, market: &MarketId) -> PathBuf {
 
 fn append_execution_log(cfg: &Config, spec: &MarketSpec, row: serde_json::Value) {
     let path = execution_log_path(cfg, &spec.market_id);
-    if let Err(e) = append_execution_log_inner(&path, &row) {
-        warn!(
-            "failed to append execution diagnostics {}: {e:#}",
-            path.display()
-        );
-    }
+    tokio::task::spawn_blocking(move || {
+        if let Err(e) = append_execution_log_inner(&path, &row) {
+            warn!(
+                "failed to append execution diagnostics {}: {e:#}",
+                path.display()
+            );
+        }
+    });
 }
 
 fn append_execution_log_inner(path: &Path, row: &serde_json::Value) -> Result<()> {
@@ -3218,12 +3641,17 @@ async fn ensure_clean_start(
     Ok(())
 }
 
-fn net_mismatch_notional(pos: PositionSnapshot, aster: &OrderBook, lighter: &OrderBook) -> Decimal {
-    let mark = aster
-        .mid()
-        .or_else(|| lighter.mid())
-        .unwrap_or(Decimal::ZERO);
-    pos.net_qty().abs() * mark
+fn net_mismatch_notional(
+    pos: PositionSnapshot,
+    aster: &OrderBook,
+    lighter: &OrderBook,
+) -> Option<Decimal> {
+    let mark_f = aster
+        .mid_f64()
+        .or_else(|| lighter.mid_f64())
+        ?;
+    let net_f = decimal_to_f64(pos.aster_qty)? + decimal_to_f64(pos.lighter_qty)?;
+    Some(f64_to_dec(net_f.abs() * mark_f))
 }
 
 fn log_scan_state(
@@ -3289,10 +3717,12 @@ fn lighter_price_bound(opp: &Opportunity, slippage_bps: Decimal) -> Decimal {
     }
 }
 
+#[cfg(test)]
 fn floor_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
     floor_to_step(floor_to_step(qty, aster_step), lighter_step)
 }
 
+#[cfg(test)]
 fn ceil_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
     if qty <= Decimal::ZERO {
         return Decimal::ZERO;
@@ -3315,6 +3745,7 @@ fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
     (qty / step).floor() * step
 }
 
+#[cfg(test)]
 fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
     if qty <= Decimal::ZERO || step <= Decimal::ZERO {
         return Decimal::ZERO;
@@ -3322,6 +3753,7 @@ fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
     (qty / step).ceil() * step
 }
 
+#[cfg(test)]
 fn is_step_multiple(qty: Decimal, step: Decimal) -> bool {
     if qty < Decimal::ZERO || step <= Decimal::ZERO {
         return false;
@@ -3390,10 +3822,23 @@ mod tests {
         }
     }
 
+    fn test_math(cfg: &Config, spec: &MarketSpec) -> MarketMathF64 {
+        MarketMathF64::from_config_spec(cfg, spec).unwrap()
+    }
+
+    fn pos_f64(pos: PositionSnapshot) -> PositionF64 {
+        PositionF64::from_snapshot(pos).unwrap()
+    }
+
+    fn margins_f64(margins: MarginSnapshot) -> MarginF64 {
+        MarginF64::from_snapshot(margins).unwrap()
+    }
+
     fn retry_opp(direction: Direction) -> Opportunity {
         Opportunity {
             direction,
             qty: dec!(0.20),
+            qty_f64: 0.20,
             gross_edge_bps: dec!(9),
             expected_net_margin_bps: dec!(3),
             sell_px: dec!(63.8000),
@@ -3445,9 +3890,29 @@ mod tests {
     }
 
     #[test]
+    fn f64_common_step_snaps_near_integer_units() {
+        let cfg = test_cfg();
+        let mut spec = test_spec();
+        spec.step = dec!(0.1);
+        spec.lighter_qty_step = dec!(0.1);
+        let math = test_math(&cfg, &spec);
+        let floored = floor_to_common_step_f64(0.3, &math);
+        assert!(
+            (floored - 0.3).abs() < 1e-12,
+            "floor should snap 0.3 to the 0.1 grid, got {floored:?}"
+        );
+        let ceiled = ceil_to_common_step_f64(0.30000000000000004, &math);
+        assert!(
+            (ceiled - 0.3).abs() < 1e-12,
+            "ceil should not jump f64-noisy 0.3 to 0.4, got {ceiled:?}"
+        );
+    }
+
+    #[test]
     fn reduce_filter_selects_reducing_opportunity() {
         let cfg = test_cfg();
         let spec = test_spec();
+        let math = test_math(&cfg, &spec);
         let pos = PositionSnapshot {
             aster_qty: dec!(-1),
             lighter_qty: dec!(1),
@@ -3455,10 +3920,11 @@ mod tests {
         let opp = best_opportunity(
             &cfg,
             &spec,
+            &math,
             &book(dec!(99), dec!(100)),
             &book(dec!(101), dec!(101.1)),
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Reduce,
         )
@@ -3474,6 +3940,7 @@ mod tests {
     fn reduce_filter_ignores_increasing_opportunity() {
         let cfg = test_cfg();
         let spec = test_spec();
+        let math = test_math(&cfg, &spec);
         let pos = PositionSnapshot {
             aster_qty: dec!(-1),
             lighter_qty: dec!(1),
@@ -3483,10 +3950,11 @@ mod tests {
         let any = best_opportunity(
             &cfg,
             &spec,
+            &math,
             &aster,
             &lighter,
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Any,
         )
@@ -3499,10 +3967,11 @@ mod tests {
         assert!(best_opportunity(
             &cfg,
             &spec,
+            &math,
             &aster,
             &lighter,
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Reduce,
         )
@@ -3513,6 +3982,7 @@ mod tests {
     fn depth_guard_rejects_profitable_but_thin_top_of_book() {
         let cfg = test_cfg();
         let spec = test_spec();
+        let math = test_math(&cfg, &spec);
         let pos = PositionSnapshot {
             aster_qty: Decimal::ZERO,
             lighter_qty: Decimal::ZERO,
@@ -3528,10 +3998,11 @@ mod tests {
         assert!(best_opportunity(
             &cfg,
             &spec,
+            &math,
             &aster,
             &lighter,
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Any,
         )
@@ -3539,13 +4010,15 @@ mod tests {
 
         let mut top_only_cfg = cfg.clone();
         top_only_cfg.arb.depth_guard.enabled = false;
+        let top_only_math = test_math(&top_only_cfg, &spec);
         assert!(best_opportunity(
             &top_only_cfg,
             &spec,
+            &top_only_math,
             &aster,
             &lighter,
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Any,
         )
@@ -3556,6 +4029,7 @@ mod tests {
     fn opportunity_profitability_uses_depth_vwap() {
         let cfg = test_cfg();
         let spec = test_spec();
+        let math = test_math(&cfg, &spec);
         let pos = PositionSnapshot {
             aster_qty: Decimal::ZERO,
             lighter_qty: Decimal::ZERO,
@@ -3571,10 +4045,11 @@ mod tests {
         let opp = best_opportunity(
             &cfg,
             &spec,
+            &math,
             &aster,
             &lighter,
-            pos,
-            margins(),
+            pos_f64(pos),
+            margins_f64(margins()),
             false,
             ExposureFilter::Any,
         )
@@ -3668,4 +4143,549 @@ mod tests {
         assert!(reason.contains("loss"));
         assert_eq!(tracker.event_count(), 2);
     }
+
+    fn assert_opp_eq_f64_vs_decimal(
+        f64_opp: &Opportunity,
+        dec_opp: &Opportunity,
+        ctx: &str,
+    ) {
+        let qty_diff = (f64_opp.qty - dec_opp.qty).abs();
+        assert!(
+            qty_diff <= dec!(0.0000001),
+            "{ctx}: qty drift exceeded: f64={} dec={} diff={}",
+            f64_opp.qty,
+            dec_opp.qty,
+            qty_diff
+        );
+        let edge_diff = (f64_opp.gross_edge_bps - dec_opp.gross_edge_bps).abs();
+        assert!(
+            edge_diff < dec!(0.001),
+            "{ctx}: gross_edge_bps drift exceeded: f64={} dec={} diff={}",
+            f64_opp.gross_edge_bps,
+            dec_opp.gross_edge_bps,
+            edge_diff
+        );
+        let net_diff = (f64_opp.expected_net_usd - dec_opp.expected_net_usd).abs();
+        assert!(
+            net_diff < dec!(0.0000001),
+            "{ctx}: expected_net_usd drift exceeded: f64={} dec={} diff={}",
+            f64_opp.expected_net_usd,
+            dec_opp.expected_net_usd,
+            net_diff
+        );
+    }
+
+    fn build_opportunity_decimal(
+        cfg: &Config,
+        direction: Direction,
+        sizing: SizingDecision,
+        sell_px: Decimal,
+        buy_px: Decimal,
+        ref_px: Decimal,
+    ) -> Opportunity {
+        let gross_edge_bps = (sell_px - buy_px) / ref_px * Decimal::from(10_000);
+        let aster_px = if matches!(direction.aster_side(), Side::Sell) {
+            sell_px
+        } else {
+            buy_px
+        };
+        let lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
+            sell_px
+        } else {
+            buy_px
+        };
+        let gross_usd = sizing.qty * (sell_px - buy_px);
+        let fee_usd = sizing.qty
+            * (aster_px * bps_to_rate(cfg.arb.aster_taker_fee_bps)
+                + lighter_px * bps_to_rate(cfg.arb.lighter_taker_fee_bps));
+        let required_margin_usd = sizing.qty * ref_px * bps_to_rate(cfg.arb.margin_bps);
+        Opportunity {
+            direction,
+            qty: sizing.qty,
+            qty_f64: sizing.qty.to_f64().unwrap(),
+            gross_edge_bps,
+            expected_net_margin_bps: gross_edge_bps - cfg.arb.required_gross_edge_bps(),
+            sell_px,
+            buy_px,
+            ref_px,
+            top_depth_qty: sizing.top_depth_qty,
+            depth_guard_enabled: sizing.depth_guard_enabled,
+            liquidity_multiple: sizing.liquidity_multiple,
+            depth_supported_qty: sizing.depth_supported_qty,
+            sell_depth_target_qty: sizing.sell_depth_target_qty,
+            buy_depth_target_qty: sizing.buy_depth_target_qty,
+            sell_depth_available_qty: sizing.sell_depth_available_qty,
+            buy_depth_available_qty: sizing.buy_depth_available_qty,
+            sell_depth_worst_px: sizing.sell_depth_worst_px,
+            buy_depth_worst_px: sizing.buy_depth_worst_px,
+            sell_depth_levels_used: sizing.sell_depth_levels_used,
+            buy_depth_levels_used: sizing.buy_depth_levels_used,
+            sell_best_px: sizing.sell_best_px,
+            buy_best_px: sizing.buy_best_px,
+            sell_best_qty: sizing.sell_best_qty,
+            buy_best_qty: sizing.buy_best_qty,
+            desired_qty: sizing.desired_qty,
+            min_qty: sizing.min_qty,
+            headroom_qty: sizing.headroom_qty,
+            margin_room_qty: sizing.margin_room_qty,
+            expected_gross_usd: gross_usd,
+            expected_fee_usd: fee_usd,
+            expected_net_usd: gross_usd - fee_usd,
+            required_margin_usd,
+        }
+    }
+
+    fn decimal_depth_priced_opportunity(
+        cfg: &Config,
+        spec: &MarketSpec,
+        direction: Direction,
+        aster: &OrderBook,
+        lighter: &OrderBook,
+        pos: PositionSnapshot,
+        margins: MarginSnapshot,
+        min_size: bool,
+    ) -> Option<Opportunity> {
+        let ref_px = aster.mid().or_else(|| lighter.mid())?;
+        if ref_px <= Decimal::ZERO {
+            return None;
+        }
+        let (sell_book, buy_book) = match direction {
+            Direction::SellAsterBuyLighter => (aster, lighter),
+            Direction::SellLighterBuyAster => (lighter, aster),
+        };
+        let sell_top = sell_book.side_levels(Side::Sell).first().copied()?;
+        let buy_top = buy_book.side_levels(Side::Buy).first().copied()?;
+        let top_depth_qty = sell_top.qty.min(buy_top.qty);
+        let desired = cfg.arb.desired_notional / ref_px;
+        let est_aster_px = if matches!(direction.aster_side(), Side::Sell) {
+            sell_top.px
+        } else {
+            buy_top.px
+        };
+        let est_lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
+            sell_top.px
+        } else {
+            buy_top.px
+        };
+        let est_min_qty = min_trade_qty(spec, est_aster_px, est_lighter_px)?;
+        let a_delta_sign = if matches!(direction.aster_side(), Side::Buy) {
+            Decimal::ONE
+        } else {
+            -Decimal::ONE
+        };
+        let l_delta_sign = -a_delta_sign;
+        let headroom = max_qty_by_headroom(
+            cfg.risk.max_abs_position_notional_usd / ref_px,
+            pos,
+            a_delta_sign,
+            l_delta_sign,
+        );
+        let margin_room =
+            max_qty_by_available_margin(cfg, ref_px, pos, margins, a_delta_sign, l_delta_sign);
+        let depth_guard_enabled = cfg.arb.depth_guard.enabled;
+        let liquidity_multiple = if depth_guard_enabled {
+            cfg.arb.depth_guard.liquidity_multiple
+        } else {
+            Decimal::ONE
+        };
+        let max_levels = if depth_guard_enabled {
+            cfg.arb.depth_guard.max_levels
+        } else {
+            1
+        };
+        let sell_available = sell_book.cumulative_qty(Side::Sell, max_levels);
+        let buy_available = buy_book.cumulative_qty(Side::Buy, max_levels);
+        let depth_supported_qty = sell_available.min(buy_available) / liquidity_multiple;
+        let max_qty = depth_supported_qty.min(headroom).min(margin_room);
+        if max_qty <= Decimal::ZERO {
+            return None;
+        }
+        let initial_qty = if min_size {
+            let q = ceil_to_common_step(est_min_qty, spec.step, spec.lighter_qty_step);
+            if q <= max_qty { q } else { return None; }
+        } else {
+            let q = floor_to_common_step(desired.min(max_qty), spec.step, spec.lighter_qty_step);
+            if q >= est_min_qty { q } else { return None; }
+        };
+        let (sizing, sell_px, buy_px) = decimal_depth_price_sized_qty(
+            spec, direction, sell_book, buy_book, initial_qty, desired,
+            top_depth_qty, headroom, margin_room, depth_guard_enabled,
+            liquidity_multiple, max_levels, depth_supported_qty, min_size,
+        )?;
+        Some(build_opportunity_decimal(cfg, direction, sizing, sell_px, buy_px, ref_px))
+    }
+
+    fn decimal_depth_price_sized_qty(
+        spec: &MarketSpec,
+        direction: Direction,
+        sell_book: &OrderBook,
+        buy_book: &OrderBook,
+        initial_qty: Decimal,
+        desired_qty: Decimal,
+        top_depth_qty: Decimal,
+        headroom_qty: Decimal,
+        margin_room_qty: Decimal,
+        depth_guard_enabled: bool,
+        liquidity_multiple: Decimal,
+        max_levels: usize,
+        depth_supported_qty: Decimal,
+        min_size: bool,
+    ) -> Option<(SizingDecision, Decimal, Decimal)> {
+        let mut qty = initial_qty;
+        for _ in 0..3 {
+            if qty <= Decimal::ZERO || qty > depth_supported_qty {
+                return None;
+            }
+            let depth_target = qty * liquidity_multiple;
+            let sell_quote = sell_book.depth_vwap(Side::Sell, depth_target, max_levels)?;
+            let buy_quote = buy_book.depth_vwap(Side::Buy, depth_target, max_levels)?;
+            let sell_px = sell_quote.vwap_px;
+            let buy_px = buy_quote.vwap_px;
+            let aster_px = if matches!(direction.aster_side(), Side::Sell) {
+                sell_px
+            } else {
+                buy_px
+            };
+            let lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
+                sell_px
+            } else {
+                buy_px
+            };
+            let min_qty = min_trade_qty(spec, aster_px, lighter_px)?;
+            if min_size {
+                let min_step_qty = ceil_to_common_step(min_qty, spec.step, spec.lighter_qty_step);
+                if min_step_qty > qty {
+                    if min_step_qty > depth_supported_qty
+                        || min_step_qty > headroom_qty
+                        || min_step_qty > margin_room_qty
+                    {
+                        return None;
+                    }
+                    qty = min_step_qty;
+                    continue;
+                }
+            } else if qty < min_qty {
+                return None;
+            }
+            return Some((
+                SizingDecision {
+                    qty,
+                    desired_qty,
+                    min_qty,
+                    top_depth_qty,
+                    depth_guard_enabled,
+                    liquidity_multiple,
+                    depth_supported_qty,
+                    sell_depth_target_qty: sell_quote.target_qty,
+                    buy_depth_target_qty: buy_quote.target_qty,
+                    sell_depth_available_qty: sell_quote.available_qty,
+                    buy_depth_available_qty: buy_quote.available_qty,
+                    sell_depth_worst_px: sell_quote.worst_px,
+                    buy_depth_worst_px: buy_quote.worst_px,
+                    sell_depth_levels_used: sell_quote.levels_used,
+                    buy_depth_levels_used: buy_quote.levels_used,
+                    sell_best_px: sell_quote.best_px,
+                    buy_best_px: buy_quote.best_px,
+                    sell_best_qty: sell_quote.best_qty,
+                    buy_best_qty: buy_quote.best_qty,
+                    headroom_qty,
+                    margin_room_qty,
+                },
+                sell_px,
+                buy_px,
+            ));
+        }
+        None
+    }
+
+    #[test]
+    fn f64_matches_decimal_top_of_book_opportunity() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: Decimal::ZERO,
+            lighter_qty: Decimal::ZERO,
+        };
+        let margins = margins();
+        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
+            let (a_bid, a_ask, l_bid, l_ask) = match direction {
+                Direction::SellAsterBuyLighter => (dec!(101), dec!(103), dec!(98), dec!(100)),
+                Direction::SellLighterBuyAster => (dec!(100), dec!(101.5), dec!(101), dec!(103)),
+            };
+            let aster = book(a_bid, a_ask);
+            let lighter = book(l_bid, l_ask);
+            let f64_opp = depth_priced_opportunity(
+                &cfg,
+                &spec,
+                &math,
+                direction,
+                &aster,
+                &lighter,
+                pos_f64(pos),
+                margins_f64(margins),
+                false,
+            )
+            .expect("f64 opportunity should exist");
+            let dec_opp = decimal_depth_priced_opportunity(
+                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
+            )
+            .expect("decimal opportunity should exist");
+            assert_opp_eq_f64_vs_decimal(&f64_opp, &dec_opp, direction.as_str());
+        }
+    }
+
+    #[test]
+    fn f64_matches_decimal_multi_level_depth_opportunity() {
+        let mut cfg = test_cfg();
+        cfg.arb.depth_guard.enabled = true;
+        cfg.arb.depth_guard.liquidity_multiple = dec!(2);
+        cfg.arb.depth_guard.max_levels = 5;
+        cfg.arb.desired_notional = dec!(1000);
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: Decimal::ZERO,
+            lighter_qty: Decimal::ZERO,
+        };
+        let margins = margins();
+        let aster = depth_book(
+            [
+                (dec!(100.00), dec!(5)),
+                (dec!(99.50), dec!(10)),
+                (dec!(99.00), dec!(20)),
+                (dec!(98.50), dec!(30)),
+            ],
+            [
+                (dec!(100.50), dec!(5)),
+                (dec!(101.00), dec!(10)),
+                (dec!(101.50), dec!(20)),
+                (dec!(102.00), dec!(30)),
+            ],
+        );
+        let lighter = depth_book(
+            [
+                (dec!(99.00), dec!(4)),
+                (dec!(98.50), dec!(8)),
+                (dec!(98.00), dec!(16)),
+                (dec!(97.50), dec!(32)),
+            ],
+            [
+                (dec!(99.50), dec!(4)),
+                (dec!(100.00), dec!(8)),
+                (dec!(100.50), dec!(16)),
+                (dec!(101.00), dec!(32)),
+            ],
+        );
+        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
+            let f64_opp = depth_priced_opportunity(
+                &cfg,
+                &spec,
+                &math,
+                direction,
+                &aster,
+                &lighter,
+                pos_f64(pos),
+                margins_f64(margins),
+                false,
+            )
+            .expect("f64 opportunity should exist");
+            let dec_opp = decimal_depth_priced_opportunity(
+                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
+            )
+            .expect("decimal opportunity should exist");
+            assert_opp_eq_f64_vs_decimal(&f64_opp, &dec_opp, direction.as_str());
+        }
+    }
+
+    #[test]
+    fn f64_matches_decimal_with_non_zero_position() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: dec!(2.5),
+            lighter_qty: dec!(-2.5),
+        };
+        let margins = margins();
+        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
+            let aster = book(dec!(100), dec!(101));
+            let lighter = book(dec!(99), dec!(100));
+            let f64_opp = depth_priced_opportunity(
+                &cfg,
+                &spec,
+                &math,
+                direction,
+                &aster,
+                &lighter,
+                pos_f64(pos),
+                margins_f64(margins),
+                false,
+            );
+            let dec_opp = decimal_depth_priced_opportunity(
+                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
+            );
+            match (f64_opp, dec_opp) {
+                (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, direction.as_str()),
+                (None, None) => {}
+                (f64_opp, dec_opp) => panic!(
+                    "{}: f64 and decimal disagree on existence: f64={:?} dec={:?}",
+                    direction.as_str(),
+                    f64_opp.map(|o| o.qty),
+                    dec_opp.map(|o| o.qty)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn f64_matches_decimal_min_size_near_min_notional() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: Decimal::ZERO,
+            lighter_qty: Decimal::ZERO,
+        };
+        let margins = margins();
+        let px = dec!(20.0);
+        let aster = book(px - dec!(0.05), px + dec!(0.05));
+        let lighter = book(px - dec!(0.10), px - dec!(0.05));
+        let f64_opp = depth_priced_opportunity(
+            &cfg,
+            &spec,
+            &math,
+            Direction::SellLighterBuyAster,
+            &aster,
+            &lighter,
+            pos_f64(pos),
+            margins_f64(margins),
+            true,
+        );
+        let dec_opp = decimal_depth_priced_opportunity(
+            &cfg, &spec, Direction::SellLighterBuyAster, &aster, &lighter, pos, margins, true,
+        );
+        match (f64_opp, dec_opp) {
+            (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, "min_size"),
+            (None, None) => {}
+            (f64_opp, dec_opp) => panic!(
+                "min_size: f64 and decimal disagree on existence: f64={:?} dec={:?}",
+                f64_opp.map(|o| o.qty),
+                dec_opp.map(|o| o.qty)
+            ),
+        }
+    }
+
+    #[test]
+    fn f64_matches_decimal_thin_top_of_book_with_depth() {
+        let mut cfg = test_cfg();
+        cfg.arb.depth_guard.enabled = true;
+        cfg.arb.depth_guard.liquidity_multiple = dec!(10);
+        cfg.arb.depth_guard.max_levels = 3;
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: Decimal::ZERO,
+            lighter_qty: Decimal::ZERO,
+        };
+        let margins = margins();
+        let aster = depth_book(
+            [(dec!(101), dec!(0.20)), (dec!(100.90), dec!(10))],
+            [(dec!(103), dec!(10))],
+        );
+        let lighter = depth_book(
+            [(dec!(98), dec!(10))],
+            [(dec!(100), dec!(0.20)), (dec!(100.10), dec!(10))],
+        );
+        let f64_opp = depth_priced_opportunity(
+            &cfg,
+            &spec,
+            &math,
+            Direction::SellAsterBuyLighter,
+            &aster,
+            &lighter,
+            pos_f64(pos),
+            margins_f64(margins),
+            false,
+        );
+        let dec_opp = decimal_depth_priced_opportunity(
+            &cfg, &spec, Direction::SellAsterBuyLighter, &aster, &lighter, pos, margins, false,
+        );
+        match (f64_opp, dec_opp) {
+            (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, "thin_top"),
+            (None, None) => {}
+            (f64_opp, dec_opp) => panic!(
+                "thin_top: f64 and decimal disagree on existence: f64={:?} dec={:?}",
+                f64_opp.map(|o| o.qty),
+                dec_opp.map(|o| o.qty)
+            ),
+        }
+    }
+
+    #[test]
+    fn exposure_effect_f64_matches_decimal() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let cases = [
+            (dec!(1), dec!(-1), dec!(0.2), Direction::SellAsterBuyLighter),
+            (dec!(-1), dec!(1), dec!(0.2), Direction::SellLighterBuyAster),
+            (dec!(0), dec!(0), dec!(0.5), Direction::SellAsterBuyLighter),
+            (dec!(2), dec!(-2), dec!(3), Direction::SellAsterBuyLighter),
+            (dec!(-2), dec!(2), dec!(3), Direction::SellLighterBuyAster),
+        ];
+        for (a, l, q, dir) in cases {
+            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
+            let dec_result = exposure_effect(pos, dir, q);
+            let f64_result = exposure_effect_f64(
+                a.to_f64().unwrap(),
+                l.to_f64().unwrap(),
+                dir,
+                q.to_f64().unwrap(),
+                &math,
+            );
+            assert_eq!(dec_result, f64_result,
+                "exposure_effect mismatch for pos=({},{}) qty={} dir={}: dec={:?} f64={:?}",
+                a, l, q, dir.as_str(), dec_result, f64_result);
+        }
+    }
+
+    #[test]
+    fn exposure_effect_f64_treats_noisy_boundary_as_flat() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        assert_eq!(
+            exposure_effect_f64(
+                0.2,
+                -0.1,
+                Direction::SellAsterBuyLighter,
+                0.3,
+                &math,
+            ),
+            ExposureEffect::Flat
+        );
+    }
+
+    #[test]
+    fn net_mismatch_notional_f64_matches_decimal() {
+        let cases = [
+            (dec!(1), dec!(-1), dec!(100), dec!(101)),
+            (dec!(0.5), dec!(-0.3), dec!(50), dec!(51)),
+            (dec!(0), dec!(0), dec!(100), dec!(101)),
+        ];
+        for (a, l, bid, ask) in cases {
+            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
+            let aster = book(bid, ask);
+            let lighter = book(bid, ask);
+            let mark = aster.mid().or_else(|| lighter.mid()).unwrap();
+            let dec_result = pos.net_qty().abs() * mark;
+            let f64_result = net_mismatch_notional(pos, &aster, &lighter).unwrap();
+            let diff = (dec_result - f64_result).abs();
+            assert!(diff < dec!(0.0000001),
+                "net_mismatch drift for pos=({},{}) bid={} ask={}: dec={} f64={} diff={}",
+                a, l, bid, ask, dec_result, f64_result, diff);
+        }
+    }
+
 }

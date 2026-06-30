@@ -26,7 +26,7 @@ pub struct BookSanitySnapshot {
     pub blocked_until: Option<DateTime<Utc>>,
     pub failure_streak: u64,
     pub success_streak: u64,
-    pub last_reason: Option<String>,
+    pub last_reason: Option<Arc<str>>,
     pub last_action: String,
     pub last_checked_at: Option<DateTime<Utc>>,
 }
@@ -73,7 +73,7 @@ impl BookSanityHandle {
     fn update_error(&self, now: DateTime<Utc>, reason: String) -> BookSanitySnapshot {
         let mut snapshot = self.inner.lock().expect("book sanity state poisoned");
         snapshot.last_checked_at = Some(now);
-        snapshot.last_reason = Some(reason);
+        snapshot.last_reason = Some(Arc::from(reason));
         snapshot.last_action = "check_error".to_string();
         snapshot.clone()
     }
@@ -87,7 +87,7 @@ impl BookSanityHandle {
         let mut snapshot = self.inner.lock().expect("book sanity state poisoned");
         let was_blocked = snapshot.blocked;
         snapshot.last_checked_at = Some(now);
-        snapshot.last_reason = Some(reason);
+        snapshot.last_reason = Some(Arc::from(reason));
         snapshot.failure_streak += 1;
         snapshot.success_streak = 0;
         if snapshot.failure_streak >= cfg.required_failures {

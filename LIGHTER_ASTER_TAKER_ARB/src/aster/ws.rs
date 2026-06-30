@@ -5,10 +5,11 @@
 //! Aster 20-level book hot in memory from the futures `@depth20@100ms` stream; the
 //! trading loop only clones the latest [`OrderBook`].
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use arc_swap::ArcSwapOption;
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
@@ -33,7 +34,7 @@ pub struct AsterBookFeed {
 
 #[derive(Default)]
 struct AsterBookState {
-    book: Mutex<Option<OrderBook>>,
+    book: ArcSwapOption<OrderBook>,
 }
 
 impl AsterBookFeed {
@@ -71,18 +72,13 @@ impl AsterBookFeed {
     pub fn order_book(&self) -> Result<OrderBook> {
         self.state
             .book
-            .lock()
-            .expect("Aster book feed state poisoned")
-            .clone()
+            .load_full()
+            .map(|arc| (*arc).clone())
             .ok_or_else(|| anyhow!("Aster websocket depth not ready for {}", self.symbol))
     }
 
     pub fn request_reconnect(&self) {
-        self.state
-            .book
-            .lock()
-            .expect("Aster book feed state poisoned")
-            .take();
+        self.state.book.store(None);
         self.reconnect.notify_one();
     }
 }
@@ -99,11 +95,7 @@ async fn depth_loop(
             Ok(()) => {}
             Err(e) => tracing::warn!("Aster depth websocket disconnected: {e:#}"),
         }
-        state
-            .book
-            .lock()
-            .expect("Aster book feed state poisoned")
-            .take();
+        state.book.store(None);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
@@ -133,7 +125,7 @@ async fn depth_session(
         match msg? {
             Message::Text(text) => {
                 if let Some(book) = parse_depth(&text)? {
-                    *state.book.lock().expect("Aster book feed state poisoned") = Some(book);
+                    state.book.store(Some(Arc::new(book)));
                 }
             }
             Message::Ping(payload) => {

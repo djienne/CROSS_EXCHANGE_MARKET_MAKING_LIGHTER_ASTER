@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
+use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::{Decimal, RoundingStrategy};
@@ -472,11 +473,11 @@ impl BookFeedState {
     }
 
     fn order_book(&self, market_id: u32) -> Option<OrderBook> {
-        self.books
-            .lock()
-            .expect("Lighter book state poisoned")
-            .get(&market_id)
-            .and_then(LighterBook::to_order_book)
+        let cached = {
+            let books = self.books.lock().expect("Lighter book state poisoned");
+            books.get(&market_id).and_then(LighterBook::load_cached)
+        };
+        cached.map(|arc| (*arc).clone())
     }
 
     fn request_reconnect(&self, market_id: u32) {
@@ -500,6 +501,7 @@ struct LighterBook {
     initialized: bool,
     updated_at: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
+    cached: ArcSwapOption<OrderBook>,
 }
 
 impl LighterBook {
@@ -522,14 +524,19 @@ impl LighterBook {
         apply_levels(&mut self.asks, &msg.order_book.asks);
         self.updated_at = Some(Utc::now());
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
+        self.refresh_cache();
         true
     }
 
-    fn to_order_book(&self) -> Option<OrderBook> {
+    fn refresh_cache(&self) {
         if !self.initialized {
-            return None;
+            self.cached.store(None);
+            return;
         }
-        let ts = self.updated_at?;
+        let Some(ts) = self.updated_at else {
+            self.cached.store(None);
+            return;
+        };
         let bids = self
             .bids
             .iter()
@@ -541,7 +548,17 @@ impl LighterBook {
             .iter()
             .take(MAX_BOOK_LEVELS)
             .map(|(p, q)| (*p, *q));
-        Some(OrderBook::from_levels(bids, asks, ts, ts))
+        let book = OrderBook::from_levels(bids, asks, ts, ts);
+        self.cached.store(Some(Arc::new(book)));
+    }
+
+    fn load_cached(&self) -> Option<Arc<OrderBook>> {
+        self.cached.load_full()
+    }
+
+    #[cfg(test)]
+    fn to_order_book(&self) -> Option<OrderBook> {
+        self.cached.load_full().map(|arc| (*arc).clone())
     }
 }
 
@@ -1035,7 +1052,7 @@ fn spawn_account_all_positions_stream(
             opts,
             None,
             move |data| {
-                if let Ok(msg) = serde_json::from_value::<AccountAllPositionsMsg>(data.clone()) {
+                if let Ok(msg) = serde_json::from_value::<AccountAllPositionsMsg>(data) {
                     apply_account_all_positions(&account_feed, &known_markets, &msg);
                 }
             },
@@ -1069,7 +1086,7 @@ fn spawn_account_all_stream(
                 }
             },
             move |data| {
-                if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data.clone()) {
+                if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data) {
                     for trades in msg.trades.values() {
                         for trade in trades {
                             fills.on_trade(trade.clone());
@@ -1097,7 +1114,7 @@ fn spawn_user_stats_stream(
             opts,
             None,
             move |data| {
-                if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data.clone()) {
+                if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data) {
                     account_feed.set_user_stats(
                         value_dec(msg.stats.available_balance.as_ref()),
                         value_dec(msg.stats.portfolio_value.as_ref()),
@@ -1162,7 +1179,7 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
                 opts,
                 Some(reconnect),
                 move |data| {
-                    if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data.clone()) {
+                    if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data) {
                         if !books.apply(market_id, &msg) {
                             tracing::warn!(
                                 "Lighter order_book nonce gap for market {}; reconnecting for fresh snapshot",
@@ -1260,17 +1277,17 @@ fn trade_matches_side(trade: &TradePayload, client_order_index: i64, side: Side)
     }
 }
 
-fn fill_identity(trade: &TradePayload) -> String {
+fn fill_identity(trade: &TradePayload) -> u128 {
     if let Some(id) = trade.trade_id {
-        return format!("id:{id}");
+        return (id as u128) | (1u128 << 64);
     }
-    format!(
-        "fallback:{}:{}:{}:{}",
-        trade.ask_client_id.unwrap_or_default(),
-        trade.bid_client_id.unwrap_or_default(),
-        trade.price.as_deref().unwrap_or_default(),
-        trade.size.as_deref().unwrap_or_default()
-    )
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    trade.ask_client_id.hash(&mut hasher);
+    trade.bid_client_id.hash(&mut hasher);
+    trade.price.hash(&mut hasher);
+    trade.size.hash(&mut hasher);
+    hasher.finish() as u128
 }
 
 fn trade_fee_usd(trade: &TradePayload) -> Decimal {

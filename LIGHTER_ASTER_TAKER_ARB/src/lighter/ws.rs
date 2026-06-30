@@ -92,7 +92,7 @@ pub async fn subscribe_loop<F, D>(
     mut on_message: F,
     mut on_disconnect: D,
 ) where
-    F: FnMut(&Value),
+    F: FnMut(Value),
     D: FnMut(),
 {
     let mut backoff = opts.reconnect_base;
@@ -127,7 +127,7 @@ pub async fn subscribe_loop_authed<F, A>(
     mut auth_fn: A,
     mut on_message: F,
 ) where
-    F: FnMut(&Value),
+    F: FnMut(Value),
     A: FnMut() -> std::collections::HashMap<String, String>,
 {
     let mut backoff = opts.reconnect_base;
@@ -165,7 +165,7 @@ async fn session<F>(
     on_message: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&Value),
+    F: FnMut(Value),
 {
     let (ws_stream, _) = connect_async(&opts.url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -267,7 +267,7 @@ where
                         // Real application message — this is the only thing that refreshes the
                         // data watchdog. Callbacks here are written to not panic.
                         last_data = Instant::now();
-                        on_message(&data);
+                        on_message(data);
                     }
                 }
             }
@@ -331,7 +331,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_data: Value| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -364,7 +364,7 @@ mod tests {
         opts.frame_timeout = 0.15;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_data: Value| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -391,7 +391,7 @@ mod tests {
         let mut opts = opts(url);
         opts.data_timeout = None;
         opts.frame_timeout = 0.16;
-        let mut on_message = |_data: &Value| {};
+        let mut on_message = |_data: Value| {};
 
         timeout(
             Duration::from_secs(2),
@@ -427,7 +427,7 @@ mod tests {
         opts.channel_auths
             .insert("test/channel".to_string(), "secret-token".to_string());
         opts.frame_timeout = 1.0;
-        let mut on_message = |_data: &Value| {};
+        let mut on_message = |_data: Value| {};
 
         timeout(
             Duration::from_secs(2),
@@ -460,7 +460,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_data: Value| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
