@@ -243,7 +243,7 @@ async fn scan_all(
 
         if divergent {
             let n = breaches.entry(key.clone()).or_insert(0);
-            *n += 1;
+            *n = step_breach_counter(*n, true, cell.is_divergent(), params.consecutive_breaches);
             warn!(
                 "book-check: {} {} WS/BBO!=REST (ws_mid={:?} rest_mid={:?} mid_diff={:?}bps vwap_diff={:?}bps bbo_diff={:?}bps ws_crossed={} bbo_crossed={:?}) breach {}/{}",
                 t.market.0,
@@ -259,28 +259,41 @@ async fn scan_all(
                 params.consecutive_breaches
             );
             if *n >= params.consecutive_breaches {
+                let already_divergent = cell.is_divergent();
                 cell.mark_divergent(true);
-                if let Some(h) = reconnect.get(&key) {
-                    h.request();
+                if !already_divergent {
+                    if let Some(h) = reconnect.get(&key) {
+                        h.request();
+                    }
+                    error!(
+                        "book-check: {} {} sustained divergence -> trading gate CLOSED + websocket reset requested",
+                        t.market.0,
+                        t.venue.as_str()
+                    );
                 }
-                error!(
-                    "book-check: {} {} sustained divergence -> trading gate CLOSED + websocket reset requested",
-                    t.market.0,
-                    t.venue.as_str()
-                );
-                *n = 0; // acted; require fresh breaches before acting again
             }
         } else {
             agreed += 1;
-            breaches.insert(key.clone(), 0);
-            if cell.is_divergent() {
-                info!(
-                    "book-check: {} {} back in agreement with REST -> divergence cleared, gate may reopen",
+            let n = breaches.entry(key.clone()).or_insert(0);
+            *n = step_breach_counter(*n, false, cell.is_divergent(), params.consecutive_breaches);
+            if *n == 0 {
+                if cell.is_divergent() {
+                    info!(
+                        "book-check: {} {} back in sustained agreement with REST -> divergence cleared, gate may reopen",
+                        t.market.0,
+                        t.venue.as_str()
+                    );
+                }
+                cell.mark_divergent(false);
+            } else if cell.is_divergent() {
+                debug!(
+                    "book-check: {} {} agreeing but waiting for sustained recovery ({}/{} remaining)",
                     t.market.0,
-                    t.venue.as_str()
+                    t.venue.as_str(),
+                    *n,
+                    params.consecutive_breaches
                 );
             }
-            cell.mark_divergent(false);
             debug!(
                 "book-check: {} {} ok (diff={}bps)",
                 t.market.0,
@@ -294,4 +307,67 @@ async fn scan_all(
         .map(|(d, who)| format!("{}bps@{who}", d.round_dp(2)))
         .unwrap_or_else(|| "n/a".to_string());
     info!("book-check: {agreed}/{checked} books agree with REST (worst {worst_s})");
+}
+
+/// Fold one scan observation into a (market, venue) breach counter.
+///
+/// `limit` CONSECUTIVE divergent scans trip the gate (the counter saturates there); once
+/// tripped, `limit` consecutive agreeing scans are required before it clears (gradual
+/// decay, so a flapping book stays gated). A healthy (non-tripped) cell resets to zero on
+/// any agreeing scan — isolated, non-consecutive blips must never accumulate toward a trip.
+fn step_breach_counter(n: u32, divergent: bool, tripped: bool, limit: u32) -> u32 {
+    if divergent {
+        n.saturating_add(1).min(limit.max(1))
+    } else if tripped {
+        n.saturating_sub(1)
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::step_breach_counter;
+
+    const LIMIT: u32 = 3;
+
+    #[test]
+    fn isolated_blips_never_accumulate() {
+        // Repeated bursts of LIMIT-1 breaches, each followed by one agreement on a
+        // healthy cell, must never reach the trip threshold.
+        let mut n = 0;
+        for _ in 0..10 {
+            n = step_breach_counter(n, true, false, LIMIT);
+            n = step_breach_counter(n, true, false, LIMIT);
+            assert!(n < LIMIT);
+            n = step_breach_counter(n, false, false, LIMIT);
+            assert_eq!(n, 0);
+        }
+    }
+
+    #[test]
+    fn consecutive_breaches_trip_and_saturate() {
+        let mut n = 0;
+        for _ in 0..LIMIT {
+            n = step_breach_counter(n, true, false, LIMIT);
+        }
+        assert_eq!(n, LIMIT);
+        // Further breaches hold at the limit so recovery always needs LIMIT agreements.
+        n = step_breach_counter(n, true, true, LIMIT);
+        assert_eq!(n, LIMIT);
+    }
+
+    #[test]
+    fn tripped_cell_requires_sustained_agreement() {
+        let mut n = LIMIT;
+        n = step_breach_counter(n, false, true, LIMIT);
+        assert_eq!(n, LIMIT - 1);
+        // A relapse mid-recovery restores the full requirement.
+        n = step_breach_counter(n, true, true, LIMIT);
+        assert_eq!(n, LIMIT);
+        for _ in 0..LIMIT {
+            n = step_breach_counter(n, false, true, LIMIT);
+        }
+        assert_eq!(n, 0);
+    }
 }

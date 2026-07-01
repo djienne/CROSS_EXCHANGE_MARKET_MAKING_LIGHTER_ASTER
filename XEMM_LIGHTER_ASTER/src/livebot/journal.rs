@@ -3,11 +3,15 @@
 //! channel (a non-blocking `try_send`); a dedicated writer task drains it to JSONL. If the
 //! process dies we recover from exchange state, not from this log — it is an audit trail,
 //! not the source of truth. The bound (vs an unbounded channel) is the safety property: a
-//! stalled writer (disk full / NFS hang) drops the OLDEST-unwritten telemetry instead of
-//! growing without limit and OOM-killing the process — which would skip the orderly shutdown
-//! that cancels resting orders on both venues.
+//! stalled writer (disk full / NFS hang) drops the NEWEST record at enqueue time (`try_send`
+//! fails; the already-queued backlog is preserved) instead of growing without limit and
+//! OOM-killing the process — which would skip the orderly shutdown that cancels resting
+//! orders on both venues. Drops are counted and warned so an incident-time gap in the
+//! audit trail is visible rather than silent.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -17,16 +21,25 @@ use tracing::warn;
 /// wedged writer can never exhaust memory. At ~100 B/record this is a few MB worst case.
 const JOURNAL_CAP: usize = 65_536;
 
-/// One journal record: a monotonic stamp, a kind tag, and a free-form JSON detail. Kept
-/// schema-light so any plane can log without a central enum churn.
+/// One journal record: a monotonic stamp, a wall-clock stamp, a kind tag, and a free-form
+/// JSON detail. Kept schema-light so any plane can log without a central enum churn.
+///
+/// `ts_ms` (epoch milliseconds, stamped at enqueue) is what downstream PnL/history tooling
+/// (`combined_pnl.py`, `trade_history.py`) uses to window trades — `mono_ns` alone is
+/// process-relative and useless across restarts.
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalRecord {
     pub mono_ns: i64,
+    pub ts_ms: i64,
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub market: Option<String>,
     pub detail: serde_json::Value,
 }
+
+/// Lifetime count of records dropped at enqueue (full/closed channel). Static because the
+/// journal handle is cloned everywhere and drops must aggregate across all planes.
+static DROPPED_RECORDS: AtomicU64 = AtomicU64::new(0);
 
 /// A cloneable journal handle. Cloning shares the same channel, so every plane logs into one
 /// stream. A `null()` handle silently drops records (paper/tests).
@@ -49,13 +62,25 @@ impl Journal {
     }
 
     /// Enqueue a record. NON-BLOCKING and infallible from the caller's view: `try_send` never
-    /// awaits, and a full (writer wedged) or closed (writer gone) channel drops the record rather
-    /// than ever stalling the hot path or growing unbounded. The journal is an audit trail, so a
-    /// dropped record under extreme backpressure is acceptable — an OOM is not.
+    /// awaits, and a full (writer wedged) or closed (writer gone) channel drops this record
+    /// rather than ever stalling the hot path or growing unbounded. The journal is an audit
+    /// trail, so a dropped record under extreme backpressure is acceptable — an OOM is not —
+    /// but drops are counted and warned (rate-limited) so the gap is visible.
     #[inline]
     pub fn record(&self, mono_ns: i64, kind: &'static str, market: Option<String>, detail: serde_json::Value) {
         if let Some(tx) = &self.tx {
-            let _ = tx.try_send(JournalRecord { mono_ns, kind, market, detail });
+            let ts_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if tx.try_send(JournalRecord { mono_ns, ts_ms, kind, market, detail }).is_err() {
+                let dropped = DROPPED_RECORDS.fetch_add(1, Ordering::Relaxed) + 1;
+                // Warn on the first drop and then once per 1024 so a wedged writer during an
+                // incident is loud without the warn itself becoming a flood.
+                if dropped == 1 || dropped % 1024 == 0 {
+                    warn!("journal backpressure: {dropped} record(s) dropped at enqueue (writer wedged or stopped)");
+                }
+            }
         }
     }
 }
@@ -135,6 +160,8 @@ mod tests {
         assert_eq!(first["kind"], "place");
         assert_eq!(first["market"], "BTC");
         assert_eq!(first["detail"]["px"], 100);
+        // Every record must carry a wall-clock stamp for PnL/history windowing.
+        assert!(first["ts_ms"].as_i64().unwrap() > 1_500_000_000_000);
         // the second record omits market (skip_serializing_if None)
         let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert!(second.get("market").is_none());

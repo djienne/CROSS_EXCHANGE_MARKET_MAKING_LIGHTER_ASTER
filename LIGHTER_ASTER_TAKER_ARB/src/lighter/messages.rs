@@ -133,6 +133,18 @@ pub struct OrderBookMsg {
     pub order_book: OrderBookPayload,
 }
 
+/// Verdict for folding a non-snapshot `order_book` update into a locally-maintained book.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BookUpdateContiguity {
+    /// Continues the local book: chained nonce, next offset, or a forward-extending overlap.
+    Apply,
+    /// Fully stale/duplicate delta — drop it and keep the book. NOT a reason to resync.
+    SkipStale,
+    /// Updates were missed (or the delta carries no usable sequence metadata), so the local
+    /// book can no longer be trusted — resync via a fresh snapshot.
+    Gap,
+}
+
 impl OrderBookMsg {
     pub fn is_snapshot(&self) -> bool {
         self.msg_type.contains("subscribed")
@@ -140,6 +152,39 @@ impl OrderBookMsg {
     /// Prefer envelope offset, fall back to payload offset.
     pub fn effective_offset(&self) -> Option<u64> {
         self.offset.or(self.order_book.offset)
+    }
+
+    /// Classify this delta against the last applied sequence position.
+    ///
+    /// Nonce chain: `begin_nonce` is where the delta starts, `nonce` where it ends. Levels
+    /// carry ABSOLUTE sizes, so an overlapping delta that extends forward
+    /// (`begin < last < end`) re-states known levels idempotently and is safe to apply;
+    /// only a delta that ends at-or-before our position is a stale replay.
+    pub fn contiguity(
+        &self,
+        last_nonce: Option<i64>,
+        last_offset: Option<u64>,
+    ) -> BookUpdateContiguity {
+        use BookUpdateContiguity::*;
+        if let (Some(begin), Some(last)) = (self.order_book.begin_nonce, last_nonce) {
+            return if begin > last {
+                Gap
+            } else if begin == last || self.order_book.nonce.is_some_and(|end| end > last) {
+                Apply
+            } else {
+                SkipStale
+            };
+        }
+        if let (Some(offset), Some(last)) = (self.effective_offset(), last_offset) {
+            return if offset == last.saturating_add(1) {
+                Apply
+            } else if offset <= last {
+                SkipStale
+            } else {
+                Gap
+            };
+        }
+        Gap
     }
 }
 

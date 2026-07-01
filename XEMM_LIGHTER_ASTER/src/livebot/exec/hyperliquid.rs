@@ -22,7 +22,8 @@ use crate::book::OrderBook;
 use crate::connectors::rest_book;
 use crate::lighter::auth::generate_ws_auth_token;
 use crate::lighter::messages::{
-    AccountAllMsg, AccountAllPositionsMsg, OrderBookMsg, PriceLevel, RemoteOrder, TradePayload,
+    AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsg, PriceLevel,
+    RemoteOrder, TradePayload,
     UserStatsMsg,
 };
 use crate::lighter::nonce::NonceManager;
@@ -296,17 +297,20 @@ struct LighterBook {
     initialized: bool,
     updated_at: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
+    last_offset: Option<u64>,
 }
 
 impl LighterBook {
     fn apply(&mut self, msg: &OrderBookMsg) -> bool {
-        if self.initialized && !msg.is_snapshot() {
-            if let (Some(begin_nonce), Some(last_nonce)) =
-                (msg.order_book.begin_nonce, self.last_nonce)
-            {
-                if begin_nonce != last_nonce {
-                    return false;
-                }
+        if !msg.is_snapshot() {
+            if !self.initialized {
+                // A delta before the subscribe snapshot must never seed the book.
+                return false;
+            }
+            match msg.contiguity(self.last_nonce, self.last_offset) {
+                BookUpdateContiguity::Apply => {}
+                BookUpdateContiguity::SkipStale => return true, // duplicate/replay: keep book
+                BookUpdateContiguity::Gap => return false,
             }
         }
         if msg.is_snapshot() || !self.initialized {
@@ -318,6 +322,7 @@ impl LighterBook {
         apply_levels(&mut self.asks, &msg.order_book.asks);
         self.updated_at = Some(Utc::now());
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
+        self.last_offset = msg.effective_offset().or(self.last_offset);
         true
     }
 
@@ -1211,7 +1216,7 @@ fn spawn_order_book_stream(
                     if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data.clone()) {
                         if !books_for_msg.apply(market_id, &msg) {
                             tracing::warn!(
-                                "Lighter order_book nonce gap for market {}; reconnecting for fresh snapshot",
+                                "Lighter order_book sequence gap for market {}; reconnecting for fresh snapshot",
                                 market_id
                             );
                             books_for_msg.reset(market_id);
@@ -1588,7 +1593,7 @@ mod tests {
     fn book_feed_detects_nonce_gap_and_keeps_top_of_book() {
         let feed = BookFeedState::default();
         let first: OrderBookMsg = serde_json::from_value(serde_json::json!({
-            "type": "update/order_book",
+            "type": "subscribed/order_book",
             "order_book": {
                 "nonce": 10,
                 "bids": [{"price": "100", "size": "1"}],
@@ -1599,17 +1604,110 @@ mod tests {
         assert!(feed.apply(24, &first));
         assert_eq!(feed.order_book(24).and_then(|b| b.mid()), Some(dec!(101)));
 
+        // begin_nonce ahead of our position => missed updates => resync.
         let gap: OrderBookMsg = serde_json::from_value(serde_json::json!({
             "type": "update/order_book",
             "order_book": {
-                "begin_nonce": 9,
-                "nonce": 11,
+                "begin_nonce": 11,
+                "nonce": 12,
                 "bids": [{"price": "100", "size": "0"}],
                 "asks": []
             }
         }))
         .unwrap();
         assert!(!feed.apply(24, &gap));
+    }
+
+    #[test]
+    fn book_feed_skips_stale_replay_and_rejects_pre_snapshot_delta() {
+        let feed = BookFeedState::default();
+        // A delta with no snapshot to apply to must never seed the book.
+        let premature: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "nonce": 10,
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "102", "size": "2"}]
+            }
+        }))
+        .unwrap();
+        assert!(!feed.apply(24, &premature));
+        assert!(feed.order_book(24).is_none());
+
+        let snapshot: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "nonce": 10,
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "102", "size": "2"}]
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &snapshot));
+
+        // A replay ending at-or-before our position is dropped without a resync.
+        let stale: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "begin_nonce": 8,
+                "nonce": 9,
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &stale));
+        assert_eq!(feed.order_book(24).and_then(|b| b.mid()), Some(dec!(101)));
+    }
+
+    #[test]
+    fn book_feed_detects_offset_gap_without_nonce() {
+        let feed = BookFeedState::default();
+        let first: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 10,
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "102", "size": "2"}]
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &first));
+
+        let gap: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "offset": 12,
+            "order_book": {
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        }))
+        .unwrap();
+        assert!(!feed.apply(24, &gap));
+    }
+
+    #[test]
+    fn book_feed_rejects_delta_without_sequence_metadata() {
+        let feed = BookFeedState::default();
+        let first: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "102", "size": "2"}]
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &first));
+
+        let unsequenced: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        }))
+        .unwrap();
+        assert!(!feed.apply(24, &unsequenced));
     }
 
     #[test]

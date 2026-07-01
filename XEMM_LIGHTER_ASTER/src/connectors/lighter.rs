@@ -11,7 +11,7 @@ use super::{EventSink, Tap};
 use crate::decimal::parse_dec;
 use crate::events::{EventKind, PriceLevel};
 use crate::lighter::local_book::LocalBook;
-use crate::lighter::messages::OrderBookMsg;
+use crate::lighter::messages::{BookUpdateContiguity, OrderBookMsg};
 use crate::lighter::ws::{subscribe_loop, SubscribeOptions};
 use crate::types::MarketId;
 
@@ -21,6 +21,9 @@ const PUBLISH_LEVELS: usize = 20;
 struct StreamState {
     book: LocalBook,
     last_nonce: Option<i64>,
+    /// Lifetime count of gap-forced resyncs on this stream — surfaced in the gap warn so
+    /// reconnect churn (e.g. from wrong sequence assumptions) is visible in logs.
+    gap_resyncs: u64,
 }
 
 impl StreamState {
@@ -71,9 +74,10 @@ pub async fn run_with_tap(
         move |data| {
             let mut state = state.lock().expect("Lighter stream book state poisoned");
             if !handle_value(data, &market, &tx, &tap, &mut state) {
+                state.gap_resyncs += 1;
                 warn!(
-                    "Lighter order_book nonce gap for market {}; reconnecting for fresh snapshot",
-                    market_id
+                    "Lighter order_book sequence gap for market {} (resync #{}); reconnecting for fresh snapshot",
+                    market_id, state.gap_resyncs
                 );
                 state.reset();
                 reconnect_on_gap.notify_one();
@@ -100,13 +104,16 @@ fn handle_value(
         Ok(m) => m,
         Err(_) => return true,
     };
-    if state.book.initialized && !msg.is_snapshot() {
-        if let (Some(begin_nonce), Some(last_nonce)) =
-            (msg.order_book.begin_nonce, state.last_nonce)
-        {
-            if begin_nonce != last_nonce {
-                return false;
-            }
+    if !msg.is_snapshot() {
+        if !state.book.initialized {
+            // A delta before the subscribe snapshot has nothing to apply to; seeding the
+            // book from it would publish a nearly-empty top-of-book. Resync instead.
+            return false;
+        }
+        match msg.contiguity(state.last_nonce, state.book.last_offset) {
+            BookUpdateContiguity::Apply => {}
+            BookUpdateContiguity::SkipStale => return true, // duplicate/replay: keep the book
+            BookUpdateContiguity::Gap => return false,
         }
     }
     let bids_f = parse_lighter_levels(&msg.order_book.bids);
@@ -116,7 +123,7 @@ fn handle_value(
     } else {
         state.book.apply_delta(&bids_f, &asks_f);
     }
-    state.book.last_offset = msg.effective_offset();
+    state.book.last_offset = msg.effective_offset().or(state.book.last_offset);
     state.last_nonce = msg.order_book.nonce.or(state.last_nonce);
     if !state.book.initialized {
         return true;
@@ -217,15 +224,208 @@ mod tests {
         assert_eq!(state.last_nonce, Some(10));
         assert!(rx.try_recv().is_ok());
 
+        // begin_nonce ahead of our position => updates were missed => resync.
         let gap = serde_json::json!({
             "type": "update/order_book",
             "order_book": {
-                "begin_nonce": 9,
-                "nonce": 11,
+                "begin_nonce": 11,
+                "nonce": 12,
                 "bids": [{"price": "100", "size": "0"}],
                 "asks": []
             }
         });
         assert!(!handle_value(&gap, &market, &sink, &tap, &mut state));
+    }
+
+    #[test]
+    fn handle_value_applies_forward_extending_nonce_overlap() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "nonce": 10,
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        let _ = rx.try_recv();
+
+        // Levels carry absolute sizes, so an overlap that extends forward is safe to apply.
+        let overlap = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "begin_nonce": 9,
+                "nonce": 11,
+                "bids": [{"price": "100", "size": "3"}],
+                "asks": []
+            }
+        });
+        assert!(handle_value(&overlap, &market, &sink, &tap, &mut state));
+        assert_eq!(state.last_nonce, Some(11));
+        assert!(rx.try_recv().is_ok(), "applied overlap must publish");
+    }
+
+    #[test]
+    fn handle_value_skips_stale_nonce_replay_without_resync() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "nonce": 10,
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        let _ = rx.try_recv();
+
+        // Ends at-or-before our position: a replay. Dropped, book kept, no resync.
+        let stale = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "begin_nonce": 8,
+                "nonce": 9,
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        });
+        assert!(handle_value(&stale, &market, &sink, &tap, &mut state));
+        assert_eq!(state.last_nonce, Some(10), "stale replay must not move the position");
+        assert!(rx.try_recv().is_err(), "stale replay must not publish");
+    }
+
+    #[test]
+    fn handle_value_detects_orderbook_offset_gap_without_nonce() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 10,
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        assert_eq!(state.book.last_offset, Some(10));
+
+        let gap = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 12,
+            "order_book": {
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        });
+        assert!(!handle_value(&gap, &market, &sink, &tap, &mut state));
+    }
+
+    #[test]
+    fn handle_value_skips_duplicate_offset_without_resync() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 10,
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        let _ = rx.try_recv();
+
+        // Same offset re-delivered: a duplicate, not a gap — no reconnect churn.
+        let dup = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 10,
+            "order_book": {
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        });
+        assert!(handle_value(&dup, &market, &sink, &tap, &mut state));
+        assert_eq!(state.book.last_offset, Some(10));
+        assert!(rx.try_recv().is_err(), "duplicate must not publish");
+
+        // The next contiguous delta still applies and preserves a known offset even if
+        // the message itself omits one elsewhere in the pipeline.
+        let next = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 11,
+            "order_book": {
+                "bids": [{"price": "100", "size": "2"}],
+                "asks": []
+            }
+        });
+        assert!(handle_value(&next, &market, &sink, &tap, &mut state));
+        assert_eq!(state.book.last_offset, Some(11));
+    }
+
+    #[test]
+    fn handle_value_resyncs_on_delta_before_snapshot() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        // A delta with no snapshot to apply it to must never seed the book.
+        let delta = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 11,
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(!handle_value(&delta, &market, &sink, &tap, &mut state));
+        assert!(!state.book.initialized);
+    }
+
+    #[test]
+    fn handle_value_rejects_delta_without_sequence_metadata() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}],
+                "asks": [{"price": "101", "size": "2"}]
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+
+        let unsequenced = serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "bids": [{"price": "100", "size": "0"}],
+                "asks": []
+            }
+        });
+        assert!(!handle_value(&unsequenced, &market, &sink, &tap, &mut state));
     }
 }

@@ -71,18 +71,24 @@ impl AsterCreds {
                 }
             }
         }
-        // The signer field is optional in the file (we can synthesize it from the key); the
-        // user (main account) is mandatory and cannot be the signer.
-        let signer = signer.unwrap_or_else(|| derived_lc.clone());
+        // Cross-check: the env file must explicitly list the API-wallet (signer) address and it
+        // must match the private key. This catches a swapped/rotated key against a stale env
+        // file before anything is signed with the wrong identity. Deliberately strict — the
+        // signer address is NOT synthesized from the key alone.
+        let Some(signer) = signer else {
+            bail!(
+                "aster env cross-check failed: neither wallet_address nor subaccount_address \
+                 matches the private key's address {derived_lc}. Add the API-wallet address \
+                 (e.g. `subaccount_address={derived_lc}`) alongside the main-account address, \
+                 or fix private_key if it was rotated."
+            );
+        };
         let user = user.ok_or_else(|| {
             anyhow!(
                 "could not determine the Aster main-account (user) address from the env file: \
                  no wallet_address/subaccount_address differs from the key's address {derived_lc}"
             )
         })?;
-        if parse_address(&signer)? != derived {
-            bail!("aster signer field does not match the private key's address");
-        }
         info!("aster credentials: user={user} signer={signer} (roles derived from the key)");
         Ok(AsterCreds { user, signer, key })
     }
@@ -91,13 +97,25 @@ impl AsterCreds {
 /// Resolved Lighter API-key credentials. These are not EVM keys, so validation is limited to
 /// required-field presence and numeric account/API-key ids; the native signer performs the
 /// authoritative key check through `CreateClient` / `CheckClient`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LighterCreds {
     pub api_private_key: String,
     pub api_public_key: String,
     pub api_key_index: i32,
     pub account_index: i64,
     pub wallet_address: String,
+}
+
+impl std::fmt::Debug for LighterCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LighterCreds")
+            .field("api_private_key", &"<redacted>")
+            .field("api_public_key", &self.api_public_key)
+            .field("api_key_index", &self.api_key_index)
+            .field("account_index", &self.account_index)
+            .field("wallet_address", &self.wallet_address)
+            .finish()
+    }
 }
 
 impl LighterCreds {
@@ -167,6 +185,28 @@ mod tests {
         let p = write_tmp("aster-bad", &body);
         assert!(AsterCreds::load(&p).is_err());
         std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn aster_rejects_when_no_address_matches_key() {
+        let body = format!("private_key={KEY1}\nwallet_address={USER1}\nsubaccount_address=0x2222222222222222222222222222222222222222\n");
+        let p = write_tmp("aster-mismatch", &body);
+        assert!(AsterCreds::load(&p).is_err());
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn lighter_debug_redacts_private_key() {
+        let creds = LighterCreds {
+            api_private_key: "secret".to_string(),
+            api_public_key: "pub".to_string(),
+            api_key_index: 1,
+            account_index: 2,
+            wallet_address: "0xabc".to_string(),
+        };
+        let text = format!("{creds:?}");
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains("secret"));
     }
 
     #[test]

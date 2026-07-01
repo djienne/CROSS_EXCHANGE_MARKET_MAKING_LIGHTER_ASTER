@@ -15,8 +15,8 @@ use crate::aster::creds::LighterCreds;
 use crate::book::{OrderBook, MAX_BOOK_LEVELS};
 use crate::lighter::auth::generate_ws_auth_token;
 use crate::lighter::messages::{
-    AccountAllMsg, AccountAllPositionsMsg, OrderBookMsg, PriceLevel, RemoteOrder, TradePayload,
-    UserStatsMsg,
+    AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsg, PriceLevel,
+    RemoteOrder, TradePayload, UserStatsMsg,
 };
 use crate::lighter::nonce::NonceManager;
 use crate::lighter::rest::RestClient;
@@ -300,6 +300,12 @@ impl Drop for PendingFill {
     }
 }
 
+/// How long a TERMINAL (filled/cancelled) order stays queryable via `order_by_client` after
+/// the feed reports it. Terminal rows exist only to serve `PendingFill::wait_confirmed`'s
+/// terminal-fill fallback, which resolves within seconds; without an expiry the maps grow by
+/// one entry per Lighter order for the life of the process.
+const TERMINAL_ORDER_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[derive(Default)]
 struct AccountFeedState {
     positions: Mutex<HashMap<u32, Decimal>>,
@@ -307,9 +313,16 @@ struct AccountFeedState {
     portfolio_value: Mutex<Option<Decimal>>,
     open_orders: Mutex<HashMap<u32, usize>>,
     client_orders: Mutex<HashMap<i64, RemoteOrder>>,
+    client_order_markets: Mutex<HashMap<i64, u32>>,
+    /// When each terminal order was first reported, for the TTL purge.
+    client_order_terminal_at: Mutex<HashMap<i64, std::time::Instant>>,
     account_all_ready: AtomicBool,
     user_stats_ready: AtomicBool,
     all_orders_ready: AtomicBool,
+    /// Once-per-session canary: a NON-snapshot update is assumed to carry the complete live
+    /// set for each mentioned market. If one ever shrinks a market's live count by more than
+    /// half, that assumption may be wrong (per-order deltas?) — warn once, loudly.
+    shrink_warned: AtomicBool,
 }
 
 impl AccountFeedState {
@@ -373,12 +386,24 @@ impl AccountFeedState {
             .expect("Lighter portfolio value poisoned")
     }
 
-    fn set_open_orders_for_markets(&self, known_markets: &[u32], orders: &serde_json::Value) {
+    fn set_open_orders_for_markets(&self, known_markets: &[u32], orders: &serde_json::Value, is_snapshot: bool) {
         let mut counts = HashMap::new();
         let mut seen_live_client_ids = HashSet::new();
         let mut parsed_orders = Vec::new();
         let order_obj = orders.as_object();
-        for market_id in known_markets {
+        let markets: Vec<u32> = if is_snapshot {
+            known_markets.to_vec()
+        } else {
+            order_obj
+                .map(|obj| {
+                    obj.keys()
+                        .filter_map(|key| key.parse::<u32>().ok())
+                        .filter(|market_id| known_markets.contains(market_id))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        for market_id in markets {
             let count = order_obj
                 .and_then(|obj| obj.get(&market_id.to_string()))
                 .and_then(|v| v.as_array())
@@ -390,7 +415,7 @@ impl AccountFeedState {
                                 if order.is_live() {
                                     seen_live_client_ids.insert(client_order_index);
                                 }
-                                parsed_orders.push(order.clone());
+                                parsed_orders.push((market_id, order.clone()));
                             }
                             order
                         })
@@ -398,25 +423,89 @@ impl AccountFeedState {
                         .count()
                 })
                 .unwrap_or(0);
-            counts.insert(*market_id, count);
+            counts.insert(market_id, count);
         }
-        *self
+        let updated_markets: HashSet<u32> = if is_snapshot {
+            known_markets.iter().copied().collect()
+        } else {
+            counts.keys().copied().collect()
+        };
+        let mut open_orders = self
             .open_orders
             .lock()
-            .expect("Lighter open orders state poisoned") = counts;
+            .expect("Lighter open orders state poisoned");
+        if is_snapshot {
+            *open_orders = counts;
+        } else {
+            for (market_id, count) in counts {
+                if let Some(prev) = open_orders.get(&market_id).copied() {
+                    if prev >= 2
+                        && count * 2 < prev
+                        && !self.shrink_warned.swap(true, Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            "Lighter account_all_orders non-snapshot update shrank market {market_id} \
+                             live orders {prev} -> {count}; if this recurs the feed may be sending \
+                             per-order deltas rather than complete per-market sets"
+                        );
+                    }
+                }
+                open_orders.insert(market_id, count);
+            }
+        }
         let mut client_orders = self
             .client_orders
             .lock()
             .expect("Lighter client orders state poisoned");
-        client_orders.retain(|client_order_index, order| {
-            !order.is_live() || seen_live_client_ids.contains(client_order_index)
-        });
-        for order in parsed_orders {
+        let mut client_order_markets = self
+            .client_order_markets
+            .lock()
+            .expect("Lighter client order market state poisoned");
+        let mut terminal_at = self
+            .client_order_terminal_at
+            .lock()
+            .expect("Lighter terminal order state poisoned");
+        let remove_ids: Vec<i64> = client_orders
+            .iter()
+            .filter_map(|(client_order_index, order)| {
+                let market_id = client_order_markets.get(client_order_index)?;
+                (updated_markets.contains(market_id)
+                    && order.is_live()
+                    && !seen_live_client_ids.contains(client_order_index))
+                    .then_some(*client_order_index)
+            })
+            .collect();
+        for client_order_index in remove_ids {
+            client_orders.remove(&client_order_index);
+            client_order_markets.remove(&client_order_index);
+            terminal_at.remove(&client_order_index);
+        }
+        let now = std::time::Instant::now();
+        for (market_id, order) in parsed_orders {
             if let Some(client_order_index) = order.client_order_index {
+                if order.is_live() {
+                    terminal_at.remove(&client_order_index);
+                } else {
+                    terminal_at.entry(client_order_index).or_insert(now);
+                }
+                client_order_markets.insert(client_order_index, market_id);
                 client_orders.insert(client_order_index, order);
             }
         }
-        self.all_orders_ready.store(true, Ordering::Release);
+        // Purge terminal orders past their fallback-lookup window (see TERMINAL_ORDER_TTL).
+        let expired: Vec<i64> = terminal_at
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) > TERMINAL_ORDER_TTL)
+            .map(|(idx, _)| *idx)
+            .collect();
+        for client_order_index in expired {
+            terminal_at.remove(&client_order_index);
+            client_orders.remove(&client_order_index);
+            client_order_markets.remove(&client_order_index);
+        }
+        if is_snapshot {
+            self.all_orders_ready.store(true, Ordering::Release);
+        }
     }
 
     fn open_orders_count(&self, market_id: u32) -> Option<usize> {
@@ -501,18 +590,21 @@ struct LighterBook {
     initialized: bool,
     updated_at: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
+    last_offset: Option<u64>,
     cached: ArcSwapOption<OrderBook>,
 }
 
 impl LighterBook {
     fn apply(&mut self, msg: &OrderBookMsg) -> bool {
-        if self.initialized && !msg.is_snapshot() {
-            if let (Some(begin_nonce), Some(last_nonce)) =
-                (msg.order_book.begin_nonce, self.last_nonce)
-            {
-                if begin_nonce != last_nonce {
-                    return false;
-                }
+        if !msg.is_snapshot() {
+            if !self.initialized {
+                // A delta before the subscribe snapshot must never seed the book.
+                return false;
+            }
+            match msg.contiguity(self.last_nonce, self.last_offset) {
+                BookUpdateContiguity::Apply => {}
+                BookUpdateContiguity::SkipStale => return true, // duplicate/replay: keep book
+                BookUpdateContiguity::Gap => return false,
             }
         }
         if msg.is_snapshot() || !self.initialized {
@@ -524,6 +616,7 @@ impl LighterBook {
         apply_levels(&mut self.asks, &msg.order_book.asks);
         self.updated_at = Some(Utc::now());
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
+        self.last_offset = msg.effective_offset().or(self.last_offset);
         self.refresh_cache();
         true
     }
@@ -1155,7 +1248,11 @@ fn spawn_account_all_orders_stream(
             },
             move |data| {
                 let orders = data.get("orders").unwrap_or(&serde_json::Value::Null);
-                account_feed.set_open_orders_for_markets(&known_markets, orders);
+                let is_snapshot = data
+                    .get("type")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|kind| kind.starts_with("subscribed/"));
+                account_feed.set_open_orders_for_markets(&known_markets, orders, is_snapshot);
             },
         )
         .await;
@@ -1182,7 +1279,7 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
                     if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data) {
                         if !books.apply(market_id, &msg) {
                             tracing::warn!(
-                                "Lighter order_book nonce gap for market {}; reconnecting for fresh snapshot",
+                                "Lighter order_book sequence gap for market {}; reconnecting for fresh snapshot",
                                 market_id
                             );
                             books.reset(market_id);
@@ -1372,7 +1469,7 @@ mod tests {
     fn lighter_book_initial_update_and_delta_remove_level() {
         let initial: OrderBookMsg = serde_json::from_str(
             r#"{
-                "type":"update/order_book",
+                "type":"subscribed/order_book",
                 "order_book":{
                     "nonce":100,
                     "bids":[{"price":"10.00","size":"2.50"}],
@@ -1408,7 +1505,7 @@ mod tests {
     fn lighter_book_rejects_nonce_gap_delta() {
         let initial: OrderBookMsg = serde_json::from_str(
             r#"{
-                "type":"update/order_book",
+                "type":"subscribed/order_book",
                 "order_book":{
                     "nonce":100,
                     "bids":[{"price":"10.00","size":"2.50"}],
@@ -1417,12 +1514,13 @@ mod tests {
             }"#,
         )
         .unwrap();
+        // begin_nonce ahead of our position => missed updates => resync.
         let gap: OrderBookMsg = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
-                    "begin_nonce":99,
-                    "nonce":101,
+                    "begin_nonce":101,
+                    "nonce":102,
                     "bids":[{"price":"10.01","size":"2.00"}],
                     "asks":[]
                 }
@@ -1437,10 +1535,138 @@ mod tests {
     }
 
     #[test]
+    fn lighter_book_applies_forward_overlap_and_skips_stale_replay() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"subscribed/order_book",
+                "order_book":{
+                    "nonce":100,
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        // Overlap extending forward (99 -> 101 over our 100): absolute level sizes make the
+        // re-stated portion idempotent, so this must apply.
+        let overlap: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "begin_nonce":99,
+                    "nonce":101,
+                    "bids":[{"price":"10.01","size":"2.00"}],
+                    "asks":[]
+                }
+            }"#,
+        )
+        .unwrap();
+        // Fully-stale replay (ends at-or-before our position): dropped, no resync.
+        let stale: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "begin_nonce":98,
+                    "nonce":99,
+                    "bids":[{"price":"10.00","size":"0"}],
+                    "asks":[]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        assert!(book.apply(&overlap));
+        let out = book.to_order_book().unwrap();
+        assert_eq!(out.best_bid().unwrap().px, Decimal::new(1001, 2));
+        assert!(book.apply(&stale));
+        let out = book.to_order_book().unwrap();
+        assert_eq!(
+            out.best_bid().unwrap().px,
+            Decimal::new(1001, 2),
+            "stale replay must not mutate the book"
+        );
+    }
+
+    #[test]
+    fn lighter_book_rejects_delta_before_snapshot() {
+        let delta: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "nonce":100,
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(!book.apply(&delta), "delta must never seed an uninitialized book");
+        assert!(book.to_order_book().is_none());
+    }
+
+    #[test]
+    fn lighter_book_rejects_offset_gap_without_nonce() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"subscribed/order_book",
+                "offset":100,
+                "order_book":{
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let gap: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "offset":102,
+                "order_book":{
+                    "bids":[{"price":"10.01","size":"2.00"}],
+                    "asks":[]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        assert!(!book.apply(&gap));
+    }
+
+    #[test]
+    fn lighter_book_rejects_delta_without_sequence_metadata() {
+        let initial: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"subscribed/order_book",
+                "order_book":{
+                    "bids":[{"price":"10.00","size":"2.50"}],
+                    "asks":[{"price":"10.10","size":"1.25"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let unsequenced: OrderBookMsg = serde_json::from_str(
+            r#"{
+                "type":"update/order_book",
+                "order_book":{
+                    "bids":[{"price":"10.01","size":"2.00"}],
+                    "asks":[]
+                }
+            }"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        assert!(!book.apply(&unsequenced));
+    }
+
+    #[test]
     fn lighter_book_publishes_multiple_depth_levels() {
         let initial: OrderBookMsg = serde_json::from_str(
             r#"{
-                "type":"update/order_book",
+                "type":"subscribed/order_book",
                 "order_book":{
                     "nonce":100,
                     "bids":[{"price":"10.00","size":"2.50"},{"price":"9.95","size":"1.00"}],
@@ -1564,7 +1790,7 @@ mod tests {
                 {"status": "cancelled", "client_order_index": 4}
             ]
         });
-        state.set_open_orders_for_markets(&[24, 25, 26], &orders);
+        state.set_open_orders_for_markets(&[24, 25, 26], &orders, true);
         assert_eq!(state.open_orders_count(24), Some(2));
         assert_eq!(state.open_orders_count(25), Some(0));
         assert_eq!(state.open_orders_count(26), Some(0));
@@ -1574,6 +1800,57 @@ mod tests {
                 .and_then(|order| order.filled_base_amount),
             Some("0.20".to_string())
         );
+    }
+
+    #[test]
+    fn account_feed_sparse_order_update_keeps_unmentioned_markets() {
+        let state = AccountFeedState::default();
+        let snapshot = serde_json::json!({
+            "24": [{"status": "open", "client_order_index": 24}],
+            "25": [{"status": "open", "client_order_index": 25}]
+        });
+        state.set_open_orders_for_markets(&[24, 25], &snapshot, true);
+        assert_eq!(state.open_orders_count(24), Some(1));
+        assert_eq!(state.open_orders_count(25), Some(1));
+
+        let sparse_update = serde_json::json!({
+            "24": []
+        });
+        state.set_open_orders_for_markets(&[24, 25], &sparse_update, false);
+        assert_eq!(state.open_orders_count(24), Some(0));
+        assert_eq!(state.open_orders_count(25), Some(1));
+        assert!(state.order_by_client(24).is_none());
+        assert!(state.order_by_client(25).is_some());
+    }
+
+    #[test]
+    fn account_feed_purges_terminal_orders_after_ttl() {
+        let state = AccountFeedState::default();
+        // Terminal order arrives: kept for the wait_confirmed fallback window.
+        let with_terminal = serde_json::json!({
+            "24": [{"status": "filled", "client_order_index": 7}]
+        });
+        state.set_open_orders_for_markets(&[24], &with_terminal, true);
+        assert!(state.order_by_client(7).is_some(), "terminal order queryable within TTL");
+
+        // Age the entry past the TTL, then any subsequent feed update purges it.
+        {
+            let mut terminal_at = state.client_order_terminal_at.lock().unwrap();
+            let aged = std::time::Instant::now()
+                .checked_sub(TERMINAL_ORDER_TTL + std::time::Duration::from_secs(1))
+                .expect("clock supports backdating in tests");
+            for at in terminal_at.values_mut() {
+                *at = aged;
+            }
+        }
+        let unrelated_update = serde_json::json!({ "24": [] });
+        state.set_open_orders_for_markets(&[24], &unrelated_update, false);
+        assert!(state.order_by_client(7).is_none(), "terminal order purged after TTL");
+        assert!(state
+            .client_orders
+            .lock()
+            .unwrap()
+            .is_empty(), "no residual map growth");
     }
 
     #[tokio::test]

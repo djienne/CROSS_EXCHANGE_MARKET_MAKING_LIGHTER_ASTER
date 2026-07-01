@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rust_decimal::Decimal;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -18,8 +18,86 @@ use crate::markets::MarketSpec;
 use crate::types::{MarketId, Side};
 
 use super::account::{AccountSnapshot, AccountState, OpenOrderSnapshot, ScaledPosition, Venue};
-use super::exec::aster::AsterRest;
+use super::exec::aster::{AsterPositionRow, AsterRest};
 use super::exec::hyperliquid::HlExchange;
+
+fn parse_decimal_field(raw: &str, field: &str) -> Result<Decimal> {
+    raw.parse::<Decimal>()
+        .with_context(|| format!("parse {field} decimal from {raw:?}"))
+}
+
+fn parse_optional_decimal_field(raw: Option<&str>, field: &str) -> Result<Decimal> {
+    match raw {
+        Some(value) => parse_defaulted_decimal_field(value, field),
+        None => Ok(Decimal::ZERO),
+    }
+}
+
+/// Like [`parse_decimal_field`] but an EMPTY string means "venue omitted the field" (these
+/// rows deserialize with `#[serde(default)]`, so a missing JSON key arrives as `""`) and
+/// parses as zero instead of failing the snapshot.
+fn parse_defaulted_decimal_field(raw: &str, field: &str) -> Result<Decimal> {
+    if raw.is_empty() {
+        return Ok(Decimal::ZERO);
+    }
+    parse_decimal_field(raw, field)
+}
+
+/// Fold `positionRisk` rows into (Σ unrealized PnL, market -> (net qty, entry px)).
+///
+/// NET rows per market: in hedge (dual-side) mode Aster returns separate LONG and SHORT
+/// rows for one symbol, each with its own signed positionAmt; summing gives the correct net
+/// regardless of mode. (One-way mode is also asserted at startup — see is_one_way.)
+/// Rows for TRADED markets are strict (a bad value fails the snapshot, fail-safe); rows for
+/// untraded symbols can never fail the fold — see `parse_untraded_row_decimal`.
+fn fold_aster_position_rows(
+    pos: &[AsterPositionRow],
+    sym_to_market: &HashMap<String, MarketId>,
+) -> Result<(Decimal, HashMap<MarketId, (Decimal, Decimal)>)> {
+    let mut unrealized_usd = Decimal::ZERO;
+    let mut net: HashMap<MarketId, (Decimal, Decimal)> = HashMap::new();
+    for (idx, p) in pos.iter().enumerate() {
+        let market = sym_to_market.get(&p.symbol.to_uppercase());
+        let field = format!("aster.positionRisk[{idx}].unRealizedProfit");
+        if market.is_some() {
+            unrealized_usd += parse_defaulted_decimal_field(&p.unrealized_profit, &field)?;
+        } else {
+            // Untraded symbol: contribute to equity when parseable, never poison the fold.
+            if let Some(u) = parse_untraded_row_decimal(&p.unrealized_profit, &field) {
+                unrealized_usd += u;
+            }
+            continue;
+        }
+        let market = market.expect("checked above");
+        let qty = parse_decimal_field(&p.position_amt, &format!("aster.positionRisk[{idx}].positionAmt"))?;
+        if qty == Decimal::ZERO {
+            continue;
+        }
+        let e = net.entry(market.clone()).or_insert((Decimal::ZERO, Decimal::ZERO));
+        e.0 += qty;
+        // Keep the entry px of the larger-magnitude leg (informational only, so an omitted
+        // field must not fail the snapshot).
+        e.1 = parse_defaulted_decimal_field(&p.entry_price, &format!("aster.positionRisk[{idx}].entryPrice"))?;
+    }
+    Ok((unrealized_usd, net))
+}
+
+/// Parse a decimal from an account row that the bot does NOT trade. A single junk field on
+/// an unrelated row (a new listing, an odd venue format) must not be able to fail the whole
+/// snapshot forever — that would age out the account state, which not only freezes quoting
+/// (safe) but also disables `recover_orphans` and the circuit breaker (NOT safe). Skipped
+/// rows are loudly warned so a format change is still visible. Rows for TRADED markets keep
+/// the strict `parse_decimal_field` path: a bad value there means the snapshot itself
+/// cannot be trusted.
+fn parse_untraded_row_decimal(raw: &str, field: &str) -> Option<Decimal> {
+    match raw.parse::<Decimal>() {
+        Ok(d) => Some(d),
+        Err(_) => {
+            warn!("reconcile: skipping unparseable {field} ({raw:?}) on untraded/asset row");
+            None
+        }
+    }
+}
 
 /// Reads both venues and publishes [`AccountSnapshot`]s.
 pub struct Reconciler {
@@ -60,41 +138,30 @@ impl Reconciler {
         // cross-margin projection (e.g. a token row reporting thousands while its real balance
         // is 0); summing real `balance` across stablecoins gives the true ~$124 USDC collateral.
         // "Any stablecoin counts" (the account is multi-collateral cross-margin).
-        let aster_available_usd = bal
-            .iter()
-            .filter_map(|r| r.balance.parse::<Decimal>().ok())
-            .filter(|b| *b > Decimal::ZERO)
-            .sum();
-        let hl_withdrawable_usd = ch.withdrawable.parse().unwrap_or(Decimal::ZERO);
+        let mut aster_available_usd = Decimal::ZERO;
+        for (idx, r) in bal.iter().enumerate() {
+            // Asset-level rows have no market mapping; a junk row only understates
+            // available/equity, which trips the breaker EARLY (fail-safe), so skip-with-warn.
+            let Some(b) =
+                parse_untraded_row_decimal(&r.balance, &format!("aster.balance[{idx}].balance"))
+            else {
+                continue;
+            };
+            if b > Decimal::ZERO {
+                aster_available_usd += b;
+            }
+        }
+        let hl_withdrawable_usd = parse_decimal_field(&ch.withdrawable, "lighter.withdrawable")?;
 
         // TOTAL (mark-to-market) equity per venue for the circuit breaker — NOT the free-margin
         // figures above, which drop by the locked margin when a hedge is open and would false-trip.
         // Aster: wallet balance + Σ position unrealized PnL. HL: marginSummary.accountValue (already
         // includes unrealized). For a delta-neutral book the unrealized legs cancel ⇒ stable equity.
-        let aster_unrealized_usd: Decimal = pos
-            .iter()
-            .filter_map(|p| p.unrealized_profit.parse::<Decimal>().ok())
-            .sum();
+        let (aster_unrealized_usd, aster_net) =
+            fold_aster_position_rows(&pos, &self.aster_sym_to_market)?;
         let aster_equity_usd = aster_available_usd + aster_unrealized_usd;
-        let hl_equity_usd = ch.margin_summary.account_value.parse().unwrap_or(Decimal::ZERO);
+        let hl_equity_usd = parse_decimal_field(&ch.margin_summary.account_value, "lighter.marginSummary.accountValue")?;
 
-        // NET positionRisk rows per market: in hedge (dual-side) mode Aster returns separate
-        // LONG and SHORT rows for one symbol, each with its own signed positionAmt. Summing the
-        // signed amounts gives the correct net regardless of mode, so a `.find()` downstream can
-        // never silently drop a side. (One-way mode is also asserted at startup — see is_one_way.)
-        let mut aster_net: HashMap<MarketId, (Decimal, Decimal)> = HashMap::new(); // market -> (net_qty, entry_px)
-        for p in &pos {
-            let qty: Decimal = p.position_amt.parse().unwrap_or(Decimal::ZERO);
-            if qty == Decimal::ZERO {
-                continue;
-            }
-            if let Some(market) = self.aster_sym_to_market.get(&p.symbol.to_uppercase()) {
-                let e = aster_net.entry(market.clone()).or_insert((Decimal::ZERO, Decimal::ZERO));
-                e.0 += qty;
-                // Keep the entry px of the larger-magnitude leg (informational only).
-                e.1 = p.entry_price.parse().unwrap_or(e.1);
-            }
-        }
         let aster_positions: Vec<ScaledPosition> = aster_net
             .into_iter()
             .filter(|(_, (q, _))| *q != Decimal::ZERO)
@@ -102,19 +169,21 @@ impl Reconciler {
             .collect();
 
         let mut hl_positions = Vec::new();
-        for ap in &ch.asset_positions {
-            let qty: Decimal = ap.position.szi.parse().unwrap_or(Decimal::ZERO);
+        for (idx, ap) in ch.asset_positions.iter().enumerate() {
+            // Market lookup first, for the same poisoning reason as the Aster rows above.
+            let Some(market) = self.hl_coin_to_market.get(&ap.position.coin) else {
+                continue;
+            };
+            let qty = parse_decimal_field(&ap.position.szi, &format!("lighter.assetPositions[{idx}].szi"))?;
             if qty == Decimal::ZERO {
                 continue;
             }
-            if let Some(market) = self.hl_coin_to_market.get(&ap.position.coin) {
-                hl_positions.push(ScaledPosition {
-                    venue: Venue::Hyperliquid,
-                    market: market.clone(),
-                    signed_qty: qty,
-                    entry_px: ap.position.entry_px.as_deref().and_then(|s| s.parse().ok()).unwrap_or(Decimal::ZERO),
-                });
-            }
+            hl_positions.push(ScaledPosition {
+                venue: Venue::Hyperliquid,
+                market: market.clone(),
+                signed_qty: qty,
+                entry_px: parse_optional_decimal_field(ap.position.entry_px.as_deref(), &format!("lighter.assetPositions[{idx}].entryPx"))?,
+            });
         }
 
         let mut open_orders = Vec::new();
@@ -124,8 +193,8 @@ impl Reconciler {
                     venue: Venue::Aster,
                     market: market.clone(),
                     side: if o.side.eq_ignore_ascii_case("SELL") { Side::Sell } else { Side::Buy },
-                    price: o.price.parse().unwrap_or(Decimal::ZERO),
-                    qty: o.orig_qty.parse().unwrap_or(Decimal::ZERO),
+                    price: parse_decimal_field(&o.price, "aster.openOrders.price")?,
+                    qty: parse_decimal_field(&o.orig_qty, "aster.openOrders.origQty")?,
                     client_id: (!o.client_order_id.is_empty()).then(|| o.client_order_id.clone()),
                     venue_order_id: Some(o.order_id.to_string()),
                 });
@@ -137,8 +206,8 @@ impl Reconciler {
                     venue: Venue::Hyperliquid,
                     market: market.clone(),
                     side: if o.side.eq_ignore_ascii_case("A") { Side::Sell } else { Side::Buy },
-                    price: o.limit_px.parse().unwrap_or(Decimal::ZERO),
-                    qty: o.sz.parse().unwrap_or(Decimal::ZERO),
+                    price: parse_decimal_field(&o.limit_px, "lighter.openOrders.limitPx")?,
+                    qty: parse_decimal_field(&o.sz, "lighter.openOrders.sz")?,
                     client_id: None,
                     venue_order_id: Some(o.oid.to_string()),
                 });
@@ -293,5 +362,69 @@ impl Reconciler {
             }
         }
         info!("account reconciler stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(symbol: &str, amt: &str, entry: &str, upnl: &str) -> AsterPositionRow {
+        AsterPositionRow {
+            symbol: symbol.to_string(),
+            position_amt: amt.to_string(),
+            entry_price: entry.to_string(),
+            unrealized_profit: upnl.to_string(),
+            position_side: String::new(),
+            leverage: String::new(),
+        }
+    }
+
+    fn traded_map() -> HashMap<String, MarketId> {
+        HashMap::from([("HYPEUSDT".to_string(), MarketId("HYPE".to_string()))])
+    }
+
+    #[test]
+    fn junk_untraded_row_never_fails_the_fold() {
+        // A new listing with unparseable fields must not poison the snapshot.
+        let rows = vec![
+            row("NEWCOINUSDT", "not-a-number", "", "garbage"),
+            row("HYPEUSDT", "1.5", "40.0", "0.25"),
+        ];
+        let (upnl, net) = fold_aster_position_rows(&rows, &traded_map()).expect("fold must succeed");
+        assert_eq!(upnl, "0.25".parse().unwrap());
+        let (qty, entry) = net[&MarketId("HYPE".to_string())];
+        assert_eq!(qty, "1.5".parse().unwrap());
+        assert_eq!(entry, "40.0".parse().unwrap());
+    }
+
+    #[test]
+    fn junk_traded_row_fails_the_fold() {
+        // A bad value on a TRADED market means the snapshot cannot be trusted.
+        let rows = vec![row("HYPEUSDT", "not-a-number", "40.0", "0.25")];
+        assert!(fold_aster_position_rows(&rows, &traded_map()).is_err());
+    }
+
+    #[test]
+    fn omitted_default_fields_parse_as_zero() {
+        // #[serde(default)] string fields arrive as "" when the venue omits them.
+        let rows = vec![row("HYPEUSDT", "2", "", "")];
+        let (upnl, net) = fold_aster_position_rows(&rows, &traded_map()).expect("fold must succeed");
+        assert_eq!(upnl, Decimal::ZERO);
+        let (qty, entry) = net[&MarketId("HYPE".to_string())];
+        assert_eq!(qty, "2".parse().unwrap());
+        assert_eq!(entry, Decimal::ZERO);
+    }
+
+    #[test]
+    fn dual_side_rows_net_per_market() {
+        let rows = vec![
+            row("HYPEUSDT", "3", "40", "0.1"),
+            row("HYPEUSDT", "-1", "41", "-0.05"),
+        ];
+        let (upnl, net) = fold_aster_position_rows(&rows, &traded_map()).expect("fold must succeed");
+        assert_eq!(upnl, "0.05".parse().unwrap());
+        let (qty, _) = net[&MarketId("HYPE".to_string())];
+        assert_eq!(qty, "2".parse().unwrap());
     }
 }
