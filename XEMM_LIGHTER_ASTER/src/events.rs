@@ -79,10 +79,14 @@ pub fn write_event<W: Write>(w: &mut W, ev: &Event) -> Result<()> {
     Ok(())
 }
 
-/// zstd compression level used when the run-log path ends in `.zst`. Level 3 is zstd's
-/// default — a strong size/speed tradeoff; the recorder runs at a few dozen events/sec so
-/// it is never CPU-bound here. Decompressed bytes are identical regardless of level.
-const ZSTD_LEVEL: i32 = 3;
+/// zstd compression level used when the run-log path ends in `.zst`. Measured on a real
+/// live tape (2026-07-01, 300 MB slice; the stream is ~99% 20-level book snapshots):
+/// level 3 -> 17.3 MB, level 9 -> 13.0 MB (-25%), level 19 -> 10.6 MB but ~330 MB encoder
+/// peak — unaffordable next to live bots on a small VPS. Level 9 costs ~1.8 s CPU and
+/// ~10 MB extra memory per 300 MB on the cold writer thread; the recorder runs at a few
+/// dozen events/sec so it is never CPU-bound. Decompressed bytes are identical
+/// regardless of level.
+const ZSTD_LEVEL: i32 = 9;
 
 /// zstd frame magic number (the four leading bytes of every zstd stream). Used to
 /// auto-detect a compressed log on read, by content rather than by file extension.

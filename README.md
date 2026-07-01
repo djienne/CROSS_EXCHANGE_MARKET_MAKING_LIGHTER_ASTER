@@ -234,6 +234,13 @@ reclaimable the file is rebuilt by copying live tables and renamed into place
 (a pre-fix 1.5 GB db shrinks to ~20 MB in under 2 s at the next bot start).
 Per-revision detail remains reconstructable by replaying the tape (`--out`).
 
+Research tapes (`--out *.jsonl.zst`, ~99% book snapshots) are written at zstd
+level 9 as of 2026-07-01 (~25% smaller than the old level 3 for negligible
+CPU; level 19 would save ~39% but needs ~330 MB of encoder memory — unsafe
+next to live bots on a small VPS). The orchestrator deletes finished tapes
+older than `--tape-retention-days` (default 7; 0 keeps everything) in an
+hourly sweep; the active tape is never eligible.
+
 Safety knobs added 2026-07-01: taker-arb `[risk] auto_flatten_on_mismatch`
 (default true) reduce-only flattens a persistent unhedged residual after
 `mismatch_flatten_after_checks` consecutive detections; taker-arb

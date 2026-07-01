@@ -34,6 +34,32 @@ def stamp(dt: datetime | None = None) -> str:
     return (dt or utc_now()).strftime("%Y%m%dT%H%M%SZ")
 
 
+def prune_old_tapes(
+    state_dir: Path, market: str, retention_days: float, now: datetime
+) -> list[tuple[Path, int]]:
+    """Delete finished XEMM research tapes (`--out` recordings) past retention.
+
+    Tapes are only needed to replay a session; at ~100-200 MB/day they are the
+    main long-term disk consumer after the results db. The active tape receives
+    book snapshots continuously, so an mtime older than the window can only
+    belong to a finished run. retention_days <= 0 keeps everything.
+    Returns (path, size_bytes) for each deleted file.
+    """
+    if retention_days <= 0:
+        return []
+    cutoff = (now - timedelta(days=retention_days)).timestamp()
+    pruned: list[tuple[Path, int]] = []
+    for path in sorted(state_dir.glob(f"orchestrator_xemm_{market}_*.jsonl.zst")):
+        try:
+            st = path.stat()
+            if st.st_mtime < cutoff:
+                path.unlink()
+                pruned.append((path, st.st_size))
+        except OSError:
+            continue
+    return pruned
+
+
 def parse_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None:
         return default
@@ -650,6 +676,7 @@ class Orchestrator:
         self.status_backoff_until: dict[str, float] = {TAKER_BOT: 0.0, XEMM_BOT: 0.0}
         self.shutdown_requested = False
         self.breaker_starvation_warned = False
+        self.last_tape_prune: datetime | None = None
         self.events_path = args.state_dir / f"orchestrator_events_{args.market}.jsonl"
         self.state_path = args.state_dir / f"orchestrator_state_{args.market}.json"
         self.stats_path = args.state_dir / f"orchestrator_stats_{args.market}.json"
@@ -882,6 +909,7 @@ class Orchestrator:
 
     def tick(self) -> None:
         self.check_child_exits()
+        self.prune_tapes_if_due()
         if self.shutdown_requested:
             return
         if self.args.live and not self.args.allow_existing_writers:
@@ -932,6 +960,26 @@ class Orchestrator:
         )
         self.ensure_observer_for(decision["target"])
         self.write_state(taker_status, xemm_status, decision, stats)
+
+    def prune_tapes_if_due(self) -> None:
+        """Hourly sweep deleting research tapes past --tape-retention-days."""
+        if self.args.tape_retention_days <= 0:
+            return
+        now = utc_now()
+        if self.last_tape_prune and (now - self.last_tape_prune).total_seconds() < 3600:
+            return
+        self.last_tape_prune = now
+        pruned = prune_old_tapes(
+            self.args.state_dir, self.args.market, self.args.tape_retention_days, now
+        )
+        if pruned:
+            self.event(
+                "tapes_pruned",
+                count=len(pruned),
+                reclaimed_mb=round(sum(size for _, size in pruned) / 1048576, 1),
+                retention_days=self.args.tape_retention_days,
+                files=[p.name for p, _ in pruned],
+            )
 
     def poll_statuses(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         taker_status: dict[str, Any] | None = None
@@ -1588,6 +1636,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-taker-observer", dest="taker_observer", action="store_false", help="Do not run taker arb in reduce-standby mode while XEMM is active.")
     parser.set_defaults(taker_observer=True)
     parser.add_argument("--taker-observer-restart-sec", type=int, default=60)
+    parser.add_argument(
+        "--tape-retention-days",
+        type=float,
+        default=7.0,
+        help="Delete finished XEMM research tapes (--out *.jsonl.zst) older than this many days; 0 keeps everything.",
+    )
     parser.add_argument("--poll-sec", type=int, default=15)
     parser.add_argument("--once", action="store_true", help="Run one status/decision cycle and exit.")
     parser.add_argument("--status-timeout-sec", type=int, default=25)
