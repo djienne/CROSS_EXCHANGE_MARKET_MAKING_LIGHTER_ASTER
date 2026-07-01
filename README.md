@@ -58,9 +58,15 @@ Credentials are local files and must not be committed:
 - `XEMM_LIGHTER_ASTER/aster.env`
 - `XEMM_LIGHTER_ASTER/lighter.env`
 
-Keep these files mode `600` on the machine running the bots. The top-level and
+Keep these files mode `600` on the machine running the bots — the orchestrator
+refuses `--live` if any env file is readable by group/other. The top-level and
 bot-level `.gitignore` files ignore env files, run outputs, sqlite databases,
 logs, jsonl/zst tapes, build outputs, PEM/key files, and local tool state.
+
+The taker-arb `aster.env` must explicitly list the API-wallet (signer) address
+in `wallet_address`/`subaccount_address` and it must match `private_key`'s
+derived address; startup fails otherwise (catches a rotated key against a
+stale env file before anything is signed).
 
 The tracked `signers/` shared libraries are binary dependencies used by the
 Lighter signing path. They are not credential files.
@@ -129,7 +135,10 @@ Useful options:
 
 - `--once` runs one status/decision cycle.
 - `--poll-sec N` controls the normal supervision interval.
-- `--max-loss-usdc N` sets the orchestrator-level realized-loss stop.
+- `--max-loss-usdc N` sets the orchestrator-level realized-loss stop
+  (default 15 — deliberately above the bot-level `max_loss_usdc` /
+  `max_cumulative_loss_usdc` of 10, so the bot breaker trips first and the
+  supervisor stays a genuine backstop).
 - `--pnl-since startup|now|<RFC3339>` controls the PnL window.
 - `--no-taker-observer` disables reduce-only taker standby while XEMM is active.
 - `--taker-arg`, `--taker-observer-arg`, and `--xemm-arg` append extra args to
@@ -197,6 +206,33 @@ Combined realized PnL:
 python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z
 python3 combined_pnl.py --market HYPE --json
 ```
+
+Canonical local trade-history DB in LAN mode:
+
+```bash
+python3 trade_history.py --mode lan --market HYPE
+python3 trade_history.py --mode lan --market HYPE --json
+```
+
+LAN mode reads local bot artifacts only, writes `runs/trade_history.sqlite`,
+and recomputes fees from policy instead of trusting venue-reported fee fields.
+
+XEMM journal rows carry a `ts_ms` wall-clock stamp (epoch milliseconds) that
+both `combined_pnl.py` and `trade_history.py` use to window trades; rows
+written by binaries built before 2026-07-01 lack it and fall under the
+`--xemm-untimestamped` policy in `combined_pnl.py`. `trade_history.py` also
+ingests the bot journal directly (`--xemm-journal`), so XEMM trades that
+filled while the orchestrator was down still enter the canonical DB with real
+trade times. The `xemm live-report` subcommand accepts `--since-ms` so
+periodic callers do not re-scan the whole append-forever journal.
+
+Safety knobs added 2026-07-01: taker-arb `[risk] auto_flatten_on_mismatch`
+(default true) reduce-only flattens a persistent unhedged residual after
+`mismatch_flatten_after_checks` consecutive detections; taker-arb
+`emergency_slippage_bps` must be >= the normal slippage bounds (validated at
+startup); XEMM `[live.hyperliquid] ws_account_max_age_ms` (default 1500)
+bounds how old the WS account cache may be before reconciler reads fall back
+to REST.
 
 XEMM hedge journal summary:
 

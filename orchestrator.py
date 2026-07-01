@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -154,26 +155,26 @@ class LockFile:
 
     def acquire(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        while True:
+        self.fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
             try:
-                self.fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-                os.write(self.fd, f"{os.getpid()}\n".encode())
-                return
-            except FileExistsError:
-                try:
-                    raw = self.path.read_text(encoding="utf-8").strip()
-                    pid = int(raw.splitlines()[0])
-                except Exception:
-                    pid = -1
-                if pid > 0 and process_alive(pid):
-                    raise SystemExit(f"orchestrator lock is active: {self.path} pid={pid}")
-                self.path.unlink(missing_ok=True)
+                raw = os.read(self.fd, 128).decode("utf-8", errors="replace").strip()
+                pid = int(raw.splitlines()[0])
+            except Exception:
+                pid = -1
+            os.close(self.fd)
+            self.fd = None
+            raise SystemExit(f"orchestrator lock is active: {self.path} pid={pid}")
+        os.ftruncate(self.fd, 0)
+        os.write(self.fd, f"{os.getpid()}\n".encode())
 
     def release(self) -> None:
         if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
             os.close(self.fd)
             self.fd = None
-        self.path.unlink(missing_ok=True)
 
 
 class BotProcess:
@@ -236,7 +237,11 @@ class BotProcess:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                result["exit_code"] = proc.wait(timeout=5)
+                try:
+                    result["exit_code"] = proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    result["exit_code"] = None
+                    result["alive_after_sigkill"] = True
         self._close_log()
         return result
 
@@ -263,6 +268,7 @@ class TradeTracker:
         self.trades_path = args.state_dir / f"orchestrator_trades_{self.market}.jsonl"
         self.seen: set[str] = set()
         self.trades: list[dict[str, Any]] = []
+        self.xemm_report_failures = 0
         self.load_existing_normalized()
 
     def load_existing_normalized(self) -> None:
@@ -374,6 +380,11 @@ class TradeTracker:
             str(journal),
             "--market",
             self.market,
+            # Window the journal scan to this tracker's PnL horizon: the journal grows
+            # forever, and an unbounded scan eventually exceeds status_timeout_sec —
+            # silently starving the realized-loss breaker of XEMM trades.
+            "--since-ms",
+            str(int(self.since.timestamp() * 1000)),
             "--json",
         ]
         try:
@@ -387,8 +398,23 @@ class TradeTracker:
             )
             report = extract_json_object(proc.stdout)
         except Exception as exc:
-            self.event("xemm_live_report_failed", error=str(exc), journal=str(journal))
+            self.xemm_report_failures += 1
+            self.event(
+                "xemm_live_report_failed",
+                error=str(exc),
+                journal=str(journal),
+                consecutive_failures=self.xemm_report_failures,
+            )
+            if self.xemm_report_failures == 3:
+                # Escalate: the realized-loss breaker is now blind to XEMM trades. One
+                # loud persistent event, not just per-failure noise.
+                self.event(
+                    "xemm_breaker_feed_starving",
+                    consecutive_failures=self.xemm_report_failures,
+                    journal=str(journal),
+                )
             return []
+        self.xemm_report_failures = 0
         return report.get("summary", {}).get("trades", []) or []
 
     def summary(self) -> dict[str, Any]:
@@ -606,6 +632,10 @@ class Orchestrator:
         self.active_bot: str | None = None
         self.active_taker_mode: str | None = None
         self.children: dict[str, BotProcess] = {}
+        # Children that survived the SIGKILL wait (D-state): kept here so their eventual
+        # exit is still reaped by the tick sweep instead of leaving a zombie for the
+        # orchestrator's lifetime.
+        self.zombies: list[BotProcess] = []
         self.switch_counts: dict[str, int] = {TAKER_BOT: 0, XEMM_BOT: 0}
         self.mode_started_at = self.start_time
         self.condition_since: dict[str, datetime] = {}
@@ -644,8 +674,14 @@ class Orchestrator:
                 state_dir=str(self.args.state_dir),
             )
             if self.breaker_path.exists():
-                self.breaker_path.unlink()
-                self.event("stale_breaker_cleared", path=str(self.breaker_path))
+                if not self.args.ack_breaker:
+                    self.event("breaker_present_abort", path=str(self.breaker_path))
+                    raise SystemExit(
+                        f"orchestrator breaker is active: {self.breaker_path}; inspect it and rerun with --ack-breaker to archive it"
+                    )
+                archive = self.breaker_path.with_name(f"{self.breaker_path.name}.acked.{stamp()}")
+                self.breaker_path.replace(archive)
+                self.event("breaker_acknowledged", path=str(self.breaker_path), archived=str(archive))
             self.preflight_existing_bots()
             if self.shutdown_requested:
                 return
@@ -1010,11 +1046,11 @@ class Orchestrator:
         )
 
     def decide(self, taker: dict[str, Any] | None, xemm: dict[str, Any] | None) -> dict[str, Any]:
-        if xemm and xemm.get("reduce_position_only") is False:
+        if xemm and xemm.get("reduce_position_only") is not True:
             return {
                 "target": "SAFE_HALT",
                 "reason": "xemm_reduce_position_only_disabled",
-                "details": {},
+                "details": {"reduce_position_only": xemm.get("reduce_position_only")},
             }
         status = taker or xemm
         if not status:
@@ -1220,6 +1256,7 @@ class Orchestrator:
         if child and child.is_running():
             result = child.stop(self.args.stop_grace_sec)
             self.event("observer_stopped", bot=TAKER_BOT, reason=reason, **result)
+            self.track_if_unkilled(child, result)
         self.children.pop(TAKER_OBSERVER, None)
 
     def stop_active(self, reason: str, grace_sec: int | None = None) -> None:
@@ -1231,16 +1268,29 @@ class Orchestrator:
         if child and child.is_running():
             result = child.stop(grace_sec if grace_sec is not None else self.args.stop_grace_sec)
             self.event("bot_stopped", bot=self.active_bot, reason=reason, **result)
+            self.track_if_unkilled(child, result)
         if self.active_bot:
             self.children.pop(self.active_bot, None)
         self.active_bot = None
         self.active_taker_mode = None
+
+    def track_if_unkilled(self, child: BotProcess, stop_result: dict[str, Any]) -> None:
+        if stop_result.get("alive_after_sigkill"):
+            self.zombies.append(child)
+
+    def reap_zombies(self) -> None:
+        for child in list(self.zombies):
+            code = child.poll_exit()
+            if code is not None:
+                self.event("zombie_reaped", bot=child.name, exit_code=code)
+                self.zombies.remove(child)
 
     def child_running(self, bot: str) -> bool:
         child = self.children.get(bot)
         return bool(child and child.is_running())
 
     def check_child_exits(self) -> None:
+        self.reap_zombies()
         for bot, child in list(self.children.items()):
             code = child.poll_exit()
             if code is not None:
@@ -1384,7 +1434,12 @@ class Orchestrator:
             args = process["args"]
             if process["bot"] == TAKER_BOT and "--observe-only" not in args:
                 writers.append(process)
-            elif process["bot"] == XEMM_BOT and ("--mode live" in args or "--mode=live" in args):
+            elif process["bot"] == XEMM_BOT and not (
+                "--mode paper" in args or "--mode=paper" in args
+            ):
+                # The XEMM livebot falls back to the config's [live] mode when --mode is
+                # absent, and the live config ships mode="live" — so only an explicit
+                # paper flag proves a process is not a live writer.
                 writers.append(process)
         return writers
 
@@ -1558,8 +1613,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--switch-headroom-clips", type=positive_decimal, default=Decimal("2"))
     parser.add_argument("--switch-margin-clips", type=positive_decimal, default=Decimal("2"))
     parser.add_argument("--pnl-since", default="startup", help='RFC3339 timestamp, "startup", or "now".')
-    parser.add_argument("--max-loss-usdc", type=strictly_positive_decimal, default=Decimal("5"))
+    parser.add_argument(
+        "--max-loss-usdc",
+        type=strictly_positive_decimal,
+        default=Decimal("15"),
+        help="Supervisor-level realized-loss backstop. Deliberately ABOVE the bot-level "
+        "max_loss_usdc (10 in the live configs) so the bot breaker trips first and this "
+        "remains a genuine second line of defense.",
+    )
     parser.add_argument("--reset-breaker-baseline", action="store_true", help="Delete the persisted PnL baseline on startup so the equity-drawdown breaker re-anchors to current equity.")
+    parser.add_argument("--ack-breaker", action="store_true", help="Archive an existing orchestrator breaker file after operator review and allow startup.")
     parser.add_argument("--backfill-existing-trades", action="store_true")
     parser.add_argument("--state-dir", type=existing_file_or_path, default=stack_root / "runs")
     parser.add_argument("--taker-repo", type=existing_file_or_path, default=taker_root)
@@ -1592,12 +1655,35 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def insecure_env_files(args: argparse.Namespace) -> list[str]:
+    """Credential env files that are readable by group/other (mode should be 600)."""
+    insecure = []
+    for repo in (args.taker_repo, args.xemm_repo):
+        for name in ("aster.env", "lighter.env"):
+            path = Path(repo) / name
+            if not path.exists():
+                continue
+            mode = path.stat().st_mode & 0o777
+            if mode & 0o077:
+                insecure.append(f"{path} (mode {mode:03o})")
+    return insecure
+
+
 def main() -> int:
     args = parse_args()
     missing = [p for p in [args.taker_bin, args.xemm_bin, args.taker_config, args.xemm_config] if not p.exists()]
     if missing:
         print("missing required path(s): " + ", ".join(str(p) for p in missing), file=sys.stderr)
         return 2
+    if args.live:
+        insecure = insecure_env_files(args)
+        if insecure:
+            print(
+                "refusing --live: credential env file(s) readable by group/other "
+                "(chmod 600 them first): " + ", ".join(insecure),
+                file=sys.stderr,
+            )
+            return 2
     orch = Orchestrator(args)
     orch.run()
     return 0

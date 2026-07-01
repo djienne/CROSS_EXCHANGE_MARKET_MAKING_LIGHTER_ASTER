@@ -69,6 +69,11 @@ pub enum Commands {
         /// Restrict to one market id, e.g. HYPE.
         #[arg(long)]
         market: Option<String>,
+        /// Only include journal rows stamped at/after this epoch-milliseconds timestamp
+        /// (rows without a ts_ms stamp are excluded). Keeps periodic callers from
+        /// re-scanning the whole append-forever journal.
+        #[arg(long)]
+        since_ms: Option<i64>,
         /// Print one row per completed fill/hedge pair.
         #[arg(long, default_value_t = false)]
         details: bool,
@@ -206,10 +211,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Report { db, run_id, out } => {
             crate::report::generate(&db, run_id, &out)?;
         }
-        Commands::LiveReport { db, journal, market, details, json } => {
+        Commands::LiveReport { db, journal, market, since_ms, details, json } => {
             let cfg = crate::config::Config::load(&cli.config)?;
             let journal_path = journal.unwrap_or_else(|| crate::live_report::inferred_journal_path(&db));
-            let summary = crate::live_report::summarize_path(&journal_path, &cfg, market.as_deref())?;
+            let summary = crate::live_report::summarize_path(&journal_path, &cfg, market.as_deref(), since_ms)?;
             if json {
                 crate::live_report::print_summary_json(&journal_path, &summary)?;
             } else {

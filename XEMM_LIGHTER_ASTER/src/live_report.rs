@@ -72,6 +72,10 @@ struct LiveReportJson<'a> {
 struct JournalLine {
     #[serde(default)]
     mono_ns: i64,
+    /// Wall-clock stamp (epoch ms) written by JournalRecord since 2026-07; absent on
+    /// legacy rows.
+    #[serde(default)]
+    ts_ms: Option<i64>,
     kind: String,
     market: Option<String>,
     detail: Value,
@@ -87,19 +91,30 @@ pub fn inferred_journal_path(db: &Path) -> PathBuf {
     dir.join(format!("{stem}-journal.jsonl"))
 }
 
-pub fn summarize_path(path: &Path, cfg: &Config, market_filter: Option<&str>) -> Result<LiveReportSummary> {
+pub fn summarize_path(
+    path: &Path,
+    cfg: &Config,
+    market_filter: Option<&str>,
+    since_ms: Option<i64>,
+) -> Result<LiveReportSummary> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    summarize_reader(BufReader::new(file), cfg, market_filter)
+    summarize_reader(BufReader::new(file), cfg, market_filter, since_ms)
 }
 
-pub fn summarize_reader<R: BufRead>(reader: R, cfg: &Config, market_filter: Option<&str>) -> Result<LiveReportSummary> {
-    summarize_reader_with_aster_fee(reader, cfg.edge.aster_maker_fee_rate(), market_filter)
+pub fn summarize_reader<R: BufRead>(
+    reader: R,
+    cfg: &Config,
+    market_filter: Option<&str>,
+    since_ms: Option<i64>,
+) -> Result<LiveReportSummary> {
+    summarize_reader_with_aster_fee(reader, cfg.edge.aster_maker_fee_rate(), market_filter, since_ms)
 }
 
 fn summarize_reader_with_aster_fee<R: BufRead>(
     reader: R,
     aster_fee_rate: Decimal,
     market_filter: Option<&str>,
+    since_ms: Option<i64>,
 ) -> Result<LiveReportSummary> {
     let mut fills: BTreeMap<String, FillRec> = BTreeMap::new();
     let mut hedges: BTreeMap<String, HedgeRec> = BTreeMap::new();
@@ -115,6 +130,15 @@ fn summarize_reader_with_aster_fee<R: BufRead>(
         };
         if market_filter.is_some_and(|want| want != market.as_str()) {
             continue;
+        }
+        // Window filter: with --since-ms, rows older than the window (and legacy rows
+        // without a wall-clock stamp, which predate it by construction) are skipped, so
+        // the scan cost of the append-forever journal stops growing without bound for
+        // periodic callers like the orchestrator's breaker feed.
+        if let Some(since) = since_ms {
+            if rec.ts_ms.is_none_or(|ts| ts < since) {
+                continue;
+            }
         }
         match rec.kind.as_str() {
             "fill" => {
@@ -294,7 +318,7 @@ mod tests {
 {"mono_ns":3,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60.46600","cloid":"b","qty":"0.21","side":"SELL"}}
 {"mono_ns":4,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"b","fee_usd":"0.000032","px":"60.4967","qty":"0.21","side":"SELL"}}
 "#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None).unwrap();
+        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
         assert_eq!(s.trades.len(), 2);
         assert_eq!(s.gross_pnl.round_dp(6), dec!(0.017967));
         assert_eq!(s.lighter_fees, dec!(0.000060));
@@ -308,9 +332,29 @@ mod tests {
 {"mono_ns":2,"kind":"hedge_fill","market":"ETH","detail":{"cloid":"b","fee_usd":"0","px":"10","qty":"1","side":"SELL"}}
 {"mono_ns":3,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"c","fee_usd":"0","px":"61","qty":"1","side":"BUY"}}
 "#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, Some("HYPE")).unwrap();
+        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, Some("HYPE"), None).unwrap();
         assert_eq!(s.trades.len(), 0);
         assert_eq!(s.unmatched_fills, 1);
         assert_eq!(s.unmatched_hedges, 1);
+    }
+
+    #[test]
+    fn since_ms_windows_rows_and_excludes_legacy_unstamped() {
+        let text = r#"
+{"mono_ns":1,"ts_ms":1000,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"old","qty":"1","side":"BUY"}}
+{"mono_ns":2,"ts_ms":1001,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"old","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
+{"mono_ns":3,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"legacy","qty":"1","side":"BUY"}}
+{"mono_ns":4,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"legacy","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
+{"mono_ns":5,"ts_ms":2000,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"new","qty":"1","side":"BUY"}}
+{"mono_ns":6,"ts_ms":2001,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"new","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
+"#;
+        // No window: all three pair up.
+        let all = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
+        assert_eq!(all.trades.len(), 3);
+        // Windowed: only the pair stamped at/after since_ms survives; legacy rows without
+        // ts_ms are excluded by construction (they predate the stamp's introduction).
+        let windowed =
+            summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, Some(1500)).unwrap();
+        assert_eq!(windowed.trades.len(), 1);
     }
 }

@@ -72,10 +72,17 @@ async fn run_reader(
     match venue {
         VenueTag::Aster => aster::run_with_tap(symbol, market, tx, tap).await,
         VenueTag::Hyperliquid => {
+            // Fail LOUDLY on a malformed "market_id:label" symbol: the old fallback of
+            // market_id 0 silently subscribed a real (wrong) Lighter market's book, only
+            // caught ~90s later by book-check divergence.
             let (market_id, label) = symbol
                 .split_once(':')
                 .and_then(|(id, label)| Some((id.parse::<u32>().ok()?, label.to_string())))
-                .unwrap_or((0, symbol));
+                .unwrap_or_else(|| {
+                    panic!(
+                        "malformed Lighter venue symbol {symbol:?} for market {market}: expected \"<market_id>:<label>\""
+                    )
+                });
             lighter::run_with_tap(market_id, label, market, tx, tap).await
         }
     }

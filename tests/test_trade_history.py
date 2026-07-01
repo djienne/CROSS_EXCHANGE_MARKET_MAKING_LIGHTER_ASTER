@@ -190,6 +190,59 @@ class TradeHistoryTests(unittest.TestCase):
                 )
             self.assertEqual(report["total"]["trades"], 1)
 
+    def test_xemm_journal_ingest_captures_downtime_trades_with_real_times(self) -> None:
+        # A fill/hedge_fill pair that only exists in the bot journal (orchestrator was
+        # down) must land in the DB with the journal's ts_ms as the trade time and the
+        # actual hedge fee from the journal.
+        def ms(iso_ts: str) -> int:
+            return int(combined_pnl.parse_dt(iso_ts).timestamp() * 1000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            taker_path = root / "taker.jsonl"
+            orch_path = root / "orchestrator.jsonl"
+            journal_path = root / "journal.jsonl"
+            db_path = root / "history.sqlite"
+            write_jsonl(taker_path, [])
+            write_jsonl(orch_path, [])
+            write_jsonl(
+                journal_path,
+                [
+                    {"ts_ms": ms("2026-01-02T00:00:00Z"), "kind": "fill", "market": "HYPE", "detail": {"cloid": "abc", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
+                    {"ts_ms": ms("2026-01-02T00:00:01Z"), "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "abc", "side": "BUY", "qty": "1", "px": "99", "fee_usd": "0.01"}},
+                ],
+            )
+            with self.open_db(db_path) as conn:
+                trade_history.refresh_lan(
+                    conn,
+                    market="HYPE",
+                    taker_trades=taker_path,
+                    orchestrator_trades=orch_path,
+                    xemm_journal=journal_path,
+                )
+                # Idempotent on re-run.
+                trade_history.refresh_lan(
+                    conn,
+                    market="HYPE",
+                    taker_trades=taker_path,
+                    orchestrator_trades=orch_path,
+                    xemm_journal=journal_path,
+                )
+                row = conn.execute(
+                    "SELECT timestamp, gross_pnl_usdc, net_pnl_usdc, lighter_fee_usdc, source FROM strategy_trades WHERE trade_key = ?",
+                    ("xemm:abc",),
+                ).fetchone()
+                trade_count = conn.execute("SELECT COUNT(*) FROM strategy_trades").fetchone()[0]
+            self.assertEqual(trade_count, 1)
+            self.assertIsNotNone(row)
+            timestamp, gross, net, lighter_fee, source = row
+            self.assertTrue(str(timestamp).startswith("2026-01-02T00:00:01"), timestamp)
+            # Hedge BUY => maker leg sold on Aster at 100, bought back at 99 => +1 gross.
+            self.assertEqual(Decimal(str(gross)), Decimal("1"))
+            self.assertEqual(Decimal(str(lighter_fee)), Decimal("0.01"))
+            self.assertEqual(Decimal(str(net)), Decimal("0.99"))
+            self.assertEqual(source, "xemm_journal")
+
 
 if __name__ == "__main__":
     unittest.main()

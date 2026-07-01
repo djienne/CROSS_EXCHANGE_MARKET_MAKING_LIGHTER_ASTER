@@ -159,7 +159,7 @@ aster_safety_buffer_usd = "26"
 # orders, LEAVES the delta-neutral position open, writes runs/<db-stem>.trip.json, and halts. It then
 # REFUSES to restart until the latch is cleared:  python scripts/reset_breaker.py
 enabled                  = true
-max_cumulative_loss_usdc = "5"
+max_cumulative_loss_usdc = "10"
 
 [[markets]]
 aster_symbol = "HYPEUSDT"
