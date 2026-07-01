@@ -179,8 +179,11 @@ impl VenueBook {
             return;
         }
         let t0 = mono_now_ns();
-        self.hot_only_pending.store(false, Ordering::Release);
         self.book.store(Some(Arc::new(book)));
+        // Clear the hot-only guard only AFTER the raw book is installed: clearing first
+        // opens a window where the strategy passes the has_hot_only_update gate and pairs
+        // NEW hot data with the OLD raw book — exactly what the guard exists to prevent.
+        self.hot_only_pending.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_book_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -203,9 +206,10 @@ impl VenueBook {
             return;
         }
         let t0 = mono_now_ns();
-        self.hot_only_pending.store(false, Ordering::Release);
         self.hot.store(Some(Arc::new(hot)));
         self.book.store(Some(Arc::new(book)));
+        // Guard cleared only after BOTH stores (see publish()).
+        self.hot_only_pending.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_book_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -220,8 +224,8 @@ impl VenueBook {
     }
 
     /// Publish only the integer L2 projection before the raw Decimal book is available.
-    /// This wakes the strategy for risk-reducing fast cancels, and sets a guard so the
-    /// exact quote path cannot place from stale raw data before [`publish_hot`] clears it.
+    /// This wakes the strategy for risk-reducing fast cancels, but deliberately does NOT
+    /// refresh `last_book_ns`; exact Decimal readers must still see the raw book's age.
     #[inline]
     pub fn publish_hot_only(&self, hot: HotBook, exch_ts: chrono::DateTime<chrono::Utc>) {
         if !accept_exch_ts(&self.last_book_exch_ms, exch_ts.timestamp_millis()) {
@@ -232,7 +236,6 @@ impl VenueBook {
         self.hot.store(Some(Arc::new(hot)));
         let ns = mono_now_ns();
         self.hot_only_pending.store(true, Ordering::Release);
-        self.last_book_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
@@ -253,8 +256,9 @@ impl VenueBook {
             return;
         }
         let t0 = mono_now_ns();
-        self.bbo_hot_only_pending.store(false, Ordering::Release);
         self.bbo.store(Some(Arc::new(book)));
+        // Guard cleared only after the raw BBO is installed (see publish()).
+        self.bbo_hot_only_pending.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -276,9 +280,10 @@ impl VenueBook {
             return;
         }
         let t0 = mono_now_ns();
-        self.bbo_hot_only_pending.store(false, Ordering::Release);
         self.bbo_hot.store(Some(Arc::new(hot)));
         self.bbo.store(Some(Arc::new(book)));
+        // Guard cleared only after BOTH stores (see publish()).
+        self.bbo_hot_only_pending.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -293,7 +298,8 @@ impl VenueBook {
     }
 
     /// Publish only the integer BBO projection before the raw Decimal BBO is available.
-    /// Safe because the strategy treats a pending hot-only update as cancel-only.
+    /// Safe because the strategy treats a pending hot-only update as cancel-only; raw
+    /// BBO freshness is unchanged until the Decimal BBO is installed.
     #[inline]
     pub fn publish_bbo_hot_only(&self, hot: HotBook, exch_ts: chrono::DateTime<chrono::Utc>) {
         if !accept_exch_ts(&self.last_bbo_exch_ms, exch_ts.timestamp_millis()) {
@@ -304,7 +310,6 @@ impl VenueBook {
         self.bbo_hot.store(Some(Arc::new(hot)));
         let ns = mono_now_ns();
         self.bbo_hot_only_pending.store(true, Ordering::Release);
-        self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
@@ -734,8 +739,26 @@ mod tests {
         vb.publish_hot_only(hot, exch_ts);
         assert!(vb.load_hot().is_some());
         assert!(vb.has_hot_only_update());
+        assert_eq!(vb.last_book_ns(), 0, "hot-only must not refresh raw L2 freshness");
         vb.publish_hot(b, hot);
         assert!(!vb.has_hot_only_update());
+        assert!(vb.last_book_ns() > 0);
+    }
+
+    #[test]
+    fn bbo_hot_only_does_not_refresh_raw_bbo_freshness() {
+        use crate::livebot::scale::{build_hot_book, MarketScale};
+        let vb = VenueBook::new();
+        let b = book(dec!(100));
+        let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
+        let hot = build_hot_book(&b, &scale, 0, 12345);
+        vb.publish_bbo_hot_only(hot, b.exch_ts.clone());
+        assert!(vb.load_bbo_hot().is_some());
+        assert!(vb.has_hot_only_update());
+        assert_eq!(vb.last_bbo_ns(), 0, "BBO hot-only must not refresh raw BBO freshness");
+        vb.publish_bbo_hot(b, hot);
+        assert!(!vb.has_hot_only_update());
+        assert!(vb.last_bbo_ns() > 0);
     }
 
     #[test]
