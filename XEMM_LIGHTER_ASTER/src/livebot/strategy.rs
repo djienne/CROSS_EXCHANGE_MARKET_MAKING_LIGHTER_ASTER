@@ -833,6 +833,11 @@ pub struct Strategy {
     /// The side is used by the anti-flip guard: if recovery would reverse direction within 3×
     /// cooldown, it is suppressed (prevents round-trip thrashing on transient snapshot glitches).
     last_recovery: HashMap<MarketId, (i64, i64, Option<Side>)>,
+    /// Per-market monotonic salt for recovery cloids. Lighter does NOT dedupe client order
+    /// indices, so every recovery dispatch must get a fresh cloid (attempt 0 = the base
+    /// `Cloid::recovery` id, then `-a{n}` salts) — reusing one against a possibly-live
+    /// earlier order would cross-attribute its fills in the FillTracker.
+    recovery_attempt_seq: HashMap<MarketId, u32>,
     /// Persistence gate for the orphan backstop: `(signed_orphan_net, snapshot source_ts_ns)` of
     /// the FIRST snapshot a net delta was seen. The backstop only ACTS when the SAME orphan (same
     /// sign, comparable size) is still present in a STRICTLY NEWER snapshot — so a transient
@@ -955,6 +960,7 @@ impl Strategy {
             aster_rate_limited_until_ns: 0,
             aster_429_count: 0,
             last_recovery: HashMap::new(),
+            recovery_attempt_seq: HashMap::new(),
             orphan_seen: HashMap::new(),
             last_hot_action_ns: HashMap::new(),
             heal_confirm: None,
@@ -2376,6 +2382,12 @@ impl Strategy {
             .as_ref()
             .and_then(|b| b.book.mid())
             .unwrap_or(fill.last_fill_px);
+        if mark <= Decimal::ZERO {
+            warn!("invalid non-positive HL mark {} for {} fill; freezing (backstop recovers the leg)", mark, fill.market);
+            self.cancel_both_sides(&fill.market, now_ns);
+            self.freeze(now_ns, "invalid_hl_mark_at_fill");
+            return;
+        }
         let fee_rate = self.cfg.edge.aster_maker_fee_bps / Decimal::from(10_000);
         let normal_slip = self.cfg.live.hyperliquid.normal_slippage_bps;
         let rules = HedgeabilityRules { hyperliquid_min_notional: hl_min_notional, hyperliquid_qty_step: hl_qty_step };
@@ -2988,8 +3000,12 @@ impl Strategy {
                 self.last_recovery.insert(m.clone(), (now_ns, snap_src, None));
                 warn!("pending residual on {m} lingered/too-large; flattening {side:?} {qty} reduce-only on Aster (exceptional)");
                 self.journal.record(now_ns, "flatten_pending", Some(m.0.clone()), serde_json::json!({"side": side.as_str(), "qty": qty.to_string()}));
+                let client_id = self.orders.next_flatten_client_id(&m);
+                // Stamp the hot action: a snapshot straddling this flatten's execution must
+                // not be trusted by the orphan backstop (same reason as maker fills).
+                self.last_hot_action_ns.insert(m.clone(), now_ns);
                 match self.try_send_aster_cmd(
-                    ExecCommand::FlattenAster { market: m.clone(), side, qty },
+                    ExecCommand::FlattenAster { market: m.clone(), side, qty, client_id },
                     AsterCommandPriority::Safety,
                     now_ns,
                 ) {
@@ -3137,6 +3153,19 @@ impl Strategy {
             // sync predicted to it so the maker gate / capital / reconcile see the real position.
             self.aster_pos.entry(m.clone()).or_default().qty = rep_a;
             self.hl_pos.entry(m.clone()).or_default().qty = rep_h;
+            // ── OUTSTANDING-RECOVERY GUARD ──
+            // Never race a second recovery order onto the wire for this market while one is
+            // still in flight. Its signed remaining qty is already folded into
+            // `effective_net` above, so this only fires in the arithmetic edge where a net
+            // remains anyway — skip, do NOT overwrite the outstanding intent's record.
+            if self
+                .hedges
+                .values()
+                .any(|h| h.market == m && h.recovery && h.state.is_in_flight())
+            {
+                warn!("orphan recovery skip {m}: a recovery hedge is still in flight; deferring");
+                continue;
+            }
             // ── THROTTLE + ANTI-FLIP GUARD ──
             // Re-fire only when the wall-clock cooldown elapsed AND a STRICTLY NEWER snapshot
             // arrived. Additionally: if the recovery would REVERSE direction from the last action
@@ -3163,12 +3192,42 @@ impl Strategy {
 
             if net_notional >= hl_min {
                 let qty = effective_net.abs();
-                let cloid = super::ids::Cloid::recovery(&m, super::fills::cum_scaled(effective_net));
+                // Supersede any DANGEROUS (Unknown/timed-out/partial) recovery record for
+                // this market before re-dispatching: reality was just re-confirmed by two
+                // snapshots and predicted is synced to reported above, so the old record's
+                // uncertainty is subsumed — and keeping it would wedge the self-heal's
+                // `hedges.is_empty()` condition forever. Journaled for the audit trail.
+                let superseded: Vec<String> = self
+                    .hedges
+                    .iter()
+                    .filter(|(_, h)| h.market == m && h.recovery && h.state.is_dangerous())
+                    .map(|(hex, _)| hex.clone())
+                    .collect();
+                for hex in superseded {
+                    if let Some(old) = self.hedges.remove(&hex) {
+                        self.journal.record(now_ns, "recovery_superseded", Some(m.0.clone()), serde_json::json!({
+                            "cloid": hex,
+                            "state": old.state.as_str(),
+                            "qty": old.qty.to_string(),
+                            "filled_qty": old.filled_qty.to_string(),
+                        }));
+                    }
+                }
+                // Fresh salted cloid per dispatch — the venue does not dedupe indices, so a
+                // reused id against a possibly-live earlier order would cross-attribute fills.
+                let attempt = {
+                    let seq = self.recovery_attempt_seq.entry(m.clone()).or_insert(0);
+                    let cur = *seq;
+                    *seq = seq.saturating_add(1);
+                    cur
+                };
+                let cloid = super::ids::Cloid::recovery_attempt(&m, super::fills::cum_scaled(effective_net), attempt);
                 let cloid_hex = cloid.to_hex();
                 let aggressive_px = cap_aggressive_px(mark, hedge_side, emerg_slip);
-                warn!("orphan recovery: net {effective_net} on {m} (${net_notional}); HL hedge {hedge_side:?} {qty} (cloid {cloid_hex})");
-                self.journal.record(now_ns, "recover_hedge", Some(m.0.clone()), serde_json::json!({"net": effective_net.to_string(), "side": hedge_side.as_str(), "qty": qty.to_string()}));
+                warn!("orphan recovery: net {effective_net} on {m} (${net_notional}); HL hedge {hedge_side:?} {qty} (cloid {cloid_hex} attempt {attempt})");
+                self.journal.record(now_ns, "recover_hedge", Some(m.0.clone()), serde_json::json!({"net": effective_net.to_string(), "side": hedge_side.as_str(), "qty": qty.to_string(), "attempt": attempt}));
                 let mut intent = HedgeIntent::with_qty(cloid, m.clone(), hedge_side, qty, mark, now_ns);
+                intent.recovery = true;
                 intent.mark_submitted(now_ns);
                 self.hedges.insert(cloid_hex.clone(), intent.clone());
                 if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: emerg_slip, emergency: true }).is_err() {
@@ -3183,8 +3242,12 @@ impl Strategy {
                 self.journal.record(now_ns, "recover_flatten", Some(m.0.clone()), serde_json::json!({"net": effective_net.to_string(), "orphan_a": orphan_a.to_string(), "hl": rep_h.to_string()}));
                 if orphan_a.abs() * mark > dust {
                     let side = if orphan_a > Decimal::ZERO { Side::Sell } else { Side::Buy };
+                    let client_id = self.orders.next_flatten_client_id(&m);
+                    // Stamp the hot action: a snapshot straddling this flatten must not be
+                    // trusted by the backstop (mirrors the maker-fill stamp).
+                    self.last_hot_action_ns.insert(m.clone(), now_ns);
                     match self.try_send_aster_cmd(
-                        ExecCommand::FlattenAster { market: m.clone(), side, qty: orphan_a.abs() },
+                        ExecCommand::FlattenAster { market: m.clone(), side, qty: orphan_a.abs(), client_id },
                         AsterCommandPriority::Safety,
                         now_ns,
                     ) {
@@ -4784,6 +4847,94 @@ lighter_symbol = "BTC"
         strat.recover_orphans(t_action + 7_000_000);
         assert!(strat.orphan_seen.contains_key(&m), "post-action snapshot must seed the persistence gate");
         assert!(hrx.try_recv().is_err(), "first valid sighting must not dispatch yet");
+    }
+
+    fn orphan_snapshot_for(m: &MarketId, qty: Decimal, src: i64, read_start: i64) -> crate::livebot::account::AccountSnapshot {
+        use crate::livebot::account::{ScaledPosition, Venue};
+        let mut s = crate::livebot::account::AccountSnapshot::empty();
+        s.aster_available_usd = dec!(1000);
+        s.hl_withdrawable_usd = dec!(1000);
+        s.aster_equity_usd = dec!(1000);
+        s.hl_equity_usd = dec!(1000);
+        s.aster_positions = vec![ScaledPosition { venue: Venue::Aster, market: m.clone(), signed_qty: qty, entry_px: dec!(100) }];
+        s.source_ts_ns = src;
+        s.read_start_ns = read_start;
+        s
+    }
+
+    #[test]
+    fn recovery_skips_redispatch_while_recovery_in_flight() {
+        // An in-flight recovery intent that only partially covers the net must NOT trigger a
+        // second overlapping recovery order — skip and defer, keep the outstanding record.
+        let account = AccountState::new(dec!(50));
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
+        let cloid = crate::livebot::ids::Cloid::recovery(&m, crate::livebot::fills::cum_scaled(dec!(0.5)));
+        let mut intent = HedgeIntent::with_qty(cloid, m.clone(), Side::Sell, dec!(0.2), dec!(100), 1);
+        intent.recovery = true;
+        intent.mark_submitted(1);
+        strat.hedges.insert(cloid.to_hex(), intent);
+
+        // Two confirming snapshots, both read after any hot action (none recorded).
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 10_000_000, 9_000_000));
+        strat.recover_orphans(11_000_000);
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 20_000_000_000, 19_000_000_000));
+        strat.recover_orphans(21_000_000_000);
+
+        assert!(hrx.try_recv().is_err(), "no second recovery order while one is in flight");
+        assert!(erx.try_recv().is_err(), "no flatten either");
+        assert!(
+            strat.hedges.contains_key(&cloid.to_hex()),
+            "outstanding in-flight record must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn recovery_redispatches_salted_cloid_after_dangerous() {
+        // After a dangerous (Unknown) recovery attempt, a confirmed persistent orphan may be
+        // re-dispatched — but ONLY under a fresh salted cloid (the venue does not dedupe
+        // client order indices), and the superseded dangerous record must be removed.
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
+        let base_cloid = crate::livebot::ids::Cloid::recovery(&m, crate::livebot::fills::cum_scaled(dec!(0.5)));
+        let mut dangerous = HedgeIntent::with_qty(base_cloid, m.clone(), Side::Sell, dec!(0.5), dec!(100), 1);
+        dangerous.recovery = true;
+        dangerous.mark_submitted(1);
+        dangerous.mark_unknown();
+        strat.hedges.insert(base_cloid.to_hex(), dangerous);
+        // Simulate that attempt 0 was already consumed by the dangerous dispatch.
+        strat.recovery_attempt_seq.insert(m.clone(), 1);
+
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 10_000_000, 9_000_000));
+        strat.recover_orphans(11_000_000);
+        assert!(hrx.try_recv().is_err(), "first sighting must not dispatch");
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 20_000_000_000, 19_000_000_000));
+        strat.recover_orphans(21_000_000_000);
+
+        let cmd = hrx.try_recv().expect("confirmed persistent orphan must redispatch");
+        let HedgeCommand::Hedge { intent, .. } = cmd else {
+            panic!("expected a hedge command");
+        };
+        assert_ne!(
+            intent.cloid.to_hex(),
+            base_cloid.to_hex(),
+            "redispatch must use a fresh salted cloid, never reuse the dangerous one"
+        );
+        assert!(
+            !strat.hedges.contains_key(&base_cloid.to_hex()),
+            "superseded dangerous record must be removed"
+        );
+        assert!(
+            strat.hedges.contains_key(&intent.cloid.to_hex()),
+            "new intent must be tracked under the salted cloid"
+        );
     }
 
     // --- circuit breaker ---

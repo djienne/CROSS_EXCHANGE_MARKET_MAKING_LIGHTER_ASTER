@@ -349,18 +349,21 @@ impl AsterRest {
     /// Reduce-only MARKET (taker) order to flatten an orphaned position (recovery path).
     /// Reduce-only orders are exempt from the min-notional filter, so a sub-min residual can
     /// still be closed. `side` = SELL to close a long, BUY to close a short.
-    pub(crate) async fn flatten(&self, market: &MarketId, side: Side, qty: Decimal) -> Result<()> {
+    pub(crate) async fn flatten(&self, market: &MarketId, side: Side, qty: Decimal, client_id: &str) -> Result<()> {
         let w = self.wire(market)?;
         let qty_lots = w.scale.qty_to_lots(qty);
         if qty_lots <= 0 {
             return Ok(()); // sub-lot dust: nothing to flatten
         }
         let q = w.scale.lots_to_qty(qty_lots);
+        // The session-prefixed client id is what lets the strategy attribute the resulting
+        // reduce-only fill to itself (is_own_client_id) and update predicted position.
         let params = vec![
             ("symbol".into(), w.symbol.clone()),
             ("side".into(), side.as_str().to_string()),
             ("type".into(), "MARKET".into()),
             ("quantity".into(), trim_dec(q)),
+            ("newClientOrderId".into(), client_id.to_string()),
             ("positionSide".into(), "BOTH".into()),
             ("reduceOnly".into(), "true".into()),
         ];
@@ -538,7 +541,7 @@ async fn send_backoff_reject(tx: &Sender<ExecEvent>, cmd: ExecCommand, reason: S
                 })
                 .await;
         }
-        ExecCommand::FlattenAster { market, side, qty } => {
+        ExecCommand::FlattenAster { market, side, qty, .. } => {
             let _ = tx.send(ExecEvent::AsterFlattenReject { market, side, qty, reason: reason.clone() }).await;
         }
         ExecCommand::CancelMarket { .. }
@@ -720,9 +723,9 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                     }
                 }
             }
-            ExecCommand::FlattenAster { market, side, qty } => {
+            ExecCommand::FlattenAster { market, side, qty, client_id } => {
                 limiter.acquire().await;
-                let ev = match rest.flatten(&market, side, qty).await {
+                let ev = match rest.flatten(&market, side, qty, &client_id).await {
                     Ok(()) => {
                         info!("aster flatten sent: {side:?} {qty} {market}");
                         ExecEvent::AsterFlattenAck { market, side, qty }

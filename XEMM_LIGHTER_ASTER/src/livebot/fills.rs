@@ -176,6 +176,10 @@ pub struct HedgeIntent {
     pub filled_qty: Decimal,
     /// How many submit attempts have been made (normal → emergency → freeze, §4.3).
     pub attempts: u32,
+    /// True for reconciler-backstop (orphan recovery) hedges. Lets `recover_orphans`
+    /// recognize its own outstanding intents so it never overwrites one or races a second
+    /// order onto the wire for the same net.
+    pub recovery: bool,
 }
 
 /// Scale a cumulative-fill quantity to integer micro-units for the cloid / FillKey (matches
@@ -203,13 +207,15 @@ impl HedgeIntent {
             hl_oid: None,
             filled_qty: Decimal::ZERO,
             attempts: 0,
+            recovery: false,
         }
     }
 
     /// A hedge intent for a given `qty` not tied 1:1 to a single fill — used both for an
     /// ACCUMULATED hedge (the net of several sub-min partials reached hedgeable size) and for a
-    /// RECOVERY hedge (the reconciler backstop offsetting an orphaned net delta). `cloid` is the
-    /// caller's deterministic id; `qty` is the amount to hedge.
+    /// RECOVERY hedge (the reconciler backstop offsetting an orphaned net delta; set
+    /// `recovery = true` on the returned intent). `cloid` is the caller's deterministic id;
+    /// `qty` is the amount to hedge.
     pub fn with_qty(cloid: Cloid, market: MarketId, hedge_side: Side, qty: Decimal, ref_px: Decimal, now_ns: i64) -> Self {
         HedgeIntent {
             cloid,
@@ -223,6 +229,7 @@ impl HedgeIntent {
             hl_oid: None,
             filled_qty: Decimal::ZERO,
             attempts: 0,
+            recovery: false,
         }
     }
 

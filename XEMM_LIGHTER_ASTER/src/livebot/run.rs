@@ -769,6 +769,7 @@ async fn setup_live_planes(
         hcreds,
         specs,
         cfg.live.hyperliquid.fill_timeout_ms,
+        cfg.live.hyperliquid.ws_account_max_age_ms,
     )
     .await?;
 

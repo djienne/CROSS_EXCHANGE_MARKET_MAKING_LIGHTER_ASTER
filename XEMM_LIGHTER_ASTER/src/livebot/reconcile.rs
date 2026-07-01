@@ -214,6 +214,18 @@ impl Reconciler {
             }
         }
 
+        // The HL side may have been served from the WS account cache, whose data ORIGINATED
+        // before this function even started. Min the true data origin into read_start_ns so
+        // the orphan backstop's straddle guard ("reads began strictly after the hot action")
+        // judges the DATA's age, not the snapshot assembly time — otherwise a cached
+        // rep_h=0 applied before a hedge fill could masquerade as a fresh venue read and
+        // double-hedge. `source_ts_ns` stays assembly-time on purpose: it feeds the
+        // strictly-increasing orphan_seen/heal_confirm gates, which must keep advancing.
+        let read_start_ns = if ch.data_origin_ns > 0 {
+            read_start_ns.min(ch.data_origin_ns)
+        } else {
+            read_start_ns
+        };
         Ok(AccountSnapshot {
             aster_available_usd,
             hl_withdrawable_usd,

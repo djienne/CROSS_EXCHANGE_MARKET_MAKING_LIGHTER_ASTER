@@ -498,6 +498,11 @@ pub struct LiveHyperliquidCfg {
     /// Max wait for an accepted Lighter transaction to surface as an account trade.
     #[serde(default = "default_lighter_fill_timeout_ms")]
     pub fill_timeout_ms: i64,
+    /// Max age (ms) of a WS account-feed cache entry before the reconciler's reads fall
+    /// back to REST. Keep at/below the reconcile cadence (~max_account_snapshot_age_ms/2,
+    /// clamped 500..2000) so two consecutive snapshots can never share one stale cache read.
+    #[serde(default = "default_ws_account_max_age_ms")]
+    pub ws_account_max_age_ms: i64,
 }
 
 impl Default for LiveHyperliquidCfg {
@@ -510,6 +515,7 @@ impl Default for LiveHyperliquidCfg {
             emergency_slippage_bps: default_emergency_slippage_bps(),
             expires_after_ms: default_expires_after_ms(),
             fill_timeout_ms: default_lighter_fill_timeout_ms(),
+            ws_account_max_age_ms: default_ws_account_max_age_ms(),
         }
     }
 }
@@ -693,6 +699,10 @@ fn default_lighter_signers_dir() -> String {
 }
 fn default_lighter_fill_timeout_ms() -> i64 {
     2_000
+}
+
+fn default_ws_account_max_age_ms() -> i64 {
+    1_500
 }
 fn default_hedge_order_type() -> String {
     "aggressive_ioc".to_string()

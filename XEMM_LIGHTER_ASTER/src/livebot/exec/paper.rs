@@ -38,7 +38,7 @@ impl PaperExec {
                     ExecEvent::PlaceAck { client_id: new_client_id, venue_order_id },
                 ]
             }
-            ExecCommand::FlattenAster { market, side, qty } => {
+            ExecCommand::FlattenAster { market, side, qty, .. } => {
                 vec![ExecEvent::AsterFlattenAck { market, side, qty }]
             }
             // Bulk safety cancels + the dead-man heartbeat have no per-order paper ack.

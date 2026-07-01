@@ -70,6 +70,23 @@ fn market_code(market: &MarketId) -> String {
 /// Aster maker `newClientOrderId`. `quote_epoch` is a per-(market,side) monotonic counter
 /// the order-state layer increments on each new quote, guaranteeing uniqueness. Form:
 /// `X{session}-{MARKET}-{B|S}-{epoch36}` — always within the 36-char / charset budget.
+/// Session-prefixed client id for a FLATTEN (reduce-only close) order. Carries the same
+/// `X{session}-` prefix as maker ids so `OrderManager::is_own_client_id` attributes the
+/// resulting reduce-only fills to this session — without it the venue assigns a foreign-
+/// looking id and the strategy drops its own flatten fills ("non-bot Aster fill").
+pub fn aster_flatten_client_id(session: &SessionId, market: &MarketId, epoch: u64) -> String {
+    let s = format!(
+        "X{}-{}-F-{}",
+        session.as_str(),
+        market_code(market),
+        base36(epoch, 0),
+    );
+    if s.len() > 36 {
+        return s[..36].to_string();
+    }
+    s
+}
+
 pub fn aster_client_id(session: &SessionId, market: &MarketId, side: Side, quote_epoch: u64) -> String {
     let s = format!(
         "X{}-{}-{}-{}",
@@ -116,12 +133,42 @@ impl Cloid {
         Cloid(b)
     }
 
-    /// Deterministic RECOVERY cloid from a market + scaled net delta. Same inputs ⇒ same cloid,
-    /// so a recovery re-dispatched for the same net delta (e.g. the snapshot still shows the
-    /// orphan on the next tick) is deduped by Hyperliquid (it rejects a reused cloid), preventing
-    /// a double-recovery. Distinct from [`Cloid::hedge`] (the `RECOVER` tag changes the hash).
+    /// Deterministic RECOVERY cloid from a market + scaled net delta. Same inputs ⇒ same
+    /// cloid, so the STRATEGY can recognize (and skip) a re-dispatch for the same orphan net
+    /// while one is already in flight, by looking the cloid up in its own intent map.
+    ///
+    /// IMPORTANT: the venue provides NO dedupe — Lighter keys orders on the derived
+    /// `client_order_index` and happily accepts a reused one, which would cross-attribute
+    /// fills in the FillTracker. Uniqueness is therefore the STRATEGY's job: a redispatch
+    /// after a dangerous/Unknown attempt must use [`Cloid::recovery_attempt`] with a fresh
+    /// attempt number, never this base cloid again. Distinct from [`Cloid::hedge`] (the
+    /// `RECOVER` tag changes the hash).
     pub fn recovery(market: &MarketId, net_scaled: i64) -> Self {
         let key = format!("XEMM-RECOVER-{}-{net_scaled}", market.0);
+        Self::from_key(&key)
+    }
+
+    /// Attempt-salted recovery cloid: attempt 0 is the base [`Cloid::recovery`] id; each
+    /// re-dispatch after a dangerous (Unknown) attempt bumps the salt so the possibly-live
+    /// earlier order can never share a Lighter client_order_index with the new one.
+    pub fn recovery_attempt(market: &MarketId, net_scaled: i64, attempt: u32) -> Self {
+        if attempt == 0 {
+            return Self::recovery(market, net_scaled);
+        }
+        let key = format!("XEMM-RECOVER-{}-{net_scaled}-a{attempt}", market.0);
+        Self::from_key(&key)
+    }
+
+    /// FLATTEN cloid, salted with the dispatch time: flattens need no restart-recovery
+    /// identity (recovery is snapshot-driven; nothing queries Lighter by flatten id), and
+    /// per-dispatch uniqueness is what prevents FillTracker collisions between overlapping
+    /// flattens or an equal-sized recovery hedge (the venue does not dedupe indices).
+    pub fn flatten(market: &MarketId, qty_scaled: i64, dispatch_ns: i64) -> Self {
+        let key = format!("XEMM-FLATTEN-{}-{qty_scaled}-{dispatch_ns}", market.0);
+        Self::from_key(&key)
+    }
+
+    fn from_key(key: &str) -> Self {
         let lo = fnv1a64(key.as_bytes(), FNV_BASIS_A);
         let hi = fnv1a64(key.as_bytes(), FNV_BASIS_B);
         let mut b = [0u8; 16];
@@ -177,6 +224,38 @@ fn base36(mut n: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flatten_cloid_distinct_from_recovery_same_inputs() {
+        let m: MarketId = "HYPE".into();
+        let recovery = Cloid::recovery(&m, 1_000_000);
+        let flatten = Cloid::flatten(&m, 1_000_000, 42);
+        assert_ne!(recovery.bytes(), flatten.bytes());
+        assert_ne!(
+            recovery.to_lighter_client_order_index(),
+            flatten.to_lighter_client_order_index(),
+            "an equal-sized flatten and recovery must never share a Lighter index"
+        );
+        // Flatten is additionally salted per dispatch time.
+        let flatten_later = Cloid::flatten(&m, 1_000_000, 43);
+        assert_ne!(flatten.bytes(), flatten_later.bytes());
+    }
+
+    #[test]
+    fn recovery_attempt_salt_changes_index() {
+        let m: MarketId = "HYPE".into();
+        let base = Cloid::recovery(&m, 5);
+        assert_eq!(Cloid::recovery_attempt(&m, 5, 0).bytes(), base.bytes());
+        let a1 = Cloid::recovery_attempt(&m, 5, 1);
+        let a2 = Cloid::recovery_attempt(&m, 5, 2);
+        assert_ne!(a1.bytes(), base.bytes());
+        assert_ne!(a1.bytes(), a2.bytes());
+        assert_ne!(
+            a1.to_lighter_client_order_index(),
+            a2.to_lighter_client_order_index(),
+            "each redispatch must get a fresh Lighter index"
+        );
+    }
 
     #[test]
     fn aster_id_is_unique_and_in_charset() {

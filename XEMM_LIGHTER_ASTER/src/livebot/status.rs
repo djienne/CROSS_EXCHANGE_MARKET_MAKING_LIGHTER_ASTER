@@ -190,6 +190,7 @@ async fn build_lighter(cfg: &Config, specs: &[MarketSpec]) -> Result<HlExchange>
         creds,
         specs,
         cfg.live.hyperliquid.fill_timeout_ms,
+        cfg.live.hyperliquid.ws_account_max_age_ms,
     )
     .await
 }

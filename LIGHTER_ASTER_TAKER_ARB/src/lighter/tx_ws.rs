@@ -38,6 +38,12 @@ type WsStream = SplitStream<Ws>;
 /// Proactive client-ping interval. Lighter closes connections idle for 2 minutes, so this must
 /// be comfortably under 120s (the Python uses `ping_interval=20`).
 const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Bound on any single sink write. A half-open TCP connection with a full send buffer
+/// otherwise blocks `send()` until the OS gives up (potentially 10+ minutes) — while the
+/// hedge-submission path waits behind this socket. On timeout the connection is marked
+/// dead and the outcome is Unknown (the frame may or may not have left the socket).
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Max wait for a tx response after the frame is written before declaring the outcome Unknown.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -119,24 +125,44 @@ impl TxWebSocket {
             .unwrap_or(resp)
     }
 
-    fn code_message(resp: &Value) -> (i64, String) {
+    /// Extract (code, message) from a frame. Returns `None` when the frame carries NO
+    /// recognizable outcome field (`error`/`code`/`status_code`) — such a frame must map
+    /// to Unknown, never default to code 0 (= Ok): treating an unrecognized frame as a
+    /// success would track a possibly-rejected order as resting.
+    fn code_message(resp: &Value) -> Option<(i64, String)> {
         let payload = Self::response_payload(resp);
         if let Some(err) = payload.get("error") {
             if let Some(obj) = err.as_object() {
                 let code = obj.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
                 let msg = Self::extract_message(obj.get("message"));
-                return (if code == 200 { 0 } else { code }, msg);
+                return Some((if code == 200 { 0 } else { code }, msg));
             } else if !err.is_null() {
-                return (-1, err.to_string());
+                return Some((-1, err.to_string()));
             }
         }
         let code = payload
             .get("code")
             .or_else(|| payload.get("status_code"))
-            .and_then(|c| c.as_i64())
-            .unwrap_or(0);
+            .and_then(|c| c.as_i64())?;
         let msg = Self::extract_message(payload.get("message"));
-        (if code == 200 { 0 } else { code }, msg)
+        Some((if code == 200 { 0 } else { code }, msg))
+    }
+
+    /// A frame counts as THE tx outcome only if it structurally looks like one: the
+    /// observed success shape always carries `code` (200) and rejects carry `code`/`error`.
+    /// Anything else (new informational frame types, notices) must not be consumed as the
+    /// in-flight request's outcome.
+    fn looks_like_tx_outcome(v: &Value) -> bool {
+        if v.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains("sendtx"))
+        {
+            return true;
+        }
+        let payload = Self::response_payload(v);
+        payload.get("code").is_some()
+            || payload.get("status_code").is_some()
+            || payload.get("error").is_some_and(|e| !e.is_null())
     }
 
     /// Extract a message field as its RAW string content (empty `""` stays empty, NOT `"\"\""`) so
@@ -174,20 +200,30 @@ impl TxWebSocket {
         // Drop any stale responses left over from a previous send before issuing this one.
         while conn.resp_rx.try_recv().is_ok() {}
 
-        // Write the frame. A write error means no frame reached the exchange on this connection,
-        // but the socket may have died mid-write — treat as Unknown (the safe, no-retry outcome).
+        // Write the frame, bounded. A write error/timeout means the frame may or may not
+        // have reached the exchange — treat as Unknown (the safe, no-retry outcome).
         {
             let mut w = conn.write.lock().await;
-            if let Err(e) = w.send(Message::Text(frame)).await {
-                conn.alive.store(false, Ordering::Release);
-                return TxSendResult::unknown(format!("send_failed:{e}"));
+            match timeout(WRITE_TIMEOUT, w.send(Message::Text(frame))).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    conn.alive.store(false, Ordering::Release);
+                    return TxSendResult::unknown(format!("send_failed:{e}"));
+                }
+                Err(_) => {
+                    conn.alive.store(false, Ordering::Release);
+                    return TxSendResult::unknown("send_timeout");
+                }
             }
         }
 
         // Await the response routed by the recv loop (single in-flight request).
         match timeout(RESPONSE_TIMEOUT, conn.resp_rx.recv()).await {
             Ok(Some(resp)) => {
-                let (code, message) = Self::code_message(&resp);
+                let Some((code, message)) = Self::code_message(&resp) else {
+                    // Outcome-shaped gate passed but no code/error field: ambiguous.
+                    return TxSendResult::unknown("unrecognized_response");
+                };
                 let payload = Self::response_payload(&resp);
                 let quota = payload
                     .get("volume_quota_remaining")
@@ -237,19 +273,22 @@ async fn recv_loop(
                     Some("ping") => {
                         // Lighter application-level ping -> must reply with a pong frame.
                         let mut w = write.lock().await;
-                        if w.send(Message::Text(r#"{"type":"pong"}"#.into()))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        match timeout(WRITE_TIMEOUT, w.send(Message::Text(r#"{"type":"pong"}"#.into()))).await {
+                            Ok(Ok(())) => {}
+                            _ => break, // write failed or wedged: connection is dead
                         }
                     }
                     Some("connected") | Some("subscribed") => {} // informational; drop
-                    _ => {
+                    _ if TxWebSocket::looks_like_tx_outcome(&v) => {
                         // Real response (tx outcome). Channel closed => no receiver; stop.
                         if resp_tx.send(v).is_err() {
                             break;
                         }
+                    }
+                    other => {
+                        // NOT outcome-shaped: never consume it as the in-flight request's
+                        // response (that would report a possibly-rejected order as Ok).
+                        tracing::debug!("tx socket: dropping non-outcome frame type={other:?}");
                     }
                 }
             }
@@ -257,7 +296,9 @@ async fn recv_loop(
             // also reply explicitly to be safe. Pongs (from our pings) are discarded.
             Ok(Message::Ping(p)) => {
                 let mut w = write.lock().await;
-                let _ = w.send(Message::Pong(p)).await;
+                if timeout(WRITE_TIMEOUT, w.send(Message::Pong(p))).await.is_err() {
+                    break; // write wedged: connection is dead
+                }
             }
             Ok(Message::Pong(_)) => {}
             Ok(Message::Close(_)) => break,
@@ -281,9 +322,12 @@ async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>) {
             break;
         }
         let mut w = write.lock().await;
-        if w.send(Message::Ping(Vec::new())).await.is_err() {
-            alive.store(false, Ordering::Release);
-            break;
+        match timeout(WRITE_TIMEOUT, w.send(Message::Ping(Vec::new()))).await {
+            Ok(Ok(())) => {}
+            _ => {
+                alive.store(false, Ordering::Release);
+                break;
+            }
         }
     }
 }
@@ -389,7 +433,7 @@ mod tests {
             "type": "jsonapi/sendtxbatch",
             "data": {"code": 200, "message": "", "volume_quota_remaining": 7}
         });
-        assert_eq!(TxWebSocket::code_message(&ok), (0, String::new()));
+        assert_eq!(TxWebSocket::code_message(&ok), Some((0, String::new())));
         assert_eq!(
             TxWebSocket::response_payload(&ok)
                 .get("volume_quota_remaining")
@@ -403,7 +447,24 @@ mod tests {
         });
         assert_eq!(
             TxWebSocket::code_message(&reject),
-            (42, "bad nonce".to_string())
+            Some((42, "bad nonce".to_string()))
         );
+    }
+
+    #[test]
+    fn frames_without_outcome_fields_are_not_tx_outcomes() {
+        // A frame with no code/status_code/error must neither pass the recv-loop gate nor
+        // default to code 0 (= Ok) — an unsolicited notice consumed as a success would
+        // track a possibly-rejected order as resting.
+        let notice = serde_json::json!({"type": "notice", "data": {"info": "maintenance"}});
+        assert!(!TxWebSocket::looks_like_tx_outcome(&notice));
+        assert_eq!(TxWebSocket::code_message(&notice), None);
+
+        let success = serde_json::json!({"code": 200, "message": "", "volume_quota_remaining": 42});
+        assert!(TxWebSocket::looks_like_tx_outcome(&success));
+
+        let err_only = serde_json::json!({"error": {"code": 7, "message": "nope"}});
+        assert!(TxWebSocket::looks_like_tx_outcome(&err_only));
+        assert_eq!(TxWebSocket::code_message(&err_only), Some((7, "nope".to_string())));
     }
 }

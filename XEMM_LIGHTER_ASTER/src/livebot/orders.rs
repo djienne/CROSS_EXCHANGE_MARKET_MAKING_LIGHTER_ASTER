@@ -165,6 +165,9 @@ fn mark_cancel_after_ack(slot: &mut MakerSlot, reason: CancelAfterAckReason) {
 pub struct OrderManager {
     session: SessionId,
     slots: Vec<MarketSlots>,
+    /// Monotonic counter for flatten (reduce-only close) client ids — session-prefixed so
+    /// their fills pass `is_own_client_id` attribution (see `handle_maker_fill`).
+    flatten_epoch: u64,
 }
 
 struct MarketSlots {
@@ -186,7 +189,17 @@ impl OrderManager {
                 replace_times_ns: VecDeque::new(),
             })
             .collect();
-        OrderManager { session, slots }
+        OrderManager { session, slots, flatten_epoch: 0 }
+    }
+
+    /// Fresh session-prefixed client id for a FLATTEN order (reduce-only close). These ids
+    /// never match a maker slot, but they DO match this session's `is_own_client_id`
+    /// prefix, so the resulting reduce-only fill updates predicted position instead of
+    /// being dropped as a foreign fill.
+    pub fn next_flatten_client_id(&mut self, market: &MarketId) -> String {
+        let id = super::ids::aster_flatten_client_id(&self.session, market, self.flatten_epoch);
+        self.flatten_epoch += 1;
+        id
     }
 
     fn market_mut(&mut self, market: &MarketId) -> Option<&mut MarketSlots> {

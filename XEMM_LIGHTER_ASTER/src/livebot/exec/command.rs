@@ -49,7 +49,9 @@ pub enum ExecCommand {
     CancelAllBot,
     /// Reduce-only taker (MARKET) order to FLATTEN an orphaned Aster position (recovery path):
     /// `side` closes the leg (SELL to close a long, BUY to close a short), `qty` base units.
-    FlattenAster { market: MarketId, side: Side, qty: Decimal },
+    /// `client_id` is a session-prefixed id (OrderManager::next_flatten_client_id) so the
+    /// resulting reduce-only fill passes the strategy's own-order attribution.
+    FlattenAster { market: MarketId, side: Side, qty: Decimal, client_id: String },
     /// Refresh the per-symbol dead-man countdown (plan §3.4).
     RefreshDeadman { market: MarketId },
     /// Drain and stop the worker.
