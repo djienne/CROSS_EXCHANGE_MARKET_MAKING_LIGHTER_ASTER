@@ -68,22 +68,23 @@ CREATE TABLE IF NOT EXISTS opportunity_rejects (
 );
 CREATE INDEX IF NOT EXISTS ix_rej_run ON opportunity_rejects(run_id, market, queue_model);
 
-CREATE TABLE IF NOT EXISTS quote_revisions (
-    id                        TEXT PRIMARY KEY,
-    run_id                    TEXT NOT NULL,
-    market                    TEXT NOT NULL,
-    side                      TEXT NOT NULL,
-    queue_model               TEXT NOT NULL,
-    previous_quote_id         TEXT,
-    new_quote_id              TEXT,
-    reason                    TEXT NOT NULL,
-    previous_price            TEXT,
-    new_price                 TEXT,
-    previous_instant_edge_bps TEXT,
-    new_instant_edge_bps      TEXT,
-    event_ts                  TEXT NOT NULL
+-- Quote revisions follow the same firehose-to-aggregate rule as accepted
+-- opportunities above: the evaluator requotes on book moves, so per-row storage
+-- grew without bound (a live week produced ~3.6M rows = ~97% of a 1.5 GB db)
+-- while nothing ever read the rows back. The engine folds them into in-memory
+-- counters (store/db.rs) and writes one summary row per (market, side,
+-- queue_model, reason) at run end; per-revision detail stays reconstructable by
+-- replaying the tape. The legacy `quote_revisions` per-row table is dropped by
+-- the startup maintenance in db.rs.
+CREATE TABLE IF NOT EXISTS quote_revision_stats (
+    run_id      TEXT NOT NULL,
+    market      TEXT NOT NULL,
+    side        TEXT NOT NULL,
+    queue_model TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    revisions   INTEGER NOT NULL,
+    PRIMARY KEY (run_id, market, side, queue_model, reason)
 );
-CREATE INDEX IF NOT EXISTS ix_rev_run ON quote_revisions(run_id, market, queue_model);
 
 CREATE TABLE IF NOT EXISTS simulated_fills (
     id                             TEXT PRIMARY KEY,

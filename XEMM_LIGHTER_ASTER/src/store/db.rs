@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use rusqlite::{params, Connection};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::edge::EdgeConfig;
@@ -46,7 +47,31 @@ pub struct Db {
     writes: usize,
     /// Keyed by (market, side, queue_model); flushed to `opportunity_stats` at run end.
     opp_aggs: HashMap<(String, String, String), OppAgg>,
+    /// Requote counts keyed by (market, side, queue_model, reason); flushed to
+    /// `quote_revision_stats` at run end. Same firehose-to-aggregate rule as
+    /// `opp_aggs` — see the schema comment.
+    rev_aggs: HashMap<(String, String, String, String), i64>,
 }
+
+/// Per-row telemetry from runs that ended longer ago than this is pruned at open.
+/// Aggregates, real fills/hedges and run metadata are kept indefinitely (tiny).
+const RETENTION_DAYS: i64 = 14;
+/// Rebuild the file at open only when at least this much is reclaimable, so
+/// routine startups skip the rebuild entirely.
+const REBUILD_MIN_RECLAIM_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Tables carried over on a rebuild. `quote_revisions` (the legacy per-row
+/// firehose) is deliberately absent — leaving it behind IS the reclaim.
+const REBUILD_TABLES: &[&str] = &[
+    "runs",
+    "markets",
+    "opportunity_stats",
+    "opportunity_rejects",
+    "quote_revision_stats",
+    "simulated_fills",
+    "hedges",
+    "pending_inventory_events",
+];
 
 // --- small conversion helpers ---
 fn s(d: Decimal) -> String {
@@ -64,6 +89,12 @@ fn ot(dt: Option<DateTime<Utc>>) -> Option<String> {
 fn bit(x: bool) -> i64 {
     i64::from(x)
 }
+/// SQLite sidecar path: `<db file name>-wal` / `-shm`, next to the db file.
+fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut os = path.as_os_str().to_owned();
+    os.push(suffix);
+    std::path::PathBuf::from(os)
+}
 
 impl Db {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -72,6 +103,12 @@ impl Db {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent).ok();
             }
+        }
+        // Maintenance runs on its own connection and may replace the file; open
+        // the long-lived connection only afterwards. A maintenance failure must
+        // never keep the bot from starting — the db is research telemetry.
+        if let Err(e) = Self::maintain(path) {
+            tracing::warn!("db maintain failed (continuing with db as-is): {e:#}");
         }
         let conn = Connection::open(path).with_context(|| format!("opening db {}", path.display()))?;
         conn.execute_batch(PRAGMAS)?;
@@ -82,7 +119,102 @@ impl Db {
             tx_open: false,
             writes: 0,
             opp_aggs: HashMap::new(),
+            rev_aggs: HashMap::new(),
         })
+    }
+
+    /// Startup maintenance (cold path, no other connection is open yet): prune
+    /// per-row telemetry past retention, and when there is real space to give
+    /// back — a legacy `quote_revisions` firehose table or a large freelist —
+    /// rebuild the file by copying only the live tables into a fresh db and
+    /// renaming it into place. Rebuild-by-copy instead of DROP+VACUUM because
+    /// dropping a ~1.4 GB table journals enough pages to exhaust a nearly-full
+    /// disk, while the copy only ever touches the few MB of rows we keep.
+    fn maintain(path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let conn = Connection::open(path)?;
+        // A db created before this schema existed (or by an older build) may lack
+        // some REBUILD_TABLES; make the CREATEs idempotently before touching them.
+        conn.execute_batch(SCHEMA)?;
+
+        // Prune sparse per-row telemetry from runs that ended past retention. A run
+        // with NULL finished_at older than the cutoff crashed without finalizing —
+        // its started_at stands in. The current run is inserted after this, so it
+        // can never match.
+        let cutoff = t(Utc::now() - chrono::Duration::days(RETENTION_DAYS));
+        let pruned = conn.execute(
+            "DELETE FROM opportunity_rejects WHERE run_id IN
+             (SELECT run_id FROM runs WHERE COALESCE(finished_at, started_at) < ?1)",
+            params![cutoff],
+        )?;
+        if pruned > 0 {
+            info!("db maintain: pruned {pruned} opportunity_rejects rows past {RETENTION_DAYS}d retention");
+        }
+
+        // Legacy per-row requote firehose: written by every pre-2026-07 run, read
+        // by nothing (reports read only aggregates; per-revision detail stays
+        // reconstructable by replaying the tape). Superseded by quote_revision_stats.
+        let legacy_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quote_revisions'",
+                [],
+                |r| r.get(0),
+            )
+            .and_then(|n: i64| {
+                if n > 0 {
+                    conn.query_row("SELECT COUNT(*) FROM quote_revisions", [], |r| r.get(0))
+                } else {
+                    Ok(-1)
+                }
+            })?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+        let freelist: i64 = conn.query_row("PRAGMA freelist_count", [], |r| r.get(0))?;
+        let needs_rebuild = legacy_rows >= 0 || freelist * page_size >= REBUILD_MIN_RECLAIM_BYTES;
+        if !needs_rebuild {
+            return Ok(());
+        }
+
+        // Flush the WAL into the main file so the copy source is complete, and so
+        // no stale -wal can be replayed against the rebuilt file after the rename.
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+
+        let tmp = path.with_extension("rebuild.sqlite");
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(sidecar(&tmp, "-wal"));
+        let _ = std::fs::remove_file(sidecar(&tmp, "-shm"));
+        {
+            let dst = Connection::open(&tmp)?;
+            dst.execute_batch(SCHEMA)?;
+            dst.execute(
+                "ATTACH DATABASE ?1 AS src",
+                params![path.to_str().context("db path is not utf-8")?],
+            )?;
+            dst.execute_batch("BEGIN")?;
+            for table in REBUILD_TABLES {
+                // Identical CREATEs on both sides (SCHEMA above), so SELECT * maps 1:1.
+                dst.execute(&format!("INSERT INTO {table} SELECT * FROM src.{table}"), [])?;
+            }
+            dst.execute_batch("COMMIT")?;
+            dst.execute_batch("DETACH DATABASE src")?;
+        }
+        drop(conn);
+        let old_bytes = std::fs::metadata(path)?.len();
+        let new_bytes = std::fs::metadata(&tmp)?.len();
+        std::fs::rename(&tmp, path)?;
+        let _ = std::fs::remove_file(sidecar(path, "-wal"));
+        let _ = std::fs::remove_file(sidecar(path, "-shm"));
+        let _ = std::fs::remove_file(sidecar(&tmp, "-wal"));
+        let _ = std::fs::remove_file(sidecar(&tmp, "-shm"));
+        info!(
+            "db maintain: rebuilt {} ({} MB -> {} MB; dropped legacy quote_revisions rows: {})",
+            path.display(),
+            old_bytes / (1024 * 1024),
+            new_bytes / (1024 * 1024),
+            legacy_rows.max(0),
+        );
+        Ok(())
     }
 
     pub fn run_id(&self) -> &str {
@@ -138,6 +270,7 @@ impl Db {
 
     pub fn finish_run(&mut self, finished_at: DateTime<Utc>) -> Result<()> {
         self.flush_opportunity_stats()?;
+        self.flush_quote_revision_stats()?;
         self.ensure_tx()?;
         self.conn.execute(
             "UPDATE runs SET finished_at = ?1 WHERE run_id = ?2",
@@ -163,6 +296,24 @@ impl Db {
                     run_id, market, side, queue_model,
                     agg.accepted, agg.sum_instant_edge_bps, agg.sum_distance_bps, agg.size_clamped, agg.queue_truncated
                 ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Write the folded requote counters as one row per (market, side, queue_model,
+    /// reason). Called once at run end by [`finish_run`]; committed by the
+    /// subsequent [`flush`].
+    fn flush_quote_revision_stats(&mut self) -> Result<()> {
+        let aggs = std::mem::take(&mut self.rev_aggs);
+        let run_id = self.run_id.clone();
+        self.ensure_tx()?;
+        for ((market, side, queue_model, reason), revisions) in &aggs {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO quote_revision_stats
+                 (run_id, market, side, queue_model, reason, revisions)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+                params![run_id, market, side, queue_model, reason, revisions],
             )?;
         }
         Ok(())
@@ -225,21 +376,21 @@ impl Db {
         self.after_write()
     }
 
-    pub fn insert_quote_revision(&mut self, r: &QuoteRevisionRow) -> Result<()> {
-        self.ensure_tx()?;
-        self.conn.execute(
-            "INSERT INTO quote_revisions
-             (id, run_id, market, side, queue_model, previous_quote_id, new_quote_id, reason,
-              previous_price, new_price, previous_instant_edge_bps, new_instant_edge_bps, event_ts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-            params![
-                r.id, self.run_id, r.market.0, r.side.as_str(), r.queue_model.as_str(),
-                r.previous_quote_id, r.new_quote_id, r.reason,
-                os(r.previous_price), os(r.new_price), os(r.previous_instant_edge_bps), os(r.new_instant_edge_bps),
-                t(r.event_ts),
-            ],
-        )?;
-        self.after_write()
+    /// Record one quote revision. Folded into the in-memory `rev_aggs` counters and
+    /// written as one `quote_revision_stats` row per (market, side, queue_model,
+    /// reason) by [`finish_run`] — never per-row (see the schema comment; the old
+    /// per-row table grew ~3.6M rows/week with zero readers).
+    pub fn record_quote_revision(&mut self, r: &QuoteRevisionRow) -> Result<()> {
+        *self
+            .rev_aggs
+            .entry((
+                r.market.0.clone(),
+                r.side.as_str().to_string(),
+                r.queue_model.as_str().to_string(),
+                r.reason.clone(),
+            ))
+            .or_default() += 1;
+        Ok(())
     }
 
     pub fn insert_fill(&mut self, r: &FillRow) -> Result<()> {
@@ -308,7 +459,7 @@ impl Db {
             "markets",
             "opportunity_stats",
             "opportunity_rejects",
-            "quote_revisions",
+            "quote_revision_stats",
             "simulated_fills",
             "hedges",
             "pending_inventory_events",
@@ -476,6 +627,10 @@ impl OpportunityRow {
     }
 }
 
+/// One quote revision as observed by the engine. Only (market, side, queue_model,
+/// reason) survive into `quote_revision_stats`; the price/id/timestamp fields are
+/// carried for callers and tracing but are not persisted — the tape retains the
+/// full detail for replay.
 #[derive(Debug, Clone)]
 pub struct QuoteRevisionRow {
     pub id: String,
@@ -722,6 +877,100 @@ mod tests {
         assert_eq!(db.count("runs").unwrap(), 1);
         assert_eq!(db.count("markets").unwrap(), 1);
         assert_eq!(db.count("opportunity_rejects").unwrap(), 1);
+        std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
+    fn quote_revisions_fold_into_stats_rows() {
+        let dir = std::env::temp_dir().join(format!("xemm_revagg_{}.sqlite", Uuid::new_v4()));
+        let mut db = Db::open(&dir).unwrap();
+        db.insert_run("r1", ts(), "replay", None, "t", "{}").unwrap();
+        let rev = |reason: &str| QuoteRevisionRow {
+            id: Uuid::new_v4().to_string(),
+            market: "BTC".into(),
+            side: Side::Buy,
+            queue_model: QueueModel::Optimistic,
+            previous_quote_id: None,
+            new_quote_id: None,
+            reason: reason.to_string(),
+            previous_price: None,
+            new_price: None,
+            previous_instant_edge_bps: None,
+            new_instant_edge_bps: None,
+            event_ts: ts(),
+        };
+        for _ in 0..3 {
+            db.record_quote_revision(&rev("PRICE_MOVED")).unwrap();
+        }
+        db.record_quote_revision(&rev("NO_LONGER_PROFITABLE")).unwrap();
+        db.finish_run(ts()).unwrap();
+        db.flush().unwrap();
+        // Two (reason) groups, counts preserved; no per-row table exists at all.
+        assert_eq!(db.count("quote_revision_stats").unwrap(), 2);
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT revisions FROM quote_revision_stats WHERE reason='PRICE_MOVED'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3);
+        let legacy: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quote_revisions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0);
+        std::fs::remove_file(&dir).ok();
+    }
+
+    #[test]
+    fn open_drops_legacy_table_and_prunes_stale_rejects() {
+        let dir = std::env::temp_dir().join(format!("xemm_maint_{}.sqlite", Uuid::new_v4()));
+        {
+            // Seed a db shaped like a pre-fix live db: the legacy per-row table plus
+            // reject rows from an old finished run, a crashed (never-finished) old
+            // run, and a recent run.
+            let mut db = Db::open(&dir).unwrap();
+            db.insert_run("old", ts(), "livebot-live", None, "t", "{}").unwrap();
+            db.finish_run(ts()).unwrap();
+            db.flush().unwrap();
+            let conn = Connection::open(&dir).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE quote_revisions (id TEXT PRIMARY KEY, run_id TEXT NOT NULL);
+                 INSERT INTO quote_revisions VALUES ('a', 'old');
+                 INSERT INTO runs (run_id, started_at, finished_at, mode, config_json)
+                 VALUES ('crashed', '2026-01-01T00:00:00+00:00', NULL, 'livebot-live', '{}');
+                 INSERT INTO runs (run_id, started_at, finished_at, mode, config_json)
+                 VALUES ('recent', '2099-01-01T00:00:00+00:00', '2099-01-01T01:00:00+00:00', 'livebot-live', '{}');
+                 INSERT INTO opportunity_rejects VALUES ('old', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO opportunity_rejects VALUES ('crashed', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO opportunity_rejects VALUES ('recent', 'BTC', 'buy', 'optimistic', 'X', '2099-01-01T00:00:00+00:00');",
+            )
+            .unwrap();
+        }
+        // ts() is 2023 — both the finished 'old' run and the crashed run fall past
+        // the 14-day retention; 'recent' (2099) must survive.
+        let db = Db::open(&dir).unwrap();
+        let legacy: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='quote_revisions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy, 0);
+        assert_eq!(db.count("opportunity_rejects").unwrap(), 1);
+        let survivor: String = db
+            .conn()
+            .query_row("SELECT run_id FROM opportunity_rejects", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(survivor, "recent");
         std::fs::remove_file(&dir).ok();
     }
 

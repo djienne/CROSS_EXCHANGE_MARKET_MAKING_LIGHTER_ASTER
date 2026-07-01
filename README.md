@@ -226,6 +226,14 @@ filled while the orchestrator was down still enter the canonical DB with real
 trade times. The `xemm live-report` subcommand accepts `--since-ms` so
 periodic callers do not re-scan the whole append-forever journal.
 
+The XEMM results sqlite (`--db`) is self-maintaining as of 2026-07-01: quote
+revisions are stored as per-run aggregates (`quote_revision_stats`) instead of
+per-row (the old firehose grew ~200 MB/day with zero readers), reject rows
+from runs older than 14 days are pruned at startup, and when ≥64 MB is
+reclaimable the file is rebuilt by copying live tables and renamed into place
+(a pre-fix 1.5 GB db shrinks to ~20 MB in under 2 s at the next bot start).
+Per-revision detail remains reconstructable by replaying the tape (`--out`).
+
 Safety knobs added 2026-07-01: taker-arb `[risk] auto_flatten_on_mismatch`
 (default true) reduce-only flattens a persistent unhedged residual after
 `mismatch_flatten_after_checks` consecutive detections; taker-arb

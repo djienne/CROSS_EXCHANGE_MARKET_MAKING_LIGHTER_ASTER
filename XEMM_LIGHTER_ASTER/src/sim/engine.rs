@@ -399,7 +399,7 @@ fn recompute_quotes(
                         match replace {
                             Some(reason) => {
                                 db.record_opportunity(&OpportunityRow::accepted(market.clone(), qm, &dq, edge, now))?;
-                                db.insert_quote_revision(&QuoteRevisionRow {
+                                db.record_quote_revision(&QuoteRevisionRow {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     market: market.clone(),
                                     side,
