@@ -84,9 +84,9 @@ pub struct PendingRiskEvent {
 /// Minimum hedgeable quantity on HL for a given reference price ($10 min notional
 /// rounded up to the size step, but at least one step).
 pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
-    // Invariant: ref_px comes from mark_price (book mids, non-positive levels dropped)
-    // or a validated fill price, so it is always > 0 here.
-    debug_assert!(ref_px > Decimal::ZERO, "hl_min_hedge_qty: ref_px must be positive");
+    if ref_px <= Decimal::ZERO {
+        return rules.hyperliquid_qty_step;
+    }
     let by_notional = ceil_to_step(rules.hyperliquid_min_notional / ref_px, rules.hyperliquid_qty_step);
     by_notional.max(rules.hyperliquid_qty_step)
 }
