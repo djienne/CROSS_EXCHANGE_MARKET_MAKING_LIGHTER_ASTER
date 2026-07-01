@@ -24,6 +24,15 @@ use crate::decimal::parse_dec;
 const RECONNECT_BASE: Duration = Duration::from_millis(250);
 const RECONNECT_MAX: Duration = Duration::from_secs(10);
 const READY_POLL: Duration = Duration::from_millis(20);
+/// The @depth20@100ms stream delivers a frame every ~100ms; silence this long means a
+/// dead/half-open connection. Without this watchdog a NAT/LB silently dropping the
+/// connection blocks `read.next()` forever, the book freezes, and the staleness gate
+/// halts trading permanently with no reconnect.
+const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client keepalive ping cadence (keeps NAT/LB state alive between server pings).
+const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// Bound on sink writes so a wedged socket can never block the session task.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone)]
 pub struct AsterBookFeed {
@@ -111,29 +120,48 @@ async fn depth_session(
     let (mut write, mut read) = ws.split();
     tracing::info!("Aster depth connected: symbol={} url={}", symbol, url);
 
+    let mut ping_tick = tokio::time::interval(PING_INTERVAL);
+    ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ping_tick.tick().await; // first tick fires immediately; skip it (just connected)
+
     loop {
-        let msg = tokio::select! {
+        tokio::select! {
             _ = reconnect.notified() => {
                 tracing::warn!("Aster depth reconnect requested: symbol={symbol}");
                 return Ok(());
             }
-            msg = read.next() => match msg {
-                Some(msg) => msg,
-                None => return Ok(()),
-            },
-        };
-        match msg? {
-            Message::Text(text) => {
-                if let Some(book) = parse_depth(&text)? {
-                    state.book.store(Some(Arc::new(book)));
+            _ = ping_tick.tick() => {
+                match tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::Ping(Vec::new()))).await {
+                    Ok(Ok(())) => {}
+                    _ => anyhow::bail!("Aster depth keepalive ping failed/wedged: symbol={symbol}"),
                 }
             }
-            Message::Ping(payload) => {
-                // Do not depend on a future writer to flush tungstenite's auto-pong.
-                let _ = write.send(Message::Pong(payload)).await;
+            msg = tokio::time::timeout(FRAME_TIMEOUT, read.next()) => {
+                let msg = match msg {
+                    Ok(Some(msg)) => msg?,
+                    Ok(None) => return Ok(()),
+                    Err(_) => anyhow::bail!(
+                        "Aster depth frame timeout ({}s of silence, half-open connection?): symbol={symbol}",
+                        FRAME_TIMEOUT.as_secs()
+                    ),
+                };
+                match msg {
+                    Message::Text(text) => {
+                        if let Some(book) = parse_depth(&text)? {
+                            state.book.store(Some(Arc::new(book)));
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        // Do not depend on a future writer to flush tungstenite's auto-pong.
+                        match tokio::time::timeout(WRITE_TIMEOUT, write.send(Message::Pong(payload))).await {
+                            Ok(Ok(())) => {}
+                            _ => anyhow::bail!("Aster depth pong write failed/wedged: symbol={symbol}"),
+                        }
+                    }
+                    Message::Close(_) => return Ok(()),
+                    _ => {}
+                }
             }
-            Message::Close(_) => return Ok(()),
-            _ => {}
         }
     }
 }

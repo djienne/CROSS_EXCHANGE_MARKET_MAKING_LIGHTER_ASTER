@@ -715,6 +715,11 @@ struct ActualEconomics {
     net_usd: Decimal,
     net_bps: Decimal,
     fill_qty_mismatch: Decimal,
+    /// Signed unmatched leg qty (sell − buy): NOT PnL, open exposure. Booked separately so
+    /// the loss breaker sees real matched PnL instead of up to ~$3/trade of phantom profit.
+    residual_qty: Decimal,
+    /// Absolute residual valued at the opportunity reference price.
+    residual_notional_usd: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1027,6 +1032,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
     let mut recovered_failures = RecoveredFailureTracker::default();
+    // Consecutive main-loop position-mismatch detections (see the guard below): after
+    // `risk.mismatch_flatten_after_checks` in a row the residual is actively flattened
+    // instead of pausing forever on a naked position.
+    let mut mismatch_consecutive: u32 = 0;
+    let mut last_fill_stats_log = tokio::time::Instant::now();
 
     info!(
         "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} control_file={:?} signal_file={:?} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
@@ -1119,6 +1129,16 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         }
         last_stale_account_log_at = None;
 
+        // Throttled fill-matching health log (cold: one Instant compare per iteration).
+        if last_fill_stats_log.elapsed() >= Duration::from_secs(60) {
+            last_fill_stats_log = tokio::time::Instant::now();
+            let s = lighter.fill_tracker_stats();
+            info!(
+                "lighter fill-tracker stats: registered={} trades_seen={} matched={} unmatched={} duplicates={} timeouts={}",
+                s.registered, s.trades_seen, s.matched_trades, s.unmatched_trades, s.duplicate_trades, s.timeouts
+            );
+        }
+
         let pos = account.position;
         let Some(mismatch_notional) = net_mismatch_notional(pos, &aster_book, &lighter_book) else {
             warn!(
@@ -1129,15 +1149,77 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         };
         if mismatch_notional > cfg.risk.max_position_mismatch_usd {
+            mismatch_consecutive = mismatch_consecutive.saturating_add(1);
             warn!(
-                "position mismatch too large: aster={} lighter={} net={}; pausing",
+                "position mismatch too large: aster={} lighter={} net={}; pausing ({} consecutive, auto-flatten at {})",
                 pos.aster_qty,
                 pos.lighter_qty,
-                pos.net_qty()
+                pos.net_qty(),
+                mismatch_consecutive,
+                cfg.risk.mismatch_flatten_after_checks
             );
+            // A residual that persists across several reconciles is a real naked position
+            // (e.g. an external fill, or an Unknown-outcome leg that landed): act on it
+            // with the same reduce-only emergency-bound machinery as the rescue path,
+            // instead of riding market moves until a human notices.
+            if cfg.risk.auto_flatten_on_mismatch
+                && mismatch_consecutive >= cfg.risk.mismatch_flatten_after_checks
+            {
+                error!(
+                    "position mismatch persisted {mismatch_consecutive} checks (${mismatch_notional}); auto-flattening residual reduce-only"
+                );
+                account_refresh_paused.store(true, Ordering::Release);
+                let recovery_result =
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, account.margins).await;
+                account_refresh_paused.store(false, Ordering::Release);
+                match recovery_result {
+                    Ok(recovery) => {
+                        mismatch_consecutive = 0;
+                        warn!(
+                            "mismatch auto-flatten complete action_taken={} estimated_loss=${} final_aster={} final_lighter={}",
+                            recovery.action_taken,
+                            recovery.estimated_loss_usdc,
+                            recovery.position.aster_qty,
+                            recovery.position.lighter_qty
+                        );
+                        if recovery.action_taken {
+                            if let Some(reason) =
+                                recovered_failures.record(recovery.estimated_loss_usdc, &cfg)
+                            {
+                                bail!("recovered-failure breaker triggered: {reason}");
+                            }
+                            record_recovery_loss(&mut pnl, &spec, &recovery)?;
+                        }
+                        account = AccountSnapshot {
+                            position: recovery.position,
+                            lighter_ws_qty: recovery.lighter_ws_qty,
+                            lighter_ws_rest_divergence_qty: recovery
+                                .lighter_ws_qty
+                                .map(|ws| (ws - recovery.position.lighter_qty).abs()),
+                            margins: recovery.margin_after,
+                            refreshed_at: tokio::time::Instant::now(),
+                        };
+                        let _ = account_tx.send(account);
+                    }
+                    Err(e) => {
+                        error!("mismatch auto-flatten failed: {e:#}");
+                        // Repeated failure to even inspect/flatten means the bot cannot
+                        // guarantee its own safety: exit nonzero so the supervisor
+                        // safe-halts loudly instead of pausing on a naked position forever.
+                        if mismatch_consecutive
+                            >= cfg.risk.mismatch_flatten_after_checks.saturating_mul(3)
+                        {
+                            bail!(
+                                "position mismatch persisted {mismatch_consecutive} checks and auto-flatten kept failing: {e:#}"
+                            );
+                        }
+                    }
+                }
+            }
             tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms)).await;
             continue;
         }
+        mismatch_consecutive = 0;
         let mark = aster_book
             .mid()
             .or_else(|| lighter_book.mid())
@@ -1566,6 +1648,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     {
                         bail!("recovered-failure breaker triggered: {reason}");
                     }
+                    record_recovery_loss(&mut pnl, &spec, &recovery)?;
                 }
                 match refresh_account_snapshot(&spec.market_id, &aster, &lighter).await {
                     Ok(snapshot) => {
@@ -2357,7 +2440,22 @@ async fn execute_opportunity(
                     "error": format!("one or both legs not accepted: Aster={a_res:?} Lighter={l_res:?}"),
                 }),
             );
+            let aster_unknown = matches!(&a_res, AsterOutcome::Unknown { .. });
+            let lighter_unknown = matches!(&l_res, LighterOutcome::Unknown { .. });
             if !aster_accepted && !lighter_accepted {
+                if aster_unknown || lighter_unknown {
+                    // An Unknown outcome (HTTP timeout, ws response_timeout /
+                    // disconnected_after_send) means the order may actually be LIVE and
+                    // FILLED at the venue. That is not a clean skip: classify as
+                    // Unreconciled so needs_recovery() runs the post-trade reconcile +
+                    // rescue path, which verifies real positions and flattens any
+                    // residual leg instead of cooling down on top of a naked position.
+                    return Err(ExecutionError::Unreconciled {
+                        details: format!(
+                            "no leg accepted but outcome(s) unknown (order may exist at venue): Aster={a_res:?} Lighter={l_res:?}"
+                        ),
+                    });
+                }
                 return Err(ExecutionError::Skipped {
                     details: format!(
                         "neither leg accepted: Aster={a_res:?} Lighter={l_res:?}"
@@ -2581,6 +2679,8 @@ async fn execute_opportunity(
             "net_usd": e.net_usd,
             "net_bps": e.net_bps,
             "fill_qty_mismatch": e.fill_qty_mismatch,
+            "residual_qty": e.residual_qty,
+            "residual_notional_usd": e.residual_notional_usd,
         })
     });
     let final_positions_json = reconciled_position.map(|p| {
@@ -2844,6 +2944,69 @@ fn immediate_fill_summary(fill: AsterImmediateFill, fee_bps: Decimal) -> FillSum
     }
 }
 
+/// Ledger row for a recovery/auto-flatten that took action: books the estimated realized
+/// loss into cumulative PnL so the loss breaker cannot develop blind spots (previously
+/// recovery losses only fed the coarse hourly recovered-loss limiter, never the ledger).
+fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedgerRow {
+    let loss = recovery.estimated_loss_usdc;
+    TradeLedgerRow {
+        timestamp: Utc::now(),
+        market: spec.market_id.0.clone(),
+        direction: "RECOVERY".to_string(),
+        qty: Decimal::ZERO,
+        expected_net_usd: Decimal::ZERO,
+        actual_gross_usd: -loss,
+        actual_fees_usd: Decimal::ZERO,
+        actual_net_usd: -loss,
+        actual_net_bps: Decimal::ZERO,
+        fill_qty_mismatch: Decimal::ZERO,
+        aster_fill: zero_fill_summary(),
+        lighter_fill: zero_fill_summary(),
+        aster_order_id: 0,
+        lighter_client_order_index: 0,
+        final_aster_position: recovery.position.aster_qty,
+        final_lighter_position: recovery.position.lighter_qty,
+        final_net_position: recovery.position.net_qty(),
+        available_before_usd: recovery.margin_after.aster_available_usd
+            + recovery.margin_after.lighter_available_usd
+            + loss,
+        available_after_usd: recovery.margin_after.aster_available_usd
+            + recovery.margin_after.lighter_available_usd,
+        aster_available_before_usd: recovery.margin_after.aster_available_usd,
+        aster_available_after_usd: recovery.margin_after.aster_available_usd,
+        lighter_available_before_usd: recovery.margin_after.lighter_available_usd,
+        lighter_available_after_usd: recovery.margin_after.lighter_available_usd,
+    }
+}
+
+/// Record a recovery-loss ledger row (if the PnL tracker is enabled) and enforce the
+/// cumulative-loss breaker, mirroring the normal trade path.
+fn record_recovery_loss(
+    pnl: &mut Option<PnlTracker>,
+    spec: &MarketSpec,
+    recovery: &RecoveryReport,
+) -> Result<()> {
+    if recovery.estimated_loss_usdc <= Decimal::ZERO {
+        return Ok(());
+    }
+    let Some(pnl) = pnl.as_mut() else {
+        return Ok(());
+    };
+    let update = pnl.record_trade(recovery_loss_row(spec, recovery))?;
+    warn!(
+        "recovery loss booked to pnl ledger: market={} loss=${} cumulative_pnl=${}",
+        spec.market_id, recovery.estimated_loss_usdc, update.cumulative_pnl_usdc
+    );
+    if let Some(breaker) = update.breaker {
+        bail!(
+            "circuit breaker triggered by recovery loss: cumulative PnL ${} <= -${}; manual reset required",
+            breaker.cumulative_pnl_usdc,
+            breaker.max_loss_usdc
+        );
+    }
+    Ok(())
+}
+
 fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> TradeLedgerRow {
     TradeLedgerRow {
         timestamp: Utc::now(),
@@ -2900,7 +3063,15 @@ fn actual_economics(
         Direction::SellAsterBuyLighter => (aster_fill, lighter_fill),
         Direction::SellLighterBuyAster => (lighter_fill, aster_fill),
     };
-    let gross_usd = sell_fill.notional - buy_fill.notional;
+    // PnL is realized only over the MATCHED quantity at the two VWAPs. With unequal legs
+    // (tolerated up to max_position_mismatch_usd) the naive `sell.notional − buy.notional`
+    // books the unhedged residual as pure profit/loss — masking the loss breaker with
+    // fiction and later mirrored by the residual close. The residual is reported as open
+    // exposure instead; recovery losses book via `estimated_loss_usdc`.
+    let matched_qty = sell_fill.qty.min(buy_fill.qty);
+    let gross_usd = matched_qty * (sell_fill.vwap - buy_fill.vwap);
+    let residual_qty = sell_fill.qty - buy_fill.qty;
+    let residual_notional_usd = residual_qty.abs() * opp.ref_px;
     let fees_usd = aster_fill.fee_usd + lighter_fill.fee_usd;
     let net_usd = gross_usd - fees_usd;
     let denom = (aster_fill.notional + lighter_fill.notional) / Decimal::from(2u32);
@@ -2917,6 +3088,8 @@ fn actual_economics(
         net_usd,
         net_bps,
         fill_qty_mismatch,
+        residual_qty,
+        residual_notional_usd,
     })
 }
 
@@ -3292,7 +3465,24 @@ async fn wait_post_trade_reconciled_for(
     let poll = Duration::from_millis(cfg.risk.min_reconcile_interval_ms.max(250));
     loop {
         tokio::time::sleep(poll).await;
-        let pos = reconcile_positions(&spec.market_id, aster, lighter).await?;
+        // A transient position-query failure must NOT abort as a generic error (which is
+        // excluded from recovery): retry within the deadline, and if the venue still can't
+        // be read, classify as Unreconciled so the rescue path runs — the trade may have
+        // filled and the positions are simply unverified.
+        let pos = match reconcile_positions(&spec.market_id, aster, lighter).await {
+            Ok(pos) => pos,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ExecutionError::Unreconciled {
+                        details: format!(
+                            "post-trade position query kept failing (positions unverified): {e:#}"
+                        ),
+                    });
+                }
+                warn!("post-trade position query failed; retrying: {e:#}");
+                continue;
+            }
+        };
         let net_notional = pos.net_qty().abs() * opp.ref_px;
         if net_notional <= cfg.risk.max_position_mismatch_usd {
             return Ok((pos, net_notional));
@@ -3869,6 +4059,32 @@ mod tests {
             expected_net_usd: dec!(0.011),
             required_margin_usd: dec!(0.0025),
         }
+    }
+
+    #[test]
+    fn actual_economics_books_only_matched_qty() {
+        // Unequal legs: sell 0.20 @ 63.80, buy 0.16 @ 63.72. The naive notional difference
+        // (12.76 − 10.1952 = +2.56) would book the unhedged 0.04 residual as phantom
+        // profit; real matched PnL is 0.16 × (63.80 − 63.72) = 0.0128.
+        let cfg = test_cfg();
+        let opp = retry_opp(Direction::SellAsterBuyLighter);
+        let aster_fill = FillSummary {
+            qty: dec!(0.20),
+            vwap: dec!(63.80),
+            notional: dec!(12.76),
+            fee_usd: dec!(0.005),
+        };
+        let lighter_fill = FillSummary {
+            qty: dec!(0.16),
+            vwap: dec!(63.72),
+            notional: dec!(10.1952),
+            fee_usd: dec!(0),
+        };
+        let e = actual_economics(&cfg, &opp, aster_fill, lighter_fill).expect("within tolerance");
+        assert_eq!(e.gross_usd, dec!(0.0128));
+        assert_eq!(e.net_usd, dec!(0.0078));
+        assert_eq!(e.residual_qty, dec!(0.04));
+        assert_eq!(e.residual_notional_usd, dec!(0.04) * opp.ref_px);
     }
 
     #[test]

@@ -5,7 +5,10 @@ aster_taker_fee_bps = "4.0"
 lighter_taker_fee_bps = "0.0"
 max_aster_slippage_bps = "30.0"
 max_lighter_slippage_bps = "30.0"
-emergency_slippage_bps = "25.0"
+# Emergency (naked-leg recovery) bound: must be WIDER than the normal bounds — recovery
+# fires exactly when the market has moved, and an IOC that can't cross a moved/thin book
+# leaves the naked leg open through repeated attempts. (2.5x normal; XEMM uses 90 vs 60.)
+emergency_slippage_bps = "75.0"
 hedge_retry_slippage_bps = "30.0"
 hedge_retry_timeout_ms = 5000
 max_hedge_retry_attempts = 1
@@ -45,7 +48,7 @@ min_extra_bps = "0.5"
 enabled = true
 persist_dir = "runs"
 since = "2026-06-23T23:00:00Z"
-max_loss_usdc = "5"
+max_loss_usdc = "10"
 
 [live]
 enabled = true

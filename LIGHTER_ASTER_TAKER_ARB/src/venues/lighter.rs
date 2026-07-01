@@ -30,6 +30,9 @@ use crate::types::{FillSummary, MarketId, Side, TxSendStatus};
 
 const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
 static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
+/// Millisecond in which the 7-bit client-order counter last wrapped (see the wrap guard in
+/// `random_client_order_index`).
+static LAST_COUNTER_WRAP_MS: AtomicI64 = AtomicI64::new(-1);
 
 #[derive(Debug, Clone)]
 pub enum SubmitOutcome {
@@ -1001,6 +1004,12 @@ impl LighterVenue {
             })
     }
 
+    /// Fill-matching health counters for the periodic status log (rising `unmatched` or
+    /// `timeouts` means the trades stream and our client-order registry are drifting).
+    pub fn fill_tracker_stats(&self) -> FillTrackerStats {
+        self.fills.stats()
+    }
+
     pub async fn available_usdc(&self) -> Result<Decimal> {
         self.rest_available_usdc().await
     }
@@ -1388,11 +1397,26 @@ fn fill_identity(trade: &TradePayload) -> u128 {
 }
 
 fn trade_fee_usd(trade: &TradePayload) -> Decimal {
-    value_dec(trade.taker_fee.as_ref())
+    let fee = value_dec(trade.taker_fee.as_ref())
         .or_else(|| value_dec(trade.maker_fee.as_ref()))
         .map(|v| v / Decimal::from(1_000_000u64))
         .unwrap_or(Decimal::ZERO)
-        .abs()
+        .abs();
+    // Sanity canary for the assumed 1e-6 raw scaling: a per-trade fee above 1% of the
+    // trade notional almost certainly means the venue changed the fee units, which would
+    // silently mis-value net PnL feeding the breaker.
+    let notional = trade
+        .usd_amount
+        .as_deref()
+        .and_then(|s| s.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO)
+        .abs();
+    if notional > Decimal::ZERO && fee > notional / Decimal::from(100u32) {
+        tracing::warn!(
+            "Lighter trade fee {fee} exceeds 1% of notional {notional}: fee scaling assumption (1e-6 raw) may be wrong"
+        );
+    }
+    fee
 }
 
 fn raw_amount(qty: Decimal, decimals: u32) -> Result<i64> {
@@ -1429,13 +1453,35 @@ fn raw_price(px: Decimal, decimals: u32, side: Side) -> Result<i32> {
     Ok(raw)
 }
 
+/// Layout: 40 bits wall-clock ms | 7-bit counter | side bit. Collision-free ONLY within a
+/// single process on one account (documented assumption: one live writer per account — the
+/// orchestrator's external-writer guard enforces it). Within a process, two ids collide
+/// only if the 7-bit counter wraps inside one millisecond; the wrap guard below spins to
+/// the next millisecond instead (128+ orders per ms never happens in practice — this is a
+/// correctness backstop, not a hot path).
 fn random_client_order_index(_market: &MarketId, side: Side) -> i64 {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    };
+    let mut millis = now_ms();
+    let raw_counter = CLIENT_ORDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let counter = raw_counter & 0x7f;
+    // Wrap guard: if this counter value was already used in the SAME millisecond (i.e. the
+    // raw counter advanced 128+ since that millisecond started), wait out the millisecond.
+    let last_wrap_ms = LAST_COUNTER_WRAP_MS.load(Ordering::Relaxed);
+    if counter == 0 {
+        if millis == last_wrap_ms {
+            while now_ms() == millis {
+                std::thread::yield_now();
+            }
+            millis = now_ms();
+        }
+        LAST_COUNTER_WRAP_MS.store(millis, Ordering::Relaxed);
+    }
     let side_bit = if matches!(side, Side::Sell) { 1 } else { 0 };
-    let counter = CLIENT_ORDER_COUNTER.fetch_add(1, Ordering::Relaxed) & 0x7f;
     let idx = ((millis & 0x00ff_ffff_ffff) << 8) | (counter << 1) | side_bit;
     idx.min(MAX_CLIENT_ORDER_INDEX)
 }

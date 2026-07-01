@@ -485,6 +485,14 @@ fn parse_optional_dec(raw: &str) -> Option<Decimal> {
     }
 }
 
+/// USD-pegged commission assets that need no conversion.
+fn is_usd_stable_asset(asset: &str) -> bool {
+    matches!(
+        asset.to_ascii_uppercase().as_str(),
+        "" | "USD" | "USDT" | "USDC" | "BUSD" | "USDF" | "FDUSD" | "DAI"
+    )
+}
+
 fn summarize_user_trades(rows: &[AsterUserTrade]) -> Option<FillSummary> {
     let mut qty = Decimal::ZERO;
     let mut notional = Decimal::ZERO;
@@ -502,11 +510,24 @@ fn summarize_user_trades(rows: &[AsterUserTrade]) -> Option<FillSummary> {
         }
         qty += q;
         notional += if quote > Decimal::ZERO { quote } else { q * px };
-        fee += row
+        let commission = row
             .commission
             .parse::<Decimal>()
             .unwrap_or(Decimal::ZERO)
             .abs();
+        // Commission is only USD when the commission asset is a USD stablecoin; a
+        // base-asset commission must be valued at the trade price or per-trade fees
+        // (hence net PnL feeding the breaker) are mis-valued.
+        if is_usd_stable_asset(&row.commission_asset) {
+            fee += commission;
+        } else {
+            tracing::warn!(
+                "Aster commission in non-USD asset {:?}; valuing at trade price {}",
+                row.commission_asset,
+                px
+            );
+            fee += commission * px;
+        }
     }
     FillSummary::from_qty_notional(qty, notional, fee)
 }

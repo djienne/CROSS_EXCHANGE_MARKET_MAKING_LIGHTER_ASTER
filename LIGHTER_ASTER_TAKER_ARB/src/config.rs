@@ -94,6 +94,23 @@ impl Config {
         if self.risk.min_reconcile_interval_ms == 0 {
             bail!("risk.min_reconcile_interval_ms must be > 0");
         }
+        if self.risk.mismatch_flatten_after_checks == 0 {
+            bail!("risk.mismatch_flatten_after_checks must be >= 1");
+        }
+        // Recovery fires when the market has moved against the naked leg; an emergency
+        // bound tighter than the normal entry bounds cannot cross a moved book and would
+        // leave the leg open through repeated recovery attempts.
+        let normal_max = self
+            .arb
+            .max_aster_slippage_bps
+            .max(self.arb.max_lighter_slippage_bps);
+        if self.arb.emergency_slippage_bps < normal_max {
+            bail!(
+                "arb.emergency_slippage_bps ({}) must be >= the normal slippage bounds ({}): recovery must be able to cross a moved book",
+                self.arb.emergency_slippage_bps,
+                normal_max
+            );
+        }
         let mut ids = HashSet::new();
         for m in &self.markets {
             if !ids.insert(m.id().0) {
@@ -477,6 +494,23 @@ pub struct RiskCfg {
     pub max_position_mismatch_usd: Decimal,
     pub margin_buffer_usd: Decimal,
     pub min_reconcile_interval_ms: u64,
+    /// When the main-loop position-mismatch guard sees an unhedged residual persist for
+    /// `mismatch_flatten_after_checks` consecutive checks, actively flatten it reduce-only
+    /// at the emergency slippage bound instead of pausing forever on a naked position.
+    #[serde(default = "default_auto_flatten_on_mismatch")]
+    pub auto_flatten_on_mismatch: bool,
+    /// Consecutive mismatch detections (at `min_reconcile_interval_ms` cadence) before the
+    /// auto-flatten fires. Filters transient reconcile lag.
+    #[serde(default = "default_mismatch_flatten_after_checks")]
+    pub mismatch_flatten_after_checks: u32,
+}
+
+fn default_auto_flatten_on_mismatch() -> bool {
+    true
+}
+
+fn default_mismatch_flatten_after_checks() -> u32 {
+    4
 }
 
 impl Default for RiskCfg {
@@ -486,6 +520,8 @@ impl Default for RiskCfg {
             max_position_mismatch_usd: Decimal::from(3),
             margin_buffer_usd: Decimal::from(25),
             min_reconcile_interval_ms: 500,
+            auto_flatten_on_mismatch: default_auto_flatten_on_mismatch(),
+            mismatch_flatten_after_checks: default_mismatch_flatten_after_checks(),
         }
     }
 }
@@ -533,6 +569,27 @@ mod tests {
                 lighter_min_notional: Some(dec!(10)),
             }],
         }
+    }
+
+    #[test]
+    fn emergency_slippage_must_cover_normal_bounds() {
+        let mut cfg = valid_config();
+        cfg.arb.max_aster_slippage_bps = dec!(30);
+        cfg.arb.max_lighter_slippage_bps = dec!(30);
+        cfg.arb.emergency_slippage_bps = dec!(25);
+        assert!(
+            cfg.validate().is_err(),
+            "emergency bound tighter than normal bounds cannot cross a moved book"
+        );
+        cfg.arb.emergency_slippage_bps = dec!(75);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mismatch_flatten_after_checks_must_be_positive() {
+        let mut cfg = valid_config();
+        cfg.risk.mismatch_flatten_after_checks = 0;
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
