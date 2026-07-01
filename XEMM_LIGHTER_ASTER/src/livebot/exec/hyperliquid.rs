@@ -838,7 +838,7 @@ impl HlExchange {
         // fills against the raw `sz` would make a fully-filled order look partial and burn
         // the whole fill timeout on the happy path.
         let requested_qty = match self.wire(market) {
-            Ok(w) => Decimal::new(plan.base_amount, w.size_decimals as u32),
+            Ok(w) => Decimal::new(plan.base_amount, w.size_decimals),
             Err(e) => {
                 return HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
                     cloid,
