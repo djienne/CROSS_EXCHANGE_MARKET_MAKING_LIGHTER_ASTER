@@ -558,10 +558,29 @@ impl BookFeedState {
     }
 
     fn reset(&self, market_id: u32) {
+        // Reset IN PLACE (never remove the entry): the published cell Arc is shared with
+        // scan-path readers resolved at startup, and must stay identical across resyncs.
+        if let Some(book) = self
+            .books
+            .lock()
+            .expect("Lighter book state poisoned")
+            .get_mut(&market_id)
+        {
+            book.reset_in_place();
+        }
+    }
+
+    /// The lock-free published-book cell for a market (created on first use). Readers
+    /// resolve this ONCE at startup and then load it without touching the books mutex —
+    /// the scan hot path must not share a lock with the feed writer.
+    fn cell(&self, market_id: u32) -> Arc<ArcSwapOption<OrderBook>> {
         self.books
             .lock()
             .expect("Lighter book state poisoned")
-            .remove(&market_id);
+            .entry(market_id)
+            .or_default()
+            .cached
+            .clone()
     }
 
     fn order_book(&self, market_id: u32) -> Option<OrderBook> {
@@ -594,7 +613,10 @@ struct LighterBook {
     updated_at: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
     last_offset: Option<u64>,
-    cached: ArcSwapOption<OrderBook>,
+    /// Published snapshot cell. Behind an Arc so scan-path readers can hold the cell
+    /// directly (resolved once at startup) and read it lock-free; it must survive
+    /// `reset_in_place` across gap resyncs.
+    cached: Arc<ArcSwapOption<OrderBook>>,
 }
 
 impl LighterBook {
@@ -652,6 +674,18 @@ impl LighterBook {
         self.cached.load_full()
     }
 
+    /// Clear all state after a sequence gap, keeping the SAME published cell Arc (readers
+    /// hold it directly); the next snapshot repopulates it.
+    fn reset_in_place(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
+        self.initialized = false;
+        self.updated_at = None;
+        self.last_nonce = None;
+        self.last_offset = None;
+        self.cached.store(None);
+    }
+
     #[cfg(test)]
     fn to_order_book(&self) -> Option<OrderBook> {
         self.cached.load_full().map(|arc| (*arc).clone())
@@ -669,6 +703,9 @@ pub struct LighterVenue {
     fills: Arc<FillTracker>,
     account_feed: Arc<AccountFeedState>,
     book_feed: Arc<BookFeedState>,
+    /// Per-market published-book cells resolved ONCE at construction so the scan hot path
+    /// reads books with a plain ArcSwap load — no mutex shared with the feed writer.
+    book_cells: std::collections::HashMap<u32, Arc<ArcSwapOption<OrderBook>>>,
     write_lock: AsyncMutex<()>,
 }
 
@@ -737,6 +774,10 @@ impl LighterVenue {
                 )
             })
             .collect();
+        let book_cells = specs
+            .iter()
+            .map(|s| (s.lighter_market_id, book_feed.cell(s.lighter_market_id)))
+            .collect();
         Ok(LighterVenue {
             rest,
             tx_ws,
@@ -748,6 +789,7 @@ impl LighterVenue {
             fills,
             account_feed,
             book_feed,
+            book_cells,
             write_lock: AsyncMutex::new(()),
         })
     }
@@ -785,6 +827,14 @@ impl LighterVenue {
 
     pub fn order_book(&self, market: &MarketId) -> Result<OrderBook> {
         let wire = self.wire(market)?;
+        // Lock-free scan-path read: the cell was resolved at construction, so this is a
+        // plain ArcSwap load — never contends with the feed writer's books mutex.
+        if let Some(cell) = self.book_cells.get(&(wire.market_index as u32)) {
+            return cell
+                .load_full()
+                .map(|arc| (*arc).clone())
+                .ok_or_else(|| anyhow!("Lighter order_book websocket not ready for {market}"));
+        }
         self.book_feed
             .order_book(wire.market_index as u32)
             .ok_or_else(|| anyhow!("Lighter order_book websocket not ready for {market}"))

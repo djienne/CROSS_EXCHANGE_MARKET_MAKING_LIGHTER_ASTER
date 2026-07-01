@@ -1,3 +1,21 @@
+//! Taker-arb engine: scan both books for cross-venue edge, then fire simultaneous IOCs.
+//!
+//! # Hot/cold separation rules (hold these when changing the scan loop)
+//!
+//! The scan iteration (fetch books → f64 edge scan → gate checks) is the hot path:
+//! * **Book reads are lock-free** — Aster via `ArcSwapOption` load, Lighter via the
+//!   per-market cells resolved at venue construction (never the feed writer's mutex).
+//! * **All math on the scan path is f64** (`MarketMathF64`); Decimal appears only at the
+//!   submission/logging boundary for a qualifying opportunity.
+//! * **No inline file I/O** — entry-gate samples, reduce-signal files, and execution logs
+//!   go through `spawn_blocking` (see `write_file_atomic_off_path`); account state arrives
+//!   via a `watch` channel from the background refresher.
+//! * **No inline REST on the iteration** — the lease nonce refresh runs as a spawned task
+//!   with execution gated until it lands; account snapshots refresh on their own task.
+//! Execution itself (sign + submit both legs concurrently, confirm, reconcile, rescue) is
+//! deliberately synchronous within the loop: nothing may scan for new entries while legs
+//! are unconfirmed.
+
 use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -444,13 +462,33 @@ impl ReduceSignalTracker {
                 gate_sample_count: best.gate_sample_count,
             },
         };
-        if let Err(e) = write_json_atomic(path, &body) {
-            warn!("failed to write reduce signal {}: {e:#}", path.display());
+        // Serialize in-memory (fast), then hand the actual filesystem work to a blocking
+        // task: this runs inside the scan loop, and an fsync/rename on a slow disk would
+        // otherwise stall the hot path for 0.5-10ms.
+        match serde_json::to_vec_pretty(&body) {
+            Ok(bytes) => write_file_atomic_off_path(path.clone(), bytes),
+            Err(e) => warn!("failed to serialize reduce signal {}: {e:#}", path.display()),
         }
     }
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+/// Atomically write `bytes` to `path` (tmp + rename) OFF the calling task when a tokio
+/// runtime is available. The scan loop must never block on filesystem latency; outside a
+/// runtime (tests/tools) the write happens inline.
+fn write_file_atomic_off_path(path: PathBuf, bytes: Vec<u8>) {
+    let write = move || {
+        if let Err(e) = write_bytes_atomic(&path, &bytes) {
+            warn!("failed to write {}: {e:#}", path.display());
+        }
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(write);
+    } else {
+        write();
+    }
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create parent dir {}", parent.display()))?;
@@ -460,7 +498,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("reduce_signal.json");
     let tmp = path.with_file_name(format!(".{file_name}.tmp"));
-    let bytes = serde_json::to_vec_pretty(value).context("serialize JSON")?;
     std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
@@ -1029,6 +1066,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut trades_executed = 0u64;
     let mut reduce_signal_tracker = ReduceSignalTracker::new(&options);
     let mut nonce_refreshed_for_lease: Option<String> = None;
+    // In-flight lease nonce refresh (E: keep the REST round-trip off the scan iteration).
+    let mut nonce_refresh_task: Option<(String, tokio::task::JoinHandle<Result<()>>)> = None;
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
     let mut recovered_failures = RecoveredFailureTracker::default();
@@ -1274,12 +1313,47 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 .and_then(|lease| lease.lease_id.clone())
                 .unwrap_or_else(|| "unidentified".to_string());
             if nonce_refreshed_for_lease.as_deref() != Some(lease_key.as_str()) {
-                lighter.refresh_nonce().await?;
-                nonce_refreshed_for_lease = Some(lease_key.clone());
-                info!(
-                    "refreshed Lighter nonce for reduce execution lease market={} lease_id={lease_key}",
-                    spec.market_id
-                );
+                // Run the refresh OFF the scan iteration (a REST round-trip would stall
+                // the loop). Execution under the new lease stays gated until the refresh
+                // completes — the `continue`s below skip this iteration — so there is no
+                // nonce-reuse risk, only a brief entry delay.
+                match nonce_refresh_task.take() {
+                    Some((pending_key, handle))
+                        if pending_key == lease_key && handle.is_finished() =>
+                    {
+                        match handle.await {
+                            Ok(Ok(())) => {
+                                nonce_refreshed_for_lease = Some(lease_key.clone());
+                                info!(
+                                    "refreshed Lighter nonce for reduce execution lease market={} lease_id={lease_key}",
+                                    spec.market_id
+                                );
+                            }
+                            Ok(Err(e)) => {
+                                return Err(e.context("lease nonce refresh failed"));
+                            }
+                            Err(e) => bail!("lease nonce refresh task panicked: {e}"),
+                        }
+                    }
+                    Some((pending_key, handle)) if pending_key == lease_key => {
+                        // Still in flight: keep waiting, do not execute under this lease.
+                        nonce_refresh_task = Some((pending_key, handle));
+                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                        continue;
+                    }
+                    stale => {
+                        if let Some((_, handle)) = stale {
+                            handle.abort(); // lease changed under a pending refresh
+                        }
+                        let lighter_for_refresh = lighter.clone();
+                        nonce_refresh_task = Some((
+                            lease_key.clone(),
+                            tokio::spawn(async move { lighter_for_refresh.refresh_nonce().await }),
+                        ));
+                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                        continue;
+                    }
+                }
             }
         }
         let Some(opp) = best_opportunity(

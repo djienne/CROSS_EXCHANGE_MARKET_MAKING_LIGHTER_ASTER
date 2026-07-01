@@ -27,6 +27,21 @@
 //! default-on) so the deterministic core builds with zero lock-free code under
 //! `--no-default-features`.
 //!
+//! ## Separation rules (hold these when changing ANY hot-path code)
+//!
+//! The two latency-critical paths are (1) market-data tick → quote decision →
+//! cancel/place dispatch and (2) maker fill → hedge dispatch. On those paths:
+//!
+//! * **No locks** shared with cold tasks — reads are ArcSwap loads / atomics only.
+//! * **No syscalls or I/O** — journal/telemetry is a bounded `try_send` enqueue; the
+//!   writer drains on a cold task.
+//! * **No unbounded sends** — every channel touched is bounded, `try_send`-only, with
+//!   an explicit fail-closed action (freeze) on dispatch failure of a safety command.
+//! * **No REST / signing** — signing and wire sends live in the exec workers; the
+//!   strategy loop only enqueues commands.
+//! * Nonce and tx-socket access stay strictly serialized in the hedge worker's send
+//!   phase; only fill-WAITING may run concurrently (see `exec::hyperliquid`).
+//!
 //! ## Pieces
 //!
 //! - [`book_cell`] — `VenueBook`: the lock-free latest-book cell + liveness stamp.

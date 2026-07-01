@@ -271,7 +271,7 @@ impl OpportunityGate {
         };
         self.samples.push_back(sample.clone());
         self.last_sample_at = Some(input.timestamp);
-        append_sample(&self.path, &sample);
+        append_sample_off_path(&self.path, sample);
         true
     }
 
@@ -324,6 +324,19 @@ fn append_sample(path: &Path, sample: &OpportunitySample) {
             "failed to append opportunity history {}: {e:#}",
             path.display()
         );
+    }
+}
+
+/// Append a sample OFF the calling task when a tokio runtime is available: this is called
+/// from the scan loop, and the open/append/flush syscalls would otherwise stall the hot
+/// path on filesystem latency. Outside a runtime (tests/tools) it writes inline. Samples
+/// carry timestamps, so occasional out-of-order appends are harmless to the history reader.
+fn append_sample_off_path(path: &Path, sample: OpportunitySample) {
+    let path = path.to_path_buf();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn_blocking(move || append_sample(&path, &sample));
+    } else {
+        append_sample(&path, &sample);
     }
 }
 
