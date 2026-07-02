@@ -302,6 +302,51 @@ struct ExecutionLease {
     expires_at: DateTime<Utc>,
 }
 
+/// The lease file is re-read at most this often. The scan loop polls every ~10ms but
+/// the orchestrator rewrites the lease at seconds cadence; validity (market/mode/
+/// expiry) is still re-checked against `now` on EVERY scan, so expiry stays exact and
+/// a revocation-by-rewrite is honored within one interval — negligible next to the
+/// post-trade cooldown, and fail-closed (a missing/invalid new lease disables
+/// execution at the next read).
+const LEASE_REREAD_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Caches the parsed execution-lease file between throttled reads so lease mode does
+/// not pay a blocking `read_to_string` + JSON parse on every scan iteration.
+struct LeaseFileCache {
+    last_read_at: Option<tokio::time::Instant>,
+    lease: Option<ExecutionLease>,
+}
+
+impl LeaseFileCache {
+    fn new() -> Self {
+        Self {
+            last_read_at: None,
+            lease: None,
+        }
+    }
+
+    fn read_if_due(&mut self, path: &Path) {
+        let due = match self.last_read_at {
+            Some(at) => at.elapsed() >= LEASE_REREAD_INTERVAL,
+            None => true,
+        };
+        if !due {
+            return;
+        }
+        self.last_read_at = Some(tokio::time::Instant::now());
+        self.lease = match std::fs::read_to_string(path) {
+            Ok(text) => match serde_json::from_str::<ExecutionLease>(&text) {
+                Ok(lease) => Some(lease),
+                Err(e) => {
+                    warn!("invalid execution lease {}: {e:#}", path.display());
+                    None
+                }
+            },
+            Err(_) => None,
+        };
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ReduceSignalSample {
     timestamp: DateTime<Utc>,
@@ -505,6 +550,7 @@ fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn valid_execution_lease(
+    cache: &mut LeaseFileCache,
     options: &RunOptions,
     spec: &MarketSpec,
     now: DateTime<Utc>,
@@ -515,17 +561,8 @@ fn valid_execution_lease(
     let Some(path) = &options.control_file else {
         return None;
     };
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(_) => return None,
-    };
-    let lease: ExecutionLease = match serde_json::from_str(&text) {
-        Ok(lease) => lease,
-        Err(e) => {
-            warn!("invalid execution lease {}: {e:#}", path.display());
-            return None;
-        }
-    };
+    cache.read_if_due(path);
+    let lease = cache.lease.as_ref()?;
     if lease.market != spec.market_id.0 || lease.mode != "reduce_only" || lease.expires_at <= now {
         return None;
     }
@@ -535,10 +572,11 @@ fn valid_execution_lease(
             spec.market_id
         );
     }
-    Some(lease)
+    Some(lease.clone())
 }
 
 fn execution_lease_enabled(
+    cache: &mut LeaseFileCache,
     options: &RunOptions,
     spec: &MarketSpec,
     now: DateTime<Utc>,
@@ -549,7 +587,7 @@ fn execution_lease_enabled(
     if options.control_file.is_none() {
         return (true, None);
     }
-    let lease = valid_execution_lease(options, spec, now);
+    let lease = valid_execution_lease(cache, options, spec, now);
     (lease.is_some(), lease)
 }
 
@@ -610,6 +648,14 @@ fn f64_to_dec(v: f64) -> Decimal {
         .unwrap_or(Decimal::ZERO)
         .round_dp(12)
 }
+
+/// Skip the Decimal opportunity build only when the f64 edge is CLEARLY below the
+/// exact threshold. 1e-9 bps dwarfs every error term between the f64 edge and its
+/// round_dp(12) Decimal (<= 5e-13 bps) plus the Decimal->f64 threshold conversion
+/// (<= ~2e-12 bps for realistic thresholds), while being economically zero; anything
+/// closer than this band still takes the exact Decimal comparison, so borderline
+/// accept/reject behavior is unchanged.
+const EDGE_PREFILTER_EPS_BPS: f64 = 1e-9;
 
 fn qty_f64_to_dec(math: &MarketMathF64, v: f64) -> Decimal {
     Decimal::from_f64_retain(round_qty_to_scale_f64(v, math))
@@ -1070,12 +1116,17 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut nonce_refresh_task: Option<(String, tokio::task::JoinHandle<Result<()>>)> = None;
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
+    // Gated/standby decisions can repeat every 10ms scan while an edge stays visible;
+    // log only on decision change or every 5s (recorded samples stay unthrottled).
+    let mut last_gate_log: Option<(&'static str, tokio::time::Instant)> = None;
+    let mut last_standby_log_at: Option<tokio::time::Instant> = None;
     let mut recovered_failures = RecoveredFailureTracker::default();
     // Consecutive main-loop position-mismatch detections (see the guard below): after
     // `risk.mismatch_flatten_after_checks` in a row the residual is actively flattened
     // instead of pausing forever on a naked position.
     let mut mismatch_consecutive: u32 = 0;
     let mut last_fill_stats_log = tokio::time::Instant::now();
+    let mut lease_cache = LeaseFileCache::new();
 
     info!(
         "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} control_file={:?} signal_file={:?} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
@@ -1300,7 +1351,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         if tracing::enabled!(Level::DEBUG) {
             log_scan_state(&cfg, &spec, &aster_book, &lighter_book, pos, margins);
         }
-        let (execution_enabled, valid_lease) = execution_lease_enabled(&options, &spec, now);
+        let (execution_enabled, valid_lease) =
+            execution_lease_enabled(&mut lease_cache, &options, &spec, now);
         if options.control_file.is_some() && valid_lease.is_none() {
             nonce_refreshed_for_lease = None;
         }
@@ -1464,18 +1516,30 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             cfg.arb.required_gross_edge_bps(),
         );
         if gate.recorded || !gate.allow_execution {
-            info!(
-                "entry gate decision market={} mode={} decision={} allow_execution={} would_allow={} gross={}bps threshold={:?} samples={} recorded={}",
-                spec.market_id,
-                cfg.arb.entry_gate.mode.as_str(),
-                gate.decision,
-                gate.allow_execution,
-                gate.would_allow,
-                opp.gross_edge_bps,
-                gate.threshold_bps,
-                gate.sample_count,
-                gate.recorded
-            );
+            // A visible-but-gated edge re-evaluates every poll; only log transitions
+            // and a 5s heartbeat. Recorded samples (<=1/s by design) always log.
+            let log_now = gate.recorded
+                || match last_gate_log {
+                    Some((decision, at)) => {
+                        decision != gate.decision || at.elapsed() >= Duration::from_secs(5)
+                    }
+                    None => true,
+                };
+            if log_now {
+                info!(
+                    "entry gate decision market={} mode={} decision={} allow_execution={} would_allow={} gross={}bps threshold={:?} samples={} recorded={}",
+                    spec.market_id,
+                    cfg.arb.entry_gate.mode.as_str(),
+                    gate.decision,
+                    gate.allow_execution,
+                    gate.would_allow,
+                    opp.gross_edge_bps,
+                    gate.threshold_bps,
+                    gate.sample_count,
+                    gate.recorded
+                );
+                last_gate_log = Some((gate.decision, tokio::time::Instant::now()));
+            }
         }
         if !gate.allow_execution {
             tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
@@ -1492,20 +1556,28 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             reduce_signal_tracker.observe(&spec, &opp, &gate, now);
         }
         if !execution_enabled {
-            info!(
-                "standby skip order submission market={} direction={} qty={} gross={}bps expected_net=${} gate_decision={} threshold={:?} samples={} recorded={} observe_only={} lease_required={}",
-                spec.market_id,
-                opp.direction.as_str(),
-                opp.qty,
-                opp.gross_edge_bps,
-                opp.expected_net_usd,
-                gate.decision,
-                gate.threshold_bps,
-                gate.sample_count,
-                gate.recorded,
-                options.observe_only,
-                options.control_file.is_some()
-            );
+            // Standby/observe hits this every poll while an edge exists; 5s heartbeat.
+            let log_now = match last_standby_log_at {
+                Some(at) => at.elapsed() >= Duration::from_secs(5),
+                None => true,
+            };
+            if log_now {
+                info!(
+                    "standby skip order submission market={} direction={} qty={} gross={}bps expected_net=${} gate_decision={} threshold={:?} samples={} recorded={} observe_only={} lease_required={}",
+                    spec.market_id,
+                    opp.direction.as_str(),
+                    opp.qty,
+                    opp.gross_edge_bps,
+                    opp.expected_net_usd,
+                    gate.decision,
+                    gate.threshold_bps,
+                    gate.sample_count,
+                    gate.recorded,
+                    options.observe_only,
+                    options.control_file.is_some()
+                );
+                last_standby_log_at = Some(tokio::time::Instant::now());
+            }
             tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
             continue;
         }
@@ -1789,17 +1861,28 @@ fn best_opportunity(
     exposure_filter: ExposureFilter,
 ) -> Option<Opportunity> {
     let required = cfg.arb.required_gross_edge_bps();
+    // f64 mirror of `required` for the cheap pre-filter; a non-representable Decimal
+    // falls back to NEG_INFINITY, which disables early skipping (never fails open).
+    let required_f = decimal_to_f64(required).unwrap_or(f64::NEG_INFINITY);
 
     let mut best: Option<Opportunity> = None;
     for direction in [
         Direction::SellAsterBuyLighter,
         Direction::SellLighterBuyAster,
     ] {
-        let Some(opp) =
-            depth_priced_opportunity(cfg, spec, math, direction, aster, lighter, pos, margins, min_size)
+        let Some((sizing, sell_px, buy_px, ref_px)) =
+            depth_priced_sizing(cfg, spec, math, direction, aster, lighter, pos, margins, min_size)
         else {
             continue;
         };
+        // Same expression as build_opportunity_f64 -> identical f64 by IEEE determinism.
+        let gross_edge_bps_f = (sell_px - buy_px) / ref_px * 10_000.0;
+        if gross_edge_bps_f < required_f - EDGE_PREFILTER_EPS_BPS {
+            // Clearly below the edge floor: skip the ~30-conversion Decimal build.
+            // Candidates within the epsilon band fall through to the exact filter.
+            continue;
+        }
+        let opp = build_opportunity_f64(cfg, math, direction, sizing, sell_px, buy_px, ref_px);
         if opp.gross_edge_bps < required {
             continue;
         }
@@ -1978,6 +2061,27 @@ fn depth_priced_opportunity(
     margins: MarginF64,
     min_size: bool,
 ) -> Option<Opportunity> {
+    let (sizing, sell_px, buy_px, ref_px_f) = depth_priced_sizing(
+        cfg, spec, math, direction, aster, lighter, pos, margins, min_size,
+    )?;
+    Some(build_opportunity_f64(
+        cfg, math, direction, sizing, sell_px, buy_px, ref_px_f,
+    ))
+}
+
+/// The all-f64 sizing/pricing stage of [`depth_priced_opportunity`], split out so the
+/// scan loop can apply the edge pre-filter before paying for the Decimal build.
+fn depth_priced_sizing(
+    cfg: &Config,
+    spec: &MarketSpec,
+    math: &MarketMathF64,
+    direction: Direction,
+    aster: &OrderBook,
+    lighter: &OrderBook,
+    pos: PositionF64,
+    margins: MarginF64,
+    min_size: bool,
+) -> Option<(SizingDecisionF64, f64, f64, f64)> {
     let ref_px_f = aster.mid_f64().or_else(|| lighter.mid_f64())?;
     if ref_px_f <= 0.0 {
         return None;
@@ -2074,9 +2178,7 @@ fn depth_priced_opportunity(
         depth_supported_qty,
         min_size,
     )?;
-    Some(build_opportunity_f64(
-        cfg, math, direction, sizing, sell_px, buy_px, ref_px_f,
-    ))
+    Some((sizing, sell_px, buy_px, ref_px_f))
 }
 
 fn depth_price_sized_qty_f64(
@@ -4353,6 +4455,130 @@ mod tests {
         assert_eq!(opp.buy_depth_levels_used, 2);
         assert!(opp.gross_edge_bps < dec!(100));
         assert!(opp.gross_edge_bps >= cfg.arb.required_gross_edge_bps());
+    }
+
+    #[test]
+    fn edge_prefilter_never_skips_what_exact_filter_accepts() {
+        // The f64 pre-filter may only skip candidates the exact Decimal filter also
+        // rejects; anything within the epsilon band must fall through to the exact
+        // comparison. Sweep a dense neighborhood of several thresholds.
+        for required in [dec!(6), dec!(0.5), dec!(4.5), dec!(10.000000000001)] {
+            let required_f = decimal_to_f64(required).unwrap();
+            for k in -10_000i64..=10_000 {
+                let edge_f = required_f + k as f64 * 1e-13;
+                if edge_f < required_f - EDGE_PREFILTER_EPS_BPS {
+                    assert!(
+                        f64_to_dec(edge_f) < required,
+                        "pre-filter skipped a candidate the exact filter accepts: edge_f={edge_f} required={required}"
+                    );
+                }
+            }
+            // The threshold itself and its immediate neighborhood sit inside the band:
+            // they must NOT be pre-skipped (the exact filter decides them, as today).
+            for k in [-5_000i64, -1, 0, 1, 5_000] {
+                let edge_f = required_f + k as f64 * 1e-13;
+                assert!(edge_f >= required_f - EDGE_PREFILTER_EPS_BPS);
+            }
+            // NaN never triggers the skip; it falls through and f64_to_dec(NaN) == 0
+            // is rejected by the exact filter — identical to the pre-change behavior.
+            assert!(!(f64::NAN < required_f - EDGE_PREFILTER_EPS_BPS));
+        }
+    }
+
+    #[test]
+    fn lease_cache_throttles_reads_and_enforces_expiry() {
+        let dir = std::env::temp_dir().join(format!(
+            "lighter_aster_taker_arb_lease_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lease.json");
+        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let expires = now + chrono::Duration::seconds(60);
+        let write_lease = |id: &str| {
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"market":"HYPE","mode":"reduce_only","lease_id":"{id}","expires_at":"{}"}}"#,
+                    expires.to_rfc3339()
+                ),
+            )
+            .unwrap()
+        };
+        write_lease("a");
+        let options = RunOptions {
+            control_file: Some(path.clone()),
+            ..RunOptions::default()
+        };
+        let spec = test_spec();
+        let mut cache = LeaseFileCache::new();
+
+        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(enabled);
+        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("a"));
+
+        // A rewrite within the reread interval is not seen yet (the read is throttled)...
+        write_lease("b");
+        let (_, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("a"));
+
+        // ...but expiry is enforced against the CACHED lease on every call, no re-read.
+        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, expires);
+        assert!(!enabled);
+        assert!(lease.is_none());
+
+        // Once the interval passes (backdate the last read) the rewrite is picked up.
+        cache.last_read_at = Some(tokio::time::Instant::now() - LEASE_REREAD_INTERVAL);
+        let (_, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("b"));
+
+        // A deleted file fails closed at the next re-read.
+        std::fs::remove_file(&path).unwrap();
+        cache.last_read_at = Some(tokio::time::Instant::now() - LEASE_REREAD_INTERVAL);
+        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(!enabled);
+        assert!(lease.is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn best_opportunity_boundary_matches_exact_filter() {
+        // End-to-end: books one tick apart straddling the 6 bps threshold (test_cfg:
+        // 4 + 0 + 2). ref = aster mid = s + 0.1; edge_bps = (s - 100)/(s + 0.1) * 1e4:
+        // s = 100.061 -> ~6.09 bps (accept), s = 100.060 -> ~5.99 bps (reject).
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let pos = PositionSnapshot {
+            aster_qty: Decimal::ZERO,
+            lighter_qty: Decimal::ZERO,
+        };
+        let lighter = depth_book([(dec!(98), dec!(10))], [(dec!(100), dec!(10))]);
+        let run = |s: Decimal| {
+            let aster = depth_book([(s, dec!(10))], [(s + dec!(0.2), dec!(10))]);
+            best_opportunity(
+                &cfg,
+                &spec,
+                &math,
+                &aster,
+                &lighter,
+                pos_f64(pos),
+                margins_f64(margins()),
+                false,
+                ExposureFilter::Any,
+            )
+        };
+        let above = run(dec!(100.061)).expect("edge above threshold must survive");
+        assert_eq!(above.direction, Direction::SellAsterBuyLighter);
+        assert!(above.gross_edge_bps >= cfg.arb.required_gross_edge_bps());
+        assert!(run(dec!(100.060)).is_none(), "edge below threshold must be filtered");
     }
 
     #[test]

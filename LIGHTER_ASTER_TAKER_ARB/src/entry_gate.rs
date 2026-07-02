@@ -111,6 +111,22 @@ pub struct OpportunityGate {
     path: PathBuf,
     samples: VecDeque<OpportunitySample>,
     last_sample_at: Option<DateTime<Utc>>,
+    /// Bumped whenever `samples` changes (push in `record_if_due`, pops in `prune`);
+    /// part of the threshold cache key so a served threshold can never be stale.
+    samples_gen: u64,
+    /// Memo for `dynamic_threshold`: the window percentile sorts the whole sample
+    /// window, so it is recomputed only when the window (or the required edge) changes
+    /// instead of on every 10 ms scan iteration while an opportunity is visible.
+    cached_threshold: Option<ThresholdCache>,
+    /// Lifetime percentile recomputes — cheap observability + test hook.
+    threshold_recomputes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThresholdCache {
+    samples_gen: u64,
+    required_gross_edge_bps: Decimal,
+    threshold: Decimal,
 }
 
 impl OpportunityGate {
@@ -135,6 +151,9 @@ impl OpportunityGate {
             path,
             samples,
             last_sample_at: None,
+            samples_gen: 0,
+            cached_threshold: None,
+            threshold_recomputes: 0,
         })
     }
 
@@ -205,23 +224,42 @@ impl OpportunityGate {
         }
     }
 
-    fn dynamic_threshold(&self, required_gross_edge_bps: Decimal) -> Decimal {
+    fn dynamic_threshold(&mut self, required_gross_edge_bps: Decimal) -> Decimal {
+        if let Some(c) = self.cached_threshold {
+            if c.samples_gen == self.samples_gen
+                && c.required_gross_edge_bps == required_gross_edge_bps
+            {
+                return c.threshold;
+            }
+        }
         let percentile = percentile(
             self.samples.iter().map(|s| s.gross_edge_bps),
             self.cfg.entry_percentile,
         )
         .unwrap_or(required_gross_edge_bps);
-        (required_gross_edge_bps + self.cfg.min_extra_bps).max(percentile)
+        let threshold = (required_gross_edge_bps + self.cfg.min_extra_bps).max(percentile);
+        self.threshold_recomputes = self.threshold_recomputes.wrapping_add(1);
+        self.cached_threshold = Some(ThresholdCache {
+            samples_gen: self.samples_gen,
+            required_gross_edge_bps,
+            threshold,
+        });
+        threshold
     }
 
     fn prune(&mut self, now: DateTime<Utc>) {
         let cutoff = cutoff(now, self.cfg.history_window_hours);
+        let mut popped = false;
         while self
             .samples
             .front()
             .is_some_and(|sample| sample.timestamp < cutoff)
         {
             self.samples.pop_front();
+            popped = true;
+        }
+        if popped {
+            self.samples_gen = self.samples_gen.wrapping_add(1);
         }
     }
 
@@ -270,9 +308,15 @@ impl OpportunityGate {
             history_sample_count: sample_count,
         };
         self.samples.push_back(sample.clone());
+        self.samples_gen = self.samples_gen.wrapping_add(1);
         self.last_sample_at = Some(input.timestamp);
         append_sample_off_path(&self.path, sample);
         true
+    }
+
+    #[cfg(test)]
+    fn threshold_recomputes(&self) -> u64 {
+        self.threshold_recomputes
     }
 
     fn sample_due(&self, now: DateTime<Utc>) -> bool {
@@ -503,6 +547,136 @@ mod tests {
     fn percentile_uses_nearest_rank() {
         let values = vec![dec!(6), dec!(8), dec!(10), dec!(12)];
         assert_eq!(percentile(values, dec!(90)).unwrap(), dec!(12));
+    }
+
+    #[test]
+    fn threshold_cached_between_sample_mutations() {
+        let dir = tmp_dir("cache_serve");
+        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let market = MarketId::from("HYPE");
+        let path = dir.join("opportunities_HYPE.jsonl");
+        append_test_row(&path, &row(now - Duration::minutes(10), "HYPE", dec!(8)));
+        append_test_row(&path, &row(now - Duration::minutes(9), "HYPE", dec!(10)));
+        append_test_row(&path, &row(now - Duration::minutes(8), "HYPE", dec!(12)));
+        let mut gate = OpportunityGate::new(
+            &cfg(EntryGateMode::Enforce),
+            &market,
+            dir.to_str().unwrap(),
+            now,
+        )
+        .unwrap();
+        // Call 1 records (the first sample is always due) — the window mutates after
+        // its threshold was computed, so call 2 recomputes once for the new gen; call
+        // 3 (throttled, no prune) must be a pure cache hit.
+        let d1 = gate.evaluate(sampled_input(now, dec!(6)), dec!(6));
+        let r1 = gate.threshold_recomputes();
+        let d2 = gate.evaluate(sampled_input(now + Duration::milliseconds(250), dec!(6)), dec!(6));
+        let r2 = gate.threshold_recomputes();
+        let d3 = gate.evaluate(sampled_input(now + Duration::milliseconds(500), dec!(6)), dec!(6));
+        let r3 = gate.threshold_recomputes();
+        assert_eq!(d1.threshold_bps, Some(dec!(12)));
+        assert_eq!(d2.threshold_bps, Some(dec!(12)));
+        assert_eq!(d3.threshold_bps, Some(dec!(12)));
+        assert_eq!(r1, 1);
+        assert_eq!(r2, r1 + 1);
+        assert_eq!(r3, r2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_cache_invalidates_on_new_sample() {
+        let dir = tmp_dir("cache_new_sample");
+        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let market = MarketId::from("HYPE");
+        let path = dir.join("opportunities_HYPE.jsonl");
+        append_test_row(&path, &row(now - Duration::minutes(10), "HYPE", dec!(8)));
+        append_test_row(&path, &row(now - Duration::minutes(9), "HYPE", dec!(9)));
+        append_test_row(&path, &row(now - Duration::minutes(8), "HYPE", dec!(10)));
+        let mut gate = OpportunityGate::new(
+            &cfg(EntryGateMode::Enforce),
+            &market,
+            dir.to_str().unwrap(),
+            now,
+        )
+        .unwrap();
+        // Call 1 computes over the seeded window {8,9,10} (p90 = 10) and then records
+        // the 50-edge sample; call 2 (due again after 2s) must see the enlarged window.
+        let d1 = gate.evaluate(sampled_input(now, dec!(50)), dec!(6));
+        assert_eq!(d1.threshold_bps, Some(dec!(10)));
+        let r1 = gate.threshold_recomputes();
+        let d2 = gate.evaluate(sampled_input(now + Duration::seconds(2), dec!(50)), dec!(6));
+        assert_eq!(d2.threshold_bps, Some(dec!(50)));
+        assert_eq!(gate.threshold_recomputes(), r1 + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_cache_invalidates_on_prune() {
+        let dir = tmp_dir("cache_prune");
+        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let market = MarketId::from("HYPE");
+        let path = dir.join("opportunities_HYPE.jsonl");
+        // Huge sample interval so recording can't mutate the window after call 1 —
+        // isolating prune as the only invalidator between calls 2 and 3.
+        let mut c = cfg(EntryGateMode::Enforce);
+        c.sample_interval_ms = 1_000_000_000;
+        append_test_row(
+            &path,
+            &row(now - Duration::hours(72) + Duration::minutes(1), "HYPE", dec!(100)),
+        );
+        append_test_row(&path, &row(now - Duration::minutes(10), "HYPE", dec!(8)));
+        append_test_row(&path, &row(now - Duration::minutes(9), "HYPE", dec!(9)));
+        append_test_row(&path, &row(now - Duration::minutes(8), "HYPE", dec!(10)));
+        let mut gate = OpportunityGate::new(&c, &market, dir.to_str().unwrap(), now).unwrap();
+        let d1 = gate.evaluate(sampled_input(now, dec!(6)), dec!(6));
+        assert_eq!(d1.threshold_bps, Some(dec!(100)));
+        let d2 = gate.evaluate(sampled_input(now + Duration::seconds(1), dec!(6)), dec!(6));
+        assert_eq!(d2.threshold_bps, Some(dec!(100)));
+        let r2 = gate.threshold_recomputes();
+        // Two minutes later the 100-edge row crosses the 72h cutoff: prune pops it,
+        // the gen bumps, and the threshold must drop to the surviving window's p90.
+        let d3 = gate.evaluate(sampled_input(now + Duration::minutes(2), dec!(6)), dec!(6));
+        assert_eq!(d3.threshold_bps, Some(dec!(10)));
+        assert_eq!(gate.threshold_recomputes(), r2 + 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn threshold_cache_keys_on_required_edge() {
+        let dir = tmp_dir("cache_required_key");
+        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let market = MarketId::from("HYPE");
+        let path = dir.join("opportunities_HYPE.jsonl");
+        let mut c = cfg(EntryGateMode::Enforce);
+        c.sample_interval_ms = 1_000_000_000;
+        append_test_row(&path, &row(now - Duration::minutes(10), "HYPE", dec!(8)));
+        append_test_row(&path, &row(now - Duration::minutes(9), "HYPE", dec!(9)));
+        append_test_row(&path, &row(now - Duration::minutes(8), "HYPE", dec!(10)));
+        let mut gate = OpportunityGate::new(&c, &market, dir.to_str().unwrap(), now).unwrap();
+        // required=6: max(6.5, p90{8,9,10}=10) = 10.
+        let d1 = gate.evaluate(sampled_input(now, dec!(6)), dec!(6));
+        assert_eq!(d1.threshold_bps, Some(dec!(10)));
+        // Same window shape, different required: must recompute, not serve stale.
+        // (p90 over {6,8,9,10} after call 1's record is still 10.)
+        let d2 = gate.evaluate(sampled_input(now + Duration::seconds(1), dec!(6)), dec!(11));
+        assert_eq!(d2.threshold_bps, Some(dec!(11.5)));
+        let r2 = gate.threshold_recomputes();
+        let d3 = gate.evaluate(sampled_input(now + Duration::seconds(2), dec!(6)), dec!(11));
+        assert_eq!(d3.threshold_bps, Some(dec!(11.5)));
+        assert_eq!(gate.threshold_recomputes(), r2);
+        // Switching back must not serve the (gen, 11) entry either.
+        let d4 = gate.evaluate(sampled_input(now + Duration::seconds(3), dec!(6)), dec!(6));
+        assert_eq!(d4.threshold_bps, Some(dec!(10)));
+        assert_eq!(gate.threshold_recomputes(), r2 + 1);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
