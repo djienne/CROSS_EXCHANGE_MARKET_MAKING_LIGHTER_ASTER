@@ -687,7 +687,14 @@ class Orchestrator:
     def event(self, kind: str, **details: Any) -> None:
         row = {"timestamp": iso(), "kind": kind, **details}
         append_jsonl(self.events_path, row)
-        print(f"{row['timestamp']} {kind} {json.dumps(details, default=json_default, separators=(',', ':'))}", flush=True)
+        try:
+            print(f"{row['timestamp']} {kind} {json.dumps(details, default=json_default, separators=(',', ':'))}", flush=True)
+        except OSError:
+            # A dead console pipe (e.g. the tee died) must never abort the caller —
+            # especially the shutdown path, where an uncaught BrokenPipeError here
+            # would exit before stop_observer/stop_active and orphan live bots
+            # (observed 2026-07-02). The jsonl event above is the durable record.
+            pass
 
     def run(self) -> None:
         self.lock.acquire()

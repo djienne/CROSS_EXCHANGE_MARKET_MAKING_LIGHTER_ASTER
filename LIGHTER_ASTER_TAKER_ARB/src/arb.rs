@@ -1163,6 +1163,14 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         );
     }
 
+    // Register the SIGINT listener ONCE, before the loop. A fresh signal::ctrl_c()
+    // per iteration only listens while the select! below is polling — a SIGINT landing
+    // during any of the loop's plain poll-interval sleeps was silently swallowed
+    // (observed live 2026-07-02: the reduce-only observer survived SIGINT for minutes
+    // and needed SIGTERM). The pinned future buffers a signal from the moment it is
+    // first polled and resolves at the next select.
+    let ctrl_c = signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
         if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
@@ -1171,7 +1179,10 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             }
         }
         tokio::select! {
-            _ = signal::ctrl_c() => {
+            // biased: cooldown_until is usually already elapsed, and an unbiased
+            // select could keep picking the ready timer over a pending SIGINT.
+            biased;
+            _ = &mut ctrl_c => {
                 info!("ctrl-c; stopping");
                 break;
             }
