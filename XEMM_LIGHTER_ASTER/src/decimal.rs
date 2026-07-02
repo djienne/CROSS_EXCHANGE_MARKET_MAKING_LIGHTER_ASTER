@@ -41,6 +41,16 @@ pub fn parse_dec(s: &str) -> Result<Decimal> {
     Decimal::from_str(s.trim()).with_context(|| format!("invalid decimal: {s:?}"))
 }
 
+/// Decimal for an f64 book level, matching the legacy `format!("{v:.12}")` + trim +
+/// `parse_dec` path bit-for-bit: round the exact binary value at 12 dp (ties-to-even,
+/// same rule as float formatting) and strip trailing zeros so `serde-str` tape
+/// serialization stays byte-identical to what the string path produced.
+/// `None` for NaN/infinity (the legacy path failed `parse_dec` and dropped the level).
+#[inline]
+pub fn dec_from_f64_book(v: f64) -> Option<Decimal> {
+    Decimal::from_f64_retain(v).map(|d| d.round_dp(12).normalize())
+}
+
 /// Quantize a price to a valid Hyperliquid perp price: at most 5 significant
 /// figures AND at most `6 - sz_decimals` decimal places (integers are always
 /// valid). Not on the hedge path (hedging takes VWAP from the book), but used
@@ -134,5 +144,52 @@ mod tests {
     fn parse_ok_and_err() {
         assert_eq!(parse_dec(" 12345.6 ").unwrap(), dec!(12345.6));
         assert!(parse_dec("not-a-number").is_err());
+    }
+
+    /// The legacy string path this helper replaces (connectors/lighter.rs pre-2026-07):
+    /// format at 12 dp, trim trailing zeros/dot, parse as Decimal.
+    fn legacy_format_float(v: f64) -> String {
+        let s = format!("{v:.12}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
+    #[test]
+    fn dec_from_f64_book_matches_legacy_format_float() {
+        let corpus = [
+            100.0,
+            0.001,
+            0.06,
+            0.1,
+            64820.2,
+            0.30000000000000004,
+            2f64.powi(-13),      // exact decimal midpoint at dp 13: banker's rounding
+            1e-13,               // rounds to zero -> "0"
+            123456.789012345,
+            42.4242,
+            0.00051,
+            0.19283,
+            1.0,
+            99999.9999,
+        ];
+        for v in corpus {
+            let legacy = legacy_format_float(v);
+            let got = dec_from_f64_book(v).unwrap().to_string();
+            assert_eq!(got, legacy, "mismatch for {v}");
+        }
+        // Deterministic pseudo-random sweep across price/qty magnitudes.
+        let mut x: u64 = 0x9e3779b97f4a7c15;
+        for _ in 0..5000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mant = (x >> 11) as f64 / (1u64 << 53) as f64; // [0,1)
+            let exp = (x % 9) as i32 - 4; // 1e-4 .. 1e4
+            let v = mant * 10f64.powi(exp);
+            let legacy = legacy_format_float(v);
+            let got = dec_from_f64_book(v).unwrap().to_string();
+            assert_eq!(got, legacy, "mismatch for {v}");
+        }
+        // NaN/inf: the legacy path failed parse_dec and dropped the level.
+        assert!(dec_from_f64_book(f64::NAN).is_none());
+        assert!(dec_from_f64_book(f64::INFINITY).is_none());
+        assert!(dec_from_f64_book(f64::NEG_INFINITY).is_none());
     }
 }

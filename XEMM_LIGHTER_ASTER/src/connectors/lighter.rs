@@ -7,11 +7,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::warn;
 
+use serde::Deserialize;
+
 use super::{EventSink, Tap};
-use crate::decimal::parse_dec;
+use crate::decimal::dec_from_f64_book;
 use crate::events::{EventKind, PriceLevel};
 use crate::lighter::local_book::LocalBook;
-use crate::lighter::messages::{BookUpdateContiguity, OrderBookMsg};
+use crate::lighter::messages::{BookUpdateContiguity, OrderBookMsgRef, PriceLevelRef};
 use crate::lighter::ws::{subscribe_loop, SubscribeOptions};
 use crate::types::MarketId;
 
@@ -100,7 +102,9 @@ fn handle_value(
     tap: &Tap,
     state: &mut StreamState,
 ) -> bool {
-    let msg: OrderBookMsg = match serde_json::from_value(data.clone()) {
+    // Borrowed deserialize straight from the routed `Value`: no deep clone, no
+    // re-parse, no per-level String allocations on the hedge-source ingest thread.
+    let msg = match OrderBookMsgRef::deserialize(data) {
         Ok(m) => m,
         Err(_) => return true,
     };
@@ -129,28 +133,35 @@ fn handle_value(
         return true;
     }
     let exch_ts = Utc::now();
-    let bids = side_to_decimals(&state.book.bids, false);
-    let asks = side_to_decimals(&state.book.asks, true);
-    if bids.is_empty() || asks.is_empty() {
+    // Same publishability gate as the old string path: both sides non-empty.
+    if state.book.bids.is_empty() || state.book.asks.is_empty() {
         return true;
     }
+    // Numeric top-20 straight off the local book: dec_from_f64_book reproduces the
+    // legacy format!("{v:.12}")+trim string path bit-for-bit (pinned by tests), so
+    // the tape stays byte-identical while skipping ~80 String allocations per frame.
+    let bid_levels: Vec<PriceLevel> = state
+        .book
+        .bids
+        .top_descending(PUBLISH_LEVELS)
+        .filter_map(|(p, q)| Some((dec_from_f64_book(p)?, dec_from_f64_book(q)?)))
+        .collect();
+    let ask_levels: Vec<PriceLevel> = state
+        .book
+        .asks
+        .top_ascending(PUBLISH_LEVELS)
+        .filter_map(|(p, q)| Some((dec_from_f64_book(p)?, dec_from_f64_book(q)?)))
+        .collect();
     #[cfg(feature = "hotpath")]
-    let prebuilt_hot = tap.hot_book_from_raw(
-        bids.iter().map(|(p, q)| (p.as_str(), q.as_str())),
-        asks.iter().map(|(p, q)| (p.as_str(), q.as_str())),
-        exch_ts,
-    );
+    let prebuilt_hot = tap.hot_book_from_levels(&bid_levels, &ask_levels, exch_ts);
+    #[cfg(feature = "hotpath")]
+    if let Some((hot, _)) = prebuilt_hot.as_ref() {
+        // Integer projection first (mirrors the Aster connector): fast-cancel
+        // prechecks see the move before the raw Decimal book is installed.
+        tap.publish_hot_only(*hot, exch_ts);
+    }
     #[cfg(not(feature = "hotpath"))]
     let prebuilt_hot = None;
-
-    let bid_levels: Vec<PriceLevel> = bids
-        .iter()
-        .filter_map(|(p, q)| Some((parse_dec(p).ok()?, parse_dec(q).ok()?)))
-        .collect();
-    let ask_levels: Vec<PriceLevel> = asks
-        .iter()
-        .filter_map(|(p, q)| Some((parse_dec(p).ok()?, parse_dec(q).ok()?)))
-        .collect();
     tap.publish_prebuilt(&bid_levels, &ask_levels, exch_ts, prebuilt_hot);
     tx.send(
         market.clone(),
@@ -164,7 +175,7 @@ fn handle_value(
     true
 }
 
-fn parse_lighter_levels(levels: &[crate::lighter::messages::PriceLevel]) -> Vec<(f64, f64)> {
+fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Vec<(f64, f64)> {
     levels
         .iter()
         .filter_map(|l| {
@@ -174,34 +185,49 @@ fn parse_lighter_levels(levels: &[crate::lighter::messages::PriceLevel]) -> Vec<
         .collect()
 }
 
-fn side_to_decimals(
-    side: &crate::lighter::local_book::BookSide,
-    ask: bool,
-) -> Vec<(String, String)> {
-    let mut rows = side.levels();
-    if !ask {
-        rows.reverse();
-    }
-    rows.into_iter()
-        .take(PUBLISH_LEVELS)
-        .map(|(p, q)| (format_float(p), format_float(q)))
-        .collect()
-}
-
-fn format_float(v: f64) -> String {
-    let s = format!("{v:.12}");
-    s.trim_end_matches('0').trim_end_matches('.').to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::sync::mpsc;
 
     #[test]
-    fn formats_float_without_noise() {
-        assert_eq!(format_float(100.0), "100");
-        assert_eq!(format_float(0.001), "0.001");
+    fn published_levels_match_legacy_string_formatting() {
+        // The numeric Decimal path must serialize exactly like the old
+        // format!("{v:.12}")+trim string path, byte for byte on the tape.
+        let legacy = |v: f64| {
+            let s = format!("{v:.12}");
+            s.trim_end_matches('0').trim_end_matches('.').to_string()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 1,
+            "order_book": {
+                "bids": [
+                    {"price": "64820.2", "size": "0.00051"},
+                    {"price": "0.30000000000000004", "size": "1"}
+                ],
+                "asks": [{"price": "64820.3", "size": "0.19283"}],
+                "offset": 1
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        let (_, kind) = rx.try_recv().expect("book published");
+        let EventKind::HlL2Book { bids, asks, .. } = kind else {
+            panic!("expected HlL2Book event");
+        };
+        // Bids best-first (highest price), asks best-first (lowest price).
+        assert_eq!(bids.len(), 2);
+        assert_eq!(bids[0].0.to_string(), legacy(64820.2)); // "64820.199999999997"
+        assert_eq!(bids[0].1.to_string(), legacy(0.00051));
+        assert_eq!(bids[1].0.to_string(), legacy(0.30000000000000004)); // "0.3"
+        assert_eq!(bids[1].1.to_string(), "1");
+        assert_eq!(asks[0].0.to_string(), legacy(64820.3));
+        assert_eq!(asks[0].1.to_string(), legacy(0.19283));
     }
 
     #[test]

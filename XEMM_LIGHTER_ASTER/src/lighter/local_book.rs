@@ -118,12 +118,23 @@ impl BookSide {
         }
     }
 
-    pub fn levels(&self) -> Vec<(f64, f64)> {
+    /// Up to `n` best ask levels, lowest price first — no full-side copy.
+    pub fn top_ascending(&self, n: usize) -> impl Iterator<Item = (f64, f64)> + '_ {
         self.prices
             .iter()
             .copied()
             .zip(self.sizes.iter().copied())
-            .collect()
+            .take(n)
+    }
+
+    /// Up to `n` best bid levels, highest price first — no full-side copy.
+    pub fn top_descending(&self, n: usize) -> impl Iterator<Item = (f64, f64)> + '_ {
+        self.prices
+            .iter()
+            .copied()
+            .zip(self.sizes.iter().copied())
+            .rev()
+            .take(n)
     }
 }
 
@@ -211,6 +222,27 @@ mod tests {
         b.apply_delta(&[(100.5, 3.0)], &[(102.0, 0.0)]); // add bid, remove ask
         assert_eq!(b.best_bid(), Some(100.5));
         assert_eq!(b.best_ask(), None);
+    }
+
+    #[test]
+    fn top_iterators_order_and_truncate() {
+        let mut b = LocalBook::new();
+        let bids: Vec<(f64, f64)> = (0..25).map(|i| (100.0 + i as f64, i as f64 + 1.0)).collect();
+        let asks: Vec<(f64, f64)> = (0..25).map(|i| (200.0 + i as f64, i as f64 + 1.0)).collect();
+        b.apply_snapshot(bids, asks);
+        let top_bids: Vec<(f64, f64)> = b.bids.top_descending(20).collect();
+        let top_asks: Vec<(f64, f64)> = b.asks.top_ascending(20).collect();
+        assert_eq!(top_bids.len(), 20);
+        assert_eq!(top_asks.len(), 20);
+        assert_eq!(top_bids[0], (124.0, 25.0)); // best bid = highest price
+        assert_eq!(top_bids[19], (105.0, 6.0));
+        assert_eq!(top_asks[0], (200.0, 1.0)); // best ask = lowest price
+        assert_eq!(top_asks[19], (219.0, 20.0));
+        // Short sides yield everything they have.
+        let mut small = LocalBook::new();
+        small.apply_snapshot(vec![(1.0, 1.0)], vec![(2.0, 1.0)]);
+        assert_eq!(small.bids.top_descending(20).count(), 1);
+        assert_eq!(small.asks.top_ascending(20).count(), 1);
     }
 
     #[test]

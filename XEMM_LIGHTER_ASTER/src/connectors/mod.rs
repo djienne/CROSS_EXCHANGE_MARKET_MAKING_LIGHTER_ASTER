@@ -177,6 +177,34 @@ impl Tap {
         Some((hot, recv_ns))
     }
 
+    /// Build the integer hot book from already-parsed Decimal levels (best-first) — the
+    /// numeric sibling of [`Tap::hot_book_from_raw`] for connectors that no longer
+    /// format levels as strings. Same stamps and metric.
+    #[cfg(feature = "hotpath")]
+    #[inline]
+    pub(crate) fn hot_book_from_levels(
+        &self,
+        bids: &[PriceLevel],
+        asks: &[PriceLevel],
+        exch_ts: DateTime<Utc>,
+    ) -> Option<(crate::hot_types::HotBook, i64)> {
+        let scale = self.scale.as_ref()?;
+        let t0 = crate::hotpath::clock::mono_now_ns();
+        let recv_ns = crate::hotpath::clock::mono_now_ns();
+        let hot = crate::livebot::scale::build_hot_book_from_dec_levels_with_qty_scale(
+            bids,
+            asks,
+            scale,
+            self.qty_scale,
+            0,
+            recv_ns,
+            exch_ts.timestamp_millis(),
+        );
+        let done_ns = crate::hotpath::clock::mono_now_ns();
+        crate::metrics::BOOK_BUILD.record((done_ns - t0).max(0) as u64);
+        Some((hot, recv_ns))
+    }
+
     /// Publish only a prebuilt integer L2 snapshot before the raw Decimal book is built.
     /// The hot cell marks this as cancel-only until the subsequent full publish clears it.
     #[cfg(feature = "hotpath")]

@@ -145,6 +145,28 @@ impl MarketScale {
     pub fn hl_lots_to_qty(&self, lots: i64) -> Decimal {
         Decimal::from(lots) * self.hl_qty_step
     }
+
+    /// Exact ticks for an already-rounded Decimal price (nearest tick) — the numeric
+    /// twin of [`price_str_to_ticks`]: it feeds the Decimal's own (mantissa, scale)
+    /// into the SAME i128 rational core, so ticks are bit-identical to the string
+    /// path. Deliberately NOT [`price_to_ticks`], whose Decimal division can round
+    /// differently in >28-digit quotients.
+    #[inline]
+    pub fn price_dec_to_ticks(&self, px: Decimal) -> Option<i64> {
+        dec_units(px, self.tick, UnitRound::Nearest)
+    }
+
+    /// Numeric twin of [`qty_str_to_lots`] (floor). See [`price_dec_to_ticks`].
+    #[inline]
+    pub fn qty_dec_to_lots(&self, qty: Decimal) -> Option<i64> {
+        dec_units(qty, self.step, UnitRound::Floor)
+    }
+
+    /// Numeric twin of [`hl_qty_str_to_lots`] (floor). See [`price_dec_to_ticks`].
+    #[inline]
+    pub fn hl_qty_dec_to_lots(&self, qty: Decimal) -> Option<i64> {
+        dec_units(qty, self.hl_qty_step, UnitRound::Floor)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -155,10 +177,25 @@ enum UnitRound {
 
 #[inline]
 fn decimal_str_to_units(s: &str, unit: Decimal, round: UnitRound) -> Option<i64> {
-    if unit <= Decimal::ZERO {
+    let (mant, scale) = parse_positive_decimal(s)?;
+    units_from_parts(mant, scale, unit, round)
+}
+
+/// A positive Decimal's (mantissa, scale) through the same exact i128 rational core
+/// as the string path — the two entry points must stay bit-identical.
+#[inline]
+fn dec_units(v: Decimal, unit: Decimal, round: UnitRound) -> Option<i64> {
+    if v.is_sign_negative() || v.is_zero() {
         return None;
     }
-    let (mant, scale) = parse_positive_decimal(s)?;
+    units_from_parts(v.mantissa(), v.scale(), unit, round)
+}
+
+#[inline]
+fn units_from_parts(mant: i128, scale: u32, unit: Decimal, round: UnitRound) -> Option<i64> {
+    if unit <= Decimal::ZERO || mant <= 0 {
+        return None;
+    }
     let unit_mant = unit.mantissa().abs();
     if unit_mant <= 0 {
         return None;
@@ -288,6 +325,26 @@ where
     HotBook::new(bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms)
 }
 
+/// Build a [`HotBook`] from already-rounded Decimal levels (best-first), mirroring
+/// [`build_hot_book_from_strs_with_qty_scale`] without the string round-trip: same
+/// duplicate-price aggregation, non-positive filtering, and [`HOT_LEVELS`] truncation
+/// via `upsert_hot_sorted`, and bit-identical ticks/lots via the shared i128 unit core.
+pub fn build_hot_book_from_dec_levels_with_qty_scale(
+    bids_in: &[(Decimal, Decimal)],
+    asks_in: &[(Decimal, Decimal)],
+    scale: &MarketScale,
+    qty_scale: HotQtyScale,
+    generation: u64,
+    recv_ns: i64,
+    exch_ms: i64,
+) -> HotBook {
+    let mut bids = [HotLevel::default(); HOT_LEVELS];
+    let mut asks = [HotLevel::default(); HOT_LEVELS];
+    let bid_len = fill_dec(&mut bids, bids_in, scale, qty_scale, true);
+    let ask_len = fill_dec(&mut asks, asks_in, scale, qty_scale, false);
+    HotBook::new(bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms)
+}
+
 /// Fill a fixed level array from `Decimal` levels (already canonically sorted by
 /// `OrderBook::from_levels`). Returns the count written.
 fn fill(out: &mut [HotLevel; HOT_LEVELS], levels: &[crate::book::Level], scale: &MarketScale, qty_scale: HotQtyScale) -> u8 {
@@ -326,6 +383,29 @@ where
         let qty_lots = match qty_scale {
             HotQtyScale::Aster => scale.qty_str_to_lots(qty_s),
             HotQtyScale::Hyperliquid => scale.hl_qty_str_to_lots(qty_s),
+        };
+        let Some(qty_lots) = qty_lots else { continue };
+        if px_ticks <= 0 || qty_lots <= 0 {
+            continue;
+        }
+        upsert_hot_sorted(out, &mut n, HotLevel { px_ticks, qty_lots }, descending);
+    }
+    n as u8
+}
+
+fn fill_dec(
+    out: &mut [HotLevel; HOT_LEVELS],
+    levels: &[(Decimal, Decimal)],
+    scale: &MarketScale,
+    qty_scale: HotQtyScale,
+    descending: bool,
+) -> u8 {
+    let mut n = 0usize;
+    for &(px, qty) in levels {
+        let Some(px_ticks) = scale.price_dec_to_ticks(px) else { continue };
+        let qty_lots = match qty_scale {
+            HotQtyScale::Aster => scale.qty_dec_to_lots(qty),
+            HotQtyScale::Hyperliquid => scale.hl_qty_dec_to_lots(qty),
         };
         let Some(qty_lots) = qty_lots else { continue };
         if px_ticks <= 0 || qty_lots <= 0 {
@@ -385,6 +465,87 @@ mod tests {
             hl_qty_step: dec!(0.001),
             hl_min_notional: dec!(10),
         }
+    }
+
+    /// The legacy connector formatting the Decimal path replaces.
+    fn legacy_format_float(v: f64) -> String {
+        let s = format!("{v:.12}");
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+
+    #[test]
+    fn dec_units_match_str_units() {
+        let s = MarketScale::from_spec(&spec());
+        let corpus: [f64; 12] = [
+            100.0, 0.001, 0.06, 0.1, 64820.2, 0.3, 0.0059, 42.4242, 0.05, 0.15, 99999.9999,
+            0.30000000000000004,
+        ];
+        for v in corpus {
+            let as_str = legacy_format_float(v);
+            let as_dec = crate::decimal::dec_from_f64_book(v).unwrap();
+            assert_eq!(
+                s.price_dec_to_ticks(as_dec),
+                s.price_str_to_ticks(&as_str),
+                "price ticks diverged for {v}"
+            );
+            assert_eq!(
+                s.qty_dec_to_lots(as_dec),
+                s.qty_str_to_lots(&as_str),
+                "qty lots diverged for {v}"
+            );
+            assert_eq!(
+                s.hl_qty_dec_to_lots(as_dec),
+                s.hl_qty_str_to_lots(&as_str),
+                "hl qty lots diverged for {v}"
+            );
+        }
+        // Non-positive inputs: both entry points refuse.
+        assert_eq!(s.price_dec_to_ticks(dec!(0)), None);
+        assert_eq!(s.price_dec_to_ticks(dec!(-1)), None);
+        assert_eq!(s.price_str_to_ticks("-1"), None);
+    }
+
+    #[test]
+    fn dec_levels_hot_book_matches_strs_hot_book() {
+        let s = MarketScale::from_spec(&spec());
+        // Includes a duplicate-after-rounding price pair (100.04 / 100.041 -> same tick)
+        // to pin the aggregation semantics, and a sub-lot qty that must be dropped.
+        let raw: [(f64, f64); 5] = [
+            (100.04, 0.005),
+            (100.041, 0.003),
+            (99.9, 1.5),
+            (99.8, 0.0004), // floors to 0 lots -> dropped by both paths
+            (98.15, 0.25),
+        ];
+        let strs: Vec<(String, String)> = raw
+            .iter()
+            .map(|&(p, q)| (legacy_format_float(p), legacy_format_float(q)))
+            .collect();
+        let decs: Vec<(Decimal, Decimal)> = raw
+            .iter()
+            .map(|&(p, q)| {
+                (
+                    crate::decimal::dec_from_f64_book(p).unwrap(),
+                    crate::decimal::dec_from_f64_book(q).unwrap(),
+                )
+            })
+            .collect();
+        let from_strs = build_hot_book_from_strs_with_qty_scale(
+            strs.iter().map(|(p, q)| (p.as_str(), q.as_str())),
+            strs.iter().map(|(p, q)| (p.as_str(), q.as_str())),
+            &s,
+            HotQtyScale::Hyperliquid,
+            7,
+            123,
+            456,
+        );
+        let from_decs = build_hot_book_from_dec_levels_with_qty_scale(
+            &decs, &decs, &s, HotQtyScale::Hyperliquid, 7, 123, 456,
+        );
+        assert_eq!(from_strs.bids(), from_decs.bids());
+        assert_eq!(from_strs.asks(), from_decs.asks());
+        // The duplicate-tick pair aggregated and the sub-lot level dropped: 3 levels.
+        assert_eq!(from_strs.bids().len(), 3);
     }
 
     #[test]
