@@ -826,10 +826,16 @@ async fn setup_live_planes(
         info!("leverage gate: {} = 1x (Aster verified, Lighter verified)", s.market_id.0);
     }
 
-    // Spawn the venue workers (writes).
+    // Spawn the venue workers (writes) as SEPARATE tasks: a join! in one task would
+    // serialize them, letting an Aster ECDSA sign (or response parse) head-of-line
+    // block a hedge dequeue exactly when a fill just landed. The returned handle is a
+    // supervisor that only awaits the two real tasks at shutdown.
     let etx = events_tx.clone();
+    let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, etx, worker_aster));
+    let hl_worker_task = tokio::spawn(run_hl_worker(hedge_rx, events_tx, worker_hl));
     let worker_task = tokio::spawn(async move {
-        tokio::join!(run_aster_worker(exec_rx, etx, worker_aster), run_hl_worker(hedge_rx, events_tx, worker_hl));
+        let _ = aster_worker_task.await;
+        let _ = hl_worker_task.await;
     });
 
     // Refuse to trade live in hedge mode (the bot assumes one-way).

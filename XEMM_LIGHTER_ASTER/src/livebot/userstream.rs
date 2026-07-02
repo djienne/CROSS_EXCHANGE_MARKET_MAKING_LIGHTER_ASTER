@@ -151,6 +151,9 @@ pub async fn run_aster_user_stream(
     liveness: Arc<StreamLiveness>,
     shutdown: CancellationToken,
 ) {
+    // Arc so the periodic keepalive can run on its own task instead of blocking the
+    // fill-read select (a keepalive REST round trip must never delay a fill->hedge).
+    let aster = Arc::new(aster);
     info!("aster user stream starting");
     let mut listen_key: Option<String> = None;
     let mut listen_backoff = Backoff::new(RECONNECT_DELAY, LISTEN_KEY_BACKOFF_MAX);
@@ -220,7 +223,7 @@ async fn connect_and_read(
     url: &str,
     sym_to_market: &HashMap<String, MarketId>,
     fill_tx: &Sender<AsterFill>,
-    aster: &AsterRest,
+    aster: &Arc<AsterRest>,
     liveness: &StreamLiveness,
     shutdown: &CancellationToken,
 ) -> Result<bool> {
@@ -246,9 +249,17 @@ async fn connect_and_read(
                 }
             }
             _ = keepalive.tick() => {
-                if let Err(e) = aster.keepalive_listen_key().await {
-                    warn!("aster listenKey keepalive failed: {e:#}");
-                }
+                // Fire-and-forget on its own task: the PUT's round trip (50ms..5s
+                // client timeout) must not stall the ORDER_TRADE_UPDATE reads below —
+                // a fill landing during an inline keepalive would delay its hedge.
+                // Failure handling is unchanged (warn only; the authoritative signal
+                // is the venue's listenKeyExpired frame).
+                let aster = aster.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = aster.keepalive_listen_key().await {
+                        warn!("aster listenKey keepalive failed: {e:#}");
+                    }
+                });
             }
             msg = read.next() => {
                 match msg {

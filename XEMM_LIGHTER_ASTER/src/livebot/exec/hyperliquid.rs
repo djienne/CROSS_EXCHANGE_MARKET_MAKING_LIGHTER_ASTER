@@ -848,6 +848,7 @@ impl HlExchange {
         };
         let (fill_token, fill_rx) = self.fills.register(client_order_index);
         let nonce = self.nonce.next();
+        let sign_start_ns = crate::hotpath::clock::mono_now_ns();
         let signed = match self.sign_order_plan(&plan, nonce) {
             Ok(tx) => tx,
             Err(e) => {
@@ -859,7 +860,9 @@ impl HlExchange {
                 });
             }
         };
-        match self.send_signed(signed).await {
+        let sign_ns = crate::hotpath::clock::mono_now_ns() - sign_start_ns;
+        let send_start_ns = crate::hotpath::clock::mono_now_ns();
+        let outcome = match self.send_signed(signed).await {
             r if r.status == TxSendStatus::Ok => HedgeSendOutcome::AwaitFills {
                 client_order_index,
                 token: fill_token,
@@ -897,7 +900,17 @@ impl HlExchange {
                     reason: format!("Lighter tx outcome unknown: {}", r.message),
                 })
             }
-        }
+        };
+        // Cold (post-wire): per-hedge sign + wire-accept cost. The FFI sign was the one
+        // unmeasured term in the fill->hedge latency budget; hedges are sparse enough
+        // that one line per dispatch is free.
+        info!(
+            "hedge timing: coi={} sign_us={} send_us={}",
+            client_order_index,
+            sign_ns / 1_000,
+            (crate::hotpath::clock::mono_now_ns() - send_start_ns) / 1_000
+        );
+        outcome
     }
 
     pub(crate) async fn place_raw(
