@@ -18,8 +18,47 @@ use crate::markets::MarketSpec;
 use crate::types::{MarketId, Side};
 
 use super::account::{AccountSnapshot, AccountState, OpenOrderSnapshot, ScaledPosition, Venue};
-use super::exec::aster::{AsterPositionRow, AsterRest};
+use super::exec::aster::{AsterBalanceRow, AsterPositionRow, AsterRest};
 use super::exec::hyperliquid::HlExchange;
+
+/// USD-pegged collateral assets counted at face value in the wallet sum.
+fn is_usd_stable_asset(asset: &str) -> bool {
+    matches!(
+        asset.to_ascii_uppercase().as_str(),
+        "USD" | "USDT" | "USDC" | "BUSD" | "USDF" | "FDUSD" | "DAI"
+    )
+}
+
+/// Net USD wallet balance across the Aster futures account's USD-pegged rows — SIGNED.
+///
+/// Cross-margin settles funding and PnL per asset: an account collateralized in USDC can
+/// carry a NEGATIVE USDT row (real debt — observed live 2026-07-04: USDT at -5.67 while
+/// USDC held +124.40). Skipping non-positive rows overstated the wallet by that debt and
+/// blinded the equity metric to funding flowing through the negative row. Non-USD assets
+/// (e.g. asBNB) are skipped with a warn: counting units as dollars is wrong in both
+/// directions.
+fn fold_aster_balance_rows(rows: &[AsterBalanceRow]) -> Decimal {
+    let mut usd = Decimal::ZERO;
+    for (idx, r) in rows.iter().enumerate() {
+        let Some(b) =
+            parse_untraded_row_decimal(&r.balance, &format!("aster.balance[{idx}].balance"))
+        else {
+            continue;
+        };
+        if b == Decimal::ZERO {
+            continue;
+        }
+        if is_usd_stable_asset(&r.asset) {
+            usd += b;
+        } else {
+            warn!(
+                "reconcile: skipping non-USD Aster collateral row {} balance {} (not valued)",
+                r.asset, b
+            );
+        }
+    }
+    usd
+}
 
 fn parse_decimal_field(raw: &str, field: &str) -> Result<Decimal> {
     raw.parse::<Decimal>()
@@ -194,24 +233,11 @@ impl Reconciler {
         );
         let (bal, pos, oo, ch, hloo) = (bal?, pos?, oo?, ch?, hloo?);
 
-        // Aster available USD = the sum of actually-deposited collateral (`balance`/wallet
-        // balance), NOT `availableBalance`. The per-asset `availableBalance` is an inflated
-        // cross-margin projection (e.g. a token row reporting thousands while its real balance
-        // is 0); summing real `balance` across stablecoins gives the true ~$124 USDC collateral.
-        // "Any stablecoin counts" (the account is multi-collateral cross-margin).
-        let mut aster_available_usd = Decimal::ZERO;
-        for (idx, r) in bal.iter().enumerate() {
-            // Asset-level rows have no market mapping; a junk row only understates
-            // available/equity, which trips the breaker EARLY (fail-safe), so skip-with-warn.
-            let Some(b) =
-                parse_untraded_row_decimal(&r.balance, &format!("aster.balance[{idx}].balance"))
-            else {
-                continue;
-            };
-            if b > Decimal::ZERO {
-                aster_available_usd += b;
-            }
-        }
+        // Aster available USD = the NET wallet balance across USD-pegged rows (`balance`),
+        // NOT `availableBalance` (an inflated cross-margin projection). SIGNED sum: a
+        // negative stablecoin row is real debt (see `fold_aster_balance_rows`). Junk rows
+        // are skip-with-warn (understating equity trips the breaker EARLY — fail-safe).
+        let aster_available_usd = fold_aster_balance_rows(&bal);
         let hl_withdrawable_usd = parse_decimal_field(&ch.withdrawable, "lighter.withdrawable")?;
 
         // TOTAL (mark-to-market) equity per venue for the circuit breaker — NOT the free-margin
@@ -528,6 +554,39 @@ mod tests {
         assert_eq!(upnl, "0.05".parse().unwrap());
         let (qty, _) = net[&MarketId("HYPE".to_string())];
         assert_eq!(qty, "2".parse().unwrap());
+    }
+
+    fn bal_row(asset: &str, balance: &str) -> AsterBalanceRow {
+        AsterBalanceRow {
+            asset: asset.to_string(),
+            balance: balance.to_string(),
+            cross_wallet_balance: String::new(),
+            available_balance: String::new(),
+        }
+    }
+
+    #[test]
+    fn balance_fold_nets_negative_stable_rows() {
+        // The observed live composition: USDC collateral, NEGATIVE USDT (funding/settlement
+        // debt), dust USDF. The old `> 0` filter overstated the wallet by the debt.
+        let rows = vec![
+            bal_row("USDC", "124.40000063"),
+            bal_row("USDT", "-5.66890386"),
+            bal_row("USDF", "0.02350381"),
+        ];
+        assert_eq!(fold_aster_balance_rows(&rows), "118.75460058".parse().unwrap());
+    }
+
+    #[test]
+    fn balance_fold_skips_non_usd_assets_and_junk() {
+        let rows = vec![
+            bal_row("USDT", "100"),
+            bal_row("ASBNB", "5.5"),      // units, not dollars — must not be counted
+            bal_row("BNB", "-0.1"),       // nor negative non-USD rows
+            bal_row("USDC", "not-a-number"), // junk row skip-with-warn
+            bal_row("USDF", "0"),         // zero rows are ignored silently
+        ];
+        assert_eq!(fold_aster_balance_rows(&rows), "100".parse().unwrap());
     }
 
     fn hl_pos(market: &str, qty: &str, entry: &str) -> ScaledPosition {

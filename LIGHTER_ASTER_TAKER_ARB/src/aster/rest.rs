@@ -361,11 +361,12 @@ impl AsterRest {
             .await?;
         let rows: Vec<AsterBalanceRow> =
             serde_json::from_str(&body).map_err(|e| anyhow!("parse Aster balance: {e}: {body}"))?;
+        // ALL USD-pegged rows, not just USDT/USDC: cross-margin settles funding/PnL per
+        // asset, so an account collateralized in USDC can carry a NEGATIVE USDT row
+        // (real debt — observed live 2026-07-04).
         let stable_rows: Vec<AsterBalanceRow> = rows
             .into_iter()
-            .filter(|r| {
-                r.asset.eq_ignore_ascii_case("USDT") || r.asset.eq_ignore_ascii_case("USDC")
-            })
+            .filter(|r| !r.asset.is_empty() && is_usd_stable_asset(&r.asset))
             .collect();
         if stable_rows.is_empty() {
             return Ok(AsterBalanceSnapshot {
@@ -380,30 +381,34 @@ impl AsterRest {
             .filter_map(|r| parse_optional_dec(&r.available_balance))
             .max()
             .unwrap_or(Decimal::ZERO);
+        // SIGNED sum: a negative stablecoin row is debt and must reduce the wallet total
+        // (the old `> 0` filter overstated it by the debt).
         let wallet_balance_usd: Decimal = stable_rows
             .iter()
             .filter_map(|r| parse_optional_dec(&r.balance))
-            .filter(|v| *v > Decimal::ZERO)
             .sum();
-        let cross_wallet_balance_usd = stable_rows
+        // SIGNED sums across ALL stable rows for the equity terms: the old
+        // positive-only `.max()` picked the USDC collateral row and dropped the negative
+        // USDT debt row, so `equity_usd()` overstated equity by the debt — and per-asset
+        // crossUnPnl on rows other than the single positive one was silently dropped.
+        // Absent-on-every-row keeps the Option at None (equity falls back to the wallet sum).
+        let cross_vals: Vec<Decimal> = stable_rows
             .iter()
             .filter_map(|r| parse_optional_dec(&r.cross_wallet_balance))
-            .filter(|v| *v > Decimal::ZERO)
-            .max();
-        let cross_unrealized_pnl_usd = stable_rows
+            .collect();
+        let cross_wallet_balance_usd =
+            (!cross_vals.is_empty()).then(|| cross_vals.into_iter().sum::<Decimal>());
+        let unpnl_vals: Vec<Decimal> = stable_rows
             .iter()
-            .find(|r| {
-                parse_optional_dec(&r.cross_wallet_balance).is_some_and(|v| v > Decimal::ZERO)
-            })
-            .and_then(|r| parse_optional_dec(&r.cross_un_pnl))
-            .or_else(|| {
-                stable_rows
-                    .iter()
-                    .filter_map(|r| parse_optional_dec(&r.cross_un_pnl))
-                    .find(|v| *v != Decimal::ZERO)
-            });
+            .filter_map(|r| parse_optional_dec(&r.cross_un_pnl))
+            .collect();
+        let cross_unrealized_pnl_usd =
+            (!unpnl_vals.is_empty()).then(|| unpnl_vals.into_iter().sum::<Decimal>());
         Ok(AsterBalanceSnapshot {
             available_usd,
+            // None here means "unknown", so a net-NEGATIVE wallet (fully underwater
+            // account) is hidden from the equity fallback; acceptable while the cross
+            // fields above (signed) are the primary equity terms.
             wallet_balance_usd: (wallet_balance_usd > Decimal::ZERO).then_some(wallet_balance_usd),
             cross_wallet_balance_usd,
             cross_unrealized_pnl_usd,
