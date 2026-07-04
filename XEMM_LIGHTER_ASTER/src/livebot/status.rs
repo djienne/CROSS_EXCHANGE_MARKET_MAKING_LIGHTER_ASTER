@@ -53,8 +53,12 @@ pub struct AccountStatus {
     pub aster_available_usd: Decimal,
     pub aster_equity_usd: Decimal,
     pub lighter_available_usd: Decimal,
+    /// Lighter `portfolio_value` — collateral-style, EXCLUDES open-position uPnL.
     pub lighter_equity_usd: Decimal,
+    /// Marked uPnL of the Lighter leg (see `AccountSnapshot::hl_unrealized_usd`).
+    pub lighter_unrealized_usd: Decimal,
     pub total_available_usd: Decimal,
+    /// Fully marked cross-venue equity (both legs' uPnL included).
     pub total_equity_usd: Decimal,
     pub aster_open_orders: usize,
     pub lighter_open_orders: usize,
@@ -140,7 +144,7 @@ pub async fn run(cfg: &Config, target: Option<String>, json: bool) -> Result<()>
     let spec = specs.first().context("no resolved market spec")?.clone();
     let aster = build_aster(cfg, &specs)?;
     let lighter = build_lighter(cfg, &specs).await?;
-    let reconciler = Reconciler::new(aster, lighter, &specs);
+    let reconciler = Reconciler::new(aster, lighter, &specs, cfg.simulation.max_book_staleness_ms);
     let snapshot = reconciler.snapshot().await?;
 
     let http = rest_book::client()?;
@@ -261,6 +265,7 @@ fn account_status(snapshot: &AccountSnapshot, market: &MarketId) -> AccountStatu
         aster_equity_usd: snapshot.aster_equity_usd,
         lighter_available_usd: snapshot.hl_withdrawable_usd,
         lighter_equity_usd: snapshot.hl_equity_usd,
+        lighter_unrealized_usd: snapshot.hl_unrealized_usd,
         total_available_usd: snapshot.aster_available_usd + snapshot.hl_withdrawable_usd,
         total_equity_usd: snapshot.total_equity_usd(),
         aster_open_orders,

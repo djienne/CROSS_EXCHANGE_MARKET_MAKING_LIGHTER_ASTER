@@ -1202,6 +1202,34 @@ impl HlExchange {
         Ok(out)
     }
 
+    /// Lighter mid for `market` from the live WS book cache, plus the age (ms) of the book
+    /// data (wall-clock since the last applied order_book message). `None` when the cache has
+    /// no initialized book (pre-warmup, or after a sequence-gap reset — the reset clears the
+    /// book, so a dead stream reads as `None`, never as an old mid).
+    pub fn cached_lighter_mid(&self, market: &MarketId) -> Option<(Decimal, i64)> {
+        let w = self.wire(market).ok()?;
+        let book = self.book_feed.order_book(w.market_index as u32)?;
+        let mid = book.mid()?;
+        Some((mid, book.age_ms(chrono::Utc::now())))
+    }
+
+    /// Lighter mid fetched directly over REST, bypassing the WS book cache. Used by the
+    /// reconciler's uPnL marking when the cached book is stale — `mid()` would serve the
+    /// stale cache first. Also the only path in the `status` command (no WS streams).
+    pub async fn rest_mid(&self, market: &MarketId) -> Result<Decimal> {
+        let w = self.wire(market)?;
+        let client = rest_book::client()?;
+        let book = rest_book::fetch_lighter_book_from_base(
+            &client,
+            &self.base_url,
+            w.market_index as u32,
+            20,
+        )
+        .await?;
+        book.mid()
+            .ok_or_else(|| anyhow!("no Lighter mid for {}", market.0))
+    }
+
     pub async fn mid(&self, coin: &str) -> Result<Decimal> {
         let market = self
             .symbol_to_market

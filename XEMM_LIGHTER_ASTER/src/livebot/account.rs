@@ -74,9 +74,17 @@ pub struct AccountSnapshot {
     /// `aster_available_usd`. Used by the circuit breaker so opening a hedge (which locks margin)
     /// does not look like a loss.
     pub aster_equity_usd: Decimal,
-    /// HL total equity = `marginSummary.accountValue` (includes unrealized), NOT the free-margin
-    /// `hl_withdrawable_usd` (which drops when a position locks margin).
+    /// Lighter `portfolio_value` — collateral-style: it does NOT mark unrealized PnL of open
+    /// positions to price (observed live 2026-07-04: frozen for 41h while the position's uPnL
+    /// moved $8). The marked leg lives in `hl_unrealized_usd`; `total_equity_usd()` adds both.
     pub hl_equity_usd: Decimal,
+    /// Signed unrealized PnL of the Lighter leg, marked to the reconciler's Lighter mid.
+    /// Lighter's `portfolio_value` excludes uPnL of open positions, so this is added on top of
+    /// `hl_equity_usd` in `total_equity_usd()`.
+    pub hl_unrealized_usd: Decimal,
+    /// True iff EVERY nonzero Lighter position contributed a trusted uPnL (fresh mark AND
+    /// `entry_px > 0`). The circuit breaker ignores samples where this is false.
+    pub hl_upnl_marked: bool,
     pub aster_positions: Vec<ScaledPosition>,
     pub hl_positions: Vec<ScaledPosition>,
     pub open_orders: Vec<OpenOrderSnapshot>,
@@ -100,6 +108,10 @@ impl AccountSnapshot {
             hl_withdrawable_usd: Decimal::ZERO,
             aster_equity_usd: Decimal::ZERO,
             hl_equity_usd: Decimal::ZERO,
+            // A flat book is trivially marked: uPnL of nothing is exactly zero, and the
+            // startup baseline (usually armed before any position exists) must not stall.
+            hl_unrealized_usd: Decimal::ZERO,
+            hl_upnl_marked: true,
             aster_positions: Vec::new(),
             hl_positions: Vec::new(),
             open_orders: Vec::new(),
@@ -110,9 +122,11 @@ impl AccountSnapshot {
     }
 
     /// Total cross-venue mark-to-market equity (USD). For a delta-neutral book this is stable; it
-    /// moves only with realized PnL, fees, funding, and residual basis — the circuit breaker's signal.
+    /// moves only with realized PnL, fees, funding, and residual basis — the circuit breaker's
+    /// signal. Both legs are marked: Aster via the venue's own unrealized PnL, Lighter via
+    /// `hl_unrealized_usd` (its `portfolio_value` alone is blind to open-position uPnL).
     pub fn total_equity_usd(&self) -> Decimal {
-        self.aster_equity_usd + self.hl_equity_usd
+        self.aster_equity_usd + self.hl_equity_usd + self.hl_unrealized_usd
     }
 
     /// Reported signed position for a (venue, market), 0 if none.
@@ -279,6 +293,8 @@ mod tests {
             hl_withdrawable_usd: dec!(900),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(900),
+            hl_unrealized_usd: dec!(0),
+            hl_upnl_marked: true,
             aster_positions: vec![ScaledPosition {
                 venue: Venue::Aster,
                 market: "BTC".into(),
@@ -350,6 +366,16 @@ mod tests {
         assert_eq!(st.load().aster_available_usd, dec!(1000));
         // max_unhedged mirror is scaled into micro-dollars.
         assert_eq!(st.hot.max_unhedged_notional_scaled(), 5_000_000);
+    }
+
+    #[test]
+    fn total_equity_includes_hl_unrealized() {
+        let mut s = snap();
+        assert_eq!(s.total_equity_usd(), dec!(1900));
+        s.hl_unrealized_usd = dec!(8.5);
+        assert_eq!(s.total_equity_usd(), dec!(1908.5));
+        s.hl_unrealized_usd = dec!(-3.25);
+        assert_eq!(s.total_equity_usd(), dec!(1896.75));
     }
 
     #[test]

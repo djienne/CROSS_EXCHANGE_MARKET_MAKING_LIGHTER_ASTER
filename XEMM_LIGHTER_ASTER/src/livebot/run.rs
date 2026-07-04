@@ -507,6 +507,13 @@ pub async fn run(
     if let Some(e) = strategy_error {
         return Err(e);
     }
+    // A circuit-breaker trip rides the graceful-shutdown path above; without this guard it
+    // exits 0 — indistinguishable from a clean stop — and the supervisor restarts the bot
+    // straight into the startup latch (observed 2026-07-04). The startup guard barred any
+    // pre-existing latch, so "latch exists at shutdown" ⇔ "the breaker fired THIS run".
+    if exec_mode.sends_real_orders() {
+        super::breaker::check_shutdown(&db_path)?;
+    }
 
     info!("livebot stopped. research tape -> {} ; results db -> {}", tape_path.display(), db_path.display());
     Ok(())
@@ -777,7 +784,7 @@ async fn setup_live_planes(
     // writes (worker), reads (reconciler), listenKey+WS (user stream).
     let worker_aster = new_aster()?;
     let worker_hl = hedge.clone();
-    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs);
+    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.simulation.max_book_staleness_ms);
     let stream_aster = new_aster()?;
     let mut sym_to_market: HashMap<String, MarketId> = HashMap::new();
     for s in specs {

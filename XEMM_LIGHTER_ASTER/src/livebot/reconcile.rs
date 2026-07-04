@@ -82,6 +82,29 @@ fn fold_aster_position_rows(
     Ok((unrealized_usd, net))
 }
 
+/// Σ signed unrealized PnL over the Lighter positions, and whether EVERY nonzero position
+/// was trustworthily marked (mark present AND `entry_px > 0`). An unmarked or entry-less
+/// position contributes ZERO and flips the flag false — never an error: the breaker skips
+/// unmarked samples, while computing with a garbage entry (0 ⇒ full notional as "uPnL")
+/// could fake or mask a real loss in either direction.
+fn fold_hl_unrealized(
+    positions: &[ScaledPosition],
+    marks: &HashMap<MarketId, Decimal>,
+) -> (Decimal, bool) {
+    let mut upnl = Decimal::ZERO;
+    let mut all_marked = true;
+    for p in positions {
+        if p.signed_qty == Decimal::ZERO {
+            continue;
+        }
+        match (marks.get(&p.market), p.entry_px > Decimal::ZERO) {
+            (Some(mark), true) => upnl += p.signed_qty * (*mark - p.entry_px),
+            _ => all_marked = false,
+        }
+    }
+    (upnl, all_marked)
+}
+
 /// Parse a decimal from an account row that the bot does NOT trade. A single junk field on
 /// an unrelated row (a new listing, an odd venue format) must not be able to fail the whole
 /// snapshot forever — that would age out the account state, which not only freezes quoting
@@ -107,17 +130,49 @@ pub struct Reconciler {
     aster_sym_to_market: HashMap<String, MarketId>,
     /// HL coin → market id.
     hl_coin_to_market: HashMap<String, MarketId>,
+    /// Max age (ms) of a cached Lighter book mid used to mark the Lighter leg's uPnL —
+    /// same freshness bound the strategy requires of a Lighter book before quoting.
+    mark_max_age_ms: i64,
+    /// Throttle for the "uPnL unmarked" warn (mono ns of the last emit).
+    last_upnl_warn_ns: std::sync::atomic::AtomicI64,
 }
 
 impl Reconciler {
-    pub fn new(aster: AsterRest, hl: HlExchange, specs: &[MarketSpec]) -> Self {
+    pub fn new(aster: AsterRest, hl: HlExchange, specs: &[MarketSpec], mark_max_age_ms: i64) -> Self {
         let mut aster_sym_to_market = HashMap::new();
         let mut hl_coin_to_market = HashMap::new();
         for s in specs {
             aster_sym_to_market.insert(s.aster_symbol.to_uppercase(), s.market_id.clone());
             hl_coin_to_market.insert(s.hl_coin.clone(), s.market_id.clone());
         }
-        Reconciler { aster, hl, aster_sym_to_market, hl_coin_to_market }
+        Reconciler {
+            aster,
+            hl,
+            aster_sym_to_market,
+            hl_coin_to_market,
+            mark_max_age_ms,
+            last_upnl_warn_ns: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// Fresh Lighter mark for `market`: the exchange's WS book cache if within
+    /// `mark_max_age_ms`, else ONE bounded REST attempt (covers the `status` command,
+    /// which never starts the WS streams, and a live cache gap). `None` ⇒ the snapshot is
+    /// published UNMARKED — never an `Err`: a missing mark must not age out the snapshot,
+    /// which would silently disable orphan recovery AND the breaker (see module note on
+    /// `parse_untraded_row_decimal`).
+    async fn lighter_mark(&self, market: &MarketId) -> Option<Decimal> {
+        if let Some((mid, age_ms)) = self.hl.cached_lighter_mid(market) {
+            if (0..=self.mark_max_age_ms).contains(&age_ms) && mid > Decimal::ZERO {
+                return Some(mid);
+            }
+        }
+        // rest_mid bypasses the (stale) cache; 800ms keeps a worst-case cycle inside the
+        // reconcile loop's `interval * 3` budget.
+        match tokio::time::timeout(Duration::from_millis(800), self.hl.rest_mid(market)).await {
+            Ok(Ok(mid)) if mid > Decimal::ZERO => Some(mid),
+            _ => None,
+        }
     }
 
     /// Assemble a fresh snapshot from live reads on both venues.
@@ -125,13 +180,19 @@ impl Reconciler {
         // Stamp the read-START before ANY venue read (the orphan backstop's straddle guard requires
         // a timestamp from BEFORE the reads, not the post-read `source_ts_ns`).
         let read_start_ns = mono_now_ns();
+        // Both venues concurrently: sequential awaits marked the two uPnL legs at instants
+        // up to the full read latency apart, so a fast move made the delta-neutral
+        // cancellation transiently imperfect inside a single snapshot.
         // Aster: balance + positions + open orders (signed).
-        let bal = self.aster.balance().await?;
-        let pos = self.aster.position_risk().await?;
-        let oo = self.aster.open_orders(None).await?;
         // HL: clearinghouse state + open orders (unsigned /info).
-        let ch = self.hl.clearinghouse_state().await?;
-        let hloo = self.hl.open_orders_info().await?;
+        let (bal, pos, oo, ch, hloo) = tokio::join!(
+            self.aster.balance(),
+            self.aster.position_risk(),
+            self.aster.open_orders(None),
+            self.hl.clearinghouse_state(),
+            self.hl.open_orders_info(),
+        );
+        let (bal, pos, oo, ch, hloo) = (bal?, pos?, oo?, ch?, hloo?);
 
         // Aster available USD = the sum of actually-deposited collateral (`balance`/wallet
         // balance), NOT `availableBalance`. The per-asset `availableBalance` is an inflated
@@ -186,6 +247,33 @@ impl Reconciler {
             });
         }
 
+        // Mark the Lighter leg: `portfolio_value` above is collateral-style (it does NOT
+        // move with open-position uPnL — observed frozen for 41h while the leg's uPnL
+        // moved $8), so without this the combined equity bleeds 1:1 with price on a
+        // delta-neutral book and false-trips the breaker (2026-07-04 incident).
+        let mut hl_marks: HashMap<MarketId, Decimal> = HashMap::new();
+        for p in &hl_positions {
+            if p.signed_qty == Decimal::ZERO {
+                continue;
+            }
+            if let Some(mark) = self.lighter_mark(&p.market).await {
+                hl_marks.insert(p.market.clone(), mark);
+            }
+        }
+        let (hl_unrealized_usd, hl_upnl_marked) = fold_hl_unrealized(&hl_positions, &hl_marks);
+        if !hl_upnl_marked {
+            use std::sync::atomic::Ordering;
+            let now = mono_now_ns();
+            let last = self.last_upnl_warn_ns.load(Ordering::Relaxed);
+            if now.saturating_sub(last) > 30_000_000_000 {
+                self.last_upnl_warn_ns.store(now, Ordering::Relaxed);
+                warn!(
+                    "reconcile: Lighter uPnL UNMARKED (missing mark or entry px) — \
+                     circuit breaker paused on this sample"
+                );
+            }
+        }
+
         let mut open_orders = Vec::new();
         for o in &oo {
             if let Some(market) = self.aster_sym_to_market.get(&o.symbol.to_uppercase()) {
@@ -231,6 +319,8 @@ impl Reconciler {
             hl_withdrawable_usd,
             aster_equity_usd,
             hl_equity_usd,
+            hl_unrealized_usd,
+            hl_upnl_marked,
             aster_positions,
             hl_positions,
             open_orders,
@@ -438,5 +528,63 @@ mod tests {
         assert_eq!(upnl, "0.05".parse().unwrap());
         let (qty, _) = net[&MarketId("HYPE".to_string())];
         assert_eq!(qty, "2".parse().unwrap());
+    }
+
+    fn hl_pos(market: &str, qty: &str, entry: &str) -> ScaledPosition {
+        ScaledPosition {
+            venue: Venue::Hyperliquid,
+            market: MarketId(market.to_string()),
+            signed_qty: qty.parse().unwrap(),
+            entry_px: entry.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn fold_hl_unrealized_long_gain() {
+        let positions = vec![hl_pos("HYPE", "1.17", "40")];
+        let marks = HashMap::from([(MarketId("HYPE".to_string()), "47.27".parse().unwrap())]);
+        let (upnl, marked) = fold_hl_unrealized(&positions, &marks);
+        assert_eq!(upnl, "8.5059".parse().unwrap());
+        assert!(marked);
+    }
+
+    #[test]
+    fn fold_hl_unrealized_short_position_sign() {
+        let positions = vec![hl_pos("HYPE", "-2", "40")];
+        let marks = HashMap::from([(MarketId("HYPE".to_string()), "44".parse().unwrap())]);
+        let (upnl, marked) = fold_hl_unrealized(&positions, &marks);
+        assert_eq!(upnl, "-8".parse().unwrap());
+        assert!(marked);
+    }
+
+    #[test]
+    fn fold_hl_unrealized_missing_mark_unmarks_and_zeroes() {
+        let positions = vec![hl_pos("HYPE", "1.17", "40")];
+        let (upnl, marked) = fold_hl_unrealized(&positions, &HashMap::new());
+        assert_eq!(upnl, Decimal::ZERO);
+        assert!(!marked);
+    }
+
+    #[test]
+    fn fold_hl_unrealized_zero_entry_unmarks() {
+        // entry_px == 0 is the "venue omitted avg_entry_price" sentinel; computing with it
+        // would count the full notional as uPnL.
+        let positions = vec![hl_pos("HYPE", "1.17", "0")];
+        let marks = HashMap::from([(MarketId("HYPE".to_string()), "44".parse().unwrap())]);
+        let (upnl, marked) = fold_hl_unrealized(&positions, &marks);
+        assert_eq!(upnl, Decimal::ZERO);
+        assert!(!marked);
+    }
+
+    #[test]
+    fn fold_hl_unrealized_flat_positions_marked_true() {
+        let (upnl, marked) = fold_hl_unrealized(&[], &HashMap::new());
+        assert_eq!(upnl, Decimal::ZERO);
+        assert!(marked);
+        // Zero-qty rows are ignored, not treated as unmarked.
+        let positions = vec![hl_pos("HYPE", "0", "40")];
+        let (upnl, marked) = fold_hl_unrealized(&positions, &HashMap::new());
+        assert_eq!(upnl, Decimal::ZERO);
+        assert!(marked);
     }
 }

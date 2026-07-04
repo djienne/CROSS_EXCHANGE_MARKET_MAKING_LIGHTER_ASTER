@@ -52,6 +52,13 @@ const MAKER_GATE_FROZEN: &str = "FROZEN";
 // (targeted cancels, CancelAllBot, dead-man refresh). Optional quote churn must
 // not be allowed to consume the entire bounded queue and then block a cancel.
 const EXEC_CANCEL_RESERVE: usize = 64;
+/// Circuit-breaker baseline = median of this many fresh marked equity samples (~10s at the
+/// 2s reconcile cadence). A single-read baseline let one bad startup sample manufacture
+/// phantom loss for a whole run (2026-07-04 incident).
+const BREAKER_BASELINE_SAMPLES: usize = 5;
+/// Consecutive fresh marked samples that must breach the loss limit before the breaker
+/// trips (~4-6s at the 2s reconcile cadence). One anomalous snapshot must not halt the bot.
+const BREAKER_TRIP_STREAK: u32 = 3;
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -863,8 +870,19 @@ pub struct Strategy {
     shutdown: tokio_util::sync::CancellationToken,
     /// Where to write the persistent trip latch on a trip (set with the shutdown token).
     trip_file_path: Option<std::path::PathBuf>,
-    /// Total cross-venue equity captured at the first good snapshot — the breaker's baseline.
+    /// Total cross-venue equity baseline: the MEDIAN of the first
+    /// [`BREAKER_BASELINE_SAMPLES`] fresh marked snapshots (a single-read baseline let one
+    /// bad startup sample manufacture phantom loss for the whole run — 2026-07-04 incident).
     breaker_baseline_equity: Option<Decimal>,
+    /// Fresh marked equity samples collected while arming the baseline.
+    breaker_baseline_samples: Vec<Decimal>,
+    /// Consecutive fresh marked samples breaching the limit; trips at
+    /// [`BREAKER_TRIP_STREAK`]. Reset by any non-breaching, stale, or unmarked sample.
+    breaker_breach_streak: u32,
+    /// Snapshot generation of the last sample the breaker processed — each published
+    /// snapshot is counted at most once (the tick and publish cadences would otherwise let
+    /// one bad snapshot be seen several times in a row).
+    breaker_last_generation: u64,
     /// Latched once the breaker fires (prevents re-tripping / duplicate latch writes).
     breaker_tripped: bool,
     /// Per-market maker-gate suppression tracking, for OBSERVABILITY: `(since_ns, reason, logged)`.
@@ -968,6 +986,9 @@ impl Strategy {
             shutdown: tokio_util::sync::CancellationToken::new(),
             trip_file_path: None,
             breaker_baseline_equity: None,
+            breaker_baseline_samples: Vec::new(),
+            breaker_breach_streak: 0,
+            breaker_last_generation: 0,
             breaker_tripped: false,
             quote_suppressed: HashMap::new(),
             margin_suppressed: HashMap::new(),
@@ -2875,13 +2896,19 @@ impl Strategy {
         self.hedges.values().any(|h| h.state.is_dangerous())
     }
 
-    /// Cumulative-loss circuit breaker (live only). Measures TOTAL cross-venue account equity (Aster
-    /// wallet+unrealized + HL accountValue) against a baseline captured at the first trustworthy
-    /// snapshot; if the drawdown exceeds `live.circuit_breaker.max_cumulative_loss_usdc` it cancels
-    /// orders via the graceful-shutdown path, LEAVES the delta-neutral position open, writes a
-    /// persistent trip latch, and halts the process (which then refuses to restart until reset). Off
-    /// the money path (cold tick), self-clocking on the reconciler's snapshot cadence. NEVER trips on
-    /// untrusted data (no snapshot yet, stale snapshot, or non-positive equity).
+    /// Cumulative-loss circuit breaker (live only). Measures TOTAL cross-venue MARKED equity
+    /// (Aster wallet+unrealized + Lighter portfolio_value + marked Lighter uPnL) against a
+    /// baseline armed from the median of the first [`BREAKER_BASELINE_SAMPLES`] fresh marked
+    /// snapshots; a drawdown beyond `live.circuit_breaker.max_cumulative_loss_usdc` must
+    /// persist for [`BREAKER_TRIP_STREAK`] consecutive fresh marked samples before tripping
+    /// (accepted trade-off: a true catastrophic drawdown trips ~4-6s later — the breaker only
+    /// cancels quotes and halts, positions stay open regardless — in exchange for immunity to
+    /// single-sample venue glitches). On trip: cancels orders via the graceful-shutdown path,
+    /// LEAVES the delta-neutral position open, writes a persistent trip latch, and halts the
+    /// process (which then refuses to restart until reset, and exits nonzero so the
+    /// supervisor safe-halts in one step). Off the money path (cold tick), counting each
+    /// published snapshot generation at most once. NEVER trips on untrusted data (no
+    /// snapshot yet, stale snapshot, unmarked Lighter uPnL, or non-positive equity).
     fn check_circuit_breaker(&mut self, now_ns: i64) {
         if !self.cfg.live.circuit_breaker.enabled
             || !self.exec_mode.sends_real_orders()
@@ -2892,22 +2919,58 @@ impl Strategy {
         let limit = self.cfg.live.circuit_breaker.max_cumulative_loss_usdc;
         let snap = self.account.load();
         if snap.source_ts_ns == 0 || self.account.age_ms(now_ns) > self.cfg.live.max_account_snapshot_age_ms {
-            return; // no snapshot yet or stale — don't trip on data we can't trust
+            // No snapshot yet or stale — don't trip on data we can't trust, and don't let
+            // pre-staleness breaches persist across the gap.
+            self.breaker_breach_streak = 0;
+            return;
+        }
+        if snap.generation == self.breaker_last_generation {
+            return; // same sample as last time: neither counts toward nor resets the streak
+        }
+        self.breaker_last_generation = snap.generation;
+        if !snap.hl_upnl_marked {
+            // The Lighter leg's uPnL could not be marked (missing mark or entry px): the
+            // combined equity is the exact distorted metric that false-tripped 2026-07-04.
+            // Skip the sample entirely (no trip, no baseline arming, streak reset).
+            self.breaker_breach_streak = 0;
+            return;
         }
         let equity = snap.total_equity_usd();
         if equity <= Decimal::ZERO {
-            return; // a zero/garbage read (e.g. a failed parse) must never look like a total loss
+            // A zero/garbage read (e.g. a failed parse) must never look like a total loss.
+            self.breaker_breach_streak = 0;
+            return;
         }
         let baseline = match self.breaker_baseline_equity {
             Some(b) => b,
             None => {
-                self.breaker_baseline_equity = Some(equity);
-                info!("circuit breaker armed: baseline equity = {equity} USD, limit = {limit} USD");
+                // Arm from the MEDIAN of the first K fresh marked samples: one outlier
+                // startup read must not set a phantom reference for the whole run.
+                self.breaker_baseline_samples.push(equity);
+                if self.breaker_baseline_samples.len() >= BREAKER_BASELINE_SAMPLES {
+                    let mut v = self.breaker_baseline_samples.clone();
+                    v.sort();
+                    let b = v[v.len() / 2];
+                    self.breaker_baseline_equity = Some(b);
+                    info!(
+                        "circuit breaker armed: baseline equity = {b} USD (median of {} samples), limit = {limit} USD",
+                        v.len()
+                    );
+                }
                 return;
             }
         };
         let loss = baseline - equity;
         if loss <= limit {
+            self.breaker_breach_streak = 0;
+            return;
+        }
+        self.breaker_breach_streak += 1;
+        if self.breaker_breach_streak < BREAKER_TRIP_STREAK {
+            warn!(
+                "circuit breaker: breach {} of {BREAKER_TRIP_STREAK} (loss {loss} USD > limit {limit} USD); not tripping yet",
+                self.breaker_breach_streak
+            );
             return;
         }
         // TRIP — latch, journal, persist, and halt (graceful drain leaves the position open).
@@ -2926,6 +2989,14 @@ impl Strategy {
                 "equity_usd": equity.to_string(),
                 "loss_usd": loss.to_string(),
                 "limit_usd": limit.to_string(),
+                // Components + freshness, so the next forensic run reads straight off the row.
+                "aster_equity_usd": snap.aster_equity_usd.to_string(),
+                "hl_equity_usd": snap.hl_equity_usd.to_string(),
+                "hl_unrealized_usd": snap.hl_unrealized_usd.to_string(),
+                "snapshot_age_ms": self.account.age_ms(now_ns),
+                "read_start_age_ms": now_ns.saturating_sub(snap.read_start_ns) / 1_000_000,
+                "breach_streak": self.breaker_breach_streak,
+                "generation": snap.generation,
             }),
         );
         if let Some(path) = self.trip_file_path.clone() {
@@ -4590,6 +4661,8 @@ lighter_symbol = "BTC"
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
+            hl_unrealized_usd: dec!(0),
+            hl_upnl_marked: true,
             aster_positions: vec![],
             hl_positions: vec![],
             open_orders: vec![],
@@ -4646,6 +4719,8 @@ lighter_symbol = "BTC"
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
+            hl_unrealized_usd: dec!(0),
+            hl_upnl_marked: true,
             aster_positions: vec![],
             hl_positions: vec![],
             open_orders: vec![],
@@ -4823,6 +4898,8 @@ lighter_symbol = "BTC"
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
+            hl_unrealized_usd: dec!(0),
+            hl_upnl_marked: true,
             aster_positions: vec![ScaledPosition { venue: Venue::Aster, market: m.clone(), signed_qty: dec!(0.5), entry_px: dec!(100) }],
             hl_positions: vec![],
             open_orders: vec![],
@@ -4968,23 +5045,38 @@ lighter_symbol = "BTC"
         let _ = std::fs::remove_file(&trip);
         strat.arm_circuit_breaker(trip.clone(), tok.clone());
 
-        let now = 1_000_000_000_i64;
-        // First good reading arms the baseline; no trip.
-        account.publish(equity_snap(dec!(100), now));
-        strat.check_circuit_breaker(now);
+        let mut t = 1_000_000_000_i64;
+        // Baseline arms from the MEDIAN of the first K fresh marked samples; not before.
+        for _ in 0..BREAKER_BASELINE_SAMPLES {
+            assert!(strat.breaker_baseline_equity.is_none());
+            account.publish(equity_snap(dec!(100), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
         assert_eq!(strat.breaker_baseline_equity, Some(dec!(100)));
         assert!(!strat.breaker_tripped);
         assert!(!tok.is_cancelled());
 
         // Drawdown within the limit (loss 4 <= 5) does NOT trip.
-        account.publish(equity_snap(dec!(96), now + 1_000_000));
-        strat.check_circuit_breaker(now + 1_000_000);
+        account.publish(equity_snap(dec!(96), t));
+        strat.check_circuit_breaker(t);
+        t += 1_000_000;
         assert!(!strat.breaker_tripped);
         assert!(!tok.is_cancelled());
 
-        // Drawdown beyond the limit (loss 6 > 5) TRIPS: cancels shutdown + writes the latch.
-        account.publish(equity_snap(dec!(94), now + 2_000_000));
-        strat.check_circuit_breaker(now + 2_000_000);
+        // Drawdown beyond the limit (loss 6 > 5) must PERSIST: breaches 1 and 2 warn only...
+        for expect_streak in 1..BREAKER_TRIP_STREAK {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+            assert_eq!(strat.breaker_breach_streak, expect_streak);
+            assert!(!strat.breaker_tripped);
+            assert!(!tok.is_cancelled());
+        }
+        // ...the Nth consecutive breach TRIPS: cancels shutdown + writes the latch.
+        account.publish(equity_snap(dec!(94), t));
+        strat.check_circuit_breaker(t);
+        t += 1_000_000;
         assert!(strat.breaker_tripped);
         assert!(tok.is_cancelled(), "breaker must cancel the shutdown token to halt the process");
         assert!(trip.exists(), "breaker must write the trip latch");
@@ -4992,8 +5084,8 @@ lighter_symbol = "BTC"
 
         // Latched: a further reading neither un-trips nor rewrites the latch.
         let latch = std::fs::read_to_string(&trip).unwrap();
-        account.publish(equity_snap(dec!(80), now + 3_000_000));
-        strat.check_circuit_breaker(now + 3_000_000);
+        account.publish(equity_snap(dec!(80), t));
+        strat.check_circuit_breaker(t);
         assert!(strat.breaker_tripped);
         assert_eq!(std::fs::read_to_string(&trip).unwrap(), latch, "latch must not be rewritten");
         let _ = std::fs::remove_file(&trip);
@@ -5035,6 +5127,145 @@ lighter_symbol = "BTC"
         let way_later = now + 10_000 * 1_000_000;
         strat2.check_circuit_breaker(way_later);
         assert!(strat2.breaker_baseline_equity.is_none(), "stale snapshot must not arm/trip");
+        assert_eq!(strat2.breaker_breach_streak, 0, "stale sample must reset the breach streak");
         assert!(!tok2.is_cancelled());
+    }
+
+    /// A live strategy with the breaker enabled (limit 5) and an armed baseline of 100,
+    /// built from `BREAKER_BASELINE_SAMPLES` fresh publishes. Returns (strat, account,
+    /// token, next monotonic ns).
+    fn armed_breaker_strat(
+        tag: &str,
+    ) -> (Strategy, AccountState, CancellationToken, i64) {
+        let account = AccountState::new(dec!(5));
+        let (etx, _erx) = tokio::sync::mpsc::channel(64);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(64);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        strat.cfg.live.circuit_breaker.enabled = true;
+        strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
+        let tok = CancellationToken::new();
+        let trip = tmp_trip_path(tag);
+        let _ = std::fs::remove_file(&trip);
+        strat.arm_circuit_breaker(trip, tok.clone());
+        let mut t = 3_000_000_000_i64;
+        for _ in 0..BREAKER_BASELINE_SAMPLES {
+            account.publish(equity_snap(dec!(100), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert_eq!(strat.breaker_baseline_equity, Some(dec!(100)));
+        (strat, account, tok, t)
+    }
+
+    #[test]
+    fn breaker_outlier_sample_does_not_trip() {
+        let (mut strat, account, tok, mut t) = armed_breaker_strat("outlier");
+        // Two breaching samples, then a recovered one: the streak resets.
+        for _ in 0..2 {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert_eq!(strat.breaker_breach_streak, 2);
+        account.publish(equity_snap(dec!(100), t));
+        strat.check_circuit_breaker(t);
+        t += 1_000_000;
+        assert_eq!(strat.breaker_breach_streak, 0);
+        // Two more breaches still don't trip (the earlier pair must not carry over)...
+        for _ in 0..2 {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert!(!strat.breaker_tripped);
+        assert!(!tok.is_cancelled());
+        // ...but a third consecutive one does.
+        account.publish(equity_snap(dec!(94), t));
+        strat.check_circuit_breaker(t);
+        assert!(strat.breaker_tripped);
+        let _ = std::fs::remove_file(tmp_trip_path("outlier"));
+    }
+
+    #[test]
+    fn breaker_stale_sample_resets_streak() {
+        let (mut strat, account, tok, mut t) = armed_breaker_strat("stale_reset");
+        for _ in 0..2 {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert_eq!(strat.breaker_breach_streak, 2);
+        // The same (last) snapshot seen way later is stale: the streak must reset.
+        strat.check_circuit_breaker(t + 10_000 * 1_000_000);
+        assert_eq!(strat.breaker_breach_streak, 0);
+        // Two fresh breaches after the gap must not trip (need a full new streak).
+        t += 11_000 * 1_000_000;
+        for _ in 0..2 {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert!(!strat.breaker_tripped);
+        assert!(!tok.is_cancelled());
+        let _ = std::fs::remove_file(tmp_trip_path("stale_reset"));
+    }
+
+    #[test]
+    fn breaker_unmarked_sample_resets_streak_and_never_arms() {
+        // Unmarked samples must never ARM a baseline...
+        let account = AccountState::new(dec!(5));
+        let (etx, _erx) = tokio::sync::mpsc::channel(64);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(64);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        strat.cfg.live.circuit_breaker.enabled = true;
+        strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
+        let tok = CancellationToken::new();
+        strat.arm_circuit_breaker(tmp_trip_path("unmarked_arm"), tok.clone());
+        let mut t = 4_000_000_000_i64;
+        for _ in 0..(BREAKER_BASELINE_SAMPLES + 2) {
+            let mut s = equity_snap(dec!(100), t);
+            s.hl_upnl_marked = false;
+            account.publish(s);
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert!(strat.breaker_baseline_equity.is_none(), "unmarked samples must not arm");
+
+        // ...and must RESET an in-progress breach streak, never count toward a trip.
+        let (mut strat2, account2, tok2, mut t2) = armed_breaker_strat("unmarked_reset");
+        for _ in 0..2 {
+            account2.publish(equity_snap(dec!(94), t2));
+            strat2.check_circuit_breaker(t2);
+            t2 += 1_000_000;
+        }
+        assert_eq!(strat2.breaker_breach_streak, 2);
+        let mut s = equity_snap(dec!(94), t2);
+        s.hl_upnl_marked = false;
+        account2.publish(s);
+        strat2.check_circuit_breaker(t2);
+        t2 += 1_000_000;
+        assert_eq!(strat2.breaker_breach_streak, 0, "unmarked sample must reset the streak");
+        for _ in 0..2 {
+            account2.publish(equity_snap(dec!(94), t2));
+            strat2.check_circuit_breaker(t2);
+            t2 += 1_000_000;
+        }
+        assert!(!strat2.breaker_tripped);
+        assert!(!tok2.is_cancelled());
+        let _ = std::fs::remove_file(tmp_trip_path("unmarked_reset"));
+    }
+
+    #[test]
+    fn breaker_same_generation_not_double_counted() {
+        let (mut strat, account, tok, t) = armed_breaker_strat("same_gen");
+        // ONE breaching snapshot observed on three consecutive ticks counts once.
+        account.publish(equity_snap(dec!(94), t));
+        for i in 0..3 {
+            strat.check_circuit_breaker(t + i * 1_000_000);
+        }
+        assert_eq!(strat.breaker_breach_streak, 1, "one published sample must count once");
+        assert!(!strat.breaker_tripped);
+        assert!(!tok.is_cancelled());
+        let _ = std::fs::remove_file(tmp_trip_path("same_gen"));
     }
 }

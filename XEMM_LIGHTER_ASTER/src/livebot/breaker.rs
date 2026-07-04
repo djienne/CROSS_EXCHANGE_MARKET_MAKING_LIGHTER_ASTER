@@ -70,6 +70,23 @@ pub fn check_startup(db_path: &Path) -> Result<()> {
     );
 }
 
+/// Shutdown guard for `run()`: if the trip latch exists when the run ends, the breaker fired
+/// DURING this run (`check_startup` barred any pre-existing latch at startup) — return `Err`
+/// so the process exits NONZERO and the supervisor safe-halts in one step. Without this, a
+/// trip rode the graceful-shutdown path to exit 0, indistinguishable from a clean stop: the
+/// orchestrator restarted the bot, the restart refused via the latch (exit 1), and only then
+/// did it halt (observed 2026-07-04).
+pub fn check_shutdown(db_path: &Path) -> Result<()> {
+    let path = trip_path(db_path);
+    if path.exists() {
+        bail!(
+            "circuit breaker tripped during this run (latch: {}); exiting nonzero so the supervisor halts",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Atomically write the trip latch (temp file + rename) so a reader never sees a partial file.
 pub fn write_trip(path: &Path, rec: &TripRecord) -> Result<()> {
     if let Some(dir) = path.parent() {
@@ -120,6 +137,27 @@ mod tests {
         let back: TripRecord =
             serde_json::from_str(&std::fs::read_to_string(trip_path(&db)).unwrap()).unwrap();
         assert_eq!(back.loss_usd, dec!(6));
+        let _ = std::fs::remove_file(trip_path(&db));
+    }
+
+    #[test]
+    fn check_shutdown_errs_when_latch_present() {
+        let dir = std::env::temp_dir().join(format!("xemm_breaker_shutdown_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("live-eth.sqlite");
+        let _ = std::fs::remove_file(trip_path(&db));
+        assert!(check_shutdown(&db).is_ok());
+        let rec = TripRecord {
+            ts_utc: "2026-07-04T04:23:57Z".into(),
+            market: "HYPE".into(),
+            baseline_usd: dec!(244),
+            equity_usd: dec!(234),
+            loss_usd: dec!(10),
+            limit_usd: dec!(10),
+            reason: "test".into(),
+        };
+        write_trip(&trip_path(&db), &rec).unwrap();
+        assert!(check_shutdown(&db).is_err());
         let _ = std::fs::remove_file(trip_path(&db));
     }
 }
