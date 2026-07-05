@@ -50,6 +50,18 @@ class TapePruneTests(unittest.TestCase):
             self.assertEqual([], prune_old_tapes(state_dir, "HYPE", 0, NOW))
             self.assertTrue(old.exists())
 
+    def test_exclude_protects_active_tape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            active = make_tape(state_dir, "orchestrator_xemm_HYPE_20260610T000000Z.jsonl.zst", 20)
+            stale = make_tape(state_dir, "orchestrator_xemm_HYPE_20260615T000000Z.jsonl.zst", 15, size=200)
+
+            pruned = prune_old_tapes(state_dir, "HYPE", 7.0, NOW, exclude=active)
+
+            self.assertEqual([(stale, 200)], pruned)
+            self.assertTrue(active.exists())
+            self.assertFalse(stale.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

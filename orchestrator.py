@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -35,21 +36,24 @@ def stamp(dt: datetime | None = None) -> str:
 
 
 def prune_old_tapes(
-    state_dir: Path, market: str, retention_days: float, now: datetime
+    state_dir: Path, market: str, retention_days: float, now: datetime, exclude: Path | None = None
 ) -> list[tuple[Path, int]]:
     """Delete finished XEMM research tapes (`--out` recordings) past retention.
 
     Tapes are only needed to replay a session; at ~100-200 MB/day they are the
     main long-term disk consumer after the results db. The active tape receives
     book snapshots continuously, so an mtime older than the window can only
-    belong to a finished run. retention_days <= 0 keeps everything.
-    Returns (path, size_bytes) for each deleted file.
+    belong to a finished run; `exclude` (the running child's tape) is skipped
+    outright in case that assumption ever breaks. retention_days <= 0 keeps
+    everything. Returns (path, size_bytes) for each deleted file.
     """
     if retention_days <= 0:
         return []
     cutoff = (now - timedelta(days=retention_days)).timestamp()
     pruned: list[tuple[Path, int]] = []
     for path in sorted(state_dir.glob(f"orchestrator_xemm_{market}_*.jsonl.zst")):
+        if exclude is not None and path == exclude:
+            continue
         try:
             st = path.stat()
             if st.st_mtime < cutoff:
@@ -129,12 +133,44 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+TRACING_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+\s+(?:TRACE|DEBUG|INFO|WARN|ERROR)\b")
+
+
 def extract_json_object(stdout: str) -> dict[str, Any]:
-    start = stdout.find("{")
-    end = stdout.rfind("}")
-    if start < 0 or end < start:
-        raise ValueError(f"no JSON object in command output: {stdout[:300]!r}")
-    return json.loads(stdout[start : end + 1])
+    """Pull the status/live-report JSON out of stdout shared with tracing output.
+
+    The bots' tracing writer is a background thread on the same fd as the
+    pretty-printed report, so log lines can precede, follow, or land INSIDE the
+    JSON body — and a log line may itself contain braces or a small JSON
+    fragment. Strip tracing lines first, then decode from candidate '{'
+    positions, preferring the object that spans to the payload's final '}' so a
+    surviving fragment can never masquerade as the report.
+    """
+    text = "\n".join(
+        line for line in stdout.splitlines() if not TRACING_LINE_RE.match(line)
+    ).strip()
+    decoder = json.JSONDecoder()
+    end_target = text.rfind("}")
+    best: dict[str, Any] | None = None
+    best_span = -1
+    idx = text.find("{")
+    attempts = 0
+    while idx >= 0 and attempts < 50:
+        attempts += 1
+        try:
+            value, end = decoder.raw_decode(text, idx)
+        except ValueError:
+            idx = text.find("{", idx + 1)
+            continue
+        if isinstance(value, dict):
+            if end - 1 == end_target:
+                return value
+            if end - idx > best_span:
+                best, best_span = value, end - idx
+        idx = text.find("{", idx + 1)
+    if best is not None:
+        return best
+    raise ValueError(f"no JSON object in command output: {stdout[:300]!r}")
 
 
 def parse_since(raw: str, start: datetime) -> datetime:
@@ -531,15 +567,19 @@ class TradeTracker:
 
 
 class PnlTracker:
-    def __init__(self, args: argparse.Namespace, since: datetime):
+    def __init__(self, args: argparse.Namespace, since: datetime, event):
         self.args = args
         self.since = since
+        self.event = event
         self.samples_path = args.state_dir / f"orchestrator_pnl_{args.market}.jsonl"
         self.baseline_path = args.state_dir / f"orchestrator_baseline_{args.market}.json"
         self.baseline_equity: Decimal | None = None
         self.baseline_ts: datetime | None = None
+        self.baseline_source_bot: str | None = None
         self.last_equity: Decimal | None = None
         self.last_sample: dict[str, Any] | None = None
+        self.last_persist_ts: datetime | None = None
+        self.pending_divergence_check = False
         if args.pnl_since.lower() not in {"startup", "now"}:
             self.load_baseline()
         elif args.pnl_since.lower() == "startup":
@@ -559,6 +599,8 @@ class PnlTracker:
                     continue
                 self.baseline_ts = ts
                 self.baseline_equity = equity
+                self.baseline_source_bot = row.get("source_bot")
+                self.pending_divergence_check = True
                 break
 
     def load_persisted_baseline(self) -> None:
@@ -570,21 +612,45 @@ class PnlTracker:
             return
         equity = parse_decimal(row.get("baseline_equity_usd"))
         ts = TradeTracker.parse_ts(row.get("baseline_ts"))
-        if equity is not None and ts is not None:
-            self.baseline_equity = equity
-            self.baseline_ts = ts
+        if equity is None or ts is None:
+            return
+        last_seen = TradeTracker.parse_ts(row.get("last_seen_ts")) or ts
+        max_gap_hours = float(self.args.baseline_max_gap_hours)
+        gap_hours = (utc_now() - last_seen).total_seconds() / 3600
+        if max_gap_hours > 0 and gap_hours > max_gap_hours:
+            # A baseline that spanned a long unsupervised window predates exactly the
+            # things that redefine equity (redeploys, metric fixes); importing it
+            # would seed phantom drawdown. Re-anchor to the first live sample.
+            self.event(
+                "baseline_stale_discarded",
+                baseline_equity_usd=equity,
+                baseline_ts=iso(ts),
+                last_seen_ts=iso(last_seen),
+                gap_hours=round(gap_hours, 1),
+                max_gap_hours=max_gap_hours,
+            )
+            self.baseline_path.unlink(missing_ok=True)
+            return
+        self.baseline_equity = equity
+        self.baseline_ts = ts
+        self.baseline_source_bot = row.get("source_bot")
+        self.pending_divergence_check = True
 
     def persist_baseline(self) -> None:
         if self.baseline_equity is None or self.baseline_ts is None:
             return
+        now = utc_now()
         write_json_atomic(
             self.baseline_path,
             {
                 "market": self.args.market,
                 "baseline_equity_usd": dec_to_json(self.baseline_equity),
                 "baseline_ts": iso(self.baseline_ts),
+                "last_seen_ts": iso(now),
+                "source_bot": self.baseline_source_bot,
             },
         )
+        self.last_persist_ts = now
 
     def record(self, status: dict[str, Any] | None, active_bot: str | None) -> dict[str, Any] | None:
         if not status:
@@ -594,9 +660,29 @@ class PnlTracker:
         if total_equity is None:
             return None
         now = utc_now()
+        source_bot = status.get("bot") or active_bot
         if self.baseline_equity is None:
             self.baseline_equity = total_equity
             self.baseline_ts = now
+            self.baseline_source_bot = source_bot
+            self.persist_baseline()
+        elif self.pending_divergence_check:
+            gap = total_equity - self.baseline_equity
+            if abs(gap) >= self.args.max_loss_usdc * Decimal("0.2"):
+                # A reloaded baseline already this far from live equity usually means
+                # the equity definition changed while we were down. Warn loudly but do
+                # NOT re-anchor: a real loss during downtime must keep counting.
+                self.event(
+                    "baseline_restart_gap",
+                    baseline_equity_usd=self.baseline_equity,
+                    baseline_ts=iso(self.baseline_ts),
+                    first_sample_equity_usd=total_equity,
+                    gap_usdc=gap,
+                    baseline_source_bot=self.baseline_source_bot,
+                    sample_source_bot=source_bot,
+                )
+        self.pending_divergence_check = False
+        if self.last_persist_ts is None or (now - self.last_persist_ts).total_seconds() >= 3600:
             self.persist_baseline()
         self.last_equity = total_equity
         row = {
@@ -677,23 +763,42 @@ class Orchestrator:
         self.shutdown_requested = False
         self.breaker_starvation_warned = False
         self.last_tape_prune: datetime | None = None
+        self.event_write_failures = 0
+        self.equity_sample_failures = 0
+        self.last_pnl_source: str | None = None
+        self.last_divergence_event_at: datetime | None = None
+        self.current_xemm_tape: Path | None = None
         self.events_path = args.state_dir / f"orchestrator_events_{args.market}.jsonl"
         self.state_path = args.state_dir / f"orchestrator_state_{args.market}.json"
         self.stats_path = args.state_dir / f"orchestrator_stats_{args.market}.json"
         self.breaker_path = args.state_dir / f"orchestrator_breaker_{args.market}.json"
         self.trades = TradeTracker(args, self.since, self.event)
-        self.pnl = PnlTracker(args, self.since)
+        self.pnl = PnlTracker(args, self.since, self.event)
 
     def event(self, kind: str, **details: Any) -> None:
+        # Must never raise: this runs inside the shutdown chain, where an escaping
+        # error (ENOSPC on the jsonl, a dead console pipe, a closed stdout, an
+        # unserializable detail) would abort before stop_observer/stop_active and
+        # orphan live bots (observed 2026-07-02 via BrokenPipeError).
         row = {"timestamp": iso(), "kind": kind, **details}
-        append_jsonl(self.events_path, row)
+        try:
+            append_jsonl(self.events_path, row)
+            self.event_write_failures = 0
+        except Exception as exc:
+            self.event_write_failures += 1
+            if self.event_write_failures >= 10:
+                # No durable audit trail for this long means trading must stop;
+                # flag-only so a full disk cannot block the halt itself.
+                self.shutdown_requested = True
+            try:
+                print(f"event write failed ({exc}): {kind}", file=sys.stderr, flush=True)
+            except Exception:
+                pass
         try:
             print(f"{row['timestamp']} {kind} {json.dumps(details, default=json_default, separators=(',', ':'))}", flush=True)
-        except OSError:
-            # A dead console pipe (e.g. the tee died) must never abort the caller —
-            # especially the shutdown path, where an uncaught BrokenPipeError here
-            # would exit before stop_observer/stop_active and orphan live bots
-            # (observed 2026-07-02). The jsonl event above is the durable record.
+        except Exception:
+            # A dead console pipe (e.g. the tee died) must never abort the caller.
+            # The jsonl event above is the durable record.
             pass
 
     def run(self) -> None:
@@ -732,9 +837,17 @@ class Orchestrator:
                     next_status_poll = time.monotonic() + self.args.poll_sec
                 time.sleep(max(0.05, self.args.fast_signal_poll_ms / 1000))
         finally:
+            # Each step guarded independently: a failure in one must not skip the
+            # remaining child stops or the lock release.
             self.event("orchestrator_stopping", active_bot=self.active_bot)
-            self.stop_observer("orchestrator_exit")
-            self.stop_active("orchestrator_exit")
+            try:
+                self.stop_observer("orchestrator_exit")
+            except Exception as exc:
+                self.event("stop_failed", stage="observer", error=str(exc))
+            try:
+                self.stop_active("orchestrator_exit")
+            except Exception as exc:
+                self.event("stop_failed", stage="active", error=str(exc))
             self.lock.release()
 
     def install_signals(self) -> None:
@@ -941,6 +1054,7 @@ class Orchestrator:
         stats = self.trades.summary()
         pnl_source = xemm_status or taker_status
         pnl_sample = self.pnl.record(pnl_source, self.active_bot)
+        self.note_pnl_sample(pnl_sample, taker_status, xemm_status)
         breaker = self.pnl.breaker_reason(stats)
         if breaker:
             self.safe_halt("pnl_breaker", breaker_reason=breaker, pnl_sample=pnl_sample)
@@ -968,6 +1082,60 @@ class Orchestrator:
         self.ensure_observer_for(decision["target"])
         self.write_state(taker_status, xemm_status, decision, stats)
 
+    def note_pnl_sample(
+        self,
+        pnl_sample: dict[str, Any] | None,
+        taker_status: dict[str, Any] | None,
+        xemm_status: dict[str, Any] | None,
+    ) -> None:
+        """Watch the equity feed itself: starvation, source flips, cross-bot drift."""
+        if pnl_sample is None:
+            # A status arrived but carried no usable total_equity_usd (a legitimate
+            # taker transient) — the equity-drawdown breaker is frozen on its last
+            # good sample. Alarm once after 3 consecutive misses, like the trades feed.
+            if taker_status is not None or xemm_status is not None:
+                self.equity_sample_failures += 1
+                if self.equity_sample_failures == 3:
+                    self.event(
+                        "equity_feed_starving",
+                        consecutive_failures=self.equity_sample_failures,
+                        active_bot=self.active_bot,
+                    )
+            return
+        self.equity_sample_failures = 0
+        taker_equity = self.status_equity(taker_status)
+        xemm_equity = self.status_equity(xemm_status)
+        source = pnl_sample.get("source_bot")
+        if self.last_pnl_source is not None and source != self.last_pnl_source:
+            self.event(
+                "pnl_source_switched",
+                from_bot=self.last_pnl_source,
+                to_bot=source,
+                taker_equity_usd=taker_equity,
+                xemm_equity_usd=xemm_equity,
+            )
+        self.last_pnl_source = source
+        if taker_equity is not None and xemm_equity is not None:
+            divergence = abs(taker_equity - xemm_equity)
+            now = utc_now()
+            if divergence >= self.args.max_loss_usdc * Decimal("0.2") and (
+                self.last_divergence_event_at is None
+                or (now - self.last_divergence_event_at).total_seconds() >= 1800
+            ):
+                self.last_divergence_event_at = now
+                self.event(
+                    "equity_calc_divergence",
+                    taker_equity_usd=taker_equity,
+                    xemm_equity_usd=xemm_equity,
+                    divergence_usdc=divergence,
+                )
+
+    @staticmethod
+    def status_equity(status: dict[str, Any] | None) -> Decimal | None:
+        if not status:
+            return None
+        return parse_decimal((status.get("accounts") or {}).get("total_equity_usd"))
+
     def prune_tapes_if_due(self) -> None:
         """Hourly sweep deleting research tapes past --tape-retention-days."""
         if self.args.tape_retention_days <= 0:
@@ -977,7 +1145,11 @@ class Orchestrator:
             return
         self.last_tape_prune = now
         pruned = prune_old_tapes(
-            self.args.state_dir, self.args.market, self.args.tape_retention_days, now
+            self.args.state_dir,
+            self.args.market,
+            self.args.tape_retention_days,
+            now,
+            exclude=self.current_xemm_tape,
         )
         if pruned:
             self.event(
@@ -1368,6 +1540,15 @@ class Orchestrator:
                         )
                         return
                 if bot == TAKER_OBSERVER:
+                    uptime_sec = (
+                        (utc_now() - child.started_at).total_seconds()
+                        if child.started_at
+                        else 0.0
+                    )
+                    if uptime_sec >= 600:
+                        # A long healthy run resets the ladder — only genuine crash
+                        # loops should escalate toward the 300s cap.
+                        self.observer_exit_count = 0
                     self.observer_exit_count += 1
                     retry_sec = min(
                         300,
@@ -1399,6 +1580,7 @@ class Orchestrator:
                 ]
             return BotProcess(bot, self.args.taker_repo, cmd, log)
         out = self.args.state_dir / f"orchestrator_xemm_{self.args.market}_{stamp()}.jsonl.zst"
+        self.current_xemm_tape = out
         cmd = [
             str(self.args.xemm_bin),
             "--config",
@@ -1536,6 +1718,9 @@ class Orchestrator:
         return result
 
     def safe_halt(self, reason: str, **details: Any) -> None:
+        # Flag first: even if every write below fails (full disk), the run loop
+        # must still exit and the finally block must still stop the children.
+        self.shutdown_requested = True
         self.event("safe_halt", reason=reason, details=details)
         self.stop_observer("safe_halt")
         self.stop_active("safe_halt")
@@ -1548,9 +1733,14 @@ class Orchestrator:
             "pnl": self.pnl.summary(),
             "trades": self.trades.summary(),
         }
-        write_json_atomic(self.breaker_path, state)
-        self.write_state(None, None, {"target": "SAFE_HALT", "reason": reason, "details": details}, self.trades.summary())
-        self.shutdown_requested = True
+        try:
+            write_json_atomic(self.breaker_path, state)
+        except Exception as exc:
+            self.event("breaker_file_write_failed", path=str(self.breaker_path), error=str(exc))
+        try:
+            self.write_state(None, None, {"target": "SAFE_HALT", "reason": reason, "details": details}, self.trades.summary())
+        except Exception as exc:
+            self.event("state_write_failed", error=str(exc))
 
     def write_state(
         self,
@@ -1681,6 +1871,16 @@ def parse_args() -> argparse.Namespace:
         help="Supervisor-level realized-loss backstop. Deliberately ABOVE the bot-level "
         "max_loss_usdc (10 in the live configs) so the bot breaker trips first and this "
         "remains a genuine second line of defense.",
+    )
+    parser.add_argument(
+        "--baseline-max-gap-hours",
+        type=float,
+        default=48.0,
+        help="Discard a persisted PnL baseline whose last supervision timestamp is "
+        "older than this many hours of downtime, re-anchoring the equity-drawdown "
+        "breaker to current equity (long gaps usually span redeploys that change "
+        "the equity definition). 0 keeps any persisted baseline; use --pnl-since "
+        "now to ignore persistence entirely.",
     )
     parser.add_argument("--reset-breaker-baseline", action="store_true", help="Delete the persisted PnL baseline on startup so the equity-drawdown breaker re-anchors to current equity.")
     parser.add_argument("--ack-breaker", action="store_true", help="Archive an existing orchestrator breaker file after operator review and allow startup.")
