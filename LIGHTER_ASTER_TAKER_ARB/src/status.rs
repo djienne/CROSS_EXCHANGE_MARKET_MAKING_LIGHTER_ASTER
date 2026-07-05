@@ -54,6 +54,7 @@ pub struct AccountStatus {
     pub aster_equity_usd: Option<Decimal>,
     pub lighter_available_usd: Decimal,
     pub lighter_equity_usd: Option<Decimal>,
+    pub lighter_unrealized_usd: Option<Decimal>,
     pub lighter_available_usd_ws: Option<Decimal>,
     pub total_available_usd: Decimal,
     pub total_equity_usd: Option<Decimal>,
@@ -240,10 +241,15 @@ async fn build_report(
         lighter_available_usd: lighter_account.available_usdc,
     };
     let lighter_equity = lighter_account.account_value_usdc;
+    let lighter_upnl = lighter_account.unrealized_pnl_usdc;
     let now = Utc::now();
     let mark = aster_book.mid().or_else(|| lighter_book.mid());
-    let total_equity = match (aster_balance.equity_usd(), lighter_equity) {
-        (Some(a), Some(l)) => Some(a + l),
+    // Lighter's account value is collateral-style and EXCLUDES open-position uPnL,
+    // so total equity must add the venue-reported unrealized PnL — otherwise a
+    // delta-neutral book bleeds 1:1 with price in this metric (the 2026-07-04
+    // false-trip class; XEMM fixed the same hole in 733ba55).
+    let total_equity = match (aster_balance.equity_usd(), lighter_equity, lighter_upnl) {
+        (Some(a), Some(l), Some(u)) => Some(a + l + u),
         _ => None,
     };
 
@@ -262,6 +268,7 @@ async fn build_report(
             aster_equity_usd: aster_balance.equity_usd(),
             lighter_available_usd: margins.lighter_available_usd,
             lighter_equity_usd: lighter_equity,
+            lighter_unrealized_usd: lighter_upnl,
             lighter_available_usd_ws: lighter_available_ws,
             total_available_usd: margins.aster_available_usd + margins.lighter_available_usd,
             total_equity_usd: total_equity,

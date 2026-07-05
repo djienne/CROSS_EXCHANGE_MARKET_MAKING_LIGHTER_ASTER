@@ -84,7 +84,11 @@ pub struct FillTrackerStats {
 pub struct LighterAccountSnapshot {
     pub position_qty: Decimal,
     pub available_usdc: Decimal,
+    /// Collateral-style account value: EXCLUDES open-position unrealized PnL.
     pub account_value_usdc: Option<Decimal>,
+    /// Venue-reported unrealized PnL summed over all open positions; `None` when
+    /// any nonzero position lacks the field (account unmarkable, not zero).
+    pub unrealized_pnl_usdc: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1042,6 +1046,7 @@ impl LighterVenue {
             position_qty: account_position_qty(account, wire.market_index as u32),
             available_usdc: account_available_usdc(account),
             account_value_usdc: account_value_usdc(account),
+            unrealized_pnl_usdc: account_unrealized_pnl(account),
         })
     }
 
@@ -1148,6 +1153,23 @@ fn account_available_usdc(account: &serde_json::Value) -> Decimal {
         .or_else(|| value_dec(account.get("available_balance")))
         .or_else(|| value_dec(account.get("available")))
         .unwrap_or(Decimal::ZERO)
+}
+
+fn account_unrealized_pnl(account: &serde_json::Value) -> Option<Decimal> {
+    let Some(rows) = account.get("positions").and_then(|p| p.as_array()) else {
+        return Some(Decimal::ZERO);
+    };
+    let mut total = Decimal::ZERO;
+    for p in rows {
+        let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
+        if signed_position_json_dec(p.get("position"), sign) == Decimal::ZERO {
+            continue;
+        }
+        // A nonzero position without a parseable mark makes the whole account
+        // unmarkable: report None rather than silently under-counting equity.
+        total += value_dec(p.get("unrealized_pnl"))?;
+    }
+    Some(total)
 }
 
 fn account_value_usdc(account: &serde_json::Value) -> Option<Decimal> {
@@ -1804,8 +1826,8 @@ mod tests {
                 "available_capital": "123.45",
                 "portfolio_value": "234.56",
                 "positions": [
-                    {"market_id": 23, "position": "9.99", "sign": 1},
-                    {"market_id": 24, "position": "0.42", "sign": -1}
+                    {"market_id": 23, "position": "9.99", "sign": 1, "unrealized_pnl": "-1.25"},
+                    {"market_id": 24, "position": "0.42", "sign": -1, "unrealized_pnl": "7.804932"}
                 ]
             }]
         });
@@ -1823,6 +1845,40 @@ mod tests {
         assert_eq!(
             account_value_usdc(account),
             Some("234.56".parse::<Decimal>().unwrap())
+        );
+        assert_eq!(
+            account_unrealized_pnl(account),
+            Some("6.554932".parse::<Decimal>().unwrap())
+        );
+    }
+
+    #[test]
+    fn account_unrealized_pnl_fails_closed_and_skips_flat_rows() {
+        // Nonzero position without a parseable unrealized_pnl -> whole account
+        // unmarkable (None), never a silent partial sum.
+        let missing = serde_json::json!({
+            "positions": [
+                {"market_id": 24, "position": "0.99", "sign": 1}
+            ]
+        });
+        assert_eq!(account_unrealized_pnl(&missing), None);
+
+        // Flat rows are ignored even when their unrealized_pnl is absent or junk.
+        let flat = serde_json::json!({
+            "positions": [
+                {"market_id": 23, "position": "0.00", "sign": 1},
+                {"market_id": 24, "position": "1.17", "sign": -1, "unrealized_pnl": "0.5"}
+            ]
+        });
+        assert_eq!(
+            account_unrealized_pnl(&flat),
+            Some("0.5".parse::<Decimal>().unwrap())
+        );
+
+        // No positions array at all: a flat account has zero unrealized PnL.
+        assert_eq!(
+            account_unrealized_pnl(&serde_json::json!({})),
+            Some(Decimal::ZERO)
         );
     }
 
