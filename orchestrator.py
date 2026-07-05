@@ -662,10 +662,17 @@ class PnlTracker:
         now = utc_now()
         source_bot = status.get("bot") or active_bot
         if self.baseline_equity is None:
-            self.baseline_equity = total_equity
-            self.baseline_ts = now
-            self.baseline_source_bot = source_bot
-            self.persist_baseline()
+            if active_bot is None:
+                # Bootstrap tick: the sample comes from whichever bot answered first,
+                # but the two bots' equity calcs differ (the taker's excludes Lighter
+                # uPnL). Anchor only once a bot is active so the baseline matches the
+                # steady-state series instead of seeding a phantom offset.
+                pass
+            else:
+                self.baseline_equity = total_equity
+                self.baseline_ts = now
+                self.baseline_source_bot = source_bot
+                self.persist_baseline()
         elif self.pending_divergence_check:
             gap = total_equity - self.baseline_equity
             if abs(gap) >= self.args.max_loss_usdc * Decimal("0.2"):
@@ -692,7 +699,9 @@ class PnlTracker:
             "source_bot": status.get("bot") or active_bot,
             "total_equity_usd": total_equity,
             "baseline_equity_usd": self.baseline_equity,
-            "equity_pnl_usdc": total_equity - self.baseline_equity,
+            "equity_pnl_usdc": (
+                total_equity - self.baseline_equity if self.baseline_equity is not None else None
+            ),
             "aster_equity_usd": accounts.get("aster_equity_usd"),
             "lighter_equity_usd": accounts.get("lighter_equity_usd"),
             "total_available_usd": accounts.get("total_available_usd"),

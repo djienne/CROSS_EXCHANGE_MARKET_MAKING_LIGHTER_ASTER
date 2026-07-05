@@ -99,16 +99,31 @@ class BaselineGapTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state_dir = Path(tmp)
             tracker = PnlTracker(make_args(state_dir), utc_now(), lambda kind, **d: None)
-            tracker.record(status(), None)
+            tracker.record(status(), "XEMM_LIGHTER_ASTER")
             path = state_dir / "orchestrator_baseline_HYPE.json"
             first_seen = json.loads(path.read_text(encoding="utf-8"))["last_seen_ts"]
-            tracker.record(status("238.90"), None)
+            tracker.record(status("238.90"), "XEMM_LIGHTER_ASTER")
             self.assertEqual(first_seen, json.loads(path.read_text(encoding="utf-8"))["last_seen_ts"])
             tracker.last_persist_ts = utc_now() - timedelta(hours=2)
-            tracker.record(status("238.95"), None)
+            tracker.record(status("238.95"), "XEMM_LIGHTER_ASTER")
             refreshed = json.loads(path.read_text(encoding="utf-8"))
             self.assertGreater(refreshed["last_seen_ts"], first_seen)
             self.assertEqual("238.83", refreshed["baseline_equity_usd"])
+
+    def test_bootstrap_sample_does_not_arm_baseline(self) -> None:
+        # The bootstrap tick samples whichever bot answered first (usually the
+        # taker), whose equity calc differs from XEMM's; arming there seeds a
+        # phantom offset (observed +7.69 on 2026-07-05).
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            tracker = PnlTracker(make_args(state_dir), utc_now(), lambda kind, **d: None)
+            row = tracker.record(status("231.13", bot="LIGHTER_ASTER_TAKER_ARB"), None)
+            self.assertIsNone(tracker.baseline_equity)
+            self.assertIsNone(row["equity_pnl_usdc"])
+            self.assertFalse((state_dir / "orchestrator_baseline_HYPE.json").exists())
+            tracker.record(status("238.83"), "XEMM_LIGHTER_ASTER")
+            self.assertEqual(Decimal("238.83"), tracker.baseline_equity)
+            self.assertEqual("XEMM_LIGHTER_ASTER", tracker.baseline_source_bot)
 
     def test_restart_gap_event_fires_once_on_divergence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
