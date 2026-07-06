@@ -163,6 +163,26 @@ fn handle_value(
     #[cfg(not(feature = "hotpath"))]
     let prebuilt_hot = None;
     tap.publish_prebuilt(&bid_levels, &ask_levels, exch_ts, prebuilt_hot);
+    // Lighter has no separate bookTicker stream (Aster does), so mirror the L2
+    // top-of-book into the optional BBO fast-path slot. Without this the slot is
+    // never populated: the hedge always takes the slower L2 walk and qdiag shows a
+    // misleading hl_bbo=none / age=i64::MAX. Same data and freshness as this L2
+    // frame, so hedge pricing is unchanged — it only lets the BBO fast path engage.
+    if let (Some(&bid_top), Some(&ask_top)) = (bid_levels.first(), ask_levels.first()) {
+        #[cfg(feature = "hotpath")]
+        let bbo_hot = tap.hot_book_from_levels(
+            std::slice::from_ref(&bid_top),
+            std::slice::from_ref(&ask_top),
+            exch_ts,
+        );
+        #[cfg(feature = "hotpath")]
+        if let Some((hot, _)) = bbo_hot.as_ref() {
+            tap.publish_bbo_hot_only(*hot, exch_ts);
+        }
+        #[cfg(not(feature = "hotpath"))]
+        let bbo_hot = None;
+        tap.publish_bbo_prebuilt(bid_top, ask_top, exch_ts, bbo_hot);
+    }
     tx.send(
         market.clone(),
         EventKind::HlL2Book {
@@ -228,6 +248,46 @@ mod tests {
         assert_eq!(bids[1].1.to_string(), "1");
         assert_eq!(asks[0].0.to_string(), legacy(64820.3));
         assert_eq!(asks[0].1.to_string(), legacy(0.19283));
+    }
+
+    #[test]
+    fn handle_value_mirrors_l2_top_into_bbo_slot() {
+        // Lighter has no bookTicker stream; the connector mirrors the L2 top-of-book
+        // into the BBO slot so the hedge fast path can engage and qdiag stops showing
+        // hl_bbo=none. Regression guard: the slot must be populated with exactly the
+        // top level of each side.
+        use crate::connectors::BookTap;
+        use crate::hotpath::book_cell::VenueBook;
+        use std::sync::Arc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let cell = Arc::new(VenueBook::new());
+        let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+        // Prices chosen exactly representable in f64 so the dec_from_f64_book path
+        // yields clean strings.
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 1,
+            "order_book": {
+                "bids": [{"price": "100.5", "size": "3"}, {"price": "100.25", "size": "5"}],
+                "asks": [{"price": "100.75", "size": "4"}, {"price": "101", "size": "6"}],
+                "offset": 1
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+
+        let bbo = cell.load_bbo().expect("BBO slot populated from L2 top");
+        let bid = bbo.best_bid().expect("bbo bid");
+        let ask = bbo.best_ask().expect("bbo ask");
+        assert_eq!(bid.px.to_string(), "100.5");
+        assert_eq!(bid.qty.to_string(), "3");
+        assert_eq!(ask.px.to_string(), "100.75");
+        assert_eq!(ask.qty.to_string(), "4");
+        // A 1-level mirror: the second level must not leak into the BBO book.
+        assert!(bbo.bids.len() == 1 && bbo.asks.len() == 1);
     }
 
     #[test]
