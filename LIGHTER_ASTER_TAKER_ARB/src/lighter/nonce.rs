@@ -28,6 +28,17 @@ impl NonceManager {
         })
     }
 
+    /// Offline stub for read-only venues (status/monitoring): no REST round-trip, and the
+    /// stored counter is a poison value. It must NEVER sign a live order — read-only
+    /// venues hard-reject submits before reaching the nonce (pinned by tests there).
+    pub fn offline(account_index: i64, api_key_index: i32) -> Self {
+        Self {
+            account_index,
+            api_key_index,
+            nonce: AtomicI64::new(i64::MIN / 2),
+        }
+    }
+
     /// Reserve and return the next nonce.
     #[inline]
     pub fn next(&self) -> i64 {
@@ -80,6 +91,14 @@ mod tests {
         assert_eq!(nm.next(), 101);
         nm.acknowledge_failure(); // roll back the 101
         assert_eq!(nm.next(), 101);
+    }
+
+    #[test]
+    fn offline_nonce_is_a_poison_value() {
+        // The offline stub must never produce a plausible live nonce.
+        let nm = NonceManager::offline(1, 0);
+        assert!(nm.next() < 0);
+        assert_eq!(nm.api_key_index(), 0);
     }
 
     #[test]

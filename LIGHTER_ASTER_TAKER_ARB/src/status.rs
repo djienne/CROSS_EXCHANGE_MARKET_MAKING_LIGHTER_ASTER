@@ -1,6 +1,5 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -180,16 +179,15 @@ pub async fn run(cfg: &Config, markets: Vec<MarketCfg>, json: bool) -> Result<()
     let signer: Arc<dyn AsterSigner> =
         Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
     let aster = AsterRest::new(cfg.venues.aster_base_url.clone(), signer, &specs)?;
-    let lighter = LighterVenue::new(
+    // Read-only venue: no order-capable tx socket, no authed streams, no 20s
+    // wait_ready — a monitoring poll answers from REST in a couple of seconds and can
+    // never place an order. The report's *_ws fields are null by construction.
+    let lighter = LighterVenue::new_read_only(
         &cfg.venues.lighter_base_url,
         Path::new(&cfg.venues.signers_dir),
         lcreds,
         &specs,
-    )
-    .await?;
-    lighter
-        .wait_ready(&spec.market_id, Duration::from_secs(20))
-        .await?;
+    )?;
 
     let report = build_report(cfg, &spec, &aster, &lighter).await?;
     if json {
@@ -217,7 +215,12 @@ async fn build_report(
         lighter_open,
     ) = tokio::join!(
         rest_book::fetch_aster_book(&http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20),
-        async { lighter.order_book(&spec.market_id) },
+        rest_book::fetch_lighter_book(
+            &http,
+            &cfg.venues.lighter_base_url,
+            spec.lighter_market_id,
+            20
+        ),
         aster.position_qty(&spec.market_id),
         lighter.account_snapshot(&spec.market_id),
         aster.balance_snapshot(),

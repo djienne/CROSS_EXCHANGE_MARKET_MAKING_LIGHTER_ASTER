@@ -588,11 +588,12 @@ impl BookFeedState {
     }
 
     fn order_book(&self, market_id: u32) -> Option<OrderBook> {
-        let cached = {
-            let books = self.books.lock().expect("Lighter book state poisoned");
-            books.get(&market_id).and_then(LighterBook::load_cached)
-        };
-        cached.map(|arc| (*arc).clone())
+        self.order_book_arc(market_id).map(|arc| (*arc).clone())
+    }
+
+    fn order_book_arc(&self, market_id: u32) -> Option<Arc<OrderBook>> {
+        let books = self.books.lock().expect("Lighter book state poisoned");
+        books.get(&market_id).and_then(LighterBook::load_cached)
     }
 
     fn request_reconnect(&self, market_id: u32) {
@@ -711,6 +712,9 @@ pub struct LighterVenue {
     /// reads books with a plain ArcSwap load — no mutex shared with the feed writer.
     book_cells: std::collections::HashMap<u32, Arc<ArcSwapOption<OrderBook>>>,
     write_lock: AsyncMutex<()>,
+    /// Monitoring-only venue (status subcommand): offline nonce stub, no tx-socket
+    /// connect, no spawned streams. Submits hard-reject before touching the nonce.
+    read_only: bool,
 }
 
 impl LighterVenue {
@@ -795,6 +799,69 @@ impl LighterVenue {
             book_feed,
             book_cells,
             write_lock: AsyncMutex::new(()),
+            read_only: false,
+        })
+    }
+
+    /// Read-only venue for the status/monitoring path: REST + signer (the
+    /// accountActiveOrders auth token needs it) and the market wire context, but an
+    /// OFFLINE nonce stub, an UNCONNECTED tx socket, and NO spawned streams — a status
+    /// poll must never open an order-capable socket or pay wait_ready. Everything the
+    /// report needs comes from REST; `submit_market_order_deferred_fill` hard-rejects.
+    pub fn new_read_only(
+        base_url: &str,
+        signers_dir: &Path,
+        creds: LighterCreds,
+        specs: &[MarketSpec],
+    ) -> Result<Self> {
+        let rest = RestClient::new(base_url)?;
+        let signer = Arc::new(Signer::load(
+            signers_dir,
+            base_url,
+            &creds.api_private_key,
+            creds.api_key_index,
+            creds.account_index,
+        )?);
+        let nonce = Arc::new(NonceManager::offline(
+            creds.account_index,
+            creds.api_key_index,
+        ));
+        let ws_url = lighter_ws_url(base_url);
+        let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
+        let fills = Arc::new(FillTracker::default());
+        let account_feed = Arc::new(AccountFeedState::default());
+        let book_feed = Arc::new(BookFeedState::default());
+        let markets = specs
+            .iter()
+            .map(|s| {
+                (
+                    s.market_id.clone(),
+                    Wire {
+                        market_index: s.lighter_market_id as i32,
+                        size_decimals: s.lighter_size_decimals,
+                        price_decimals: s.lighter_price_decimals,
+                    },
+                )
+            })
+            .collect();
+        let book_cells = specs
+            .iter()
+            .map(|s| (s.lighter_market_id, book_feed.cell(s.lighter_market_id)))
+            .collect();
+        Ok(LighterVenue {
+            rest,
+            tx_ws,
+            signer,
+            nonce,
+            account_index: creds.account_index,
+            api_key_index: creds.api_key_index,
+            markets,
+            fills,
+            account_feed,
+            book_feed,
+            book_cells,
+            write_lock: AsyncMutex::new(()),
+            read_only: true,
         })
     }
 
@@ -830,17 +897,23 @@ impl LighterVenue {
     }
 
     pub fn order_book(&self, market: &MarketId) -> Result<OrderBook> {
+        self.order_book_arc(market).map(|arc| (*arc).clone())
+    }
+
+    /// Lock-free scan-path read WITHOUT the snapshot clone: the published Arc is
+    /// returned directly, so the scan loop can also use pointer identity as its
+    /// book-change detector (each applied update stores a fresh Arc; resets store None).
+    pub fn order_book_arc(&self, market: &MarketId) -> Result<Arc<OrderBook>> {
         let wire = self.wire(market)?;
-        // Lock-free scan-path read: the cell was resolved at construction, so this is a
-        // plain ArcSwap load — never contends with the feed writer's books mutex.
+        // The cell was resolved at construction, so this is a plain ArcSwap load —
+        // never contends with the feed writer's books mutex.
         if let Some(cell) = self.book_cells.get(&(wire.market_index as u32)) {
             return cell
                 .load_full()
-                .map(|arc| (*arc).clone())
                 .ok_or_else(|| anyhow!("Lighter order_book websocket not ready for {market}"));
         }
         self.book_feed
-            .order_book(wire.market_index as u32)
+            .order_book_arc(wire.market_index as u32)
             .ok_or_else(|| anyhow!("Lighter order_book websocket not ready for {market}"))
     }
 
@@ -889,6 +962,17 @@ impl LighterVenue {
         price_bound: Decimal,
         reduce_only: bool,
     ) -> (SubmitOutcome, Option<PendingFill>) {
+        // Hard gate BEFORE any nonce/sign work: a read-only (monitoring) venue carries
+        // an offline nonce stub that must never sign a live order.
+        if self.read_only {
+            return (
+                SubmitOutcome::Rejected {
+                    reason: "read-only LighterVenue (status/monitoring): order submission disabled"
+                        .to_string(),
+                },
+                None,
+            );
+        }
         let wire = match self.wire(market) {
             Ok(w) => w.clone(),
             Err(e) => {
