@@ -58,6 +58,26 @@ pub enum ExecCommand {
     Shutdown,
 }
 
+/// Commands eligible for the exec worker's priority lane (jump ahead of queued
+/// places/replaces). Safe by construction:
+/// - `Cancel` with `venue_order_id: Some(_)`: the id is set ONLY when the strategy has
+///   processed the `PlaceAck` (orders.rs is the sole setter), which proves no `Place` for
+///   that client id can still be queued — so reordering cannot produce the
+///   `-2011 → AlreadyGone → slot cleared → ghost order rests` sequence. Un-acked cancels
+///   (`venue_order_id: None`) stay FIFO.
+/// - `FlattenAster`: reduce-only MARKET with no slot interaction.
+/// - `CancelAllBot`/`CancelMarket` must stay FIFO: sweeping ahead of queued `Place`s
+///   would let those places rest AFTER the sweep.
+pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
+    matches!(
+        cmd,
+        ExecCommand::Cancel {
+            venue_order_id: Some(_),
+            ..
+        } | ExecCommand::FlattenAster { .. }
+    )
+}
+
 /// Fill reactor / strategy → Hyperliquid hedge worker.
 #[derive(Debug, Clone)]
 pub enum HedgeCommand {

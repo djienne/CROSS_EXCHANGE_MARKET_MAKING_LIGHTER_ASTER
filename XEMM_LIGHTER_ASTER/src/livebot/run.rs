@@ -266,6 +266,10 @@ pub async fn run(
 
     // --- execution plane: bounded command queues ---
     let (exec_tx, exec_rx) = mpsc::channel::<ExecCommand>(CMD_QUEUE_DEPTH);
+    // Priority lane for acked cancels + flattens (see exec::command::is_priority_cmd):
+    // depth mirrors the strategy's EXEC_CANCEL_RESERVE. run() keeps `exec_prio_tx` alive
+    // for its whole lifetime so the worker's priority arm never closes early.
+    let (exec_prio_tx, exec_prio_rx) = mpsc::channel::<ExecCommand>(64);
     let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeCommand>(CMD_QUEUE_DEPTH);
     let (events_tx, events_rx) = mpsc::channel::<ExecEvent>(CMD_QUEUE_DEPTH);
     let (maker_fill_tx, maker_fill_rx) = mpsc::channel::<AsterFill>(256);
@@ -284,14 +288,14 @@ pub async fn run(
     let mut aux_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let (worker_task, clean_start, stream_liveness) = if exec_mode.sends_real_orders() {
         setup_live_planes(
-            cfg, &specs, &account, exec_rx, hedge_rx, events_tx, maker_fill_tx, shutdown.clone(), &mut aux_tasks,
+            cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, shutdown.clone(), &mut aux_tasks,
         )
         .await?
     } else {
         let mut snap = AccountSnapshot::empty();
         snap.source_ts_ns = mono_now_ns();
         account.publish(snap);
-        (tokio::spawn(run_paper_workers(exec_rx, hedge_rx, events_tx)), true, None)
+        (tokio::spawn(run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx)), true, None)
     };
     // (Startup cancel-all + clean-start verification now happen inside `setup_live_planes`
     // BEFORE the initial reconcile via `Reconciler::ensure_clean_start`, so the bot can never
@@ -307,6 +311,7 @@ pub async fn run(
         cfg.clone(), &specs, &eligibility, registry.clone(), account.clone(),
         journal.clone(), session, exec_tx.clone(), hedge_tx.clone(), exec_mode,
     );
+    strat.set_exec_prio_lane(exec_prio_tx.clone());
     if clean_start {
         strat.mark_clean_start();
     }
@@ -442,6 +447,35 @@ pub async fn run(
     if cfg.live.shutdown_cancel_all {
         send_exec_safety(&exec_tx, ExecCommand::CancelAllBot, "shutdown CancelAllBot").await;
         tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Wait (bounded) for the strategy's shutdown fill-drain before stopping the workers:
+    // a fill queued at ctrl-c raced the old immediate worker Shutdown and could be dropped
+    // unhedged. The strategy's own drain is capped at 3s; a panic fires the supervision
+    // channel immediately (the send is outside the unwind), so crash paths don't wait.
+    if !strategy_done_seen {
+        match tokio::time::timeout(Duration::from_secs(10), &mut strat_done_rx).await {
+            Ok(res) => {
+                strategy_done_seen = true;
+                match res {
+                    Ok(Ok(())) => {}
+                    Ok(Err(msg)) => {
+                        warn!("strategy thread panicked: {msg}");
+                        if strategy_error.is_none() {
+                            strategy_error = Some(anyhow::anyhow!("strategy thread panicked: {msg}"));
+                        }
+                    }
+                    Err(_) => {
+                        if strategy_error.is_none() {
+                            strategy_error =
+                                Some(anyhow::anyhow!("strategy thread supervision channel closed"));
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                warn!("strategy did not stop within 10s of shutdown; stopping workers anyway");
+            }
+        }
     }
     send_exec_safety(&exec_tx, ExecCommand::Shutdown, "exec Shutdown").await;
     send_hedge_safety(&hedge_tx, HedgeCommand::Shutdown, "hedge Shutdown").await;
@@ -678,12 +712,24 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config, exec_mode: ExecMod
 /// Paper executor task: one loop draining both command queues into the event channel.
 async fn run_paper_workers(
     mut exec_rx: mpsc::Receiver<ExecCommand>,
+    mut exec_prio_rx: mpsc::Receiver<ExecCommand>,
     mut hedge_rx: mpsc::Receiver<HedgeCommand>,
     events_tx: mpsc::Sender<ExecEvent>,
 ) {
     let paper = PaperExec::new();
     loop {
         tokio::select! {
+            biased;
+            cmd = exec_prio_rx.recv() => match cmd {
+                Some(c) => {
+                    let stop = matches!(c, ExecCommand::Shutdown);
+                    for ev in paper.on_exec_command(c) {
+                        let _ = events_tx.send(ev).await;
+                    }
+                    if stop { break; }
+                }
+                None => break,
+            },
             cmd = exec_rx.recv() => match cmd {
                 Some(c) => {
                     let stop = matches!(c, ExecCommand::Shutdown);
@@ -720,6 +766,7 @@ async fn setup_live_planes(
     specs: &[MarketSpec],
     account: &AccountState,
     exec_rx: mpsc::Receiver<ExecCommand>,
+    exec_prio_rx: mpsc::Receiver<ExecCommand>,
     hedge_rx: mpsc::Receiver<HedgeCommand>,
     events_tx: mpsc::Sender<ExecEvent>,
     maker_fill_tx: mpsc::Sender<AsterFill>,
@@ -838,7 +885,7 @@ async fn setup_live_planes(
     // block a hedge dequeue exactly when a fill just landed. The returned handle is a
     // supervisor that only awaits the two real tasks at shutdown.
     let etx = events_tx.clone();
-    let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, etx, worker_aster));
+    let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, exec_prio_rx, etx, worker_aster));
     let hl_worker_task = tokio::spawn(run_hl_worker(hedge_rx, events_tx, worker_hl));
     let worker_task = tokio::spawn(async move {
         let _ = aster_worker_task.await;

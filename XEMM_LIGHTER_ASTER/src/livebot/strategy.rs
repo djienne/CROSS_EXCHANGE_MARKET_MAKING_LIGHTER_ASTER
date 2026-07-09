@@ -827,6 +827,10 @@ pub struct Strategy {
     /// per-partial taker flatten). A residual that genuinely lingers is flattened in `on_tick`.
     pending: HashMap<MarketId, PendingInventory>,
     exec_tx: Sender<ExecCommand>,
+    /// Optional priority lane to the Aster exec worker (acked cancels + flattens jump
+    /// queued places/replaces — see `exec::command::is_priority_cmd`). `None` (tests
+    /// without the lane) falls back to the FIFO `exec_tx`.
+    exec_prio_tx: Option<Sender<ExecCommand>>,
     hedge_tx: Sender<HedgeCommand>,
     cooldown_ns: i64,
     exec_mode: ExecMode,
@@ -981,6 +985,7 @@ impl Strategy {
             hl_pos: HashMap::new(),
             pending: HashMap::new(),
             exec_tx,
+            exec_prio_tx: None,
             hedge_tx,
             cooldown_ns,
             exec_mode,
@@ -1032,6 +1037,10 @@ impl Strategy {
     }
 
     /// Mark startup reconciliation complete — quoting may begin (still gated by feeds/cooldown).
+    pub fn set_exec_prio_lane(&mut self, tx: Sender<ExecCommand>) {
+        self.exec_prio_tx = Some(tx);
+    }
+
     pub fn mark_clean_start(&mut self) {
         self.clean_start = true;
         self.account.hot.set_trading_allowed(true);
@@ -1236,6 +1245,23 @@ impl Strategy {
         if !self.aster_budget_allows(priority, cost, now_ns) {
             return ExecDispatch::BudgetBlocked;
         }
+        // Priority-lane routing: an acked cancel/flatten jumps the FIFO of queued places.
+        // A full (or missing) priority queue falls back to the normal lane — ordering-safe
+        // by definition, since the FIFO lane is where these commands lived before.
+        let cmd = if super::exec::command::is_priority_cmd(&cmd) {
+            match &self.exec_prio_tx {
+                Some(ptx) => match ptx.try_send(cmd) {
+                    Ok(()) => {
+                        self.record_aster_command_dispatch(cost, now_ns);
+                        return ExecDispatch::Sent;
+                    }
+                    Err(TrySendError::Full(cmd)) | Err(TrySendError::Closed(cmd)) => cmd,
+                },
+                None => cmd,
+            }
+        } else {
+            cmd
+        };
         match self.exec_tx.try_send(cmd) {
             Ok(()) => {
                 self.record_aster_command_dispatch(cost, now_ns);
@@ -3526,6 +3552,31 @@ pub async fn run_strategy(
             }
         }
     }
+    // Shutdown fill-drain: a maker fill already queued when ctrl-c landed must still be
+    // dispatched to the hedge worker. The workers stay up until this function returns —
+    // run() waits on the strategy supervision channel before sending the worker Shutdown
+    // commands. The userstream's shutdown arm drops its fill sender, so the drain normally
+    // completes in milliseconds; the deadline bounds abnormal cases (paper mode keeps a
+    // sender alive for the session).
+    let drain_deadline =
+        tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    loop {
+        // Exec events first: acks/rejects that update slot state consumed by fill handling.
+        while let Ok(ev) = exec_events.try_recv() {
+            strat.handle_exec_event(ev, mono_now_ns());
+        }
+        match tokio::time::timeout_at(drain_deadline, maker_fills.recv()).await {
+            Ok(Some(fill)) => {
+                warn!("shutdown drain: dispatching maker fill queued at shutdown");
+                strat.handle_maker_fill(fill, mono_now_ns()).await;
+            }
+            Ok(None) => break, // fill senders dropped and queue empty — nothing can race
+            Err(_) => {
+                warn!("shutdown drain: 3s deadline reached with fill senders still open");
+                break;
+            }
+        }
+    }
     info!("strategy loop stopped");
 }
 
@@ -3864,6 +3915,95 @@ mod tests {
             }
             other => panic!("expected primary hedge, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn priority_lane_routes_acked_cancels_and_falls_back_when_full() {
+        use crate::livebot::exec::command::ExecCommand;
+        let account = AccountState::new(dec!(5));
+        let (etx, mut erx) = tokio::sync::mpsc::channel(8);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(8);
+        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let (ptx, mut prx) = tokio::sync::mpsc::channel(1); // depth 1: makes "full" testable
+        strat.set_exec_prio_lane(ptx);
+        let m: MarketId = "BTC".into();
+
+        let acked = |cid: &str| ExecCommand::Cancel {
+            market: m.clone(),
+            side: Side::Sell,
+            client_id: cid.into(),
+            venue_order_id: Some("v1".into()),
+        };
+        // Acked cancel → priority lane, not the FIFO lane.
+        assert!(matches!(
+            strat.try_send_aster_cmd(acked("c1"), AsterCommandPriority::RiskReducing, 1),
+            ExecDispatch::Sent
+        ));
+        // Prio lane full → falls back to the normal lane (ordering-safe), still Sent.
+        assert!(matches!(
+            strat.try_send_aster_cmd(acked("c2"), AsterCommandPriority::RiskReducing, 2),
+            ExecDispatch::Sent
+        ));
+        // Un-acked cancel → normal lane only.
+        let unacked = ExecCommand::Cancel {
+            market: m.clone(),
+            side: Side::Sell,
+            client_id: "c3".into(),
+            venue_order_id: None,
+        };
+        assert!(matches!(
+            strat.try_send_aster_cmd(unacked, AsterCommandPriority::RiskReducing, 3),
+            ExecDispatch::Sent
+        ));
+
+        let on_prio = prx.try_recv().expect("acked cancel must ride the priority lane");
+        assert!(matches!(on_prio, ExecCommand::Cancel { ref client_id, .. } if client_id == "c1"));
+        assert!(prx.try_recv().is_err(), "only one command fits the prio lane");
+        let fallback = erx.try_recv().expect("overflow must fall back to the FIFO lane");
+        assert!(matches!(fallback, ExecCommand::Cancel { ref client_id, .. } if client_id == "c2"));
+        let normal = erx.try_recv().expect("un-acked cancel stays on the FIFO lane");
+        assert!(matches!(normal, ExecCommand::Cancel { ref client_id, .. } if client_id == "c3"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drain_dispatches_fill_queued_at_cancellation() {
+        // A maker fill already queued when the shutdown token fires must still reach
+        // the hedge dispatch: the loop exits into a bounded drain instead of dropping
+        // the queue on the floor (run() keeps the workers up until this returns).
+        let account = AccountState::new(dec!(5));
+        let (etx, _erx) = tokio::sync::mpsc::channel(64);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        publish_hl_l2_hot(&strat, books().1, 1_000_000);
+        publish_hl_bbo_hot(&strat, hl_bbo_at(dec!(2.1), dec!(2.1), ts()), 1_000_000);
+
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let (_ev_tx, ev_rx) = tokio::sync::mpsc::channel(16);
+        let (fill_tx, fill_rx) = tokio::sync::mpsc::channel(16);
+        let (_tp_tx, tp_rx) = tokio::sync::mpsc::channel(16);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        fill_tx
+            .send(AsterFill {
+                market: "BTC".into(),
+                aster_side: Side::Buy,
+                order_id: "oid-drain".into(),
+                trade_id: "trade-drain".into(),
+                client_id: "cid-drain".into(),
+                last_fill_qty: dec!(0.2),
+                last_fill_px: dec!(100),
+                cum_filled_qty: dec!(0.2),
+                event_time_ms: 1_700_000_000_000,
+                reduce_only: false,
+            })
+            .await
+            .unwrap();
+        drop(fill_tx); // mirrors the userstream's shutdown arm dropping its sender
+
+        run_strategy(strat, wake, ev_rx, fill_rx, tp_rx, shutdown).await;
+
+        let cmd = hrx.try_recv().expect("queued fill must be hedged during the drain");
+        assert!(matches!(cmd, HedgeCommand::Hedge { .. }));
     }
 
     #[test]

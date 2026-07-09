@@ -15,7 +15,7 @@ use anyhow::{anyhow, Result};
 use reqwest::Method;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{info, warn};
 
 use super::command::{ExecCommand, ExecEvent};
@@ -580,38 +580,130 @@ impl RestCommandLimiter {
             }
         }
     }
+
+    /// Count a request against the window WITHOUT ever sleeping — the priority lane's
+    /// cancels/flattens are already budgeted by the strategy (`aster_budget_allows` counts
+    /// every enqueue against the same per-minute cap), and a risk-reducing cancel must not
+    /// wait behind the shared limiter. The recorded timestamp is still visible to later
+    /// `acquire()` calls, so normal-lane commands keep honoring the cap.
+    fn record(&mut self) {
+        let window = Duration::from_secs(60);
+        let now = tokio::time::Instant::now();
+        while self.sent.front().is_some_and(|&t| now.saturating_duration_since(t) >= window) {
+            self.sent.pop_front();
+        }
+        self.sent.push_back(now);
+    }
+
+    /// Gate for one venue request: priority commands record-and-go, normal commands wait.
+    async fn gate(&mut self, from_prio: bool) {
+        if from_prio {
+            self.record();
+        } else {
+            self.acquire().await;
+        }
+    }
 }
 
 /// The Aster execution worker loop: drain commands, perform venue I/O, publish events.
 /// Constructed only under `mode = "live"`.
-pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEvent>, rest: AsterRest) {
+pub async fn run_aster_worker(
+    mut rx: Receiver<ExecCommand>,
+    mut prio_rx: Receiver<ExecCommand>,
+    tx: Sender<ExecEvent>,
+    rest: AsterRest,
+) {
     info!("aster live exec worker started (real signing wired; ABI+EIP-191, live-verified)");
     let mut backoff_until: Option<tokio::time::Instant> = None;
     let mut limiter = RestCommandLimiter::new(rest.max_rest_requests_per_minute);
-    while let Some(cmd) = rx.recv().await {
+    let mut prio_open = true;
+    loop {
+        // Priority lane first (acked cancels + flattens — see is_priority_cmd): drain
+        // without waiting, then block on both lanes biased toward priority. A cancel
+        // arriving while N places sit queued is executed next, not N commands later.
+        let (cmd, from_prio) = if prio_open {
+            match prio_rx.try_recv() {
+                Ok(c) => (c, true),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    prio_open = false;
+                    continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    tokio::select! {
+                        biased;
+                        c = prio_rx.recv() => match c {
+                            Some(c) => (c, true),
+                            None => {
+                                prio_open = false;
+                                continue;
+                            }
+                        },
+                        c = rx.recv() => match c {
+                            Some(c) => (c, false),
+                            None => break,
+                        },
+                    }
+                }
+            }
+        } else {
+            match rx.recv().await {
+                Some(c) => (c, false),
+                None => break,
+            }
+        };
         if matches!(cmd, ExecCommand::Shutdown) {
+            // Execute commands already queued behind Shutdown (the strategy's shutdown
+            // fill-drain may have enqueued fast-cancels) instead of dropping them.
+            while let Ok(late) = prio_rx.try_recv() {
+                if !matches!(late, ExecCommand::Shutdown) {
+                    process_cmd(late, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
+                }
+            }
+            while let Ok(late) = rx.try_recv() {
+                if !matches!(late, ExecCommand::Shutdown) {
+                    process_cmd(late, false, &tx, &rest, &mut limiter, &mut backoff_until).await;
+                }
+            }
             break;
         }
-        if let Some(until) = backoff_until {
+        process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+    }
+    info!("aster live exec worker stopped");
+}
+
+/// One command's full lifecycle: 429-backoff gate, limiter gate, venue I/O, event
+/// publication, and backoff arming. Factored out of the worker loop so the priority
+/// lane and the shutdown drain share the exact same semantics.
+async fn process_cmd(
+    cmd: ExecCommand,
+    from_prio: bool,
+    tx: &Sender<ExecEvent>,
+    rest: &AsterRest,
+    limiter: &mut RestCommandLimiter,
+    backoff_until: &mut Option<tokio::time::Instant>,
+) {
+    {
+        if let Some(until) = *backoff_until {
             let now = tokio::time::Instant::now();
             if now < until {
                 let remaining_ms = until.saturating_duration_since(now).as_millis() as i64;
                 send_backoff_reject(
-                    &tx,
+                    tx,
                     cmd,
                     format!("Aster REST backoff active ({}ms remaining)", remaining_ms),
                     remaining_ms.max(1),
                 )
                 .await;
-                continue;
+                return;
             }
-            backoff_until = None;
+            *backoff_until = None;
         }
+    }
 
         let mut rate_limit_reason: Option<String> = None;
         match cmd {
             ExecCommand::Place { market, side, price_ticks, qty_lots, client_id } => {
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 let ev = rest.place(&market, side, price_ticks, qty_lots, &client_id, false).await;
                 if let Some(reason) = exec_event_rate_limit_reason(&ev) {
                     rate_limit_reason = Some(reason.to_string());
@@ -621,7 +713,7 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
             ExecCommand::Cancel { client_id, market, .. } => {
                 // Only ack a cancel that actually succeeded — a failed cancel must NOT close the
                 // strategy's slot (the order may still be resting). Report the real outcome.
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 let ev = match rest.cancel_order(&market, &client_id).await {
                     Ok(CancelOutcome::Canceled | CancelOutcome::AlreadyGone) => ExecEvent::CancelAck { client_id },
                     Ok(CancelOutcome::FilledOrExpired) => {
@@ -646,11 +738,11 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
             ExecCommand::Replace { old_client_id, new_client_id, market, side, price_ticks, qty_lots, .. } => {
                 // Safe path: cancel-then-place (atomic PUT modify is a [VERIFY] item). NEVER place
                 // the new order unless the old cancel is VERIFIED — else both could rest at once.
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 match rest.cancel_order(&market, &old_client_id).await {
                     Ok(CancelOutcome::Canceled) => {
                         let _ = tx.send(ExecEvent::CancelAck { client_id: old_client_id }).await;
-                        limiter.acquire().await;
+                        limiter.gate(from_prio).await;
                         let ev = rest.place(&market, side, price_ticks, qty_lots, &new_client_id, false).await;
                         if let Some(reason) = exec_event_rate_limit_reason(&ev) {
                             rate_limit_reason = Some(reason.to_string());
@@ -700,7 +792,7 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 }
             }
             ExecCommand::CancelMarket { market } => {
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 if let Err(e) = rest.cancel_all_symbol(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {
@@ -711,7 +803,7 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
             }
             ExecCommand::CancelAllBot => {
                 for market in rest.markets.keys().cloned().collect::<Vec<_>>() {
-                    limiter.acquire().await;
+                    limiter.gate(from_prio).await;
                     if let Err(e) = rest.cancel_all_symbol(&market).await {
                         let reason = e.to_string();
                         if is_aster_rate_limit_reason(&reason) {
@@ -724,7 +816,7 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 }
             }
             ExecCommand::FlattenAster { market, side, qty, client_id } => {
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 let ev = match rest.flatten(&market, side, qty, &client_id).await {
                     Ok(()) => {
                         info!("aster flatten sent: {side:?} {qty} {market}");
@@ -741,7 +833,7 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                 let _ = tx.send(ev).await;
             }
             ExecCommand::RefreshDeadman { market } => {
-                limiter.acquire().await;
+                limiter.gate(from_prio).await;
                 if let Err(e) = rest.refresh_deadman(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {
@@ -750,15 +842,15 @@ pub async fn run_aster_worker(mut rx: Receiver<ExecCommand>, tx: Sender<ExecEven
                     warn!("aster deadman refresh failed: {e:#}");
                 }
             }
-            ExecCommand::Shutdown => unreachable!("handled before backoff gate"),
+            ExecCommand::Shutdown => {
+                debug_assert!(false, "Shutdown is intercepted by the worker loop");
+            }
         }
 
         if let Some(reason) = rate_limit_reason {
-            backoff_until = Some(tokio::time::Instant::now() + Duration::from_millis(rest.rate_limit_backoff_ms as u64));
-            notify_rate_limited(&tx, reason, rest.rate_limit_backoff_ms).await;
+            *backoff_until = Some(tokio::time::Instant::now() + Duration::from_millis(rest.rate_limit_backoff_ms as u64));
+            notify_rate_limited(tx, reason, rest.rate_limit_backoff_ms).await;
         }
-    }
-    info!("aster live exec worker stopped");
 }
 
 /// Format a Decimal for the wire without scientific notation or trailing-zero noise.
@@ -823,6 +915,142 @@ mod tests {
         assert!(classify_cancel(r#"{"code":-4000,"msg":"rate limited"}"#).is_err());
         assert!(classify_cancel(r#"{"status":"NEW"}"#).is_err()); // unexpected: cancel didn't take
         assert!(classify_cancel("not json").is_err());
+    }
+
+    fn rest_at(base_url: &str) -> AsterRest {
+        let signer = Arc::new(TestSigner::new());
+        let mut scales = HashMap::new();
+        scales.insert("BTC".into(), (MarketScale::from_spec(&spec()), "BTCUSDT".to_string()));
+        AsterRest::new(base_url.into(), signer, scales, 5000, 10_000, 1_200, None).unwrap()
+    }
+
+    #[test]
+    fn priority_lane_admits_only_acked_cancels_and_flattens() {
+        use super::super::command::is_priority_cmd;
+        let m: MarketId = "BTC".into();
+        assert!(is_priority_cmd(&ExecCommand::Cancel {
+            market: m.clone(),
+            side: Side::Buy,
+            client_id: "c".into(),
+            venue_order_id: Some("42".into()),
+        }));
+        assert!(is_priority_cmd(&ExecCommand::FlattenAster {
+            market: m.clone(),
+            side: Side::Sell,
+            qty: dec!(0.1),
+            client_id: "f".into(),
+        }));
+        // Un-acked cancel: a Place for this id may still be queued — must stay FIFO (I1).
+        assert!(!is_priority_cmd(&ExecCommand::Cancel {
+            market: m.clone(),
+            side: Side::Buy,
+            client_id: "c".into(),
+            venue_order_id: None,
+        }));
+        // Sweeps must run behind queued Places or they don't sweep them (I3).
+        assert!(!is_priority_cmd(&ExecCommand::CancelAllBot));
+        assert!(!is_priority_cmd(&ExecCommand::CancelMarket { market: m.clone() }));
+        assert!(!is_priority_cmd(&ExecCommand::Place {
+            market: m.clone(),
+            side: Side::Buy,
+            price_ticks: 1,
+            qty_lots: 1,
+            client_id: "p".into(),
+        }));
+        assert!(!is_priority_cmd(&ExecCommand::RefreshDeadman { market: m }));
+        assert!(!is_priority_cmd(&ExecCommand::Shutdown));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn limiter_record_never_sleeps_but_counts_toward_acquire() {
+        let mut limiter = RestCommandLimiter::new(2);
+        let t0 = tokio::time::Instant::now();
+        limiter.record();
+        limiter.record();
+        limiter.record(); // over the cap: still returns without yielding
+        assert_eq!(tokio::time::Instant::now(), t0, "record() must never sleep");
+        // A following acquire() must see the recorded stamps and wait out the window.
+        limiter.acquire().await;
+        assert!(
+            tokio::time::Instant::now().duration_since(t0) >= Duration::from_secs(60),
+            "acquire() must honor timestamps recorded by the priority lane"
+        );
+    }
+
+    #[tokio::test]
+    async fn priority_cancel_jumps_queued_places() {
+        // Nothing listens on this port: every REST call fails fast (connection refused),
+        // and the EVENT ORDER exposes the processing order.
+        let rest = rest_at("http://127.0.0.1:9");
+        let (tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+        let (norm_tx, norm_rx) = tokio::sync::mpsc::channel(64);
+        let (prio_tx, prio_rx) = tokio::sync::mpsc::channel(64);
+        for i in 0..3 {
+            norm_tx
+                .send(ExecCommand::Place {
+                    market: "BTC".into(),
+                    side: Side::Buy,
+                    price_ticks: 1000 + i,
+                    qty_lots: 10,
+                    client_id: format!("P{i}"),
+                })
+                .await
+                .unwrap();
+        }
+        prio_tx
+            .send(ExecCommand::Cancel {
+                market: "BTC".into(),
+                side: Side::Buy,
+                client_id: "C-prio".into(),
+                venue_order_id: Some("42".into()),
+            })
+            .await
+            .unwrap();
+        norm_tx.send(ExecCommand::Shutdown).await.unwrap();
+
+        run_aster_worker(norm_rx, prio_rx, tx, rest).await;
+
+        let first = ev_rx.recv().await.expect("worker must emit events");
+        assert!(
+            matches!(first, ExecEvent::CancelReject { ref client_id, .. } if client_id == "C-prio"),
+            "priority cancel must be processed before the queued places, got {first:?}"
+        );
+        // The queued places still execute (PlaceUnknown via refused transport).
+        let mut places = 0;
+        while let Some(ev) = ev_rx.recv().await {
+            if matches!(ev, ExecEvent::PlaceUnknown { .. }) {
+                places += 1;
+            }
+        }
+        assert_eq!(places, 3, "normal-lane places must not be dropped");
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_commands_queued_behind_it() {
+        let rest = rest_at("http://127.0.0.1:9");
+        let (tx, mut ev_rx) = tokio::sync::mpsc::channel(64);
+        let (norm_tx, norm_rx) = tokio::sync::mpsc::channel(64);
+        let (_prio_tx, prio_rx) = tokio::sync::mpsc::channel::<ExecCommand>(64);
+        norm_tx.send(ExecCommand::Shutdown).await.unwrap();
+        norm_tx
+            .send(ExecCommand::Cancel {
+                market: "BTC".into(),
+                side: Side::Sell,
+                client_id: "C-late".into(),
+                venue_order_id: None,
+            })
+            .await
+            .unwrap();
+
+        run_aster_worker(norm_rx, prio_rx, tx, rest).await;
+
+        // The cancel that slipped in behind Shutdown must still be executed.
+        let ev = ev_rx.recv().await.expect("drained command must emit its event");
+        assert!(
+            matches!(ev, ExecEvent::CancelReject { ref client_id, .. } if client_id == "C-late"),
+            "expected the drained cancel's outcome, got {ev:?}"
+        );
+        assert!(ev_rx.recv().await.is_none(), "worker must stop after the drain");
     }
 
     #[test]
