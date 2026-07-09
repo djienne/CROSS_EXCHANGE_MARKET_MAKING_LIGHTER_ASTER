@@ -1125,6 +1125,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     // `risk.mismatch_flatten_after_checks` in a row the residual is actively flattened
     // instead of pausing forever on a naked position.
     let mut mismatch_consecutive: u32 = 0;
+    let mut last_flatten_denied_log_at: Option<tokio::time::Instant> = None;
     let mut last_fill_stats_log = tokio::time::Instant::now();
     let mut lease_cache = LeaseFileCache::new();
 
@@ -1263,8 +1264,30 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             // (e.g. an external fill, or an Unknown-outcome leg that landed): act on it
             // with the same reduce-only emergency-bound machinery as the rescue path,
             // instead of riding market moves until a human notices.
+            // Flattening places LIVE reduce-only orders. Only an instance holding
+            // execution rights may act: the 24/7 observer/standby process shares the
+            // accounts with the active bot, and a transiently-unhedged leg of the
+            // active bot's own recovery must never be raced by a second flattener.
+            let (execution_allowed, _) =
+                execution_lease_enabled(&mut lease_cache, &options, &spec, now);
             if cfg.risk.auto_flatten_on_mismatch
                 && mismatch_consecutive >= cfg.risk.mismatch_flatten_after_checks
+                && !execution_allowed
+            {
+                let log_now = match last_flatten_denied_log_at {
+                    Some(ts) => ts.elapsed() >= Duration::from_secs(5),
+                    None => true,
+                };
+                if log_now {
+                    error!(
+                        "position mismatch persists ({mismatch_consecutive} checks, ${mismatch_notional}) but this instance holds no execution rights (observer/standby); NOT auto-flattening"
+                    );
+                    last_flatten_denied_log_at = Some(tokio::time::Instant::now());
+                }
+            }
+            if cfg.risk.auto_flatten_on_mismatch
+                && mismatch_consecutive >= cfg.risk.mismatch_flatten_after_checks
+                && execution_allowed
             {
                 error!(
                     "position mismatch persisted {mismatch_consecutive} checks (${mismatch_notional}); auto-flattening residual reduce-only"
@@ -3999,12 +4022,24 @@ async fn ensure_clean_start(
         }
     }
     if mismatch > cfg.risk.max_position_mismatch_usd {
-        bail!(
-            "clean-start failed: positions not balanced aster={} lighter={} net={}",
-            pos.aster_qty,
-            pos.lighter_qty,
-            pos.net_qty()
-        );
+        if observe_only {
+            // A read-only start (observer / standby-until-lease) must tolerate the
+            // active bot's transient residuals — bailing here crash-loops the observer
+            // exactly while the active bot is mid-recovery.
+            warn!(
+                "observe-only start: positions not balanced (likely the active bot's transient); continuing without order submission: aster={} lighter={} net={}",
+                pos.aster_qty,
+                pos.lighter_qty,
+                pos.net_qty()
+            );
+        } else {
+            bail!(
+                "clean-start failed: positions not balanced aster={} lighter={} net={}",
+                pos.aster_qty,
+                pos.lighter_qty,
+                pos.net_qty()
+            );
+        }
     }
     info!(
         "clean start confirmed: aster={} lighter_rest={} lighter_ws={:?} aster_open_orders={} lighter_open_orders={} observe_only={}",
@@ -4494,6 +4529,68 @@ mod tests {
             // is rejected by the exact filter — identical to the pre-change behavior.
             assert!(!(f64::NAN < required_f - EDGE_PREFILTER_EPS_BPS));
         }
+    }
+
+    #[test]
+    fn flatten_execution_rights_gate_denies_observer_and_standby() {
+        // The mismatch auto-flatten reuses execution_lease_enabled as its rights gate:
+        // pin the four deployment shapes. (The orchestrator's 24/7 observer runs with
+        // --control-file and NO lease — it must never be allowed to flatten.)
+        let spec = test_spec();
+        let now = DateTime::parse_from_rfc3339("2026-07-09T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Normal active taker: no control file, not observe-only -> allowed.
+        let mut cache = LeaseFileCache::new();
+        let options = RunOptions::default();
+        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(allowed, "normal taker must keep its auto-flatten safety net");
+
+        // --observe-only: never allowed, even without a control file.
+        let mut cache = LeaseFileCache::new();
+        let options = RunOptions {
+            observe_only: true,
+            ..RunOptions::default()
+        };
+        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(!allowed, "observe-only must never hold execution rights");
+
+        // Standby observer: control file set, lease file absent -> not allowed.
+        let dir = std::env::temp_dir().join(format!(
+            "lighter_aster_taker_arb_gate_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lease.json");
+        let mut cache = LeaseFileCache::new();
+        let options = RunOptions {
+            control_file: Some(path.clone()),
+            ..RunOptions::default()
+        };
+        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(!allowed, "standby without a lease must not hold execution rights");
+
+        // Reduce taker with a valid lease -> allowed.
+        let expires = now + chrono::Duration::seconds(60);
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"market":"HYPE","mode":"reduce_only","lease_id":"g","expires_at":"{}"}}"#,
+                expires.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        let mut cache = LeaseFileCache::new();
+        let (allowed, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
+        assert!(allowed, "a valid reduce lease grants execution rights");
+        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("g"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
