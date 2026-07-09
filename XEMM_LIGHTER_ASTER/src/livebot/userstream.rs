@@ -266,17 +266,13 @@ async fn connect_and_read(
                     Some(Ok(Message::Text(t))) => {
                         last_frame = tokio::time::Instant::now();
                         liveness.touch();
-                        let event_type: UserEventType<'_> = match serde_json::from_str(&t) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        match event_type.e {
-                            Some("listenKeyExpired") => {
+                        match classify_user_frame(&t) {
+                            UserFrame::ListenKeyExpired => {
                                 warn!("aster listenKeyExpired — reconnecting with a fresh key");
                                 return Ok(true);
                             }
-                            Some("ORDER_TRADE_UPDATE") => {
-                                if let Some(fill) = parse_order_trade_update(&t, sym_to_market) {
+                            UserFrame::TradeUpdate(update) => {
+                                if let Some(fill) = fill_from_update(update, sym_to_market) {
                                     // Bounded channel: if the strategy is briefly behind, block
                                     // rather than drop a fill (correctness over latency here).
                                     if fill_tx.send(fill).await.is_err() {
@@ -284,7 +280,7 @@ async fn connect_and_read(
                                     }
                                 }
                             }
-                            _ => {} // ACCOUNT_UPDATE etc. — positions come from the reconciler
+                            UserFrame::Other => {} // ACCOUNT_UPDATE etc. — positions come from the reconciler
                         }
                     }
                     Some(Ok(Message::Ping(p))) => {
@@ -308,10 +304,42 @@ async fn connect_and_read(
     }
 }
 
+enum UserFrame<'a> {
+    ListenKeyExpired,
+    TradeUpdate(AsterTradeUpdate<'a>),
+    Other,
+}
+
+/// Classify a user-stream frame with a single full parse. Frames whose fields clash with
+/// [`AsterTradeUpdate`]'s types (foreign event shapes) fall back to a bare type-tag probe so
+/// `listenKeyExpired` is never missed, whatever shape it arrives in.
+fn classify_user_frame(text: &str) -> UserFrame<'_> {
+    match serde_json::from_str::<AsterTradeUpdate<'_>>(text) {
+        Ok(update) => match update.event_type {
+            "listenKeyExpired" => UserFrame::ListenKeyExpired,
+            "ORDER_TRADE_UPDATE" => UserFrame::TradeUpdate(update),
+            _ => UserFrame::Other,
+        },
+        Err(_) => match serde_json::from_str::<UserEventType<'_>>(text) {
+            Ok(UserEventType {
+                e: Some("listenKeyExpired"),
+            }) => UserFrame::ListenKeyExpired,
+            _ => UserFrame::Other,
+        },
+    }
+}
+
 /// Parse an `ORDER_TRADE_UPDATE` into an [`AsterFill`] when it represents a real fill increment
 /// (`x == "TRADE"` and last-filled-qty `l > 0`). Other updates (NEW/CANCELED acks) return `None`.
+#[cfg(test)]
 fn parse_order_trade_update(text: &str, sym_to_market: &HashMap<String, MarketId>) -> Option<AsterFill> {
     let update: AsterTradeUpdate<'_> = serde_json::from_str(text).ok()?;
+    fill_from_update(update, sym_to_market)
+}
+
+/// Convert an already-parsed `ORDER_TRADE_UPDATE` into an [`AsterFill`] when it represents a
+/// real fill increment (`x == "TRADE"` and last-filled-qty `l > 0`).
+fn fill_from_update(update: AsterTradeUpdate<'_>, sym_to_market: &HashMap<String, MarketId>) -> Option<AsterFill> {
     if update.event_type != "ORDER_TRADE_UPDATE" {
         return None;
     }
@@ -404,5 +432,29 @@ mod tests {
         assert_eq!(f.trade_id, "trade-xyz");
         assert_eq!(f.event_time_ms, 1700000000999);
         assert!(f.reduce_only);
+    }
+
+    #[test]
+    fn classifies_listen_key_expired_via_main_parse() {
+        let text = r#"{"e":"listenKeyExpired","E":1700000000123}"#;
+        assert!(matches!(classify_user_frame(text), UserFrame::ListenKeyExpired));
+    }
+
+    #[test]
+    fn classifies_listen_key_expired_via_fallback_probe_on_foreign_shape() {
+        // "o" as a number clashes with AsterTradeUpdate's object field — the full parse
+        // fails, but the type-tag probe must still catch the key expiry.
+        let text = r#"{"e":"listenKeyExpired","o":123}"#;
+        assert!(matches!(classify_user_frame(text), UserFrame::ListenKeyExpired));
+    }
+
+    #[test]
+    fn classifies_trade_update_and_foreign_frames() {
+        let trade = r#"{"e":"ORDER_TRADE_UPDATE","E":1,"o":{"s":"HYPEUSDT","S":"BUY","x":"TRADE","i":1,"l":"0.05","z":"0.05","L":"64.5","t":7}}"#;
+        assert!(matches!(classify_user_frame(trade), UserFrame::TradeUpdate(_)));
+        let account = r#"{"e":"ACCOUNT_UPDATE","E":1,"a":{"B":[]}}"#;
+        assert!(matches!(classify_user_frame(account), UserFrame::Other));
+        // Garbage shape without a recoverable type tag stays Other (frame dropped).
+        assert!(matches!(classify_user_frame(r#"{"e":123}"#), UserFrame::Other));
     }
 }
