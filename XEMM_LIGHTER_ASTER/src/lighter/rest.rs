@@ -27,7 +27,12 @@ impl RestClient {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .tcp_nodelay(true)
-            .pool_max_idle_per_host(0)
+            // Keep a couple of warm connections so latency-adjacent REST calls
+            // (nonce hard_refresh on reject recovery, reconciler fallback) skip the
+            // TLS handshake. Idle timeout stays below typical CDN idle-close windows
+            // so hyper retires connections before the server can slam them mid-request.
+            .pool_max_idle_per_host(2)
+            .pool_idle_timeout(Some(Duration::from_secs(60)))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .build()
             .context("build reqwest client")?;
