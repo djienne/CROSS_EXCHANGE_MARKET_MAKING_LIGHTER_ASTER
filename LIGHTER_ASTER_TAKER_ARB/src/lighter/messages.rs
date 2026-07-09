@@ -95,12 +95,18 @@ impl RemoteOrder {
 // ----------------------------- WebSocket -----------------------------
 
 /// A single order book level (strings on the wire).
+///
+/// The owned book-message types below are no longer on the ingest path (the borrowed
+/// `*Ref` twins are) but are deliberately kept as the oracle for the owned/borrowed
+/// parity test suite — hence the dead_code allowance in non-test builds.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct PriceLevel {
     pub price: String,
     pub size: String,
 }
 
+#[allow(dead_code)]
 impl PriceLevel {
     #[inline]
     pub fn parsed(&self) -> (f64, f64) {
@@ -108,6 +114,7 @@ impl PriceLevel {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct OrderBookPayload {
     #[serde(default)]
@@ -124,6 +131,7 @@ pub struct OrderBookPayload {
 
 /// `order_book/{m}` envelope. `type` is `subscribed/order_book` (snapshot) or
 /// `update/order_book` (delta).
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct OrderBookMsg {
     #[serde(rename = "type")]
@@ -182,6 +190,7 @@ pub fn classify_book_update(
     Gap
 }
 
+#[allow(dead_code)]
 impl OrderBookMsg {
     pub fn is_snapshot(&self) -> bool {
         self.msg_type.contains("subscribed")

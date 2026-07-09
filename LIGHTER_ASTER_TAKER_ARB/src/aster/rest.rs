@@ -462,7 +462,8 @@ impl AsterRest {
         let deadline = tokio::time::Instant::now() + timeout;
         let min_expected = expected_qty * Decimal::from(999u32) / Decimal::from(1000u32);
         let mut last = None;
-        let mut last_err: Option<anyhow::Error> = None;
+        // Assigned by every match arm below before any read, so no initializer.
+        let mut last_err: Option<anyhow::Error>;
         loop {
             // Retry ALL order_trades errors inside the deadline (mirrors
             // wait_post_trade_reconciled): a single transient REST failure used to
