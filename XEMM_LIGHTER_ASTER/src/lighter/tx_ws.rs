@@ -46,6 +46,19 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Max wait for a tx response after the frame is written before declaring the outcome Unknown.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bound on (re)connecting the socket. `send_batch` reconnects inline on the hedge
+/// critical path: an unbounded `connect_async` against a black-holed endpoint (dropped
+/// SYNs, dead LB) otherwise wedges the hedge worker for the kernel's full connect-retry
+/// cycle (~2 minutes) with a naked maker leg — no Terminal event reaches the strategy
+/// and recovery hedges queue behind the wedged send. Timeout maps to NotSent: nothing
+/// on the wire, safe to retry.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Read-idle watchdog for the recv loop. A healthy connection receives at least our
+/// pinger's Pong every PING_INTERVAL, so 3 intervals of total silence means the socket
+/// is half-open (writes still buffer, reads never arrive): flip `alive` proactively so
+/// the next `send_batch` reconnects up front (degrading to a safe NotSent) instead of a
+/// live hedge paying WRITE/RESPONSE timeouts to discover the dead socket.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One live connection: the shared write half plus the response channel fed by the recv loop,
 /// and the background task handles (aborted on reconnect/close).
@@ -89,7 +102,9 @@ impl TxWebSocket {
 
     /// Pre-connect (best effort). Safe to call at startup.
     pub async fn connect(&self) -> Result<()> {
-        let conn = self.open().await?;
+        let conn = timeout(CONNECT_TIMEOUT, self.open())
+            .await
+            .map_err(|_| anyhow::anyhow!("tx ws connect timeout"))??;
         *self.conn.lock().await = Some(conn);
         Ok(())
     }
@@ -179,11 +194,13 @@ impl TxWebSocket {
     pub async fn send_batch(&self, tx_types: &[u8], tx_infos: &[String]) -> TxSendResult {
         let mut guard = self.conn.lock().await;
 
-        // (Re)connect if there is no live connection.
+        // (Re)connect if there is no live connection — bounded: this runs inline on the
+        // hedge path, and NotSent is the safe fast-fail (nothing on the wire).
         if !guard.as_ref().map(|c| c.is_alive()).unwrap_or(false) {
-            match self.open().await {
-                Ok(c) => *guard = Some(c),
-                Err(_) => return TxSendResult::not_sent("connect_failed"),
+            match timeout(CONNECT_TIMEOUT, self.open()).await {
+                Ok(Ok(c)) => *guard = Some(c),
+                Ok(Err(_)) => return TxSendResult::not_sent("connect_failed"),
+                Err(_) => return TxSendResult::not_sent("connect_timeout"),
             }
         }
         let conn = guard.as_mut().unwrap();
@@ -262,7 +279,22 @@ async fn recv_loop(
     alive: Arc<AtomicBool>,
     resp_tx: mpsc::UnboundedSender<Value>,
 ) {
-    while let Some(msg) = stream.next().await {
+    loop {
+        // Idle watchdog: our pinger elicits a Pong every PING_INTERVAL, so prolonged
+        // total silence means a half-open socket — exit (flipping `alive` below) so the
+        // next send reconnects instead of writing into a dead connection.
+        let msg = match timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(msg)) => msg,
+            Ok(None) => break,
+            Err(_) => {
+                tracing::warn!(
+                    "tx socket: no inbound frame for {}s (pinger every {}s) — treating connection as half-open",
+                    READ_IDLE_TIMEOUT.as_secs(),
+                    PING_INTERVAL.as_secs()
+                );
+                break;
+            }
+        };
         match msg {
             Ok(Message::Text(t)) => {
                 let v: Value = match serde_json::from_str(&t) {
@@ -425,6 +457,54 @@ mod tests {
         assert_eq!(result.status, TxSendStatus::Unknown);
         assert_eq!(result.message, "disconnected_after_send");
         server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn send_batch_fails_fast_as_not_sent_when_connect_hangs() {
+        // Black-holed endpoint (no listener; VPC drops or refuses). Either way the
+        // bounded reconnect must return NotSent quickly — never wedge the hedge worker
+        // through the kernel's multi-minute connect-retry cycle. Paused clock: the
+        // CONNECT_TIMEOUT timer auto-advances if the SYN is silently dropped.
+        let tx_ws = TxWebSocket::new("ws://10.255.255.1:81");
+        let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
+        assert_eq!(result.status, TxSendStatus::NotSent);
+        assert!(
+            result.message.starts_with("connect"),
+            "expected connect_failed/connect_timeout, got {}",
+            result.message
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recv_loop_flags_half_open_socket_via_idle_watchdog() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        // Server: complete the WS handshake, then go silent forever — never reads
+        // (so no auto-pongs) and never writes. Half-open from the client's view.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ws = accept_async(stream).await.unwrap();
+            std::future::pending::<()>().await
+        });
+
+        let tx_ws = TxWebSocket::new(&url);
+        tx_ws.connect().await.unwrap();
+        assert!(tx_ws.conn.lock().await.as_ref().unwrap().is_alive());
+
+        // The paused clock auto-advances through READ_IDLE_TIMEOUT; poll until the
+        // watchdog flips `alive` (bounded so a regression fails instead of hanging).
+        let deadline = tokio::time::Instant::now() + READ_IDLE_TIMEOUT * 3;
+        loop {
+            if !tx_ws.conn.lock().await.as_ref().unwrap().is_alive() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "idle watchdog never flipped alive=false"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        server.abort();
     }
 
     #[test]

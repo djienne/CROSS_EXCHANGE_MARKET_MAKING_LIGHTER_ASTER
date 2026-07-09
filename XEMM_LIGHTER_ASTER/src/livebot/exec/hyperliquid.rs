@@ -38,6 +38,20 @@ use crate::livebot::ids::Cloid;
 use crate::markets::MarketSpec;
 use crate::types::{MarketId, Side, TxSendStatus};
 
+/// Reason prefix for a hedge reject whose tx frame provably never reached the venue
+/// (`TxSendStatus::NotSent`: connect failed/timed out before any write; nonce already
+/// rolled back). Shared with the strategy's safe-retry gate — like the venue's
+/// "could not immediately match", NotSent is guaranteed-nothing-landed, so an
+/// immediate emergency resend cannot double-hedge.
+pub(crate) const HEDGE_NOT_SENT_PREFIX: &str = "Lighter tx not sent:";
+
+/// The ONLY two reject shapes safe to auto-retry (both guaranteed no order landed):
+/// the venue-confirmed IOC no-fill, and a NotSent transport fast-fail. Everything
+/// else (resting order, ambiguous transport error) must freeze + reconcile instead.
+pub(crate) fn hedge_reject_is_definitive_no_fill(reason: &str) -> bool {
+    reason.contains("could not immediately match") || reason.contains(HEDGE_NOT_SENT_PREFIX)
+}
+
 #[derive(Clone, Debug)]
 struct LighterMarketWire {
     market_index: i32,
@@ -603,6 +617,11 @@ impl HlExchange {
         opts.url = self.ws_url.clone();
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
+        // The ~10-min auth-token TTL drops this socket every session; the 5s default
+        // base would blind the private feed ~5-6s per expiry. Healthy sessions reset
+        // the backoff to base, so 0.5s only shortens the routine re-auth gap —
+        // consecutive failures still escalate toward reconnect_max.
+        opts.reconnect_base = 0.5;
         let fills = self.fills.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -633,6 +652,11 @@ impl HlExchange {
         opts.url = self.ws_url.clone();
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
+        // The ~10-min auth-token TTL drops this socket every session; the 5s default
+        // base would blind the private feed ~5-6s per expiry. Healthy sessions reset
+        // the backoff to base, so 0.5s only shortens the routine re-auth gap —
+        // consecutive failures still escalate toward reconnect_max.
+        opts.reconnect_base = 0.5;
         let known_markets = self.known_lighter_markets();
         let state = self.account_feed.clone();
         tokio::spawn(async move {
@@ -661,6 +685,11 @@ impl HlExchange {
         opts.url = self.ws_url.clone();
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
+        // The ~10-min auth-token TTL drops this socket every session; the 5s default
+        // base would blind the private feed ~5-6s per expiry. Healthy sessions reset
+        // the backoff to base, so 0.5s only shortens the routine re-auth gap —
+        // consecutive failures still escalate toward reconnect_max.
+        opts.reconnect_base = 0.5;
         let known_markets = self.known_lighter_markets();
         let state = self.account_feed.clone();
         tokio::spawn(async move {
@@ -686,6 +715,11 @@ impl HlExchange {
         opts.url = self.ws_url.clone();
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
+        // The ~10-min auth-token TTL drops this socket every session; the 5s default
+        // base would blind the private feed ~5-6s per expiry. Healthy sessions reset
+        // the backoff to base, so 0.5s only shortens the routine re-auth gap —
+        // consecutive failures still escalate toward reconnect_max.
+        opts.reconnect_base = 0.5;
         let state = self.account_feed.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -889,7 +923,7 @@ impl HlExchange {
                 self.fills.unregister(client_order_index, fill_token);
                 HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
                     cloid,
-                    reason: format!("Lighter tx not sent: {}", r.message),
+                    reason: format!("{HEDGE_NOT_SENT_PREFIX} {}", r.message),
                 })
             }
             r => {
@@ -1510,6 +1544,10 @@ fn spawn_order_book_stream(
         vec![channel],
     );
     opts.url = ws_url;
+    // Sequence-gap resyncs deliberately drop the session for a fresh snapshot; the 5s
+    // default base leaves the exec's book cache dark that whole time. 0.5s restores it
+    // promptly; consecutive failures still back off toward reconnect_max.
+    opts.reconnect_base = 0.5;
     let books_for_msg = books.clone();
     let books_for_disconnect = books.clone();
     let reconnect = Arc::new(Notify::new());
@@ -1720,6 +1758,26 @@ fn random_client_order_index(market: &MarketId, side: Side) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hedge_retry_gate_accepts_only_guaranteed_no_fill_rejects() {
+        use super::{hedge_reject_is_definitive_no_fill, HEDGE_NOT_SENT_PREFIX};
+        // The two guaranteed-nothing-landed shapes are retryable...
+        assert!(hedge_reject_is_definitive_no_fill(
+            "Lighter reject code=21505 order could not immediately match against any resting orders"
+        ));
+        assert!(hedge_reject_is_definitive_no_fill(&format!(
+            "{HEDGE_NOT_SENT_PREFIX} connect_timeout"
+        )));
+        // ...everything ambiguous or resting must stay frozen.
+        assert!(!hedge_reject_is_definitive_no_fill(
+            "Lighter reject code=0 order unexpectedly resting"
+        ));
+        assert!(!hedge_reject_is_definitive_no_fill("send_timeout"));
+        assert!(!hedge_reject_is_definitive_no_fill(
+            "Lighter tx outcome unknown: response_timeout"
+        ));
+    }
+
     use super::*;
     use rust_decimal_macros::dec;
 

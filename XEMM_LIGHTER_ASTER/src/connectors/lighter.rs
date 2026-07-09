@@ -59,10 +59,15 @@ pub async fn run_with_tap(
     tap: Tap,
 ) {
     let channel = format!("order_book/{market_id}");
-    let opts = SubscribeOptions::new(
+    let mut opts = SubscribeOptions::new(
         &format!("lighter-order-book-{label}-{market_id}"),
         vec![channel],
     );
+    // This is the hedge-source L2 feed: every sequence-gap resync blanks the book and
+    // then waits out the reconnect delay. The 5s default means a ≥5-6s dark window per
+    // gap (Aster's equivalent base is 1s); 0.5s keeps resyncs prompt while consecutive
+    // failures still escalate toward reconnect_max.
+    opts.reconnect_base = 0.5;
     let reconnect = tap
         .reconnect
         .clone()

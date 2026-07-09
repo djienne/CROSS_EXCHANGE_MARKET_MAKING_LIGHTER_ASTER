@@ -2752,12 +2752,15 @@ impl Strategy {
             ExecEvent::HedgeReject { cloid, reason } => {
                 let cloid_hex = cloid.to_hex();
                 warn!("hedge rejected (cloid {cloid_hex}): {reason}");
-                // ONLY "could not immediately match" means NOTHING landed on HL — that is the single
-                // case safe to auto-retry (a fresh-touch emergency resend, ~1 RTT vs the slow ~4–6 s
-                // recovery, no double-hedge risk). NOT "unexpectedly resting" (an order IS on the book
-                // → retrying would double up — freeze instead) and NOT an ambiguous transport error
-                // (might have landed → freeze + let the reconciler resolve).
-                let definitive_no_fill = reason.contains("could not immediately match");
+                // Safe to auto-retry ONLY when NOTHING can have landed on HL (a fresh-touch
+                // emergency resend, ~1 RTT vs the slow ~4–6 s recovery, no double-hedge risk):
+                // the venue-confirmed IOC no-fill ("could not immediately match") and the
+                // NotSent fast-fail (frame never left the socket, nonce rolled back). NOT
+                // "unexpectedly resting" (an order IS on the book → retrying would double up —
+                // freeze instead) and NOT an ambiguous transport error (might have landed →
+                // freeze + let the reconciler resolve).
+                let definitive_no_fill =
+                    super::exec::hyperliquid::hedge_reject_is_definitive_no_fill(&reason);
                 let info = self
                     .hedges
                     .get(&cloid_hex)
