@@ -79,10 +79,16 @@ impl AsterBookFeed {
     }
 
     pub fn order_book(&self) -> Result<OrderBook> {
+        self.order_book_arc().map(|arc| (*arc).clone())
+    }
+
+    /// The published book Arc without a snapshot clone (lock-free ArcSwap load). Pointer
+    /// identity doubles as the scan loop's change detector: every applied depth frame
+    /// stores a fresh Arc and resets store None, so an old pointer can never alias new data.
+    pub fn order_book_arc(&self) -> Result<Arc<OrderBook>> {
         self.state
             .book
             .load_full()
-            .map(|arc| (*arc).clone())
             .ok_or_else(|| anyhow!("Aster websocket depth not ready for {}", self.symbol))
     }
 
@@ -166,27 +172,39 @@ async fn depth_session(
     }
 }
 
+/// Combined-stream envelope probe: `{"stream":...,"data":{...}}`. Only `data` matters —
+/// borrowed as a `RawValue` slice so the payload is re-parsed in place, never cloned.
+#[derive(Deserialize)]
+struct CombinedRef<'a> {
+    #[serde(borrow, default)]
+    data: Option<&'a serde_json::value::RawValue>,
+}
+
 #[derive(Debug, Deserialize)]
-struct DepthMsg {
+struct DepthMsgRef<'a> {
     #[serde(rename = "E", default)]
     event_time_ms: i64,
     #[serde(rename = "T", default)]
     transaction_time_ms: i64,
-    #[serde(default, rename = "bids", alias = "b")]
-    bids: Vec<[String; 2]>,
-    #[serde(default, rename = "asks", alias = "a")]
-    asks: Vec<[String; 2]>,
+    #[serde(default, rename = "bids", alias = "b", borrow)]
+    bids: Vec<[&'a str; 2]>,
+    #[serde(default, rename = "asks", alias = "a", borrow)]
+    asks: Vec<[&'a str; 2]>,
 }
 
 fn parse_depth(text: &str) -> Result<Option<OrderBook>> {
-    let value: serde_json::Value = serde_json::from_str(text)?;
-    if value.get("result").is_some() || value.get("id").is_some() && value.get("data").is_none() {
-        return Ok(None);
-    }
-    let payload = value.get("data").unwrap_or(&value).clone();
-    let msg: DepthMsg = serde_json::from_value(payload)?;
-    let bids = parse_levels(msg.bids)?;
-    let asks = parse_levels(msg.asks)?;
+    // Borrow-parse: no Value tree, no payload clone, no per-level String allocations.
+    // Combined frames re-parse only the `data` slice; bare frames parse the whole text.
+    let payload: &str = match serde_json::from_str::<CombinedRef<'_>>(text) {
+        Ok(CombinedRef { data: Some(raw) }) => raw.get(),
+        _ => text,
+    };
+    // Ack/`result`/`id` frames deserialize as all-default (empty books) and fall out
+    // through the emptiness check below. A malformed DEPTH frame still errors — the
+    // caller tears the session down for a fresh connection (fail-closed, unchanged).
+    let msg: DepthMsgRef<'_> = serde_json::from_str(payload)?;
+    let bids = parse_levels(&msg.bids)?;
+    let asks = parse_levels(&msg.asks)?;
     if bids.is_empty() || asks.is_empty() {
         return Ok(None);
     }
@@ -199,11 +217,11 @@ fn parse_depth(text: &str) -> Result<Option<OrderBook>> {
     )))
 }
 
-fn parse_levels(raw: Vec<[String; 2]>) -> Result<Vec<(Decimal, Decimal)>> {
+fn parse_levels(raw: &[[&str; 2]]) -> Result<Vec<(Decimal, Decimal)>> {
     let mut out = Vec::with_capacity(raw.len());
     for [px, qty] in raw {
-        let px = parse_dec(&px)?;
-        let qty = parse_dec(&qty)?;
+        let px = parse_dec(px)?;
+        let qty = parse_dec(qty)?;
         if px > Decimal::ZERO && qty > Decimal::ZERO {
             out.push((px, qty));
         }
@@ -258,6 +276,19 @@ mod tests {
         let book = parse_depth(raw).unwrap().unwrap();
         assert_eq!(book.best_bid().unwrap().px, dec!(10));
         assert_eq!(book.best_ask().unwrap().px, dec!(11));
+    }
+
+    #[test]
+    fn ack_frames_yield_no_book_and_malformed_frames_error() {
+        // Subscription acks have no depth payload: all-default parse -> empty -> None.
+        assert!(parse_depth(r#"{"result":null,"id":1}"#).unwrap().is_none());
+        // An empty-book depth frame is also None (never publish a one-sided book).
+        assert!(parse_depth(r#"{"e":"depthUpdate","E":1,"T":2,"b":[],"a":[]}"#)
+            .unwrap()
+            .is_none());
+        // Malformed depth data must still ERROR -> session teardown (fail-closed).
+        assert!(parse_depth(r#"{"b":[["10"]],"a":[["11","2"]]}"#).is_err());
+        assert!(parse_depth("not json").is_err());
     }
 
     #[test]
