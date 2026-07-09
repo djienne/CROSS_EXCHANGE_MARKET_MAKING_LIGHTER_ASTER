@@ -462,17 +462,38 @@ impl AsterRest {
         let deadline = tokio::time::Instant::now() + timeout;
         let min_expected = expected_qty * Decimal::from(999u32) / Decimal::from(1000u32);
         let mut last = None;
+        let mut last_err: Option<anyhow::Error> = None;
         loop {
-            let trades = self.order_trades(market, order_id).await?;
-            if let Some(summary) = summarize_user_trades(&trades) {
-                if summary.qty >= min_expected {
-                    return Ok(summary);
+            // Retry ALL order_trades errors inside the deadline (mirrors
+            // wait_post_trade_reconciled): a single transient REST failure used to
+            // abort the whole wait and could leave a filled trade unbooked. A
+            // persistent error just costs the deadline it already cost.
+            match self.order_trades(market, order_id).await {
+                Ok(trades) => {
+                    last_err = None;
+                    if let Some(summary) = summarize_user_trades(&trades) {
+                        if summary.qty >= min_expected {
+                            return Ok(summary);
+                        }
+                        last = Some(summary);
+                    }
                 }
-                last = Some(summary);
+                Err(e) => {
+                    tracing::warn!(
+                        "Aster userTrades poll failed for orderId={order_id} (retrying within deadline): {e:#}"
+                    );
+                    last_err = Some(e);
+                }
             }
             if tokio::time::Instant::now() >= deadline {
+                // Best partial summary beats an error; an error beats nothing.
                 if let Some(summary) = last {
                     return Ok(summary);
+                }
+                if let Some(e) = last_err {
+                    return Err(e.context(format!(
+                        "Aster userTrades kept failing for orderId={order_id} until the deadline"
+                    )));
                 }
                 anyhow::bail!("no Aster userTrades found for orderId={order_id}");
             }
