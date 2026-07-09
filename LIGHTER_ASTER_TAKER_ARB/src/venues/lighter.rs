@@ -1347,6 +1347,12 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
         let mut opts =
             SubscribeOptions::new(&format!("lighter-order-book-{market_id}"), vec![channel]);
         opts.url = ws_url.clone();
+        // Every sequence-gap resync blanks the book and then waits out the reconnect
+        // delay; with max_book_staleness_ms=2000 the 5s default base is a ≥5-6s full
+        // scan/trading blackout per gap (the Aster feed's base is 0.25s). Healthy
+        // sessions reset the delay to base, so this only shortens routine resyncs —
+        // consecutive failures still escalate toward reconnect_max.
+        opts.reconnect_base = 0.5;
         let books = book_feed.clone();
         let books_for_disconnect = book_feed.clone();
         let reconnect = Arc::new(Notify::new());

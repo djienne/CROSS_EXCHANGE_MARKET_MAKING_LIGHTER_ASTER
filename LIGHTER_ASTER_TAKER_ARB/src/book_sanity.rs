@@ -198,11 +198,29 @@ pub fn start(
             tick.tick().await;
             let event = run_check(&cfg, &spec, &aster_books, lighter.as_ref(), &http, &task_handle)
                 .await;
-            if let Err(e) = append_event(&events_path, &event) {
-                warn!("failed to append book sanity event {}: {e:#}", events_path.display());
-            }
-            if let Err(e) = persist_snapshot(&state_path, &task_handle.snapshot()) {
-                warn!("failed to persist book sanity state {}: {e:#}", state_path.display());
+            // File I/O off the runtime worker: the box runs a single worker thread, so
+            // a slow disk write here would stall the scan loop, WS ingest, and any
+            // in-flight execution for the syscall duration (same hot/cold rule as
+            // append_execution_log in arb.rs).
+            let events_path_task = events_path.clone();
+            let state_path_task = state_path.clone();
+            let snapshot = task_handle.snapshot();
+            let io = tokio::task::spawn_blocking(move || {
+                let appended = append_event(&events_path_task, &event);
+                let persisted = persist_snapshot(&state_path_task, &snapshot);
+                (appended, persisted)
+            })
+            .await;
+            match io {
+                Ok((appended, persisted)) => {
+                    if let Err(e) = appended {
+                        warn!("failed to append book sanity event {}: {e:#}", events_path.display());
+                    }
+                    if let Err(e) = persisted {
+                        warn!("failed to persist book sanity state {}: {e:#}", state_path.display());
+                    }
+                }
+                Err(e) => warn!("book sanity persistence task failed: {e}"),
             }
         }
     });

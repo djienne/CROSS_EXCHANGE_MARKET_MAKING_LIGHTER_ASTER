@@ -3932,6 +3932,14 @@ fn spawn_account_snapshot_refresher(
             }
             match refresh_account_snapshot(&market, &aster, &lighter).await {
                 Ok(snapshot) => {
+                    // Re-check the pause flag before publishing: a refresh already in
+                    // flight when the executor set paused=true would otherwise
+                    // overwrite the fresh post-trade snapshot with pre-trade positions
+                    // stamped refreshed_at=now, defeating the staleness gate for up to
+                    // a full refresh interval.
+                    if paused.load(Ordering::Acquire) {
+                        continue;
+                    }
                     debug!(
                         "cold account snapshot refreshed: age_ms=0 aster_pos={} lighter_pos={} lighter_ws_pos={:?} lighter_rest_ws_divergence_qty={:?} aster_available_usd={} lighter_available_usd={}",
                         snapshot.position.aster_qty,
