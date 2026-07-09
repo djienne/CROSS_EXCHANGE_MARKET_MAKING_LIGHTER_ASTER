@@ -22,7 +22,8 @@ use crate::book::OrderBook;
 use crate::connectors::rest_book;
 use crate::lighter::auth::generate_ws_auth_token;
 use crate::lighter::messages::{
-    AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsg, PriceLevel,
+    AccountAllMsg, AccountAllPositionsMsg, AccountOrdersMsg, BookUpdateContiguity, OrderBookMsg,
+    PriceLevel,
     RemoteOrder, TradePayload,
     UserStatsMsg,
 };
@@ -365,17 +366,19 @@ impl AccountFeedState {
         self.user_stats_ready.load(Ordering::Acquire)
     }
 
-    fn set_open_orders_for_markets(&self, known_markets: &[u32], orders: &serde_json::Value) {
-        let order_obj = orders.as_object();
+    fn set_open_orders_for_markets(
+        &self,
+        known_markets: &[u32],
+        orders: &HashMap<String, Vec<RemoteOrder>>,
+    ) {
         let mut out = HashMap::new();
         for market_id in known_markets {
-            let rows = order_obj
-                .and_then(|obj| obj.get(&market_id.to_string()))
-                .and_then(|v| v.as_array())
+            let rows = orders
+                .get(&market_id.to_string())
                 .map(|rows| {
                     rows.iter()
-                        .filter_map(|row| serde_json::from_value::<RemoteOrder>(row.clone()).ok())
-                        .filter(RemoteOrder::is_live)
+                        .filter(|row| row.is_live())
+                        .cloned()
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -460,8 +463,13 @@ impl LighterBook {
             self.asks.clear();
             self.initialized = true;
         }
-        apply_levels(&mut self.bids, &msg.order_book.bids);
-        apply_levels(&mut self.asks, &msg.order_book.asks);
+        if !apply_levels(&mut self.bids, &msg.order_book.bids)
+            || !apply_levels(&mut self.asks, &msg.order_book.asks)
+        {
+            // Malformed level: the book may now be partially applied — ride the gap
+            // path (caller resets this book and reconnects for a fresh snapshot).
+            return false;
+        }
         self.updated_at = Some(Utc::now());
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
         self.last_offset = msg.effective_offset().or(self.last_offset);
@@ -637,8 +645,8 @@ impl HlExchange {
                 _ = subscribe_loop_authed(
                     opts,
                     move || auth_map(&signer, api_key_index, &channel),
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data.clone()) {
+                    move |frame| {
+                        if let Ok(msg) = serde_json::from_str::<AccountAllMsg>(frame.raw) {
                             for trades in msg.trades.values() {
                                 for tr in trades {
                                     fills.on_trade(tr.clone());
@@ -673,8 +681,8 @@ impl HlExchange {
                 _ = subscribe_loop(
                     opts,
                     None,
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<AccountAllPositionsMsg>(data.clone()) {
+                    move |frame| {
+                        if let Ok(msg) = serde_json::from_str::<AccountAllPositionsMsg>(frame.raw) {
                             apply_account_all_positions(&state, &known_markets, &msg);
                         }
                     },
@@ -706,9 +714,10 @@ impl HlExchange {
                 _ = subscribe_loop_authed(
                     opts,
                     move || auth_map(&signer, api_key_index, &auth_channel),
-                    move |data| {
-                        let orders = data.get("orders").unwrap_or(&serde_json::Value::Null);
-                        state.set_open_orders_for_markets(&known_markets, orders);
+                    move |frame| {
+                        if let Ok(msg) = serde_json::from_str::<AccountOrdersMsg>(frame.raw) {
+                            state.set_open_orders_for_markets(&known_markets, &msg.orders);
+                        }
                     },
                 ) => {}
             }
@@ -735,8 +744,8 @@ impl HlExchange {
                 _ = subscribe_loop_authed(
                     opts,
                     move || auth_map(&signer, api_key_index, &channel),
-                    move |data| {
-                        if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data.clone()) {
+                    move |frame| {
+                        if let Ok(msg) = serde_json::from_str::<UserStatsMsg>(frame.raw) {
                             state.set_stats(
                                 value_dec(msg.stats.available_balance.as_ref()),
                                 value_dec(msg.stats.portfolio_value.as_ref()),
@@ -1364,11 +1373,38 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
         // Reap finished waiters without blocking so the set stays bounded.
         while waits.try_join_next().is_some() {}
         match cmd {
-            HedgeCommand::Hedge {
-                intent,
-                aggressive_px,
-                ..
-            } => {
+            HedgeCommand::Shutdown => {
+                // run() stops the strategy before sending Shutdown, so this queue is
+                // normally empty — but a hedge that still slipped in behind Shutdown is
+                // a real venue intent. Process it instead of dropping a fill unhedged.
+                while let Ok(late) = rx.try_recv() {
+                    if !matches!(late, HedgeCommand::Shutdown) {
+                        warn!("hedge worker shutdown: draining a queued hedge command");
+                        handle_hedge_cmd(&ex, &tx, &mut waits, fill_timeout, late).await;
+                    }
+                }
+                break;
+            }
+            other => handle_hedge_cmd(&ex, &tx, &mut waits, fill_timeout, other).await,
+        }
+    }
+    drain_hl_waits(&mut waits, fill_timeout).await;
+    info!("lighter live hedge worker stopped");
+}
+
+async fn handle_hedge_cmd(
+    ex: &HlExchange,
+    tx: &Sender<ExecEvent>,
+    waits: &mut tokio::task::JoinSet<()>,
+    fill_timeout: Duration,
+    cmd: HedgeCommand,
+) {
+    match cmd {
+        HedgeCommand::Hedge {
+            intent,
+            aggressive_px,
+            ..
+        } => {
                 let cloid = intent.cloid;
                 match ex
                     .send_hedge_tx(
@@ -1521,9 +1557,11 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
                     }
                 }
             }
-            HedgeCommand::Shutdown => break,
-        }
+        HedgeCommand::Shutdown => {}
     }
+}
+
+async fn drain_hl_waits(waits: &mut tokio::task::JoinSet<()>, fill_timeout: Duration) {
     // Drain pending waits BOUNDED, then abort. Never abort first: the venue-side effect of
     // an accepted IOC already happened — the drain is what preserves intent resolution
     // (HedgeFill/HedgeUnknown) on a clean stop. run.rs awaits this worker, so the drain is
@@ -1541,7 +1579,6 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
         );
         waits.abort_all();
     }
-    info!("lighter live hedge worker stopped");
 }
 
 fn apply_account_all_positions(
@@ -1601,8 +1638,8 @@ fn spawn_order_book_stream(
             _ = subscribe_loop(
                 opts,
                 Some(reconnect),
-                move |data| {
-                    if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data.clone()) {
+                move |frame| {
+                    if let Ok(msg) = serde_json::from_str::<OrderBookMsg>(frame.raw) {
                         if !books_for_msg.apply(market_id, &msg) {
                             tracing::warn!(
                                 "Lighter order_book sequence gap for market {}; reconnecting for fresh snapshot",
@@ -1622,7 +1659,10 @@ fn spawn_order_book_stream(
 }
 
 fn auth_map(signer: &Signer, api_key_index: i32, channel: &str) -> HashMap<String, String> {
-    generate_ws_auth_token(signer, api_key_index)
+    // FFI sign on the (multi-thread) main runtime at reconnect time — never
+    // latency-critical, so hand the blocking section to the scheduler explicitly
+    // instead of stalling this worker thread's queue.
+    tokio::task::block_in_place(|| generate_ws_auth_token(signer, api_key_index))
         .map(|token| HashMap::from([(channel.to_string(), token)]))
         .unwrap_or_default()
 }
@@ -1669,13 +1709,15 @@ fn value_dec(v: Option<&serde_json::Value>) -> Option<Decimal> {
     }
 }
 
-fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevel]) {
+/// `false` when any level is unparseable — the caller must treat the frame as a gap
+/// (reset + reconnect) rather than silently dropping the level and desyncing the book.
+fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevel]) -> bool {
     for level in levels {
         let Some(px) = level.price.parse::<Decimal>().ok() else {
-            continue;
+            return false;
         };
         let Some(qty) = level.size.parse::<Decimal>().ok() else {
-            continue;
+            return false;
         };
         if px <= Decimal::ZERO {
             continue;
@@ -1686,6 +1728,7 @@ fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevel]) {
             side.insert(px, qty);
         }
     }
+    true
 }
 
 fn signed_position_payload_dec(p: &crate::lighter::messages::PositionPayload) -> Decimal {
@@ -2066,14 +2109,21 @@ mod tests {
     #[test]
     fn account_feed_caches_live_open_orders_by_market() {
         let state = AccountFeedState::default();
-        let orders = serde_json::json!({
-            "24": [
-                {"client_order_index": 1, "is_ask": true, "price": "101", "remaining_base_amount": "0.5", "status": "open"},
-                {"client_order_index": 2, "status": "filled"}
-            ],
-            "25": []
-        });
-        state.set_open_orders_for_markets(&[24, 25, 26], &orders);
+        // Parsed exactly as the stream handler does: typed AccountOrdersMsg off raw text.
+        let msg: AccountOrdersMsg = serde_json::from_str(
+            r#"{
+            "type": "update/account_all_orders",
+            "orders": {
+                "24": [
+                    {"client_order_index": 1, "is_ask": true, "price": "101", "remaining_base_amount": "0.5", "status": "open"},
+                    {"client_order_index": 2, "status": "filled"}
+                ],
+                "25": []
+            }
+        }"#,
+        )
+        .unwrap();
+        state.set_open_orders_for_markets(&[24, 25, 26], &msg.orders);
         let cached = state.open_orders().unwrap();
         assert_eq!(cached.get(&24).unwrap().len(), 1);
         assert_eq!(cached.get(&25).unwrap().len(), 0);
@@ -2107,6 +2157,52 @@ mod tests {
         }))
         .unwrap();
         assert!(!feed.apply(24, &gap));
+    }
+
+    #[test]
+    fn book_feed_resyncs_on_malformed_level_and_keeps_zero_size_deletes() {
+        let feed = BookFeedState::default();
+        let snapshot: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "subscribed/order_book",
+            "order_book": {
+                "nonce": 10,
+                "bids": [{"price": "100", "size": "1"}, {"price": "99", "size": "2"}],
+                "asks": [{"price": "102", "size": "2"}]
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &snapshot));
+
+        // Regression pin: an explicit "0" size deletes the level (no resync).
+        let delete: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "begin_nonce": 10,
+                "nonce": 11,
+                "bids": [{"price": "99", "size": "0"}],
+                "asks": []
+            }
+        }))
+        .unwrap();
+        assert!(feed.apply(24, &delete));
+        assert_eq!(
+            feed.order_book(24).and_then(|b| b.best_bid().map(|l| l.px)),
+            Some(dec!(100))
+        );
+
+        // A malformed size must ride the gap path — dropping it silently (old
+        // behavior) desyncs the hedge book.
+        let malformed: OrderBookMsg = serde_json::from_value(serde_json::json!({
+            "type": "update/order_book",
+            "order_book": {
+                "begin_nonce": 11,
+                "nonce": 12,
+                "bids": [{"price": "100", "size": "nope"}],
+                "asks": []
+            }
+        }))
+        .unwrap();
+        assert!(!feed.apply(24, &malformed));
     }
 
     #[test]

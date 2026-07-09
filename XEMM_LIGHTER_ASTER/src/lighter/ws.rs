@@ -19,6 +19,23 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 
+/// A routed application frame: the raw JSON text plus its already-extracted top-level
+/// `type` tag. Handlers deserialize the raw text straight into typed structs
+/// (`serde_json::from_str`) — no intermediate `Value` tree is ever built.
+pub struct LighterFrame<'a> {
+    /// Top-level `type` (absent on untyped frames). `Cow` because JSON escapes in the
+    /// tag (legal, e.g. `"update\/order_book"`) force an owned unescape.
+    pub msg_type: Option<std::borrow::Cow<'a, str>>,
+    pub raw: &'a str,
+}
+
+/// Envelope probe: deserializes ONLY the top-level `type` tag for routing.
+#[derive(serde::Deserialize)]
+struct Envelope<'a> {
+    #[serde(rename = "type", borrow, default)]
+    msg_type: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// Proactive client-ping interval. Lighter closes any connection that sends NO frame for 2
 /// minutes (https://apidocs.lighter.xyz/docs/websocket-reference), so quiet streams (e.g.
 /// account/user_stats) must emit a keepalive frame well under that window — matches Python's
@@ -92,7 +109,7 @@ pub async fn subscribe_loop<F, D>(
     mut on_message: F,
     mut on_disconnect: D,
 ) where
-    F: FnMut(&Value),
+    F: FnMut(&LighterFrame<'_>),
     D: FnMut(),
 {
     let mut backoff = opts.reconnect_base;
@@ -127,7 +144,7 @@ pub async fn subscribe_loop_authed<F, A>(
     mut auth_fn: A,
     mut on_message: F,
 ) where
-    F: FnMut(&Value),
+    F: FnMut(&LighterFrame<'_>),
     A: FnMut() -> std::collections::HashMap<String, String>,
 {
     let mut backoff = opts.reconnect_base;
@@ -165,7 +182,7 @@ async fn session<F>(
     on_message: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(&Value),
+    F: FnMut(&LighterFrame<'_>),
 {
     let (ws_stream, _) = connect_async(&opts.url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -240,11 +257,13 @@ where
         last_frame = Instant::now();
         match msg {
             Message::Text(t) => {
-                let data: Value = match serde_json::from_str(&t) {
+                // Envelope-only parse: route on the top-level `type` tag without ever
+                // building a `Value` tree. Handlers typed-parse the raw text themselves.
+                let env: Envelope<'_> = match serde_json::from_str(&t) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                match data.get("type").and_then(|v| v.as_str()) {
+                match env.msg_type.as_deref() {
                     Some("ping") => {
                         // Server app-level keepalive — reply, but do NOT count as feed data.
                         // Guarded + fail-fast: a stalled/broken write side ends the session
@@ -261,10 +280,14 @@ where
                     }
                     Some("connected") | Some("subscribed") => {}
                     _ => {
-                        // Real application message — this is the only thing that refreshes the
-                        // data watchdog. Callbacks here are written to not panic.
+                        // Real application message (typed or untyped — untyped frames are
+                        // still delivered) — the only thing that refreshes the data
+                        // watchdog. Callbacks here are written to not panic.
                         last_data = Instant::now();
-                        on_message(&data);
+                        on_message(&LighterFrame {
+                            msg_type: env.msg_type,
+                            raw: &t,
+                        });
                     }
                 }
             }
@@ -327,7 +350,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_frame: &LighterFrame<'_>| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -357,7 +380,7 @@ mod tests {
         opts.frame_timeout = 0.15;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_frame: &LighterFrame<'_>| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -384,7 +407,7 @@ mod tests {
         let mut opts = opts(url);
         opts.data_timeout = None;
         opts.frame_timeout = 0.16;
-        let mut on_message = |_data: &Value| {};
+        let mut on_message = |_frame: &LighterFrame<'_>| {};
 
         timeout(Duration::from_secs(2), session(&opts, None, &mut on_message))
             .await
@@ -414,7 +437,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: &Value| {
+        let mut on_message = move |_frame: &LighterFrame<'_>| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 

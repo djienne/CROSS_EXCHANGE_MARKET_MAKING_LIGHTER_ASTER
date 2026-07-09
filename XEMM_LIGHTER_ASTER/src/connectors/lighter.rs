@@ -7,8 +7,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::warn;
 
-use serde::Deserialize;
-
 use super::{EventSink, Tap};
 use crate::decimal::dec_from_f64_book;
 use crate::events::{EventKind, PriceLevel};
@@ -26,12 +24,27 @@ struct StreamState {
     /// Lifetime count of gap-forced resyncs on this stream — surfaced in the gap warn so
     /// reconnect churn (e.g. from wrong sequence assumptions) is visible in logs.
     gap_resyncs: u64,
+    /// Highest publish stamp (ms) handed to the accept gate on this stream. NOT cleared by
+    /// `reset()`: the VenueBook's monotone gate persists across reconnects, so the clamp
+    /// must persist too or a post-reconnect wall-clock step would still freeze the book.
+    last_pub_ms: i64,
 }
 
 impl StreamState {
     fn reset(&mut self) {
         self.book.reset();
         self.last_nonce = None;
+    }
+
+    /// Monotone publish stamp. Lighter frames are stamped with local wall time, and the
+    /// book cell's accept gate rejects non-monotone stamps — so a backwards wall-clock
+    /// step (NTP) would silently freeze the book while `touch()` keeps the watchdog
+    /// satisfied. Clamp to the previous stamp instead: equal-ms stamps are accepted by
+    /// the gate, and the deviation is conservative (book looks older, never fresher).
+    fn stamp_ms(&mut self, wall_ms: i64) -> i64 {
+        let stamped = wall_ms.max(self.last_pub_ms);
+        self.last_pub_ms = stamped;
+        stamped
     }
 }
 
@@ -78,9 +91,9 @@ pub async fn run_with_tap(
     subscribe_loop(
         opts,
         Some(reconnect),
-        move |data| {
+        move |frame| {
             let mut state = state.lock().expect("Lighter stream book state poisoned");
-            if !handle_value(data, &market, &tx, &tap, &mut state) {
+            if !handle_raw(frame.raw, &market, &tx, &tap, &mut state) {
                 state.gap_resyncs += 1;
                 warn!(
                     "Lighter order_book sequence gap for market {} (resync #{}); reconnecting for fresh snapshot",
@@ -100,6 +113,9 @@ pub async fn run_with_tap(
     .await;
 }
 
+/// Test shim: the suite drives frames as `serde_json::json!` values; production ingest
+/// goes through [`handle_raw`] on the raw WS text.
+#[cfg(test)]
 fn handle_value(
     data: &serde_json::Value,
     market: &MarketId,
@@ -107,9 +123,19 @@ fn handle_value(
     tap: &Tap,
     state: &mut StreamState,
 ) -> bool {
-    // Borrowed deserialize straight from the routed `Value`: no deep clone, no
-    // re-parse, no per-level String allocations on the hedge-source ingest thread.
-    let msg = match OrderBookMsgRef::deserialize(data) {
+    handle_raw(&data.to_string(), market, tx, tap, state)
+}
+
+fn handle_raw(
+    raw: &str,
+    market: &MarketId,
+    tx: &EventSink,
+    tap: &Tap,
+    state: &mut StreamState,
+) -> bool {
+    // Borrowed deserialize straight from the raw frame text: no `Value` tree, no deep
+    // clone, no per-level String allocations on the hedge-source ingest thread.
+    let msg = match serde_json::from_str::<OrderBookMsgRef<'_>>(raw) {
         Ok(m) => m,
         Err(_) => return true,
     };
@@ -125,8 +151,14 @@ fn handle_value(
             BookUpdateContiguity::Gap => return false,
         }
     }
-    let bids_f = parse_lighter_levels(&msg.order_book.bids);
-    let asks_f = parse_lighter_levels(&msg.order_book.asks);
+    // Unparseable level → false → the caller's gap path (reset + reconnect for a
+    // fresh snapshot). Applying a coerced level would silently desync the book.
+    let Some(bids_f) = parse_lighter_levels(&msg.order_book.bids) else {
+        return false;
+    };
+    let Some(asks_f) = parse_lighter_levels(&msg.order_book.asks) else {
+        return false;
+    };
     if msg.is_snapshot() || !state.book.initialized {
         state.book.apply_snapshot(bids_f, asks_f);
     } else {
@@ -137,7 +169,9 @@ fn handle_value(
     if !state.book.initialized {
         return true;
     }
-    let exch_ts = Utc::now();
+    let wall = Utc::now();
+    let exch_ts = chrono::DateTime::<Utc>::from_timestamp_millis(state.stamp_ms(wall.timestamp_millis()))
+        .unwrap_or(wall);
     // Same publishability gate as the old string path: both sides non-empty.
     if state.book.bids.is_empty() || state.book.asks.is_empty() {
         return true;
@@ -200,14 +234,18 @@ fn handle_value(
     true
 }
 
-fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Vec<(f64, f64)> {
-    levels
-        .iter()
-        .filter_map(|l| {
-            let (p, q) = l.parsed();
-            (p > 0.0 && q >= 0.0).then_some((p, q))
-        })
-        .collect()
+/// `None` when any level is unparseable — the caller must resync rather than apply
+/// (a size coerced to 0.0 would DELETE the level; a dropped price desyncs the book).
+/// Otherwise today's filter semantics: `q == 0` deletions kept, `p <= 0 || q < 0` dropped.
+fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Option<Vec<(f64, f64)>> {
+    let mut out = Vec::with_capacity(levels.len());
+    for l in levels {
+        let (p, q) = l.parsed_opt()?;
+        if p > 0.0 && q >= 0.0 {
+            out.push((p, q));
+        }
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -518,5 +556,70 @@ mod tests {
             }
         });
         assert!(!handle_value(&unsequenced, &market, &sink, &tap, &mut state));
+    }
+
+    #[test]
+    fn handle_value_resyncs_on_malformed_level_and_keeps_zero_size_deletes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let tap = Tap::none();
+        let market = MarketId("BTC".to_string());
+        let mut state = StreamState::default();
+
+        let snapshot = serde_json::json!({
+            "type": "subscribed/order_book",
+            "offset": 10,
+            "order_book": {
+                "bids": [{"price": "100", "size": "1"}, {"price": "99", "size": "2"}],
+                "asks": [{"price": "101", "size": "2"}],
+                "offset": 10
+            }
+        });
+        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        let _ = rx.try_recv();
+
+        // Regression pin: an explicit "0" size is a deletion, not a resync.
+        let delete = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 11,
+            "order_book": {
+                "bids": [{"price": "99", "size": "0"}],
+                "asks": []
+            }
+        });
+        assert!(handle_value(&delete, &market, &sink, &tap, &mut state));
+        let (_, kind) = rx.try_recv().expect("delete delta published");
+        let EventKind::HlL2Book { bids, .. } = kind else {
+            panic!("expected HlL2Book event");
+        };
+        assert_eq!(bids.len(), 1, "size=0 must delete the 99 level");
+
+        // A malformed size must resync (return false), never coerce to 0.0 — that
+        // would silently DELETE the level. And nothing may be published.
+        let malformed = serde_json::json!({
+            "type": "update/order_book",
+            "offset": 12,
+            "order_book": {
+                "bids": [{"price": "100", "size": "not-a-number"}],
+                "asks": []
+            }
+        });
+        assert!(!handle_value(&malformed, &market, &sink, &tap, &mut state));
+        assert!(rx.try_recv().is_err(), "malformed delta must not publish");
+    }
+
+    #[test]
+    fn stamp_ms_clamps_backwards_wall_clock_steps() {
+        let mut state = StreamState::default();
+        assert_eq!(state.stamp_ms(1_000), 1_000);
+        // Backwards NTP step: the stamp must not go backwards or the book cell's
+        // monotone accept gate would silently reject every publish.
+        assert_eq!(state.stamp_ms(900), 1_000);
+        // Equal-ms stamps are accepted by the gate, so publishing continues through
+        // the step; once the wall clock passes the clamp, normal stamping resumes.
+        assert_eq!(state.stamp_ms(1_100), 1_100);
+        // The clamp survives a gap-resync reset — the VenueBook gate does too.
+        state.reset();
+        assert_eq!(state.stamp_ms(500), 1_100);
     }
 }

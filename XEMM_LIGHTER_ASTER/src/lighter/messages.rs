@@ -12,6 +12,14 @@ pub fn parse_f64(s: &str) -> f64 {
     fast_float::parse(s).unwrap_or(0.0)
 }
 
+/// Like [`parse_f64`] but surfaces malformed input instead of coercing it to `0.0`.
+/// Book ingest must use this: a malformed SIZE coerced to zero DELETES the level from
+/// the local book, and a malformed price silently drops it — both desync the book.
+#[inline]
+pub fn parse_f64_opt(s: &str) -> Option<f64> {
+    fast_float::parse(s).ok()
+}
+
 // ----------------------------- REST -----------------------------
 
 #[derive(Debug, Deserialize)]
@@ -207,20 +215,29 @@ impl OrderBookMsg {
     }
 }
 
-/// Borrowed view of a book level — zero-copy when deserializing from an already-parsed
-/// `serde_json::Value` (`Value` strings are unescaped, so `&str` borrows always succeed).
+/// Borrowed view of a book level — zero-copy when deserializing from raw WS text or an
+/// already-parsed `serde_json::Value`. `Cow` (not `&str`): borrowing from RAW TEXT fails
+/// on JSON-escaped strings, and while numeric strings can't legally need escaping, `Cow`
+/// makes that failure mode an allocation instead of a dropped frame.
 #[derive(Debug, Deserialize)]
 pub struct PriceLevelRef<'a> {
     #[serde(borrow)]
-    pub price: &'a str,
+    pub price: std::borrow::Cow<'a, str>,
     #[serde(borrow)]
-    pub size: &'a str,
+    pub size: std::borrow::Cow<'a, str>,
 }
 
 impl PriceLevelRef<'_> {
     #[inline]
     pub fn parsed(&self) -> (f64, f64) {
-        (parse_f64(self.price), parse_f64(self.size))
+        (parse_f64(&self.price), parse_f64(&self.size))
+    }
+
+    /// `None` when either field is unparseable — callers must treat that as a desynced
+    /// frame (resync for a fresh snapshot), never as a zero.
+    #[inline]
+    pub fn parsed_opt(&self) -> Option<(f64, f64)> {
+        Some((parse_f64_opt(&self.price)?, parse_f64_opt(&self.size)?))
     }
 }
 
@@ -238,12 +255,14 @@ pub struct OrderBookPayloadRef<'a> {
     pub begin_nonce: Option<i64>,
 }
 
-/// Borrowed twin of [`OrderBookMsg`] for the hot ingest path: deserializing from a
-/// `&Value` borrows every string instead of deep-cloning the tree.
+/// Borrowed twin of [`OrderBookMsg`] for the hot ingest path: deserializing straight from
+/// raw WS text (or a `&Value`) borrows every string instead of deep-cloning the tree.
+/// `Cow` on the type tag: an escaped tag (legal JSON, e.g. `"subscribed\/order_book"`)
+/// costs an allocation instead of a dropped frame.
 #[derive(Debug, Deserialize)]
 pub struct OrderBookMsgRef<'a> {
     #[serde(rename = "type", borrow)]
-    pub msg_type: &'a str,
+    pub msg_type: std::borrow::Cow<'a, str>,
     #[serde(default)]
     pub offset: Option<u64>,
     #[serde(borrow)]
@@ -299,10 +318,12 @@ impl TickerMsg {
     }
 }
 
-/// `account_orders/{m}/{a}` — `orders` keyed by market id.
+/// `account_orders/{m}/{a}` / `account_all_orders/{a}` — `orders` keyed by market id.
+/// `type` is defaulted: the pre-typed consumer extracted `orders` regardless of the tag,
+/// and an untyped frame must keep updating the open-orders cache rather than stall it.
 #[derive(Debug, Deserialize)]
 pub struct AccountOrdersMsg {
-    #[serde(rename = "type")]
+    #[serde(rename = "type", default)]
     pub msg_type: String,
     #[serde(default)]
     pub orders: HashMap<String, Vec<RemoteOrder>>,
@@ -523,21 +544,40 @@ mod tests {
         for raw in cases {
             let value: serde_json::Value = serde_json::from_str(raw).unwrap();
             let owned: OrderBookMsg = serde_json::from_value(value.clone()).unwrap();
-            let borrowed = OrderBookMsgRef::deserialize(&value).unwrap();
-            assert_eq!(owned.is_snapshot(), borrowed.is_snapshot());
-            assert_eq!(owned.effective_offset(), borrowed.effective_offset());
-            assert_eq!(owned.order_book.bids.len(), borrowed.order_book.bids.len());
-            for (o, b) in owned.order_book.bids.iter().zip(&borrowed.order_book.bids) {
-                assert_eq!(o.parsed(), b.parsed());
-            }
-            for (last_nonce, last_offset) in seq_positions {
-                assert_eq!(
-                    owned.contiguity(last_nonce, last_offset),
-                    borrowed.contiguity(last_nonce, last_offset),
-                    "contiguity diverged for {raw} at {last_nonce:?}/{last_offset:?}"
-                );
+            // The borrowed view must parse identically from a routed Value AND from
+            // raw text (the production ingest path since the LighterFrame refactor).
+            for borrowed in [
+                OrderBookMsgRef::deserialize(&value).unwrap(),
+                serde_json::from_str::<OrderBookMsgRef<'_>>(raw).unwrap(),
+            ] {
+                assert_eq!(owned.is_snapshot(), borrowed.is_snapshot());
+                assert_eq!(owned.effective_offset(), borrowed.effective_offset());
+                assert_eq!(owned.order_book.bids.len(), borrowed.order_book.bids.len());
+                for (o, b) in owned.order_book.bids.iter().zip(&borrowed.order_book.bids) {
+                    assert_eq!(o.parsed(), b.parsed());
+                }
+                for (last_nonce, last_offset) in seq_positions {
+                    assert_eq!(
+                        owned.contiguity(last_nonce, last_offset),
+                        borrowed.contiguity(last_nonce, last_offset),
+                        "contiguity diverged for {raw} at {last_nonce:?}/{last_offset:?}"
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn borrowed_orderbook_msg_survives_json_escapes_in_raw_text() {
+        // An escaped solidus in the type tag is legal JSON. Borrowing &str from raw
+        // text would fail here — the Cow fields must fall back to owned instead of
+        // dropping the frame.
+        let raw = r#"{"type":"subscribed\/order_book","offset":1,
+            "order_book":{"bids":[{"price":"100.5","size":"2"}],
+            "asks":[{"price":"101","size":"3"}],"offset":1}}"#;
+        let m: OrderBookMsgRef<'_> = serde_json::from_str(raw).expect("escaped tag must parse");
+        assert!(m.is_snapshot());
+        assert_eq!(m.order_book.bids[0].parsed(), (100.5, 2.0));
     }
 
     #[test]
