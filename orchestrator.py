@@ -64,6 +64,34 @@ def prune_old_tapes(
     return pruned
 
 
+def prune_old_logs(
+    state_dir: Path, market: str, retention_days: float, now: datetime, exclude: set[Path]
+) -> list[tuple[Path, int]]:
+    """Delete per-run orchestrator child logs past retention.
+
+    Every child (re)start mints a new `orchestrator_<bot>_<market>_<stamp>.log`; only
+    the tapes had retention, so logs accumulated forever on a 94%-full disk. The live
+    children's log paths are excluded outright (their mtime is fresh anyway); the
+    console log has no market component so the glob never matches it. The events/pnl
+    jsonl audit trails are deliberately NOT pruned. retention_days <= 0 keeps all.
+    """
+    if retention_days <= 0:
+        return []
+    cutoff = (now - timedelta(days=retention_days)).timestamp()
+    pruned: list[tuple[Path, int]] = []
+    for path in sorted(state_dir.glob(f"orchestrator_*_{market}_*.log")):
+        if path in exclude:
+            continue
+        try:
+            st = path.stat()
+            if st.st_mtime < cutoff:
+                path.unlink()
+                pruned.append((path, st.st_size))
+        except OSError:
+            continue
+    return pruned
+
+
 def parse_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
     if value is None:
         return default
@@ -129,8 +157,22 @@ def text_tail(value: Any, limit: int = 2000) -> str:
 def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, default=json_default, indent=2) + "\n", encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(json.dumps(value, default=json_default, indent=2) + "\n")
+        f.flush()
+        # fsync before the rename: without it a power loss can leave the DESTINATION
+        # as an empty/truncated file (rename persisted, data not) — for the breaker or
+        # baseline files that silently re-anchors the drawdown breaker.
+        os.fsync(f.fileno())
     tmp.replace(path)
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass  # best-effort: the rename itself is what needs the directory entry
 
 
 TRACING_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\S+\s+(?:TRACE|DEBUG|INFO|WARN|ERROR)\b")
@@ -329,9 +371,49 @@ class TradeTracker:
         self.event = event
         self.trades_path = args.state_dir / f"orchestrator_trades_{self.market}.jsonl"
         self.seen: set[str] = set()
-        self.trades: list[dict[str, Any]] = []
+        # Running aggregates instead of an unbounded in-memory row list: the breaker
+        # and status output only need the sums/counters plus the best/worst rows, and
+        # a supervisor that runs for weeks must not grow with every trade.
+        self.trade_count = 0
+        self.wins = 0
+        self.net_total = Decimal("0")
+        self.gross_total = Decimal("0")
+        self.fees_total = Decimal("0")
+        self.by_bot: dict[str, dict[str, Any]] = {}
+        self.best: dict[str, Any] | None = None
+        self.worst: dict[str, Any] | None = None
+        # Byte offset of the last fully-consumed line of the taker trades file, so
+        # poll() parses only appended lines instead of the whole file every 15s.
+        self.taker_trades_offset = 0
         self.xemm_report_failures = 0
         self.load_existing_normalized()
+
+    def note_trade(self, row: dict[str, Any]) -> None:
+        net = dec_or_zero(row.get("net_pnl_usdc"))
+        self.trade_count += 1
+        self.wins += int(net > 0)
+        self.net_total += net
+        self.gross_total += dec_or_zero(row.get("gross_pnl_usdc"))
+        self.fees_total += dec_or_zero(row.get("fees_usdc"))
+        bucket = self.by_bot.setdefault(
+            str(row.get("bot")),
+            {
+                "trades": 0,
+                "net_pnl_usdc": Decimal("0"),
+                "gross_pnl_usdc": Decimal("0"),
+                "fees_usdc": Decimal("0"),
+                "wins": 0,
+            },
+        )
+        bucket["trades"] += 1
+        bucket["net_pnl_usdc"] += net
+        bucket["gross_pnl_usdc"] += dec_or_zero(row.get("gross_pnl_usdc"))
+        bucket["fees_usdc"] += dec_or_zero(row.get("fees_usdc"))
+        bucket["wins"] += int(net > 0)
+        if self.best is None or net > dec_or_zero(self.best.get("net_pnl_usdc")):
+            self.best = row
+        if self.worst is None or net < dec_or_zero(self.worst.get("net_pnl_usdc")):
+            self.worst = row
 
     def load_existing_normalized(self) -> None:
         if not self.trades_path.exists():
@@ -346,7 +428,7 @@ class TradeTracker:
                     self.seen.add(key)
                 ts = self.row_ts(row)
                 if ts is None or ts >= self.since:
-                    self.trades.append(row)
+                    self.note_trade(row)
 
     def prime_sources(self) -> None:
         if self.args.backfill_existing_trades:
@@ -411,20 +493,35 @@ class TradeTracker:
 
     def record(self, row: dict[str, Any], out: list[dict[str, Any]]) -> None:
         self.seen.add(str(row["key"]))
-        self.trades.append(row)
+        self.note_trade(row)
         append_jsonl(self.trades_path, row)
         out.append(row)
 
     def read_taker_trades(self) -> list[dict[str, Any]]:
         path = self.args.taker_trades
         if not path.exists():
+            self.taker_trades_offset = 0
             return []
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            if size < self.taker_trades_offset:
+                # Truncated/rotated: re-read from the start (the seen-keys dedup makes
+                # a re-read safe, never double-counted).
+                self.taker_trades_offset = 0
+            f.seek(self.taker_trades_offset)
+            payload = f.read()
+        # Consume only complete lines; a partially-written trailing line stays
+        # unconsumed until the writer finishes it.
+        consumed = payload.rfind(b"\n") + 1
+        if consumed <= 0:
+            return []
+        self.taker_trades_offset += consumed
         rows = []
-        with path.open("r", encoding="utf-8") as f:
-            for idx, line in enumerate(f, 1):
-                row = load_json_line(line, path, idx)
-                if row and row.get("market") in {None, self.market}:
-                    rows.append(row)
+        for idx, line in enumerate(payload[:consumed].splitlines(), 1):
+            row = load_json_line(line.decode("utf-8", "replace"), path, idx)
+            if row and row.get("market") in {None, self.market}:
+                rows.append(row)
         return rows
 
     def read_xemm_trades(self) -> list[dict[str, Any]]:
@@ -481,55 +578,23 @@ class TradeTracker:
 
     def summary(self) -> dict[str, Any]:
         by_bot: dict[str, dict[str, Any]] = {}
-        net_total = Decimal("0")
-        gross_total = Decimal("0")
-        fees_total = Decimal("0")
-        wins = 0
-        best: dict[str, Any] | None = None
-        worst: dict[str, Any] | None = None
-        for row in self.trades:
-            bot = str(row.get("bot"))
-            net = dec_or_zero(row.get("net_pnl_usdc"))
-            gross = dec_or_zero(row.get("gross_pnl_usdc"))
-            fees = dec_or_zero(row.get("fees_usdc"))
-            net_total += net
-            gross_total += gross
-            fees_total += fees
-            wins += int(net > 0)
-            bucket = by_bot.setdefault(
-                bot,
-                {
-                    "trades": 0,
-                    "net_pnl_usdc": Decimal("0"),
-                    "gross_pnl_usdc": Decimal("0"),
-                    "fees_usdc": Decimal("0"),
-                    "wins": 0,
-                },
-            )
-            bucket["trades"] += 1
-            bucket["net_pnl_usdc"] += net
-            bucket["gross_pnl_usdc"] += gross
-            bucket["fees_usdc"] += fees
-            bucket["wins"] += int(net > 0)
-            if best is None or net > dec_or_zero(best.get("net_pnl_usdc")):
-                best = row
-            if worst is None or net < dec_or_zero(worst.get("net_pnl_usdc")):
-                worst = row
-        total = len(self.trades)
-        for bucket in by_bot.values():
+        for bot, agg in self.by_bot.items():
+            bucket = dict(agg)
             trades = Decimal(bucket["trades"])
             bucket["avg_net_pnl_usdc"] = bucket["net_pnl_usdc"] / trades if trades else None
             bucket["win_rate"] = Decimal(bucket["wins"]) / trades if trades else None
+            by_bot[bot] = bucket
+        total = self.trade_count
         return {
             "trades": total,
             "by_bot": by_bot,
-            "net_pnl_usdc": net_total,
-            "gross_pnl_usdc": gross_total,
-            "fees_usdc": fees_total,
-            "avg_net_pnl_usdc": net_total / Decimal(total) if total else None,
-            "win_rate": Decimal(wins) / Decimal(total) if total else None,
-            "best_trade": best,
-            "worst_trade": worst,
+            "net_pnl_usdc": self.net_total,
+            "gross_pnl_usdc": self.gross_total,
+            "fees_usdc": self.fees_total,
+            "avg_net_pnl_usdc": self.net_total / Decimal(total) if total else None,
+            "win_rate": Decimal(self.wins) / Decimal(total) if total else None,
+            "best_trade": self.best,
+            "worst_trade": self.worst,
         }
 
     @staticmethod
@@ -608,7 +673,10 @@ class PnlTracker:
             return
         try:
             row = json.loads(self.baseline_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            # A corrupt baseline re-anchors the drawdown backstop at current equity,
+            # silently erasing accumulated drawdown — that must be loud.
+            self.event("baseline_load_failed", path=str(self.baseline_path), error=str(exc))
             return
         equity = parse_decimal(row.get("baseline_equity_usd"))
         ts = TradeTracker.parse_ts(row.get("baseline_ts"))
@@ -759,7 +827,9 @@ class Orchestrator:
         self.zombies: list[BotProcess] = []
         self.switch_counts: dict[str, int] = {TAKER_BOT: 0, XEMM_BOT: 0}
         self.mode_started_at = self.start_time
-        self.condition_since: dict[str, datetime] = {}
+        self.condition_since: dict[str, float] = {}
+        self.active_exit_count = 0
+        self.halted = False
         self.observer_retry_after: datetime | None = None
         self.observer_exit_count = 0
         self.reduce_lease_id: str | None = None
@@ -924,6 +994,8 @@ class Orchestrator:
 
     def activate_reduce_arb(self, signal_row: dict[str, Any]) -> None:
         self.event("reduce_burst_switch_start", signal=signal_row)
+        # Fresh confirm windows for the new mode (see sustained()).
+        self.condition_since.clear()
         self.stop_active("reduce_burst_signal", grace_sec=self.args.fast_xemm_stop_sec)
         ok, status = self.verify_xemm_orders_clear()
         if not ok:
@@ -932,6 +1004,9 @@ class Orchestrator:
         self.grant_reduce_lease("reduce_burst_signal", signal_row)
         child = self.children.pop(TAKER_OBSERVER, None)
         if child and child.is_running():
+            # The promoted observer IS the live reduce taker now — rename so later
+            # bot_stopped/bot_exited audit events carry the truth.
+            child.name = TAKER_BOT
             self.children[TAKER_BOT] = child
             self.active_bot = TAKER_BOT
             self.active_taker_mode = "reduce"
@@ -1146,36 +1221,54 @@ class Orchestrator:
         return parse_decimal((status.get("accounts") or {}).get("total_equity_usd"))
 
     def prune_tapes_if_due(self) -> None:
-        """Hourly sweep deleting research tapes past --tape-retention-days."""
-        if self.args.tape_retention_days <= 0:
-            return
+        """Hourly sweep deleting research tapes and per-run child logs past retention."""
         now = utc_now()
         if self.last_tape_prune and (now - self.last_tape_prune).total_seconds() < 3600:
             return
         self.last_tape_prune = now
-        pruned = prune_old_tapes(
-            self.args.state_dir,
-            self.args.market,
-            self.args.tape_retention_days,
-            now,
-            exclude=self.current_xemm_tape,
-        )
-        if pruned:
-            self.event(
-                "tapes_pruned",
-                count=len(pruned),
-                reclaimed_mb=round(sum(size for _, size in pruned) / 1048576, 1),
-                retention_days=self.args.tape_retention_days,
-                files=[p.name for p, _ in pruned],
+        if self.args.tape_retention_days > 0:
+            pruned = prune_old_tapes(
+                self.args.state_dir,
+                self.args.market,
+                self.args.tape_retention_days,
+                now,
+                exclude=self.current_xemm_tape,
             )
+            if pruned:
+                self.event(
+                    "tapes_pruned",
+                    count=len(pruned),
+                    reclaimed_mb=round(sum(size for _, size in pruned) / 1048576, 1),
+                    retention_days=self.args.tape_retention_days,
+                    files=[p.name for p, _ in pruned],
+                )
+        if self.args.log_retention_days > 0:
+            live_logs = {child.log_path for child in self.children.values()}
+            pruned_logs = prune_old_logs(
+                self.args.state_dir,
+                self.args.market,
+                self.args.log_retention_days,
+                now,
+                exclude=live_logs,
+            )
+            if pruned_logs:
+                self.event(
+                    "logs_pruned",
+                    count=len(pruned_logs),
+                    reclaimed_mb=round(sum(size for _, size in pruned_logs) / 1048576, 1),
+                    retention_days=self.args.log_retention_days,
+                    files=[p.name for p, _ in pruned_logs],
+                )
 
     def poll_statuses(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         taker_status: dict[str, Any] | None = None
         xemm_status: dict[str, Any] | None = None
         if self.active_bot == TAKER_BOT:
+            # No XEMM fallback here: has_required_status demands the ACTIVE bot's own
+            # status, so a fallback result is unreachable — fetching it only added up
+            # to a full status-subprocess timeout to every failed poll (stretching the
+            # window in which SIGINT delivery waits behind the subprocess).
             taker_status = self.read_status(TAKER_BOT)
-            if taker_status is None:
-                xemm_status = self.read_status(XEMM_BOT, inactive=True)
         elif self.active_bot == XEMM_BOT:
             xemm_status = self.read_status(XEMM_BOT)
             taker_status = self.read_status(TAKER_BOT, inactive=True)
@@ -1334,13 +1427,25 @@ class Orchestrator:
         return {"target": XEMM_BOT, "reason": "bootstrap_margin_limited_reduce_existing_position", "details": details}
 
     def taker_blocked(self, status: dict[str, Any] | None) -> tuple[bool, dict[str, Any]]:
-        margin_limited, details = self.taker_margin_state(status)
+        margin_limited, details = self.taker_margin_state(
+            status, self.args.switch_headroom_clips, self.args.switch_margin_clips
+        )
         executable_reduce = bool(details.get("taker_executable_reduce"))
         blocked = margin_limited and not executable_reduce
         details["taker_blocked"] = blocked
         return blocked, details
 
-    def taker_margin_state(self, status: dict[str, Any] | None) -> tuple[bool, dict[str, Any]]:
+    def taker_margin_state(
+        self,
+        status: dict[str, Any] | None,
+        headroom_clips: Decimal,
+        margin_clips: Decimal,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Margin-limited assessment at the given clip thresholds. Blocking uses the
+        switch_* clips; resuming uses the (higher) resume_* clips — without that level
+        hysteresis, headroom hovering at one shared boundary flips the condition every
+        tick and only the time windows (which 1.8's clear now protects) damp the flap.
+        """
         if not status:
             return False, {"status": "missing", "taker_margin_limited": False}
         required = dec_or_zero(status.get("required_gross_edge_bps"))
@@ -1366,10 +1471,12 @@ class Orchestrator:
         aster_available = parse_decimal(accounts.get("aster_available_usd"))
         lighter_available = parse_decimal(accounts.get("lighter_available_usd"))
         min_available = min(aster_available, lighter_available) if aster_available is not None and lighter_available is not None else None
-        low_headroom = headroom is not None and headroom < clip * self.args.switch_headroom_clips
-        low_margin = min_available is not None and (min_available - margin_buffer) < clip * self.args.switch_margin_clips
+        low_headroom = headroom is not None and headroom < clip * headroom_clips
+        low_margin = min_available is not None and (min_available - margin_buffer) < clip * margin_clips
         margin_limited = bool(margin_binding) or low_headroom or low_margin
         return margin_limited, {
+            "headroom_clips": headroom_clips,
+            "margin_clips": margin_clips,
             "profitable": len(profitable),
             "profitable_increase": len(profitable_increase),
             "executable_any": len(executable_any),
@@ -1388,7 +1495,9 @@ class Orchestrator:
         margin_limited = False
         margin_details: dict[str, Any] = {"status": "missing", "taker_margin_limited": False}
         if taker_status:
-            margin_limited, margin_details = self.taker_margin_state(taker_status)
+            margin_limited, margin_details = self.taker_margin_state(
+                taker_status, self.args.resume_headroom_clips, self.args.resume_margin_clips
+            )
         executable_reduce = bool(margin_details.get("taker_executable_reduce"))
         ready = near_flat or executable_reduce or (taker_status is not None and not margin_limited)
         if near_flat:
@@ -1410,11 +1519,16 @@ class Orchestrator:
         }
 
     def sustained(self, key: str, condition: bool, seconds: int) -> bool:
+        # Monotonic: an NTP step must not instantly satisfy (or reset) a confirm
+        # window. Keys are also cleared on every mode switch (ensure_bot /
+        # activate_reduce_arb / active-bot exit): each key is only EVALUATED in one
+        # mode, so a stale timestamp would survive a mode round-trip and collapse the
+        # confirm window to zero on re-entry — the 2026-07-07 flap-storm root cause.
         if not condition:
             self.condition_since.pop(key, None)
             return False
-        first = self.condition_since.setdefault(key, utc_now())
-        return (utc_now() - first).total_seconds() >= seconds
+        first = self.condition_since.setdefault(key, time.monotonic())
+        return time.monotonic() - first >= seconds
 
     def near_flat(self, status: dict[str, Any]) -> bool:
         abs_position = parse_decimal((status.get("positions") or {}).get("abs_position_notional_usd"))
@@ -1451,13 +1565,39 @@ class Orchestrator:
             and (target != TAKER_BOT or self.active_taker_mode == desired_taker_mode)
         ):
             return
+        # A child can exit mid-tick (the status polls above take seconds): re-poll
+        # exits before acting so a nonzero exit — a bot breaker trip — routes to
+        # safe_halt with its exit code recorded, instead of stop_active silently
+        # discarding it and restarting the bot.
+        self.check_child_exits()
+        if self.shutdown_requested:
+            return
         if self.args.live:
+            stopping_xemm_for_taker = self.active_bot == XEMM_BOT and target == TAKER_BOT
             if target == TAKER_BOT:
                 self.stop_observer(f"switch_to_{target}")
-            self.stop_active(f"switch_to_{target}")
+            stop_result = self.stop_active(f"switch_to_{target}")
+            if stop_result and stop_result.get("alive_after_sigkill"):
+                # The old bot survived SIGKILL (D-state): starting a replacement means
+                # two live writers on the same account — halt instead. (Previously the
+                # replacement started and the NEXT tick's external-writer check halted
+                # the NEW bot while the unkillable one kept running.)
+                self.safe_halt("bot_survived_sigkill", stop_result=stop_result)
+                return
+            if stopping_xemm_for_taker:
+                # The reduce promotion verifies this; the normal resume must too. A
+                # wedged XEMM that ate the SIGKILL path skipped its cancel-on-shutdown:
+                # starting the taker with maker orders still resting risks an unhedged
+                # fill with nobody watching it.
+                ok, status = self.verify_xemm_orders_clear()
+                if not ok:
+                    self.safe_halt("xemm_orders_not_clear_on_resume", xemm_status=status)
+                    return
             self.start_bot(target, taker_mode=desired_taker_mode or "normal")
         else:
             self.event("dry_run_switch_decision", target=target, reason=reason, details=details)
+        # Fresh confirm windows for the new mode (see sustained()).
+        self.condition_since.clear()
         self.active_bot = target
         self.active_taker_mode = desired_taker_mode
         self.mode_started_at = utc_now()
@@ -1495,12 +1635,13 @@ class Orchestrator:
             self.track_if_unkilled(child, result)
         self.children.pop(TAKER_OBSERVER, None)
 
-    def stop_active(self, reason: str, grace_sec: int | None = None) -> None:
+    def stop_active(self, reason: str, grace_sec: int | None = None) -> dict[str, Any] | None:
         if not self.active_bot:
-            return
+            return None
         if self.active_bot == TAKER_BOT and self.active_taker_mode == "reduce":
             self.revoke_reduce_lease(reason)
         child = self.children.get(self.active_bot)
+        result = None
         if child and child.is_running():
             result = child.stop(grace_sec if grace_sec is not None else self.args.stop_grace_sec)
             self.event("bot_stopped", bot=self.active_bot, reason=reason, **result)
@@ -1509,6 +1650,7 @@ class Orchestrator:
             self.children.pop(self.active_bot, None)
         self.active_bot = None
         self.active_taker_mode = None
+        return result
 
     def track_if_unkilled(self, child: BotProcess, stop_result: dict[str, Any]) -> None:
         if stop_result.get("alive_after_sigkill"):
@@ -1539,12 +1681,36 @@ class Orchestrator:
                         self.revoke_reduce_lease("active_reduce_taker_exited")
                     self.active_bot = None
                     self.active_taker_mode = None
+                    # The mode ended: stale confirm windows must not survive into the
+                    # re-bootstrap (see sustained()).
+                    self.condition_since.clear()
                     if code != 0:
                         self.safe_halt(
                             "active_bot_exited_nonzero",
                             bot=bot,
                             exit_code=code,
                             reduce_mode=was_reduce_taker,
+                            log=str(child.log_path),
+                        )
+                        return
+                    uptime_sec = (
+                        (utc_now() - child.started_at).total_seconds()
+                        if child.started_at
+                        else 0.0
+                    )
+                    if uptime_sec >= 600:
+                        self.active_exit_count = 0
+                    self.active_exit_count += 1
+                    if self.active_exit_count >= 3:
+                        # Clean-exit crash loop (e.g. a config the bot rejects at
+                        # startup): without this the orchestrator restarts it every
+                        # tick forever, minting a fresh log + tape each time. Nonzero
+                        # exits already halt above; this catches the exit-0 loop.
+                        self.safe_halt(
+                            "active_bot_crash_loop",
+                            bot=bot,
+                            consecutive_short_exits=self.active_exit_count,
+                            last_uptime_sec=int(uptime_sec),
                             log=str(child.log_path),
                         )
                         return
@@ -1730,6 +1896,7 @@ class Orchestrator:
         # Flag first: even if every write below fails (full disk), the run loop
         # must still exit and the finally block must still stop the children.
         self.shutdown_requested = True
+        self.halted = True  # main() exits nonzero so wrappers can tell halt from done
         self.event("safe_halt", reason=reason, details=details)
         self.stop_observer("safe_halt")
         self.stop_active("safe_halt")
@@ -1872,6 +2039,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--near-flat-notional-usd", type=positive_decimal, default=Decimal("0"), help="0 means use the status desired-notional clip.")
     parser.add_argument("--switch-headroom-clips", type=positive_decimal, default=Decimal("2"))
     parser.add_argument("--switch-margin-clips", type=positive_decimal, default=Decimal("2"))
+    parser.add_argument(
+        "--resume-headroom-clips",
+        type=positive_decimal,
+        default=None,
+        help="Headroom clips required to resume the taker (default: switch value + 1). "
+        "Must sit ABOVE --switch-headroom-clips: the gap is the level hysteresis that "
+        "keeps headroom hovering at one boundary from flapping the mode every tick.",
+    )
+    parser.add_argument(
+        "--resume-margin-clips",
+        type=positive_decimal,
+        default=None,
+        help="Margin clips required to resume the taker (default: switch value + 1). "
+        "See --resume-headroom-clips.",
+    )
+    parser.add_argument(
+        "--log-retention-days",
+        type=float,
+        default=14.0,
+        help="Delete per-run orchestrator child logs older than this many days "
+        "(the events/pnl jsonl audit trails are never pruned). <= 0 keeps everything.",
+    )
     parser.add_argument("--pnl-since", default="startup", help='RFC3339 timestamp, "startup", or "now".')
     parser.add_argument(
         "--max-loss-usdc",
@@ -1910,6 +2099,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taker-observer-arg", action="append", default=[], help="Extra arg appended to the taker reduce-standby command. Repeat for multiple args.")
     parser.add_argument("--xemm-arg", action="append", default=[], help="Extra arg appended to the XEMM livebot command. Repeat for multiple args.")
     args = parser.parse_args()
+    if args.resume_headroom_clips is None:
+        args.resume_headroom_clips = args.switch_headroom_clips + 1
+    if args.resume_margin_clips is None:
+        args.resume_margin_clips = args.switch_margin_clips + 1
     args.state_dir.mkdir(parents=True, exist_ok=True)
     if args.reset_breaker_baseline:
         baseline_path = args.state_dir / f"orchestrator_baseline_{args.market}.json"
@@ -1956,7 +2149,9 @@ def main() -> int:
             return 2
     orch = Orchestrator(args)
     orch.run()
-    return 0
+    # 2 = the supervisor halted itself (breaker/safety); 0 = clean stop (--once /
+    # SIGINT). Lets tmux wrappers and future automation tell the two apart.
+    return 2 if orch.halted else 0
 
 
 if __name__ == "__main__":
