@@ -30,7 +30,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tracing::{debug, error, info, warn, Level};
 
 use crate::aster::creds::{AsterCreds, LighterCreds};
@@ -1087,6 +1087,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut account = refresh_account_snapshot(&spec.market_id, &aster, &lighter).await?;
     let (account_tx, mut account_rx) = watch::channel(account);
     let account_refresh_paused = Arc::new(AtomicBool::new(false));
+    let account_refresh_now = Arc::new(Notify::new());
     let _account_refresh_task = spawn_account_snapshot_refresher(
         &cfg,
         spec.market_id.clone(),
@@ -1094,6 +1095,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         lighter.clone(),
         account_tx.clone(),
         account_refresh_paused.clone(),
+        account_refresh_now.clone(),
     );
 
     let http = rest_book::client()?;
@@ -1125,6 +1127,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     // `risk.mismatch_flatten_after_checks` in a row the residual is actively flattened
     // instead of pausing forever on a naked position.
     let mut mismatch_consecutive: u32 = 0;
+    // Change-detection state: books that fed the last FULL evaluation + the account
+    // generation it saw. Stored only after the mismatch/divergence guards pass, so a
+    // mismatched pair is re-entered every iteration.
+    const FULL_EVAL_FLOOR: Duration = Duration::from_millis(250);
+    let mut last_sized: Option<(Arc<OrderBook>, Arc<OrderBook>, u64)> = None;
+    let mut account_gen: u64 = 0;
+    let mut last_full_eval = tokio::time::Instant::now();
     let mut last_flatten_denied_log_at: Option<tokio::time::Instant> = None;
     let mut last_fill_stats_log = tokio::time::Instant::now();
     let mut lease_cache = LeaseFileCache::new();
@@ -1212,6 +1221,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         }
 
+        // "Fresh" = a NEW snapshot (a new REST read) arrived since the last iteration.
+        // The mismatch counter below only counts fresh generations — 4 reads of the same
+        // 15s snapshot are one observation, not four "consecutive checks".
+        let account_fresh = account_rx.has_changed().unwrap_or(false);
+        if account_fresh {
+            account_gen = account_gen.wrapping_add(1);
+        }
         account = *account_rx.borrow_and_update();
         if account.is_stale(account_snapshot_max_age) {
             let log_now = match last_stale_account_log_at {
@@ -1230,6 +1246,20 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         }
         last_stale_account_log_at = None;
+
+        if scan_inputs_unchanged(
+            &last_sized,
+            &aster_book,
+            &lighter_book,
+            account_gen,
+            last_full_eval.elapsed(),
+            FULL_EVAL_FLOOR,
+        ) {
+            // Nothing an evaluation depends on has changed since the last full pass —
+            // skip the sizing body this iteration (the staleness gates above already ran).
+            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            continue;
+        }
 
         // Throttled fill-matching health log (cold: one Instant compare per iteration).
         if last_fill_stats_log.elapsed() >= Duration::from_secs(60) {
@@ -1251,14 +1281,20 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         };
         if mismatch_notional > cfg.risk.max_position_mismatch_usd {
-            mismatch_consecutive = mismatch_consecutive.saturating_add(1);
+            if account_fresh {
+                mismatch_consecutive = mismatch_consecutive.saturating_add(1);
+            }
+            // Ask the refresher for an immediate re-read so the next check sees a new
+            // generation promptly (~seconds instead of one 15s refresh per count).
+            account_refresh_now.notify_one();
             warn!(
-                "position mismatch too large: aster={} lighter={} net={}; pausing ({} consecutive, auto-flatten at {})",
+                "position mismatch too large: aster={} lighter={} net={}; pausing ({} consecutive of {} needed, snapshot_fresh={})",
                 pos.aster_qty,
                 pos.lighter_qty,
                 pos.net_qty(),
                 mismatch_consecutive,
-                cfg.risk.mismatch_flatten_after_checks
+                cfg.risk.mismatch_flatten_after_checks,
+                account_fresh
             );
             // A residual that persists across several reconciles is a real naked position
             // (e.g. an external fill, or an Unknown-outcome leg that landed): act on it
@@ -1365,6 +1401,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 continue;
             }
         }
+        last_sized = Some((aster_book.clone(), lighter_book.clone(), account_gen));
+        last_full_eval = tokio::time::Instant::now();
         let margins = account.margins;
         let Some(pos_f) = PositionF64::from_snapshot(pos) else {
             warn!(
@@ -1829,6 +1867,18 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                         bail!("recovered-failure breaker triggered: {reason}");
                     }
                     record_recovery_loss(&mut pnl, &spec, &recovery)?;
+                } else if matches!(e, ExecutionError::AccountingUnavailable { .. }) {
+                    // Both legs were accepted and recovery found positions balanced: the
+                    // trade almost certainly COMPLETED but its economics could not be
+                    // read before the deadline. Book the margin-delta estimate rather
+                    // than leaving the loss breaker blind to it. Deliberately NOT
+                    // synthesized from immediate-fill data (config-estimated fees and a
+                    // possibly-partial Lighter leg would write wrong SIGNED PnL); the
+                    // delta can overstate a loss slightly and never books phantom gains,
+                    // so the breaker fails conservative. The execution journal row keeps
+                    // the raw data for manual correction. Not counted as a rescue event
+                    // in recovered_failures — nothing was rescued.
+                    record_recovery_loss(&mut pnl, &spec, &recovery)?;
                 }
                 match refresh_account_snapshot(&spec.market_id, &aster, &lighter).await {
                     Ok(snapshot) => {
@@ -1855,10 +1905,34 @@ fn fetch_books(
     spec: &MarketSpec,
     aster_books: &AsterBookFeed,
     lighter: &LighterVenue,
-) -> Result<(OrderBook, OrderBook)> {
-    let aster = aster_books.order_book()?;
-    let lighter_book = lighter.order_book(&spec.market_id)?;
+) -> Result<(Arc<OrderBook>, Arc<OrderBook>)> {
+    let aster = aster_books.order_book_arc()?;
+    let lighter_book = lighter.order_book_arc(&spec.market_id)?;
     Ok((aster, lighter_book))
+}
+
+/// Scan-loop change-detection skip: both books unchanged (same published Arcs — each
+/// applied update stores a fresh Arc, so pointer identity is a sound change proxy), no
+/// new account snapshot generation, and a full evaluation ran within the floor. The
+/// floor is a HARD bound: lease pickup, nonce-refresh completion, sanity-gate sampling,
+/// and the mismatch guard all ride full passes, so none may be deferred longer than it.
+fn scan_inputs_unchanged(
+    last_sized: &Option<(Arc<OrderBook>, Arc<OrderBook>, u64)>,
+    aster_book: &Arc<OrderBook>,
+    lighter_book: &Arc<OrderBook>,
+    account_gen: u64,
+    since_full_eval: Duration,
+    floor: Duration,
+) -> bool {
+    match last_sized {
+        Some((a, l, gen)) => {
+            Arc::ptr_eq(a, aster_book)
+                && Arc::ptr_eq(l, lighter_book)
+                && *gen == account_gen
+                && since_full_eval < floor
+        }
+        None => false,
+    }
 }
 
 async fn fetch_books_rest_lighter(
@@ -3918,6 +3992,7 @@ fn spawn_account_snapshot_refresher(
     lighter: Arc<LighterVenue>,
     tx: watch::Sender<AccountSnapshot>,
     paused: Arc<AtomicBool>,
+    refresh_now: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let refresh_ms = (cfg.live.max_account_snapshot_age_ms as u64 / 2).max(10_000);
     let retry_ms = cfg.risk.min_reconcile_interval_ms.max(5_000);
@@ -3926,7 +4001,13 @@ fn spawn_account_snapshot_refresher(
         let mut tick = tokio::time::interval(Duration::from_millis(refresh_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tick.tick().await;
+            // A forced refresh (scan loop stuck on a mismatch) skips the wait; the
+            // pause check below still applies, so recovery windows also suppress
+            // forced refreshes — a stored permit consumed post-unpause is harmless.
+            tokio::select! {
+                _ = tick.tick() => {}
+                _ = refresh_now.notified() => {}
+            }
             if paused.load(Ordering::Acquire) {
                 continue;
             }
@@ -4186,6 +4267,36 @@ mod tests {
     use super::*;
     use crate::config::{ArbCfg, LiveCfg, PnlCfg, RiskCfg, VenueCfg};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn scan_skip_requires_same_books_same_generation_and_recent_full_eval() {
+        let ts = Utc::now();
+        let book = |px: i64| {
+            Arc::new(OrderBook::from_levels(
+                vec![(Decimal::from(px), dec!(1))],
+                vec![(Decimal::from(px + 1), dec!(1))],
+                ts,
+                ts,
+            ))
+        };
+        let (a, l) = (book(100), book(100));
+        let floor = Duration::from_millis(250);
+        let within = Duration::from_millis(10);
+
+        // No prior full evaluation: never skip.
+        assert!(!scan_inputs_unchanged(&None, &a, &l, 0, within, floor));
+
+        let last = Some((a.clone(), l.clone(), 0u64));
+        // Identical inputs within the floor: skip.
+        assert!(scan_inputs_unchanged(&last, &a, &l, 0, within, floor));
+        // Either book replaced (fresh Arc, even with identical contents): no skip.
+        assert!(!scan_inputs_unchanged(&last, &book(100), &l, 0, within, floor));
+        assert!(!scan_inputs_unchanged(&last, &a, &book(100), 0, within, floor));
+        // New account snapshot generation: no skip.
+        assert!(!scan_inputs_unchanged(&last, &a, &l, 1, within, floor));
+        // Floor exceeded: full pass regardless (lease pickup / gate sampling bound).
+        assert!(!scan_inputs_unchanged(&last, &a, &l, 0, floor, floor));
+    }
 
     fn test_cfg() -> Config {
         Config {
