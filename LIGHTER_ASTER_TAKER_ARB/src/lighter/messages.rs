@@ -145,6 +145,43 @@ pub enum BookUpdateContiguity {
     Gap,
 }
 
+/// Classify a delta against the last applied sequence position. Single-sourced for the
+/// owned [`OrderBookMsg`] and borrowed [`OrderBookMsgRef`] views — this is fail-closed
+/// sequencing logic and must never fork.
+///
+/// Nonce chain: `begin_nonce` is where the delta starts, `end_nonce` where it ends. Levels
+/// carry ABSOLUTE sizes, so an overlapping delta that extends forward
+/// (`begin < last < end`) re-states known levels idempotently and is safe to apply;
+/// only a delta that ends at-or-before our position is a stale replay.
+pub fn classify_book_update(
+    begin_nonce: Option<i64>,
+    end_nonce: Option<i64>,
+    effective_offset: Option<u64>,
+    last_nonce: Option<i64>,
+    last_offset: Option<u64>,
+) -> BookUpdateContiguity {
+    use BookUpdateContiguity::*;
+    if let (Some(begin), Some(last)) = (begin_nonce, last_nonce) {
+        return if begin > last {
+            Gap
+        } else if begin == last || end_nonce.is_some_and(|end| end > last) {
+            Apply
+        } else {
+            SkipStale
+        };
+    }
+    if let (Some(offset), Some(last)) = (effective_offset, last_offset) {
+        return if offset == last.saturating_add(1) {
+            Apply
+        } else if offset <= last {
+            SkipStale
+        } else {
+            Gap
+        };
+    }
+    Gap
+}
+
 impl OrderBookMsg {
     pub fn is_snapshot(&self) -> bool {
         self.msg_type.contains("subscribed")
@@ -154,37 +191,81 @@ impl OrderBookMsg {
         self.offset.or(self.order_book.offset)
     }
 
-    /// Classify this delta against the last applied sequence position.
-    ///
-    /// Nonce chain: `begin_nonce` is where the delta starts, `nonce` where it ends. Levels
-    /// carry ABSOLUTE sizes, so an overlapping delta that extends forward
-    /// (`begin < last < end`) re-states known levels idempotently and is safe to apply;
-    /// only a delta that ends at-or-before our position is a stale replay.
+    /// See [`classify_book_update`].
     pub fn contiguity(
         &self,
         last_nonce: Option<i64>,
         last_offset: Option<u64>,
     ) -> BookUpdateContiguity {
-        use BookUpdateContiguity::*;
-        if let (Some(begin), Some(last)) = (self.order_book.begin_nonce, last_nonce) {
-            return if begin > last {
-                Gap
-            } else if begin == last || self.order_book.nonce.is_some_and(|end| end > last) {
-                Apply
-            } else {
-                SkipStale
-            };
-        }
-        if let (Some(offset), Some(last)) = (self.effective_offset(), last_offset) {
-            return if offset == last.saturating_add(1) {
-                Apply
-            } else if offset <= last {
-                SkipStale
-            } else {
-                Gap
-            };
-        }
-        Gap
+        classify_book_update(
+            self.order_book.begin_nonce,
+            self.order_book.nonce,
+            self.effective_offset(),
+            last_nonce,
+            last_offset,
+        )
+    }
+}
+
+/// Borrowed view of a book level — zero-copy when deserializing from raw WS text. `Cow`
+/// (not `&str`): borrowing from raw text fails on JSON-escaped strings, and while numeric
+/// strings can't legally need escaping, `Cow` makes that failure mode an allocation
+/// instead of a dropped frame.
+#[derive(Debug, Deserialize)]
+pub struct PriceLevelRef<'a> {
+    #[serde(borrow)]
+    pub price: std::borrow::Cow<'a, str>,
+    #[serde(borrow)]
+    pub size: std::borrow::Cow<'a, str>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrderBookPayloadRef<'a> {
+    #[serde(borrow, default)]
+    pub bids: Vec<PriceLevelRef<'a>>,
+    #[serde(borrow, default)]
+    pub asks: Vec<PriceLevelRef<'a>>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub nonce: Option<i64>,
+    #[serde(default)]
+    pub begin_nonce: Option<i64>,
+}
+
+/// Borrowed twin of [`OrderBookMsg`] for the hot ingest path: deserializing straight from
+/// raw WS text borrows every string instead of allocating two `String`s per level.
+#[derive(Debug, Deserialize)]
+pub struct OrderBookMsgRef<'a> {
+    #[serde(rename = "type", borrow)]
+    pub msg_type: std::borrow::Cow<'a, str>,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(borrow)]
+    pub order_book: OrderBookPayloadRef<'a>,
+}
+
+impl OrderBookMsgRef<'_> {
+    pub fn is_snapshot(&self) -> bool {
+        self.msg_type.contains("subscribed")
+    }
+    /// Prefer envelope offset, fall back to payload offset.
+    pub fn effective_offset(&self) -> Option<u64> {
+        self.offset.or(self.order_book.offset)
+    }
+    /// See [`classify_book_update`].
+    pub fn contiguity(
+        &self,
+        last_nonce: Option<i64>,
+        last_offset: Option<u64>,
+    ) -> BookUpdateContiguity {
+        classify_book_update(
+            self.order_book.begin_nonce,
+            self.order_book.nonce,
+            self.effective_offset(),
+            last_nonce,
+            last_offset,
+        )
     }
 }
 
@@ -474,5 +555,60 @@ mod tests {
         assert!((t.usd_amount_f64().unwrap() - 27.585403).abs() < 1e-12);
         assert!((t.ask_account_pnl_f64().unwrap() + 0.01).abs() < 1e-12);
         assert!((t.bid_account_pnl_f64().unwrap() - 0.02).abs() < 1e-12);
+    }
+
+    #[test]
+    fn borrowed_orderbook_msg_matches_owned() {
+        // The borrowed hot-path view and the owned type must agree on snapshot
+        // detection, offsets, level values, and every contiguity verdict — the
+        // sequencing logic is single-sourced in classify_book_update and this test
+        // pins the plumbing on both sides of it.
+        let cases = [
+            r#"{"type":"subscribed/order_book","offset":405053,
+                "order_book":{"bids":[{"price":"64820.2","size":"0.00051"}],
+                "asks":[{"price":"64820.3","size":"0.19283"}],"offset":405053}}"#,
+            r#"{"type":"update/order_book",
+                "order_book":{"bids":[{"price":"1.5","size":"0"}],"asks":[],
+                "offset":7,"nonce":12,"begin_nonce":10}}"#,
+            r#"{"type":"update/order_book","order_book":{"bids":[],"asks":[]}}"#,
+        ];
+        let seq_positions = [
+            (None, None),
+            (Some(10i64), Some(6u64)),
+            (Some(11), Some(7)),
+            (Some(12), Some(8)),
+            (Some(9), Some(3)),
+        ];
+        for raw in cases {
+            let owned: OrderBookMsg = serde_json::from_str(raw).unwrap();
+            let borrowed: OrderBookMsgRef<'_> = serde_json::from_str(raw).unwrap();
+            assert_eq!(owned.is_snapshot(), borrowed.is_snapshot());
+            assert_eq!(owned.effective_offset(), borrowed.effective_offset());
+            assert_eq!(owned.order_book.bids.len(), borrowed.order_book.bids.len());
+            for (o, b) in owned.order_book.bids.iter().zip(&borrowed.order_book.bids) {
+                assert_eq!(o.price, b.price.as_ref());
+                assert_eq!(o.size, b.size.as_ref());
+            }
+            for (last_nonce, last_offset) in seq_positions {
+                assert_eq!(
+                    owned.contiguity(last_nonce, last_offset),
+                    borrowed.contiguity(last_nonce, last_offset),
+                    "contiguity diverged for {raw} at {last_nonce:?}/{last_offset:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_orderbook_msg_survives_json_escapes_in_raw_text() {
+        // An escaped solidus in the type tag is legal JSON. Borrowing &str from raw
+        // text would fail here — the Cow fields must fall back to owned instead of
+        // dropping the frame.
+        let raw = r#"{"type":"subscribed\/order_book","offset":1,
+            "order_book":{"bids":[{"price":"100.5","size":"2"}],
+            "asks":[{"price":"101","size":"3"}],"offset":1}}"#;
+        let m: OrderBookMsgRef<'_> = serde_json::from_str(raw).expect("escaped tag must parse");
+        assert!(m.is_snapshot());
+        assert_eq!(m.order_book.bids[0].price.as_ref(), "100.5");
     }
 }

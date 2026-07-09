@@ -15,7 +15,7 @@ use crate::aster::creds::LighterCreds;
 use crate::book::{OrderBook, MAX_BOOK_LEVELS};
 use crate::lighter::auth::generate_ws_auth_token;
 use crate::lighter::messages::{
-    AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsg, PriceLevel,
+    AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsgRef, PriceLevelRef,
     RemoteOrder, TradePayload, UserStatsMsg,
 };
 use crate::lighter::nonce::NonceManager;
@@ -555,7 +555,7 @@ impl BookFeedState {
             .insert(market_id, reconnect);
     }
 
-    fn apply(&self, market_id: u32, msg: &OrderBookMsg) -> bool {
+    fn apply(&self, market_id: u32, msg: &OrderBookMsgRef<'_>) -> bool {
         let mut books = self.books.lock().expect("Lighter book state poisoned");
         let book = books.entry(market_id).or_default();
         book.apply(msg)
@@ -624,7 +624,7 @@ struct LighterBook {
 }
 
 impl LighterBook {
-    fn apply(&mut self, msg: &OrderBookMsg) -> bool {
+    fn apply(&mut self, msg: &OrderBookMsgRef<'_>) -> bool {
         if !msg.is_snapshot() {
             if !self.initialized {
                 // A delta before the subscribe snapshot must never seed the book.
@@ -1225,8 +1225,8 @@ fn spawn_account_all_positions_stream(
         subscribe_loop(
             opts,
             None,
-            move |data| {
-                if let Ok(msg) = serde_json::from_value::<AccountAllPositionsMsg>(data) {
+            move |raw| {
+                if let Ok(msg) = serde_json::from_str::<AccountAllPositionsMsg>(raw) {
                     apply_account_all_positions(&account_feed, &known_markets, &msg);
                 }
             },
@@ -1259,8 +1259,8 @@ fn spawn_account_all_stream(
                     HashMap::new()
                 }
             },
-            move |data| {
-                if let Ok(msg) = serde_json::from_value::<AccountAllMsg>(data) {
+            move |raw| {
+                if let Ok(msg) = serde_json::from_str::<AccountAllMsg>(raw) {
                     for trades in msg.trades.values() {
                         for trade in trades {
                             fills.on_trade(trade.clone());
@@ -1287,8 +1287,8 @@ fn spawn_user_stats_stream(
         subscribe_loop(
             opts,
             None,
-            move |data| {
-                if let Ok(msg) = serde_json::from_value::<UserStatsMsg>(data) {
+            move |raw| {
+                if let Ok(msg) = serde_json::from_str::<UserStatsMsg>(raw) {
                     account_feed.set_user_stats(
                         value_dec(msg.stats.available_balance.as_ref()),
                         value_dec(msg.stats.portfolio_value.as_ref()),
@@ -1327,7 +1327,11 @@ fn spawn_account_all_orders_stream(
                     HashMap::new()
                 }
             },
-            move |data| {
+            move |raw| {
+                // Cold path: keep the owned-Value handler contract, just parse locally.
+                let Ok(data) = serde_json::from_str::<serde_json::Value>(raw) else {
+                    return;
+                };
                 let orders = data.get("orders").unwrap_or(&serde_json::Value::Null);
                 let is_snapshot = data
                     .get("type")
@@ -1362,8 +1366,8 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
             subscribe_loop(
                 opts,
                 Some(reconnect),
-                move |data| {
-                    if let Ok(msg) = serde_json::from_value::<OrderBookMsg>(data) {
+                move |raw| {
+                    if let Ok(msg) = serde_json::from_str::<OrderBookMsgRef<'_>>(raw) {
                         if !books.apply(market_id, &msg) {
                             tracing::warn!(
                                 "Lighter order_book sequence gap for market {}; reconnecting for fresh snapshot",
@@ -1399,7 +1403,7 @@ fn remote_order_filled_qty(order: &RemoteOrder) -> Option<Decimal> {
         .map(|qty| qty.abs())
 }
 
-fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevel]) {
+fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'_>]) {
     for level in levels {
         let Some(px) = level.price.parse::<Decimal>().ok() else {
             continue;
@@ -1591,7 +1595,7 @@ mod tests {
 
     #[test]
     fn lighter_book_initial_update_and_delta_remove_level() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "order_book":{
@@ -1602,7 +1606,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let remove_bid: OrderBookMsg = serde_json::from_str(
+        let remove_bid: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1627,7 +1631,7 @@ mod tests {
 
     #[test]
     fn lighter_book_rejects_nonce_gap_delta() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "order_book":{
@@ -1639,7 +1643,7 @@ mod tests {
         )
         .unwrap();
         // begin_nonce ahead of our position => missed updates => resync.
-        let gap: OrderBookMsg = serde_json::from_str(
+        let gap: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1660,7 +1664,7 @@ mod tests {
 
     #[test]
     fn lighter_book_applies_forward_overlap_and_skips_stale_replay() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "order_book":{
@@ -1673,7 +1677,7 @@ mod tests {
         .unwrap();
         // Overlap extending forward (99 -> 101 over our 100): absolute level sizes make the
         // re-stated portion idempotent, so this must apply.
-        let overlap: OrderBookMsg = serde_json::from_str(
+        let overlap: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1686,7 +1690,7 @@ mod tests {
         )
         .unwrap();
         // Fully-stale replay (ends at-or-before our position): dropped, no resync.
-        let stale: OrderBookMsg = serde_json::from_str(
+        let stale: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1714,7 +1718,7 @@ mod tests {
 
     #[test]
     fn lighter_book_rejects_delta_before_snapshot() {
-        let delta: OrderBookMsg = serde_json::from_str(
+        let delta: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1732,7 +1736,7 @@ mod tests {
 
     #[test]
     fn lighter_book_rejects_offset_gap_without_nonce() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "offset":100,
@@ -1743,7 +1747,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let gap: OrderBookMsg = serde_json::from_str(
+        let gap: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "offset":102,
@@ -1761,7 +1765,7 @@ mod tests {
 
     #[test]
     fn lighter_book_rejects_delta_without_sequence_metadata() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "order_book":{
@@ -1771,7 +1775,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let unsequenced: OrderBookMsg = serde_json::from_str(
+        let unsequenced: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"update/order_book",
                 "order_book":{
@@ -1788,7 +1792,7 @@ mod tests {
 
     #[test]
     fn lighter_book_publishes_multiple_depth_levels() {
-        let initial: OrderBookMsg = serde_json::from_str(
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
             r#"{
                 "type":"subscribed/order_book",
                 "order_book":{

@@ -19,6 +19,18 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
 
+/// Control-frame probe: deserializes ONLY the top-level `type`/`channel` tags to route a
+/// frame (allocation-free skip-scan). Application frames are handed to the callback as raw
+/// text; handlers deserialize straight into typed structs. `Cow` because JSON escapes in a
+/// tag (legal, e.g. `"subscribed\/order_book"`) force an owned unescape.
+#[derive(serde::Deserialize)]
+struct ControlFrame<'a> {
+    #[serde(rename = "type", borrow, default)]
+    msg_type: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    channel: Option<std::borrow::Cow<'a, str>>,
+}
+
 /// Proactive client-ping interval. Lighter closes any connection that sends NO frame for 2
 /// minutes (https://apidocs.lighter.xyz/docs/websocket-reference), so quiet streams (e.g.
 /// account/user_stats) must emit a keepalive frame well under that window — matches Python's
@@ -92,7 +104,7 @@ pub async fn subscribe_loop<F, D>(
     mut on_message: F,
     mut on_disconnect: D,
 ) where
-    F: FnMut(Value),
+    F: FnMut(&str),
     D: FnMut(),
 {
     let mut backoff = opts.reconnect_base;
@@ -127,7 +139,7 @@ pub async fn subscribe_loop_authed<F, A>(
     mut auth_fn: A,
     mut on_message: F,
 ) where
-    F: FnMut(Value),
+    F: FnMut(&str),
     A: FnMut() -> std::collections::HashMap<String, String>,
 {
     let mut backoff = opts.reconnect_base;
@@ -165,7 +177,7 @@ async fn session<F>(
     on_message: &mut F,
 ) -> Result<()>
 where
-    F: FnMut(Value),
+    F: FnMut(&str),
 {
     let (ws_stream, _) = connect_async(&opts.url).await?;
     let (mut write, mut read) = ws_stream.split();
@@ -194,22 +206,23 @@ where
     let mut last_frame = Instant::now();
     let mut last_data = Instant::now();
     loop {
-        // Non-blocking forced-reconnect check.
-        if let Some(rc) = reconnect {
-            if rc.notified().now_or_never().is_some() {
+        // Race the read against the keepalive tick and the forced-reconnect Notify. The
+        // Notify is a REAL select arm (not a once-per-frame poll): a gap-resync request
+        // during a quiet stretch fires immediately instead of waiting for the next frame.
+        // Recreating `notified()` per pass is safe — an unconsumed permit is re-stored.
+        let msg = tokio::select! {
+            _ = async {
+                match reconnect {
+                    Some(rc) => rc.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
                 tracing::info!(
                     "{} reconnect requested; dropping for fresh snapshot",
                     opts.label
                 );
                 return Ok(());
             }
-        }
-
-        // Race the read against the keepalive tick. On the tick we send a proactive client Ping
-        // (so a quiet stream still satisfies Lighter's 2-min "send a frame" rule). Socket
-        // liveness is based on ANY received frame; optional data freshness is based only on real
-        // application messages.
-        let msg = tokio::select! {
             _ = ping_tick.tick() => {
                 if last_frame.elapsed() > frame_to {
                     tracing::warn!("{} watchdog: no frames for {}s", opts.label, opts.frame_timeout);
@@ -240,11 +253,13 @@ where
         last_frame = Instant::now();
         match msg {
             Message::Text(t) => {
-                let data: Value = match serde_json::from_str(&t) {
+                // Envelope-only parse: route on the top-level tags without building a
+                // `Value` tree. Handlers typed-parse the raw text themselves.
+                let ctrl: ControlFrame<'_> = match serde_json::from_str(&t) {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                match data.get("type").and_then(|v| v.as_str()) {
+                match ctrl.msg_type.as_deref() {
                     Some("ping") => {
                         // Server app-level keepalive — reply, but do NOT count as feed data.
                         let _ = write
@@ -258,16 +273,15 @@ where
                         tracing::info!(
                             "{} subscribe acknowledged channel={}",
                             opts.label,
-                            data.get("channel")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
+                            ctrl.channel.as_deref().unwrap_or("unknown")
                         );
                     }
                     _ => {
-                        // Real application message — this is the only thing that refreshes the
-                        // data watchdog. Callbacks here are written to not panic.
+                        // Real application message (typed or untyped — a frame with NO
+                        // type tag is still delivered) — the only thing that refreshes
+                        // the data watchdog. Callbacks here are written to not panic.
                         last_data = Instant::now();
-                        on_message(data);
+                        on_message(&t);
                     }
                 }
             }
@@ -280,8 +294,6 @@ where
     }
 }
 
-// bring `now_or_never` into scope
-use futures_util::future::FutureExt;
 
 #[cfg(test)]
 mod tests {
@@ -331,7 +343,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: Value| {
+        let mut on_message = move |_raw: &str| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -364,7 +376,7 @@ mod tests {
         opts.frame_timeout = 0.15;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: Value| {
+        let mut on_message = move |_raw: &str| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
@@ -391,7 +403,7 @@ mod tests {
         let mut opts = opts(url);
         opts.data_timeout = None;
         opts.frame_timeout = 0.16;
-        let mut on_message = |_data: Value| {};
+        let mut on_message = |_raw: &str| {};
 
         timeout(
             Duration::from_secs(2),
@@ -427,7 +439,7 @@ mod tests {
         opts.channel_auths
             .insert("test/channel".to_string(), "secret-token".to_string());
         opts.frame_timeout = 1.0;
-        let mut on_message = |_data: Value| {};
+        let mut on_message = |_raw: &str| {};
 
         timeout(
             Duration::from_secs(2),
@@ -437,6 +449,76 @@ mod tests {
         .unwrap()
         .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frames_without_a_type_tag_are_still_delivered() {
+        // The envelope router must not turn "no type field" into "dropped frame" —
+        // the pre-router code delivered such frames and consumers depend on that.
+        let (listener, url) = local_ws_url().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _sub = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(r#"{"n":1}"#.into())).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        });
+
+        let mut opts = opts(url);
+        opts.data_timeout = Some(0.12);
+        opts.frame_timeout = 2.0;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cb = calls.clone();
+        let mut on_message = move |raw: &str| {
+            assert_eq!(raw, r#"{"n":1}"#);
+            calls_for_cb.fetch_add(1, Ordering::Relaxed);
+        };
+
+        timeout(
+            Duration::from_secs(2),
+            session(&opts, None, &mut on_message),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_notify_fires_immediately_on_a_quiet_stream() {
+        // Regression pin for the select-arm reconnect: on the old once-per-frame
+        // now_or_never poll, a notify during a QUIET stretch (no frames arriving) sat
+        // unobserved until the next frame/tick; as a real select arm it fires at once.
+        let (listener, url) = local_ws_url().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _sub = ws.next().await.unwrap().unwrap();
+            // Say nothing: the session must exit via the Notify, not via any frame.
+            sleep(Duration::from_secs(5)).await;
+        });
+
+        let mut opts = opts(url);
+        opts.data_timeout = None;
+        opts.frame_timeout = 30.0;
+        opts.ping_interval = Duration::from_secs(20); // no tick inside the test window
+        let reconnect = Arc::new(Notify::new());
+        let rc = reconnect.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            rc.notify_one();
+        });
+        let mut on_message = |_raw: &str| {};
+
+        timeout(
+            Duration::from_millis(500),
+            session(&opts, Some(&reconnect), &mut on_message),
+        )
+        .await
+        .expect("session must return promptly on reconnect notify")
+        .unwrap();
+        server.abort();
     }
 
     #[tokio::test]
@@ -460,7 +542,7 @@ mod tests {
         opts.frame_timeout = 2.0;
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_cb = calls.clone();
-        let mut on_message = move |_data: Value| {
+        let mut on_message = move |_raw: &str| {
             calls_for_cb.fetch_add(1, Ordering::Relaxed);
         };
 
