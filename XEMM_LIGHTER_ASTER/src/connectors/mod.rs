@@ -311,6 +311,43 @@ impl Tap {
         }
     }
 
+    /// Publish a BBO assist with a COALESCED wake: data + freshness always stored, the
+    /// strategy woken only when the top prices changed (or a hot-only publish was
+    /// pending). For a BBO that mirrors an L2 frame whose own publish already woke the
+    /// strategy, the unconditional wake of `publish_bbo_prebuilt` is pure overhead.
+    #[inline]
+    pub(crate) fn publish_bbo_price_wake_prebuilt(
+        &self,
+        bid: PriceLevel,
+        ask: PriceLevel,
+        exch_ts: DateTime<Utc>,
+        #[cfg(feature = "hotpath")] prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
+        #[cfg(not(feature = "hotpath"))] _prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
+    ) {
+        if let Some(cell) = &self.book {
+            let book = OrderBook::from_levels([bid], [ask], exch_ts, Utc::now());
+            #[cfg(feature = "hotpath")]
+            if let Some(scale) = &self.scale {
+                let recv_ns = prebuilt_hot
+                    .as_ref()
+                    .map(|(_, ns)| *ns)
+                    .unwrap_or_else(crate::hotpath::clock::mono_now_ns);
+                let hot = prebuilt_hot.map(|(hot, _)| hot).unwrap_or_else(|| {
+                    crate::livebot::scale::build_hot_book_with_qty_scale(
+                        &book,
+                        scale,
+                        self.qty_scale,
+                        0,
+                        recv_ns,
+                    )
+                });
+                cell.publish_bbo_price_wake_hot(book, hot);
+                return;
+            }
+            cell.publish_bbo_price_wake(book);
+        }
+    }
+
     /// Stamp liveness on any inbound frame.
     #[inline]
     fn touch(&self) {

@@ -668,8 +668,12 @@ pub fn evaluate_side(
         current,
         replace_immediately_if_unprofitable,
     )
+    .0
 }
 
+/// Returns the side decision plus, when the quote engine rejected the candidate, the
+/// reject reason — so callers (the empty-side touch-hysteresis latch) never need to
+/// re-run the engine just to learn WHY a Hold happened.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_side_with_hl_sources(
     edge: &EdgeConfig,
@@ -686,13 +690,16 @@ fn evaluate_side_with_hl_sources(
     may_quote: bool,
     current: Option<CurrentOrder>,
     replace_immediately_if_unprofitable: bool,
-) -> SideDecision {
+) -> (SideDecision, Option<RejectReason>) {
     // Gate closed / cooldown / risk freeze: cancel anything resting, place nothing.
     if !may_quote {
-        return match current {
-            Some(_) => SideDecision::Cancel { reason: ReplaceReason::FeedStale },
-            None => SideDecision::Hold,
-        };
+        return (
+            match current {
+                Some(_) => SideDecision::Cancel { reason: ReplaceReason::FeedStale },
+                None => SideDecision::Hold,
+            },
+            None,
+        );
     }
 
     let desired = compute_desired_quote_select_books(
@@ -714,15 +721,18 @@ fn evaluate_side_with_hl_sources(
         Err(reason) => {
             // No acceptable quote right now. Pull a resting order with an honest reason
             // (stale feed vs no-longer-profitable), consistent with the simulator.
-            return match current {
-                Some(_) => SideDecision::Cancel { reason: ReplaceReason::from_reject(reason) },
-                None => SideDecision::Hold,
-            };
+            return (
+                match current {
+                    Some(_) => SideDecision::Cancel { reason: ReplaceReason::from_reject(reason) },
+                    None => SideDecision::Hold,
+                },
+                Some(reason),
+            );
         }
     };
     let (desired, selected_hl_book, _hl_source, _aster_source) = desired;
 
-    match current {
+    let decision = match current {
         None => SideDecision::Place(Box::new(desired)),
         Some(cur) => {
             // Urgent safety check FIRST: a resting order that no longer clears the minimum edge
@@ -740,10 +750,13 @@ fn evaluate_side_with_hl_sources(
                 )
                     .is_some_and(|e| e >= edge.min_net_profit_bps);
                 if !still_ok {
-                    return SideDecision::Replace {
-                        desired: Box::new(desired),
-                        reason: ReplaceReason::NoLongerProfitable,
-                    };
+                    return (
+                        SideDecision::Replace {
+                            desired: Box::new(desired),
+                            reason: ReplaceReason::NoLongerProfitable,
+                        },
+                        None,
+                    );
                 }
             }
             // Per-side requote DEADBAND (plan: don't churn on sub-bps moves): if the new desired
@@ -756,7 +769,7 @@ fn evaluate_side_with_hl_sources(
                 Decimal::from(10_000)
             };
             if move_bps < quote.min_requote_bps && cur.qty == desired.qty {
-                return SideDecision::Hold;
+                return (SideDecision::Hold, None);
             }
             // Non-urgent: replace only if price moved past the tick threshold or qty changed.
             let threshold = Decimal::from(quote.price_change_ticks_to_requote) * spec.tick;
@@ -768,7 +781,8 @@ fn evaluate_side_with_hl_sources(
                 SideDecision::Hold
             }
         }
-    }
+    };
+    (decision, None)
 }
 
 /// Per-market immutable context resolved at startup.
@@ -1109,46 +1123,30 @@ impl Strategy {
 
     /// Latch the hysteresis state for an empty side that just rejected on the base
     /// touch threshold. Existing orders are handled by `apply_decision` when the
-    /// cancel reason is `QUOTE_TOO_CLOSE_TO_TOUCH`.
-    #[allow(clippy::too_many_arguments)]
+    /// cancel reason is `QUOTE_TOO_CLOSE_TO_TOUCH`. The reject reason is the one the
+    /// side evaluation already computed — whenever this latch is reachable (guard not
+    /// active) that evaluation ran on the base quote config, so re-running the quote
+    /// engine here (the pre-2026-07 behavior, ~2x reprice cost in the standby state)
+    /// would produce the identical result.
     fn latch_empty_touch_reject_if_needed(
         &mut self,
         market: &MarketId,
         side: Side,
         decision: &SideDecision,
+        reject: Option<RejectReason>,
         current: Option<CurrentOrder>,
-        aster_book: &OrderBook,
-        aster_bbo_book: Option<&OrderBook>,
-        hl_l2_book: Option<&OrderBook>,
-        hl_bbo_book: Option<&OrderBook>,
-        spec: &MarketSpec,
-        max_stale: i64,
-        now: DateTime<Utc>,
-        pos: &PositionContext,
         now_ns: i64,
     ) {
+        if !self.touch_hysteresis_enabled() {
+            return;
+        }
         if current.is_some() || !matches!(decision, SideDecision::Hold) {
             return;
         }
         if self.aster_touch_guard_blocked.contains_key(&(market.clone(), side)) {
             return;
         }
-        if matches!(
-            compute_desired_quote_select_books(
-                &self.cfg.edge,
-                &self.cfg.quote,
-                aster_book,
-                aster_bbo_book,
-                hl_l2_book,
-                hl_bbo_book,
-                side,
-                spec,
-                max_stale,
-                now,
-                pos,
-            ),
-            Err(RejectReason::QuoteTooCloseToTouch)
-        ) {
+        if reject == Some(RejectReason::QuoteTooCloseToTouch) {
             self.latch_aster_touch_guard(market, side, now_ns);
         }
     }
@@ -2074,7 +2072,7 @@ impl Strategy {
             let touch_status = self.expire_aster_touch_guard_if_needed(market, side, current, now_ns);
             let touch_blocked = touch_status == AsterTouchGuardStatus::Active;
             let quote_cfg = quote_cfg_for_touch_guard(&self.cfg.quote, touch_blocked, current);
-            let decision = evaluate_side_with_hl_sources(
+            let (decision, reject) = evaluate_side_with_hl_sources(
                 &self.cfg.edge,
                 &quote_cfg,
                 aster_book,
@@ -2090,21 +2088,7 @@ impl Strategy {
                 current,
                 replace_unprof,
             );
-            self.latch_empty_touch_reject_if_needed(
-                market,
-                side,
-                &decision,
-                current,
-                aster_book,
-                aster_bbo_book,
-                hl_l2_book,
-                hl_bbo_book,
-                &spec,
-                max_stale,
-                now,
-                &pos,
-                now_ns,
-            );
+            self.latch_empty_touch_reject_if_needed(market, side, &decision, reject, current, now_ns);
             self.apply_decision(market, side, decision, &scale, now_ns).await;
         }
         crate::metrics::SINGLE_REPRICE.record((crate::hotpath::clock::mono_now_ns() - t0) as u64);

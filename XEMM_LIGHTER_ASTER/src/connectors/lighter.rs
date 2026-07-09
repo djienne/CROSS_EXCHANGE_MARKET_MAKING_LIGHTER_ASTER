@@ -173,6 +173,10 @@ fn handle_value(
     // never populated: the hedge always takes the slower L2 walk and qdiag shows a
     // misleading hl_bbo=none / age=i64::MAX. Same data and freshness as this L2
     // frame, so hedge pricing is unchanged — it only lets the BBO fast path engage.
+    // Coalesced-wake publish: the L2 publish above already woke the strategy for this
+    // frame, so the mirror only stamps data + freshness (no redundant generation bump).
+    // No hot-only pre-publish either — that half of the pair exists for Aster's
+    // independent bookTicker stream, not for a mirror of the frame just published.
     if let (Some(&bid_top), Some(&ask_top)) = (bid_levels.first(), ask_levels.first()) {
         #[cfg(feature = "hotpath")]
         let bbo_hot = tap.hot_book_from_levels(
@@ -180,13 +184,9 @@ fn handle_value(
             std::slice::from_ref(&ask_top),
             exch_ts,
         );
-        #[cfg(feature = "hotpath")]
-        if let Some((hot, _)) = bbo_hot.as_ref() {
-            tap.publish_bbo_hot_only(*hot, exch_ts);
-        }
         #[cfg(not(feature = "hotpath"))]
         let bbo_hot = None;
-        tap.publish_bbo_prebuilt(bid_top, ask_top, exch_ts, bbo_hot);
+        tap.publish_bbo_price_wake_prebuilt(bid_top, ask_top, exch_ts, bbo_hot);
     }
     tx.send(
         market.clone(),

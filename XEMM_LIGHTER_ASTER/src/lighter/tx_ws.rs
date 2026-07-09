@@ -475,7 +475,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn recv_loop_flags_half_open_socket_via_idle_watchdog() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -488,7 +488,12 @@ mod tests {
         });
 
         let tx_ws = TxWebSocket::new(&url);
+        // Connect under the REAL clock: a paused clock auto-advances through
+        // CONNECT_TIMEOUT while the (real) local handshake I/O is still pending.
         tx_ws.connect().await.unwrap();
+        // Then pause so auto-advance rushes through the 60s idle window instead of
+        // the test waiting it out.
+        tokio::time::pause();
         assert!(tx_ws.conn.lock().await.as_ref().unwrap().is_alive());
 
         // The paused clock auto-advances through READ_IDLE_TIMEOUT; poll until the

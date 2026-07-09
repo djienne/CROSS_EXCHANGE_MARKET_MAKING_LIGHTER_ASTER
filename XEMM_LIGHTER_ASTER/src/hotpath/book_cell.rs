@@ -341,8 +341,11 @@ impl VenueBook {
         }
         let t0 = mono_now_ns();
         let price_changed = self.bbo_price_changed(&book);
-        let had_hot_only = self.bbo_hot_only_pending.swap(false, Ordering::AcqRel);
         self.bbo.store(Some(Arc::new(book)));
+        // Clear the hot-only guard only AFTER the store (matching publish_bbo_hot): a
+        // reader between a cleared guard and the store could pair a fresher hot BBO
+        // with the old raw BBO — the torn pairing the guard exists to prevent.
+        let had_hot_only = self.bbo_hot_only_pending.swap(false, Ordering::AcqRel);
         let ns = mono_now_ns();
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -367,9 +370,12 @@ impl VenueBook {
         }
         let t0 = mono_now_ns();
         let price_changed = self.bbo_price_changed(&book);
-        let had_hot_only = self.bbo_hot_only_pending.swap(false, Ordering::AcqRel);
         self.bbo_hot.store(Some(Arc::new(hot)));
         self.bbo.store(Some(Arc::new(book)));
+        // Clear the hot-only guard only AFTER both stores (matching publish_bbo_hot):
+        // a reader between a cleared guard and the stores could pair the new hot BBO
+        // with the old raw BBO — the torn pairing the guard exists to prevent.
+        let had_hot_only = self.bbo_hot_only_pending.swap(false, Ordering::AcqRel);
         let ns = mono_now_ns();
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -759,6 +765,31 @@ mod tests {
         vb.publish_bbo_hot(b, hot);
         assert!(!vb.has_hot_only_update());
         assert!(vb.last_bbo_ns() > 0);
+    }
+
+    #[test]
+    fn bbo_price_wake_hot_completes_a_pending_hot_only_publish() {
+        // The price-wake variant is a full raw publish: it must clear the hot-only
+        // guard (only after both slots are stored — see the comment in the impl),
+        // install raw + hot, stamp freshness, and wake even without a price change
+        // (had_hot_only forces the generation bump so the pending update is consumed).
+        use crate::livebot::scale::{build_hot_book, MarketScale};
+        let vb = VenueBook::new();
+        let b = book(dec!(100));
+        let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
+        let hot = build_hot_book(&b, &scale, 0, 12345);
+        vb.publish_bbo_hot_only(hot, b.exch_ts.clone());
+        assert!(vb.has_hot_only_update());
+        let gen_before = vb.quote_generation();
+        vb.publish_bbo_price_wake_hot(b, hot);
+        assert!(!vb.has_hot_only_update());
+        assert!(vb.load_bbo().is_some());
+        assert!(vb.load_bbo_hot().is_some());
+        assert!(vb.last_bbo_ns() > 0);
+        assert!(
+            vb.quote_generation() > gen_before,
+            "pending hot-only must force the wake/generation bump"
+        );
     }
 
     #[test]

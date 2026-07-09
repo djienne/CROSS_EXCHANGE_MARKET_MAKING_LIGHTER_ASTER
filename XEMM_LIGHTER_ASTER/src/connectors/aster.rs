@@ -175,6 +175,22 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
         }
     } else if stream.contains("@bookTicker") {
         if let Ok(t) = serde_json::from_str::<BookTickerMsg<'_>>(data.get()) {
+            // Validate BEFORE any publish. The hot-only publish below sets the
+            // bbo_hot_only_pending guard that only the raw publish clears; a
+            // crossed/zero-qty frame that bailed between the two used to leave the
+            // guard latched — reprice_market then early-returns, freezing placements
+            // AND slow-path cancels until the next VALID bookTicker arrives.
+            let (Ok(bp), Ok(bq), Ok(ap), Ok(aq)) = (
+                parse_dec(t.bid_px),
+                parse_dec(t.bid_qty),
+                parse_dec(t.ask_px),
+                parse_dec(t.ask_qty),
+            ) else {
+                return;
+            };
+            if bp <= Decimal::ZERO || bq <= Decimal::ZERO || ap <= Decimal::ZERO || aq <= Decimal::ZERO || bp >= ap {
+                return;
+            }
             let exch_ts = ms_to_dt(t.ts_ms());
             #[cfg(feature = "hotpath")]
             let prebuilt_hot = tap.hot_book_from_raw(
@@ -188,17 +204,6 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
             }
             #[cfg(not(feature = "hotpath"))]
             let prebuilt_hot = None;
-            let (Ok(bp), Ok(bq), Ok(ap), Ok(aq)) = (
-                parse_dec(t.bid_px),
-                parse_dec(t.bid_qty),
-                parse_dec(t.ask_px),
-                parse_dec(t.ask_qty),
-            ) else {
-                return;
-            };
-            if bp <= Decimal::ZERO || bq <= Decimal::ZERO || ap <= Decimal::ZERO || aq <= Decimal::ZERO || bp >= ap {
-                return;
-            }
             // Aster BBO *size* influences quote safety: the quote engine only trusts a
             // bookTicker touch as the effective touch when its visible quantity covers
             // the candidate order. Therefore size-only updates must wake the strategy
@@ -248,6 +253,58 @@ fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invalid_book_ticker_never_latches_the_hot_only_guard() {
+        // A crossed/zero-qty bookTicker frame must be a complete no-op. Before the
+        // validate-first reorder, the hot-only publish fired before validation and the
+        // bail skipped the raw publish that clears bbo_hot_only_pending — leaving the
+        // guard latched so reprice_market froze placements AND slow-path cancels until
+        // the next valid frame.
+        use crate::connectors::BookTap;
+        use crate::hotpath::book_cell::VenueBook;
+        use std::sync::Arc;
+        use tokio::sync::mpsc;
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let cell = Arc::new(VenueBook::new());
+        let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
+        let market = MarketId("HYPE".to_string());
+        let frame = |b: &str, bq: &str, a: &str, aq: &str| {
+            format!(
+                r#"{{"stream":"hypeusdt@bookTicker","data":{{"e":"bookTicker","u":1,"s":"HYPEUSDT","b":"{b}","B":"{bq}","a":"{a}","A":"{aq}","T":1,"E":2}}}}"#
+            )
+        };
+
+        // Valid frame: BBO populated and the pending guard is cleared by the raw publish.
+        handle(&frame("70.5", "10", "70.6", "12"), &market, &sink, &tap).await;
+        let before = cell.load_bbo().expect("valid frame populates the BBO slot");
+        assert!(!cell.has_hot_only_update());
+
+        // Crossed frame (bid >= ask): no publish at all, guard must stay clear.
+        handle(&frame("70.7", "10", "70.6", "12"), &market, &sink, &tap).await;
+        assert!(
+            !cell.has_hot_only_update(),
+            "crossed bookTicker latched the hot-only guard"
+        );
+        // Zero-qty frame likewise.
+        handle(&frame("70.5", "0", "70.6", "12"), &market, &sink, &tap).await;
+        assert!(
+            !cell.has_hot_only_update(),
+            "zero-qty bookTicker latched the hot-only guard"
+        );
+        // And the previously published BBO is untouched.
+        let after = cell.load_bbo().expect("BBO still present");
+        assert_eq!(
+            before.best_bid().unwrap().px,
+            after.best_bid().unwrap().px
+        );
+        assert_eq!(
+            before.best_ask().unwrap().px,
+            after.best_ask().unwrap().px
+        );
+    }
 
     #[test]
     fn parses_aster_book_ticker_wire_shape() {

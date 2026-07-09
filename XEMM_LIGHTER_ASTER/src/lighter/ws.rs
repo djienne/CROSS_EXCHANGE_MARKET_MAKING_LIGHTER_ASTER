@@ -219,7 +219,13 @@ where
                         return Ok(());
                     }
                 }
-                if write.send(Message::Ping(Vec::new())).await.is_err() {
+                // Guarded: a wedged TCP write side otherwise blocks the reader task
+                // inline, making this very watchdog (and the gap-resync Notify)
+                // unreachable until the OS gives up on the socket.
+                if crate::connectors::send_guarded(&mut write, Message::Ping(Vec::new()))
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
                 continue;
@@ -241,9 +247,17 @@ where
                 match data.get("type").and_then(|v| v.as_str()) {
                     Some("ping") => {
                         // Server app-level keepalive — reply, but do NOT count as feed data.
-                        let _ = write
-                            .send(Message::Text(r#"{"type":"pong"}"#.to_string()))
-                            .await;
+                        // Guarded + fail-fast: a stalled/broken write side ends the session
+                        // (normal reconnect path) instead of wedging the reader.
+                        if crate::connectors::send_guarded(
+                            &mut write,
+                            Message::Text(r#"{"type":"pong"}"#.to_string()),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                     Some("connected") | Some("subscribed") => {}
                     _ => {
@@ -255,7 +269,12 @@ where
                 }
             }
             Message::Ping(p) => {
-                let _ = write.send(Message::Pong(p)).await;
+                if crate::connectors::send_guarded(&mut write, Message::Pong(p))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
             }
             Message::Close(_) => return Ok(()),
             _ => {}

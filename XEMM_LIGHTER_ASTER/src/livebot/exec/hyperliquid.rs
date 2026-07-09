@@ -190,7 +190,15 @@ fn record_lighter_fill_trade(
 enum HedgeSendOutcome {
     /// The dispatch resolved at send time (build/sign failure, venue reject, not-sent,
     /// unknown). Emit this event; there is nothing to wait for.
-    Terminal(ExecEvent),
+    /// `refresh_nonce_after_emit`: run the nonce `hard_refresh` (REST, up to ~10s) in
+    /// the worker loop AFTER forwarding the event — the strategy's freeze decision must
+    /// not wait behind a REST round trip during exactly the degraded-venue window, and
+    /// nonce serialization only requires the refresh to complete before the NEXT
+    /// command reserves a nonce (which the serial loop guarantees).
+    Terminal {
+        ev: ExecEvent,
+        refresh_nonce_after_emit: bool,
+    },
     /// The venue accepted the tx: run the wait phase (fill aggregation) — safe to do OFF
     /// the worker loop, it touches neither the nonce manager nor the tx socket.
     AwaitFills {
@@ -862,10 +870,13 @@ impl HlExchange {
         ) {
             Ok(p) => p,
             Err(e) => {
-                return HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
-                    cloid,
-                    reason: e.to_string(),
-                })
+                return HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeReject {
+                        cloid,
+                        reason: e.to_string(),
+                    },
+                    refresh_nonce_after_emit: false,
+                }
             }
         };
         // The venue-visible quantity: raw_amount FLOORS sz to the size step, so comparing
@@ -874,10 +885,13 @@ impl HlExchange {
         let requested_qty = match self.wire(market) {
             Ok(w) => Decimal::new(plan.base_amount, w.size_decimals),
             Err(e) => {
-                return HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
-                    cloid,
-                    reason: e.to_string(),
-                })
+                return HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeReject {
+                        cloid,
+                        reason: e.to_string(),
+                    },
+                    refresh_nonce_after_emit: false,
+                }
             }
         };
         let (fill_token, fill_rx) = self.fills.register(client_order_index);
@@ -888,15 +902,30 @@ impl HlExchange {
             Err(e) => {
                 self.nonce.acknowledge_failure();
                 self.fills.unregister(client_order_index, fill_token);
-                return HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
-                    cloid,
-                    reason: e.to_string(),
-                });
+                return HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeReject {
+                        cloid,
+                        reason: e.to_string(),
+                    },
+                    refresh_nonce_after_emit: false,
+                };
             }
         };
         let sign_ns = crate::hotpath::clock::mono_now_ns() - sign_start_ns;
         let send_start_ns = crate::hotpath::clock::mono_now_ns();
-        let outcome = match self.send_signed(signed).await {
+        let send_result = self.send_signed(signed).await;
+        // Cold (post-wire): per-hedge sign + wire-accept cost, stamped BEFORE outcome
+        // handling so send_us measures the wire round trip only (reject classification
+        // or a nonce refresh must not inflate the latency telemetry). The FFI sign was
+        // the one unmeasured term in the fill->hedge latency budget; hedges are sparse
+        // enough that one line per dispatch is free.
+        info!(
+            "hedge timing: coi={} sign_us={} send_us={}",
+            client_order_index,
+            sign_ns / 1_000,
+            (crate::hotpath::clock::mono_now_ns() - send_start_ns) / 1_000
+        );
+        match send_result {
             r if r.status == TxSendStatus::Ok => HedgeSendOutcome::AwaitFills {
                 client_order_index,
                 token: fill_token,
@@ -908,43 +937,42 @@ impl HlExchange {
                 // A nonce-shaped reject means the local optimistic counter desynced from
                 // the venue (the reject consumed nothing); without a refresh EVERY
                 // subsequent hedge would reject the same way and the recovery path (same
-                // nonce manager) could not execute either. Cold path — REST is fine.
-                if r.message.to_ascii_lowercase().contains("nonce") {
-                    warn!("Lighter nonce-shaped reject ({}); hard-refreshing nonce", r.message);
-                    let _ = self.nonce.hard_refresh(&self.rest).await;
+                // nonce manager) could not execute either. Cold path — REST is fine; the
+                // worker runs it after forwarding the event (see HedgeSendOutcome).
+                let nonce_shaped = r.message.to_ascii_lowercase().contains("nonce");
+                if nonce_shaped {
+                    warn!("Lighter nonce-shaped reject ({}); hard-refreshing nonce after emit", r.message);
                 }
-                HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
-                    cloid,
-                    reason: format!("Lighter reject code={} {}", r.code, r.message),
-                })
+                HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeReject {
+                        cloid,
+                        reason: format!("Lighter reject code={} {}", r.code, r.message),
+                    },
+                    refresh_nonce_after_emit: nonce_shaped,
+                }
             }
             r if r.status == TxSendStatus::NotSent => {
                 self.nonce.rollback(1);
                 self.fills.unregister(client_order_index, fill_token);
-                HedgeSendOutcome::Terminal(ExecEvent::HedgeReject {
-                    cloid,
-                    reason: format!("{HEDGE_NOT_SENT_PREFIX} {}", r.message),
-                })
+                HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeReject {
+                        cloid,
+                        reason: format!("{HEDGE_NOT_SENT_PREFIX} {}", r.message),
+                    },
+                    refresh_nonce_after_emit: false,
+                }
             }
             r => {
-                let _ = self.nonce.hard_refresh(&self.rest).await;
                 self.fills.unregister(client_order_index, fill_token);
-                HedgeSendOutcome::Terminal(ExecEvent::HedgeUnknown {
-                    cloid,
-                    reason: format!("Lighter tx outcome unknown: {}", r.message),
-                })
+                HedgeSendOutcome::Terminal {
+                    ev: ExecEvent::HedgeUnknown {
+                        cloid,
+                        reason: format!("Lighter tx outcome unknown: {}", r.message),
+                    },
+                    refresh_nonce_after_emit: true,
+                }
             }
-        };
-        // Cold (post-wire): per-hedge sign + wire-accept cost. The FFI sign was the one
-        // unmeasured term in the fill->hedge latency budget; hedges are sparse enough
-        // that one line per dispatch is free.
-        info!(
-            "hedge timing: coi={} sign_us={} send_us={}",
-            client_order_index,
-            sign_ns / 1_000,
-            (crate::hotpath::clock::mono_now_ns() - send_start_ns) / 1_000
-        );
-        outcome
+        }
     }
 
     pub(crate) async fn place_raw(
@@ -1353,8 +1381,17 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
                     )
                     .await
                 {
-                    HedgeSendOutcome::Terminal(ev) => {
+                    HedgeSendOutcome::Terminal {
+                        ev,
+                        refresh_nonce_after_emit,
+                    } => {
+                        // Event FIRST: the strategy's freeze/retry decision must not
+                        // queue behind a REST nonce refresh. The refresh still completes
+                        // before the next rx.recv(), preserving nonce serialization.
                         let _ = tx.send(ev).await;
+                        if refresh_nonce_after_emit {
+                            let _ = ex.nonce.hard_refresh(&ex.rest).await;
+                        }
                     }
                     HedgeSendOutcome::AwaitFills {
                         client_order_index,
@@ -1419,7 +1456,10 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
                     .send_hedge_tx(&market, side, aggressive_px, qty, cloid, true)
                     .await
                 {
-                    HedgeSendOutcome::Terminal(ev) => {
+                    HedgeSendOutcome::Terminal {
+                        ev,
+                        refresh_nonce_after_emit,
+                    } => {
                         let reason = match ev {
                             ExecEvent::HedgeReject { reason, .. }
                             | ExecEvent::HedgeUnknown { reason, .. } => reason,
@@ -1433,6 +1473,9 @@ pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>
                                 reason,
                             })
                             .await;
+                        if refresh_nonce_after_emit {
+                            let _ = ex.nonce.hard_refresh(&ex.rest).await;
+                        }
                     }
                     HedgeSendOutcome::AwaitFills {
                         client_order_index,
