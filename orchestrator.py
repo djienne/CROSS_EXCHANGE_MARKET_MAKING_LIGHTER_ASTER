@@ -556,6 +556,10 @@ class TradeTracker:
                 check=True,
             )
             report = extract_json_object(proc.stdout)
+            if not isinstance(report, dict) or "summary" not in report:
+                # A fragment or truncated payload must count as a failure — an empty
+                # trade list here silently starves the realized-loss breaker.
+                raise ValueError("live-report payload missing summary")
         except Exception as exc:
             self.xemm_report_failures += 1
             self.event(
@@ -1303,6 +1307,23 @@ class Orchestrator:
             return xemm_status is not None
         return taker_status is not None or xemm_status is not None
 
+    def status_schema_valid(self, bot: str, status: Any) -> bool:
+        # extract_json_object can return a smaller surviving JSON fragment when the
+        # real report is truncated or mangled; require the shape the deciders rely
+        # on so a fragment reads as "status unavailable" (fail closed), never as a
+        # healthy bot with every field defaulted.
+        if not isinstance(status, dict):
+            return False
+        if status.get("market") != self.args.market:
+            return False
+        if not isinstance(status.get("positions"), dict):
+            return False
+        if not isinstance(status.get("accounts"), dict):
+            return False
+        if bot == TAKER_BOT:
+            return isinstance(status.get("opportunities"), list)
+        return isinstance(status.get("reduce_position_only"), bool)
+
     def read_status(self, bot: str, inactive: bool = False) -> dict[str, Any] | None:
         if inactive:
             backoff_until = self.status_backoff_until.get(bot, 0.0)
@@ -1352,6 +1373,16 @@ class Orchestrator:
                 self.apply_status_backoff(bot, inactive)
                 return None
             status = extract_json_object(proc.stdout)
+            if not self.status_schema_valid(bot, status):
+                self.event(
+                    "status_invalid_payload",
+                    bot=bot,
+                    inactive=inactive,
+                    keys=sorted(status.keys()) if isinstance(status, dict) else None,
+                    stdout_tail=text_tail(proc.stdout),
+                )
+                self.apply_status_backoff(bot, inactive)
+                return None
             status.setdefault("bot", bot)
             self.status_backoff_until[bot] = 0.0
             return status
@@ -1517,12 +1548,17 @@ class Orchestrator:
                 taker_status, self.args.resume_headroom_clips, self.args.resume_margin_clips
             )
         executable_reduce = bool(margin_details.get("taker_executable_reduce"))
-        ready = near_flat or executable_reduce or (taker_status is not None and not margin_limited)
-        if near_flat:
+        # Never cold-start the taker without a validated taker status: near-flat
+        # alone says nothing about taker margin, and a missed inactive poll only
+        # delays resume by a tick.
+        ready = taker_status is not None and (near_flat or executable_reduce or not margin_limited)
+        if taker_status is None:
+            ready_reason = "taker_status_missing"
+        elif near_flat:
             ready_reason = "near_flat"
         elif executable_reduce:
             ready_reason = "taker_executable_reduce"
-        elif taker_status is not None and not margin_limited:
+        elif not margin_limited:
             ready_reason = "taker_margin_available"
         else:
             ready_reason = "taker_margin_limited"

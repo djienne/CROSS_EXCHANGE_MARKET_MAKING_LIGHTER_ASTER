@@ -97,6 +97,106 @@ class XemmOrdersClearTests(unittest.TestCase):
         )
 
 
+VALID_TAKER_STATUS = {"market": "HYPE", "positions": {}, "accounts": {}, "opportunities": []}
+VALID_XEMM_STATUS = {"market": "HYPE", "reduce_position_only": True, "positions": {}, "accounts": {}}
+
+
+class StatusSchemaTests(unittest.TestCase):
+    def _orch(self, tmp: Path) -> Orchestrator:
+        return make_orch(
+            tmp,
+            live=False,
+            taker_bin="/bin/true",
+            taker_config="cfg.toml",
+            taker_repo=tmp,
+            status_timeout_sec=5,
+        )
+
+    def test_valid_shapes_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch(Path(tmp))
+            self.assertTrue(orch.status_schema_valid(TAKER_BOT, VALID_TAKER_STATUS))
+            self.assertTrue(orch.status_schema_valid(XEMM_BOT, VALID_XEMM_STATUS))
+
+    def test_fragments_and_missing_fields_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch(Path(tmp))
+            self.assertFalse(orch.status_schema_valid(TAKER_BOT, None))
+            self.assertFalse(orch.status_schema_valid(TAKER_BOT, {"tiny": 1}))
+            self.assertFalse(orch.status_schema_valid(TAKER_BOT, {**VALID_TAKER_STATUS, "market": "OTHER"}))
+            missing_opps = {k: v for k, v in VALID_TAKER_STATUS.items() if k != "opportunities"}
+            self.assertFalse(orch.status_schema_valid(TAKER_BOT, missing_opps))
+            missing_reduce = {k: v for k, v in VALID_XEMM_STATUS.items() if k != "reduce_position_only"}
+            self.assertFalse(orch.status_schema_valid(XEMM_BOT, missing_reduce))
+            self.assertFalse(
+                orch.status_schema_valid(XEMM_BOT, {**VALID_XEMM_STATUS, "positions": "bogus"})
+            )
+
+    def test_read_status_rejects_surviving_fragment(self) -> None:
+        import subprocess
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch(Path(tmp))
+            fake = subprocess.CompletedProcess(args=[], returncode=0, stdout='{"tiny": 1}', stderr="")
+            with mock.patch("orchestrator.subprocess.run", return_value=fake):
+                self.assertIsNone(orch.read_status(TAKER_BOT))
+            self.assertIn("status_invalid_payload", [k for k, _ in orch.recorded_events])
+
+    def test_read_status_accepts_valid_payload(self) -> None:
+        import json
+        import subprocess
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch(Path(tmp))
+            fake = subprocess.CompletedProcess(
+                args=[], returncode=0, stdout=json.dumps(VALID_TAKER_STATUS), stderr=""
+            )
+            with mock.patch("orchestrator.subprocess.run", return_value=fake):
+                status = orch.read_status(TAKER_BOT)
+            self.assertIsNotNone(status)
+            self.assertEqual("HYPE", status["market"])
+
+
+class ReadyForTakerTests(unittest.TestCase):
+    def test_near_flat_alone_is_not_ready_without_taker_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = make_orch(
+                Path(tmp),
+                live=False,
+                near_flat_notional_usd=Decimal("50"),
+                resume_headroom_clips=Decimal("3"),
+                resume_margin_clips=Decimal("3"),
+            )
+            position_status = {"positions": {"abs_position_notional_usd": "1"}}
+            ready, details = orch.ready_for_taker(position_status, None)
+            self.assertFalse(ready)
+            self.assertEqual("taker_status_missing", details["ready_reason"])
+            self.assertTrue(details["near_flat"])
+
+    def test_near_flat_with_taker_status_still_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = make_orch(
+                Path(tmp),
+                live=False,
+                near_flat_notional_usd=Decimal("50"),
+                resume_headroom_clips=Decimal("3"),
+                resume_margin_clips=Decimal("3"),
+            )
+            position_status = {"positions": {"abs_position_notional_usd": "1"}}
+            taker_status = {
+                "desired_notional_usd": "13",
+                "margin_buffer_usd": "0",
+                "positions": {"headroom_notional_usd": "100"},
+                "accounts": {"aster_available_usd": "1000", "lighter_available_usd": "1000"},
+                "opportunities": [],
+            }
+            ready, details = orch.ready_for_taker(position_status, taker_status)
+            self.assertTrue(ready)
+            self.assertEqual("near_flat", details["ready_reason"])
+
+
 class PreflightOrderClearTests(unittest.TestCase):
     def _live_orch(self, tmp: Path) -> Orchestrator:
         orch = make_orch(tmp, live=True, allow_existing_writers=False, preflight_kill_existing=False)
