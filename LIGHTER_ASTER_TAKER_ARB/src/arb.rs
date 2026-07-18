@@ -3866,6 +3866,16 @@ async fn recover_if_needed(
         action_taken = true;
     }
     if pos.lighter_qty.abs() * mark > cfg.risk.max_position_mismatch_usd {
+        // The promoted-observer auto-flatten path reaches here BEFORE the lease
+        // nonce-refresh block ever ran, so the local nonce can be stale from another
+        // writer's turn. Refresh first; on failure warn and PROCEED with the close —
+        // the submit path self-heals via hard_refresh on a nonce reject, and a naked
+        // leg must never stay open because a refresh round-trip failed. Redundant
+        // refreshes on the post-execution rescue path are serialized by the venue
+        // write lock and harmless.
+        if let Err(e) = lighter.refresh_nonce().await {
+            warn!("Lighter nonce refresh before recovery close failed; proceeding: {e:#}");
+        }
         let side = if pos.lighter_qty > Decimal::ZERO {
             Side::Sell
         } else {
