@@ -956,6 +956,15 @@ class Orchestrator:
         self.event("preflight_existing_bots_terminated", results=results, survivors=survivors)
         if survivors:
             self.safe_halt("preflight_existing_bots_survived", survivors=survivors)
+            return
+        if any(process.get("bot") == XEMM_BOT for process in processes):
+            # A terminated external XEMM only cancels its resting maker orders on a
+            # graceful SIGINT; if the escalation reached SIGTERM/SIGKILL those orders
+            # may still be live. There is no cancel-all tooling, so refuse to start
+            # our own bots over them.
+            clear, status = self.verify_xemm_orders_clear()
+            if not clear:
+                self.safe_halt("preflight_xemm_orders_not_clear", xemm_status=status)
 
     def fast_tick(self) -> None:
         if not self.args.live or self.shutdown_requested:
@@ -1036,10 +1045,18 @@ class Orchestrator:
     def xemm_orders_clear(status: dict[str, Any] | None) -> bool:
         if not status:
             return False
-        accounts = status.get("accounts") or {}
+        accounts = status.get("accounts")
+        if not isinstance(accounts, dict):
+            return False
+        # Missing/None counts mean the status is unusable, not that orders are
+        # clear — never fail open on an absent field.
+        aster_raw = accounts.get("aster_open_orders")
+        lighter_raw = accounts.get("lighter_open_orders")
+        if aster_raw is None or lighter_raw is None:
+            return False
         try:
-            aster_open = int(accounts.get("aster_open_orders") or 0)
-            lighter_open = int(accounts.get("lighter_open_orders") or 0)
+            aster_open = int(aster_raw)
+            lighter_open = int(lighter_raw)
         except (TypeError, ValueError):
             return False
         return aster_open == 0 and lighter_open == 0
