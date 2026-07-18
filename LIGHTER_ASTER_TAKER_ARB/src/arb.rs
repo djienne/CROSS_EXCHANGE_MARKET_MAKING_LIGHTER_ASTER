@@ -1151,6 +1151,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut last_flatten_denied_log_at: Option<tokio::time::Instant> = None;
     let mut last_fill_stats_log = tokio::time::Instant::now();
     let mut lease_cache = LeaseFileCache::new();
+    // Set when the cooldown select below woke on account_rx.changed(): changed()
+    // consumes the watch seen-marker, so the freshness check later in the iteration
+    // must OR this in or fresh-snapshot mismatch counting breaks. Persists across
+    // `continue`s (e.g. a book-fetch failure) until a freshness check consumes it.
+    let mut woke_for_account_update = false;
 
     info!(
         "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} control_file={:?} signal_file={:?} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
@@ -1211,6 +1216,19 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 break;
             }
             _ = tokio::time::sleep_until(cooldown_until) => {}
+            // A fresh account snapshot wakes the loop DURING cooldown so the mismatch
+            // guard reacts within seconds instead of after a long trade cooldown; the
+            // cooldown gate before the sizing path keeps entries shut on early wakes.
+            changed = account_rx.changed() => {
+                match changed {
+                    Ok(()) => woke_for_account_update = true,
+                    // Unreachable while the refresher task holds the sender; bounded
+                    // sleep so a closed channel cannot spin this loop hot.
+                    Err(_) => {
+                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                    }
+                }
+            }
         }
         if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
@@ -1235,13 +1253,16 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         }
 
-        // "Fresh" = a NEW snapshot (a new REST read) arrived since the last iteration.
-        // The mismatch counter below only counts fresh generations — 4 reads of the same
-        // 15s snapshot are one observation, not four "consecutive checks".
-        let account_fresh = account_rx.has_changed().unwrap_or(false);
+        // "Fresh" = a NEW snapshot (a new REST read) arrived since the last iteration —
+        // either still pending on the watch, or already consumed by the cooldown select's
+        // changed() wake. The mismatch counter below only counts fresh generations — 4
+        // reads of the same 15s snapshot are one observation, not four "consecutive
+        // checks".
+        let account_fresh = account_rx.has_changed().unwrap_or(false) || woke_for_account_update;
         if account_fresh {
             account_gen = account_gen.wrapping_add(1);
         }
+        woke_for_account_update = false;
         account = *account_rx.borrow_and_update();
         if account.is_stale(account_snapshot_max_age) {
             let log_now = match last_stale_account_log_at {
@@ -1414,6 +1435,12 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms)).await;
                 continue;
             }
+        }
+        // Entries stay gated by the cooldown: an early wake (fresh account snapshot
+        // during cooldown) may only do the mismatch/divergence work above, never size
+        // or enter. The select at the top blocks until the cooldown elapses.
+        if tokio::time::Instant::now() < cooldown_until {
+            continue;
         }
         last_sized = Some((aster_book.clone(), lighter_book.clone(), account_gen));
         last_full_eval = tokio::time::Instant::now();
