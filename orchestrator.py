@@ -386,6 +386,12 @@ class TradeTracker:
         # poll() parses only appended lines instead of the whole file every 15s.
         self.taker_trades_offset = 0
         self.xemm_report_failures = 0
+        # Last-recorded XEMM economics per cloid: the live-report re-emits every
+        # cloid in its window each poll, and a partially-hedged trade's numbers
+        # change once the remaining hedge fills land. Bounded by the PnL horizon,
+        # same growth class as `seen`.
+        self.xemm_econ: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
+        self.xemm_rev_count: dict[str, int] = {}
         self.load_existing_normalized()
 
     def note_trade(self, row: dict[str, Any]) -> None:
@@ -426,6 +432,7 @@ class TradeTracker:
                 key = str(row.get("key", ""))
                 if key:
                     self.seen.add(key)
+                self.replay_xemm_econ(row, key)
                 ts = self.row_ts(row)
                 if ts is None or ts >= self.since:
                     self.note_trade(row)
@@ -467,7 +474,12 @@ class TradeTracker:
             self.record(row, new_rows)
         for trade in self.read_xemm_trades():
             key = self.xemm_key(trade)
+            cloid = trade.get("cloid")
+            gross = dec_or_zero(trade.get("gross_pnl"))
+            fees = dec_or_zero(trade.get("aster_fee")) + dec_or_zero(trade.get("lighter_fee"))
+            net = dec_or_zero(trade.get("net_pnl"))
             if key in self.seen:
+                self.maybe_record_xemm_correction(cloid, gross, fees, net, new_rows)
                 continue
             row = {
                 "timestamp": iso(),
@@ -477,15 +489,17 @@ class TradeTracker:
                 "direction": f"ASTER_MAKER_HEDGE_{trade.get('hedge_side', '')}",
                 "qty": trade.get("qty"),
                 "gross_pnl_usdc": trade.get("gross_pnl"),
-                "fees_usdc": dec_to_json(dec_or_zero(trade.get("aster_fee")) + dec_or_zero(trade.get("lighter_fee"))),
+                "fees_usdc": dec_to_json(fees),
                 "net_pnl_usdc": trade.get("net_pnl"),
                 "net_pnl_bps": None,
-                "cloid": trade.get("cloid"),
+                "cloid": cloid,
                 "first_mono_ns": trade.get("first_mono_ns"),
                 "last_mono_ns": trade.get("last_mono_ns"),
                 "aster_px": trade.get("aster_px"),
                 "lighter_px": trade.get("lighter_px"),
             }
+            if cloid is not None:
+                self.xemm_econ[str(cloid)] = (gross, fees, net)
             self.record(row, new_rows)
         if new_rows:
             self.event("trades_ingested", count=len(new_rows))
@@ -496,6 +510,73 @@ class TradeTracker:
         self.note_trade(row)
         append_jsonl(self.trades_path, row)
         out.append(row)
+
+    def maybe_record_xemm_correction(
+        self,
+        cloid: Any,
+        gross: Decimal,
+        fees: Decimal,
+        net: Decimal,
+        out: list[dict[str, Any]],
+    ) -> None:
+        """A seen cloid re-emitted with different economics (a partial hedge whose
+        remaining fills landed). Book the delta as an additive correction row so
+        aggregates, the JSONL, and restart replay all converge on the corrected
+        value; permanent cloid dedup alone would drop the completion forever."""
+        if cloid is None:
+            return
+        prev = self.xemm_econ.get(str(cloid))
+        if prev is None or prev == (gross, fees, net):
+            return
+        revision = self.xemm_rev_count.get(str(cloid), 0) + 1
+        self.xemm_rev_count[str(cloid)] = revision
+        rev_key = f"xemm:{cloid}#rev{revision}"
+        if rev_key in self.seen:
+            return
+        row = {
+            "timestamp": iso(),
+            "key": rev_key,
+            "bot": XEMM_BOT,
+            "market": self.market,
+            "direction": "XEMM_CORRECTION",
+            "qty": None,
+            "gross_pnl_usdc": dec_to_json(gross - prev[0]),
+            "fees_usdc": dec_to_json(fees - prev[1]),
+            "net_pnl_usdc": dec_to_json(net - prev[2]),
+            "net_pnl_bps": None,
+            "cloid": cloid,
+            # Absolute values after this correction, for audit.
+            "corrected_gross_pnl_usdc": dec_to_json(gross),
+            "corrected_fees_usdc": dec_to_json(fees),
+            "corrected_net_pnl_usdc": dec_to_json(net),
+        }
+        self.xemm_econ[str(cloid)] = (gross, fees, net)
+        self.record(row, out)
+        self.event("xemm_trade_corrected", cloid=str(cloid), revision=revision, net_delta=dec_to_json(net - prev[2]))
+
+    def replay_xemm_econ(self, row: dict[str, Any], key: str) -> None:
+        """Rebuild per-cloid economics state from the normalized ledger on restart.
+        Base rows set the entry; correction rows add their deltas — replaying the
+        JSONL therefore reproduces exactly the totals that were live."""
+        if row.get("bot") != XEMM_BOT:
+            return
+        cloid = row.get("cloid")
+        if cloid is None:
+            return
+        cloid = str(cloid)
+        gross = dec_or_zero(row.get("gross_pnl_usdc"))
+        fees = dec_or_zero(row.get("fees_usdc"))
+        net = dec_or_zero(row.get("net_pnl_usdc"))
+        if "#rev" in key:
+            base = self.xemm_econ.get(cloid, (Decimal("0"), Decimal("0"), Decimal("0")))
+            self.xemm_econ[cloid] = (base[0] + gross, base[1] + fees, base[2] + net)
+            try:
+                revision = int(key.rsplit("#rev", 1)[1])
+            except (ValueError, IndexError):
+                revision = self.xemm_rev_count.get(cloid, 0) + 1
+            self.xemm_rev_count[cloid] = max(self.xemm_rev_count.get(cloid, 0), revision)
+        else:
+            self.xemm_econ[cloid] = (gross, fees, net)
 
     def read_taker_trades(self) -> list[dict[str, Any]]:
         path = self.args.taker_trades

@@ -326,5 +326,74 @@ class RecoveryDedupKeyTests(unittest.TestCase):
             self.assertEqual(Decimal("-3.0"), tracker.summary()["net_pnl_usdc"])
 
 
+class XemmCorrectionTests(unittest.TestCase):
+    def _trade(self, net: str, gross: str = None, cloid: str = "abc123") -> dict:
+        return {
+            "cloid": cloid,
+            "market": "HYPE",
+            "hedge_side": "Sell",
+            "qty": "0.2",
+            "gross_pnl": gross if gross is not None else net,
+            "aster_fee": "0",
+            "lighter_fee": "0",
+            "net_pnl": net,
+            "first_mono_ns": 1,
+            "last_mono_ns": 2,
+            "aster_px": "10",
+            "lighter_px": "9",
+        }
+
+    def _tracker(self, state_dir: Path) -> TradeTracker:
+        from datetime import timedelta
+
+        args = make_args(state_dir, taker_trades=state_dir / "trades_HYPE.jsonl", backfill_existing_trades=True)
+        return TradeTracker(args, utc_now() - timedelta(hours=1), lambda kind, **d: None)
+
+    def test_partial_hedge_correction_adjusts_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            tracker = self._tracker(state_dir)
+            tracker.read_xemm_trades = lambda: [self._trade("0.10")]
+            self.assertEqual(1, len(tracker.poll()))
+            self.assertEqual(Decimal("0.10"), tracker.net_total)
+            # The live-report re-emits the same cloid with corrected economics.
+            tracker.read_xemm_trades = lambda: [self._trade("0.25")]
+            rows = tracker.poll()
+            self.assertEqual(1, len(rows))
+            self.assertEqual("XEMM_CORRECTION", rows[0]["direction"])
+            self.assertEqual(Decimal("0.25"), tracker.net_total)
+
+    def test_unchanged_reemission_books_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            tracker = self._tracker(state_dir)
+            tracker.read_xemm_trades = lambda: [self._trade("0.10")]
+            self.assertEqual(1, len(tracker.poll()))
+            self.assertEqual(0, len(tracker.poll()))
+            self.assertEqual(Decimal("0.10"), tracker.net_total)
+
+    def test_replay_reproduces_corrected_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            tracker = self._tracker(state_dir)
+            tracker.read_xemm_trades = lambda: [self._trade("0.10")]
+            tracker.poll()
+            tracker.read_xemm_trades = lambda: [self._trade("0.25")]
+            tracker.poll()
+            # Fresh tracker replays the normalized JSONL written by the first.
+            replayed = self._tracker(state_dir)
+            self.assertEqual(Decimal("0.25"), replayed.net_total)
+            self.assertEqual(2, replayed.trade_count)
+            # And a further unchanged re-emission after restart books nothing.
+            replayed.read_xemm_trades = lambda: [self._trade("0.25")]
+            self.assertEqual(0, len(replayed.poll()))
+            # While a further change books rev2 on the replayed state.
+            replayed.read_xemm_trades = lambda: [self._trade("0.30")]
+            rows = replayed.poll()
+            self.assertEqual(1, len(rows))
+            self.assertEqual("xemm:abc123#rev2", rows[0]["key"])
+            self.assertEqual(Decimal("0.30"), replayed.net_total)
+
+
 if __name__ == "__main__":
     unittest.main()
