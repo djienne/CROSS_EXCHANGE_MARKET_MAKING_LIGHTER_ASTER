@@ -605,6 +605,12 @@ class TradeTracker:
     def taker_key(row: dict[str, Any]) -> str:
         aster_id = row.get("aster_order_id")
         lighter_idx = row.get("lighter_client_order_index")
+        if str(row.get("direction") or "").upper() == "RECOVERY":
+            # Older taker binaries stamp every recovery row with ids 0:0; keying on
+            # the raw timestamp string (nanosecond precision, byte-stable across
+            # re-reads) keeps each recovery loss distinct instead of deduping all
+            # but the first away from the realized-loss breaker.
+            return f"taker:recovery:{aster_id}:{lighter_idx}:{row.get('timestamp')}"
         if aster_id is not None or lighter_idx is not None:
             return f"taker:{aster_id}:{lighter_idx}"
         raw = json.dumps(row, default=str, sort_keys=True)

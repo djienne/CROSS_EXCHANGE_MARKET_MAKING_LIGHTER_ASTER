@@ -284,5 +284,47 @@ class PreflightOrderClearTests(unittest.TestCase):
             self.assertEqual([], orch.halts)
 
 
+class RecoveryDedupKeyTests(unittest.TestCase):
+    def _recovery_row(self, ts: str) -> dict:
+        return {
+            "timestamp": ts,
+            "market": "HYPE",
+            "direction": "RECOVERY",
+            "aster_order_id": 0,
+            "lighter_client_order_index": 0,
+            "qty": "0",
+            "actual_net_usd": "-1.5",
+        }
+
+    def test_recovery_rows_with_same_ids_get_distinct_keys(self) -> None:
+        a = TradeTracker.taker_key(self._recovery_row("2026-07-18T10:00:00.123456789Z"))
+        b = TradeTracker.taker_key(self._recovery_row("2026-07-18T11:00:00.987654321Z"))
+        self.assertNotEqual(a, b)
+        self.assertTrue(a.startswith("taker:recovery:"))
+
+    def test_normal_row_key_format_unchanged(self) -> None:
+        row = {"aster_order_id": 42, "lighter_client_order_index": 7, "direction": "SELL_ASTER_BUY_LIGHTER"}
+        self.assertEqual("taker:42:7", TradeTracker.taker_key(row))
+
+    def test_both_recovery_losses_aggregate(self) -> None:
+        import json
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp)
+            trades_path = state_dir / "trades_HYPE.jsonl"
+            now = utc_now()
+            rows = [
+                self._recovery_row(iso(now - timedelta(minutes=2))),
+                self._recovery_row(iso(now - timedelta(minutes=1))),
+            ]
+            trades_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+            args = make_args(state_dir, taker_trades=trades_path, backfill_existing_trades=True)
+            tracker = TradeTracker(args, now - timedelta(hours=1), lambda kind, **d: None)
+            tracker.read_xemm_trades = lambda: []
+            self.assertEqual(2, len(tracker.poll()))
+            self.assertEqual(Decimal("-3.0"), tracker.summary()["net_pnl_usdc"])
+
+
 if __name__ == "__main__":
     unittest.main()
