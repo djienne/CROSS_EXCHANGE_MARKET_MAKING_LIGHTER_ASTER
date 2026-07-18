@@ -919,14 +919,15 @@ class Orchestrator:
             # Each step guarded independently: a failure in one must not skip the
             # remaining child stops or the lock release.
             self.event("orchestrator_stopping", active_bot=self.active_bot)
-            try:
-                self.stop_observer("orchestrator_exit")
-            except Exception as exc:
-                self.event("stop_failed", stage="observer", error=str(exc))
+            # Active bot first: a hung observer must not delay stopping the writer.
             try:
                 self.stop_active("orchestrator_exit")
             except Exception as exc:
                 self.event("stop_failed", stage="active", error=str(exc))
+            try:
+                self.stop_observer("orchestrator_exit")
+            except Exception as exc:
+                self.event("stop_failed", stage="observer", error=str(exc))
             self.lock.release()
 
     def install_signals(self) -> None:
@@ -1898,8 +1899,10 @@ class Orchestrator:
         self.shutdown_requested = True
         self.halted = True  # main() exits nonzero so wrappers can tell halt from done
         self.event("safe_halt", reason=reason, details=details)
-        self.stop_observer("safe_halt")
+        # Active bot first: it is the one writing orders, and a hung observer's
+        # SIGINT->SIGKILL escalation (~35s) must not delay stopping the writer.
         self.stop_active("safe_halt")
+        self.stop_observer("safe_halt")
         state = {
             "active": True,
             "triggered_at": iso(),
