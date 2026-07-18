@@ -344,11 +344,7 @@ impl AsterRest {
             .await?;
         let rows: Vec<AsterPositionRow> = serde_json::from_str(&body)
             .map_err(|e| anyhow!("parse Aster positionRisk: {e}: {body}"))?;
-        Ok(rows
-            .into_iter()
-            .find(|r| r.symbol.eq_ignore_ascii_case(&symbol))
-            .and_then(|r| r.position_amt.parse::<Decimal>().ok())
-            .unwrap_or(Decimal::ZERO))
+        position_qty_from_rows(&rows, &symbol)
     }
 
     pub async fn available_usdc(&self) -> Result<Decimal> {
@@ -500,6 +496,22 @@ impl AsterRest {
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+    }
+}
+
+/// Position from the positionRisk rows: an ABSENT row means genuinely flat (the venue
+/// omits flat symbols) and maps to zero; a PRESENT row with a malformed positionAmt is a
+/// parse failure and must surface as an error — reconciliation acting on a fabricated
+/// zero would treat a live position as flat.
+fn position_qty_from_rows(rows: &[AsterPositionRow], symbol: &str) -> Result<Decimal> {
+    match rows.iter().find(|r| r.symbol.eq_ignore_ascii_case(symbol)) {
+        None => Ok(Decimal::ZERO),
+        Some(row) => row.position_amt.trim().parse::<Decimal>().map_err(|e| {
+            anyhow!(
+                "malformed Aster positionAmt {:?} for {symbol}: {e}",
+                row.position_amt
+            )
+        }),
     }
 }
 
@@ -674,6 +686,45 @@ mod tests {
         assert_eq!(fill.qty, dec!(0.21));
         assert_eq!(fill.notional, dec!(12.931107));
         assert_eq!(fill.vwap, dec!(61.5767));
+    }
+
+    #[test]
+    fn position_qty_absent_row_means_flat() {
+        let rows: Vec<AsterPositionRow> =
+            serde_json::from_str(r#"[{"symbol":"BTCUSDT","positionAmt":"1.5"}]"#).unwrap();
+        assert_eq!(
+            position_qty_from_rows(&rows, "HYPEUSDT").unwrap(),
+            Decimal::ZERO
+        );
+        assert_eq!(
+            position_qty_from_rows(&[], "HYPEUSDT").unwrap(),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn position_qty_parses_present_row() {
+        let rows: Vec<AsterPositionRow> =
+            serde_json::from_str(r#"[{"symbol":"HYPEUSDT","positionAmt":"-0.42"}]"#).unwrap();
+        assert_eq!(
+            position_qty_from_rows(&rows, "HYPEUSDT").unwrap(),
+            dec!(-0.42)
+        );
+    }
+
+    #[test]
+    fn position_qty_malformed_row_is_error_not_zero() {
+        let rows: Vec<AsterPositionRow> =
+            serde_json::from_str(r#"[{"symbol":"HYPEUSDT","positionAmt":"garbage"}]"#).unwrap();
+        assert!(position_qty_from_rows(&rows, "HYPEUSDT").is_err());
+    }
+
+    #[test]
+    fn position_qty_malformed_envelope_is_error() {
+        // The venue's error object instead of the positionRisk array must fail the
+        // envelope parse (position_qty maps this to Err), never read as "flat".
+        let body = r#"{"code":-1021,"msg":"Timestamp outside recvWindow"}"#;
+        assert!(serde_json::from_str::<Vec<AsterPositionRow>>(body).is_err());
     }
 
     #[test]

@@ -1125,10 +1125,10 @@ impl LighterVenue {
     pub async fn account_snapshot(&self, market: &MarketId) -> Result<LighterAccountSnapshot> {
         let wire = self.wire(market)?;
         let raw = self.rest.account_raw(self.account_index).await?;
-        let account = account_root(&raw);
+        let account = account_root(&raw)?;
         Ok(LighterAccountSnapshot {
-            position_qty: account_position_qty(account, wire.market_index as u32),
-            available_usdc: account_available_usdc(account),
+            position_qty: account_position_qty(account, wire.market_index as u32)?,
+            available_usdc: account_available_usdc(account)?,
             account_value_usdc: account_value_usdc(account),
             unrealized_pnl_usdc: account_unrealized_pnl(account),
         })
@@ -1155,8 +1155,7 @@ impl LighterVenue {
 
     pub async fn rest_available_usdc(&self) -> Result<Decimal> {
         let raw = self.rest.account_raw(self.account_index).await?;
-        let account = account_root(&raw);
-        Ok(account_available_usdc(account))
+        account_available_usdc(account_root(&raw)?)
     }
 
     pub fn ws_available_usdc(&self) -> Result<Decimal> {
@@ -1171,8 +1170,7 @@ impl LighterVenue {
 
     pub async fn rest_account_value_usdc(&self) -> Result<Option<Decimal>> {
         let raw = self.rest.account_raw(self.account_index).await?;
-        let account = account_root(&raw);
-        Ok(account_value_usdc(account))
+        Ok(account_value_usdc(account_root(&raw)?))
     }
 
     pub fn ws_account_value_usdc(&self) -> Result<Option<Decimal>> {
@@ -1213,30 +1211,41 @@ fn lighter_nonce_reject(code: i64, message: &str) -> bool {
     code == 21104 || message.to_ascii_lowercase().contains("invalid nonce")
 }
 
-fn account_root(raw: &serde_json::Value) -> &serde_json::Value {
-    raw.get("accounts")
-        .and_then(|a| a.as_array())
-        .and_then(|a| a.first())
-        .unwrap_or(raw)
+/// Fail-closed envelope selection: an "accounts" key that is present but not a non-empty
+/// array is a malformed payload (Err), never silently read as the legacy flat shape — the
+/// legacy fallback applies only when the key is genuinely absent.
+fn account_root(raw: &serde_json::Value) -> Result<&serde_json::Value> {
+    match raw.get("accounts") {
+        None => Ok(raw),
+        Some(accounts) => accounts.as_array().and_then(|a| a.first()).ok_or_else(|| {
+            anyhow!("Lighter account payload 'accounts' is not a non-empty array: {raw}")
+        }),
+    }
 }
 
-fn account_position_qty(account: &serde_json::Value, market_id: u32) -> Decimal {
-    if let Some(poss) = account.get("positions").and_then(|p| p.as_array()) {
-        for p in poss {
-            if p.get("market_id").and_then(|m| m.as_u64()) == Some(market_id as u64) {
-                let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
-                return signed_position_json_dec(p.get("position"), sign);
-            }
+/// A missing positions array means a flat account (mirrors `account_unrealized_pnl`);
+/// a matched row whose position magnitude cannot be parsed is an error — fabricating a
+/// zero here would make reconciliation treat a live position as flat.
+fn account_position_qty(account: &serde_json::Value, market_id: u32) -> Result<Decimal> {
+    let Some(rows) = account.get("positions").and_then(|p| p.as_array()) else {
+        return Ok(Decimal::ZERO);
+    };
+    for p in rows {
+        if p.get("market_id").and_then(|m| m.as_u64()) == Some(market_id as u64) {
+            let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
+            return signed_position_json_dec(p.get("position"), sign).ok_or_else(|| {
+                anyhow!("Lighter position row for market {market_id} has no parseable position: {p}")
+            });
         }
     }
-    Decimal::ZERO
+    Ok(Decimal::ZERO)
 }
 
-fn account_available_usdc(account: &serde_json::Value) -> Decimal {
+fn account_available_usdc(account: &serde_json::Value) -> Result<Decimal> {
     value_dec(account.get("available_capital"))
         .or_else(|| value_dec(account.get("available_balance")))
         .or_else(|| value_dec(account.get("available")))
-        .unwrap_or(Decimal::ZERO)
+        .ok_or_else(|| anyhow!("Lighter account payload has no parseable available balance"))
 }
 
 fn account_unrealized_pnl(account: &serde_json::Value) -> Option<Decimal> {
@@ -1246,7 +1255,9 @@ fn account_unrealized_pnl(account: &serde_json::Value) -> Option<Decimal> {
     let mut total = Decimal::ZERO;
     for p in rows {
         let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
-        if signed_position_json_dec(p.get("position"), sign) == Decimal::ZERO {
+        // Unparseable position magnitude: cannot even tell whether the row is flat, so
+        // the account is unmarkable — same fail-closed rule as the uPnL read below.
+        if signed_position_json_dec(p.get("position"), sign)? == Decimal::ZERO {
             continue;
         }
         // A nonzero position without a parseable mark makes the whole account
@@ -1520,13 +1531,12 @@ fn signed_position_payload_dec(p: &crate::lighter::messages::PositionPayload) ->
     }
 }
 
-fn signed_position_json_dec(position: Option<&serde_json::Value>, sign: i64) -> Decimal {
-    let mag = value_dec(position).unwrap_or(Decimal::ZERO).abs();
-    if sign < 0 {
-        -mag
-    } else {
-        mag
-    }
+/// `None` when the position magnitude is absent or unparseable — callers decide whether
+/// that means "malformed row" (error) or "account unmarkable" (propagate None); a silent
+/// zero here masqueraded parse failures as flat positions.
+fn signed_position_json_dec(position: Option<&serde_json::Value>, sign: i64) -> Option<Decimal> {
+    let mag = value_dec(position)?.abs();
+    Some(if sign < 0 { -mag } else { mag })
 }
 
 fn lighter_ws_url(base_url: &str) -> String {
@@ -1925,15 +1935,15 @@ mod tests {
                 ]
             }]
         });
-        let account = account_root(&raw);
+        let account = account_root(&raw).unwrap();
 
         assert_eq!(
-            account_position_qty(account, 24),
+            account_position_qty(account, 24).unwrap(),
             "-0.42".parse::<Decimal>().unwrap()
         );
-        assert_eq!(account_position_qty(account, 99), Decimal::ZERO);
+        assert_eq!(account_position_qty(account, 99).unwrap(), Decimal::ZERO);
         assert_eq!(
-            account_available_usdc(account),
+            account_available_usdc(account).unwrap(),
             "123.45".parse::<Decimal>().unwrap()
         );
         assert_eq!(
@@ -1973,6 +1983,53 @@ mod tests {
         assert_eq!(
             account_unrealized_pnl(&serde_json::json!({})),
             Some(Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn account_root_malformed_envelope_is_error() {
+        // "accounts" present but not a non-empty array: malformed payload, not the
+        // legacy flat shape — reading it as legacy would fabricate a flat/zero account.
+        assert!(account_root(&serde_json::json!({"accounts": []})).is_err());
+        assert!(account_root(&serde_json::json!({"accounts": "oops"})).is_err());
+        assert!(account_root(&serde_json::json!({"accounts": null})).is_err());
+    }
+
+    #[test]
+    fn account_root_absent_accounts_key_is_legacy_shape() {
+        let raw = serde_json::json!({"available_capital": "10.5"});
+        let account = account_root(&raw).unwrap();
+        assert_eq!(
+            account_available_usdc(account).unwrap(),
+            "10.5".parse::<Decimal>().unwrap()
+        );
+    }
+
+    #[test]
+    fn account_position_qty_missing_positions_array_means_flat() {
+        assert_eq!(
+            account_position_qty(&serde_json::json!({}), 24).unwrap(),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn account_position_qty_unparseable_matched_position_is_error() {
+        let account = serde_json::json!({
+            "positions": [
+                {"market_id": 24, "position": "garbage", "sign": 1}
+            ]
+        });
+        assert!(account_position_qty(&account, 24).is_err());
+        // Other markets are unaffected by the malformed row.
+        assert_eq!(account_position_qty(&account, 23).unwrap(), Decimal::ZERO);
+    }
+
+    #[test]
+    fn account_available_usdc_unparseable_is_error() {
+        assert!(account_available_usdc(&serde_json::json!({})).is_err());
+        assert!(
+            account_available_usdc(&serde_json::json!({"available_capital": "junk"})).is_err()
         );
     }
 
