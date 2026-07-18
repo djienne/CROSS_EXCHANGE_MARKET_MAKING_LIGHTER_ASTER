@@ -91,6 +91,25 @@ pub struct LighterAccountSnapshot {
     pub unrealized_pnl_usdc: Option<Decimal>,
 }
 
+impl LighterAccountSnapshot {
+    /// Marked equity: the collateral-style account value PLUS venue-reported uPnL (the
+    /// 733ba55 marked-equity composition); `None` when either part is unavailable.
+    pub fn equity_usdc(&self) -> Option<Decimal> {
+        match (self.account_value_usdc, self.unrealized_pnl_usdc) {
+            (Some(value), Some(upnl)) => Some(value + upnl),
+            _ => None,
+        }
+    }
+}
+
+/// Market-free margin/equity read (no market wire needed) for recovery accounting.
+#[derive(Debug, Clone, Copy)]
+pub struct LighterMarginSnapshot {
+    pub available_usdc: Decimal,
+    /// Marked equity (account value + uPnL); `None` when either part is unavailable.
+    pub equity_usdc: Option<Decimal>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LighterFillStatus {
     Filled,
@@ -1156,6 +1175,21 @@ impl LighterVenue {
     pub async fn rest_available_usdc(&self) -> Result<Decimal> {
         let raw = self.rest.account_raw(self.account_index).await?;
         account_available_usdc(account_root(&raw)?)
+    }
+
+    /// Available margin plus marked equity from a single account payload — the same
+    /// REST call as `rest_available_usdc`, so callers get equity for free.
+    pub async fn rest_margin_snapshot(&self) -> Result<LighterMarginSnapshot> {
+        let raw = self.rest.account_raw(self.account_index).await?;
+        let account = account_root(&raw)?;
+        let equity_usdc = match (account_value_usdc(account), account_unrealized_pnl(account)) {
+            (Some(value), Some(upnl)) => Some(value + upnl),
+            _ => None,
+        };
+        Ok(LighterMarginSnapshot {
+            available_usdc: account_available_usdc(account)?,
+            equity_usdc,
+        })
     }
 
     pub fn ws_available_usdc(&self) -> Result<Decimal> {

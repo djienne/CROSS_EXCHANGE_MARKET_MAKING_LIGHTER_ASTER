@@ -140,6 +140,20 @@ impl PositionSnapshot {
 struct MarginSnapshot {
     aster_available_usd: Decimal,
     lighter_available_usd: Decimal,
+    /// Per-venue marked equity (balance + uPnL) when the venue payload allows computing
+    /// it. Recovery loss estimation prefers equity deltas: closing a position RELEASES
+    /// available margin, so an available-only delta can fully mask a realized loss.
+    aster_equity_usd: Option<Decimal>,
+    lighter_equity_usd: Option<Decimal>,
+}
+
+impl MarginSnapshot {
+    fn total_equity_usd(self) -> Option<Decimal> {
+        match (self.aster_equity_usd, self.lighter_equity_usd) {
+            (Some(a), Some(l)) => Some(a + l),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3241,8 +3255,9 @@ fn immediate_fill_summary(fill: AsterImmediateFill, fee_bps: Decimal) -> FillSum
 /// recovery losses only fed the coarse hourly recovered-loss limiter, never the ledger).
 fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedgerRow {
     let loss = recovery.estimated_loss_usdc;
+    let timestamp = Utc::now();
     TradeLedgerRow {
-        timestamp: Utc::now(),
+        timestamp,
         market: spec.market_id.0.clone(),
         direction: "RECOVERY".to_string(),
         qty: Decimal::ZERO,
@@ -3254,7 +3269,10 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
         fill_qty_mismatch: Decimal::ZERO,
         aster_fill: zero_fill_summary(),
         lighter_fill: zero_fill_summary(),
-        aster_order_id: 0,
+        // The orchestrator dedups rows on `taker:<aster_order_id>:<lighter_client_order_index>`;
+        // a constant 0 collapsed every recovery after the first into one key, hiding
+        // repeat losses from downstream accounting. The row timestamp keys each recovery.
+        aster_order_id: timestamp.timestamp_millis(),
         lighter_client_order_index: 0,
         final_aster_position: recovery.position.aster_qty,
         final_lighter_position: recovery.position.lighter_qty,
@@ -3826,11 +3844,7 @@ async fn recover_if_needed(
                 open_l
             );
         }
-        let estimated_loss_usdc = (margin_before.aster_available_usd
-            + margin_before.lighter_available_usd
-            - margin_after.aster_available_usd
-            - margin_after.lighter_available_usd)
-            .max(Decimal::ZERO);
+        let estimated_loss_usdc = estimated_recovery_loss(margin_before, margin_after);
         return Ok(RecoveryReport {
             action_taken: false,
             position: pos,
@@ -3925,11 +3939,7 @@ async fn recover_if_needed(
             && open_a.is_empty()
             && open_l == 0
         {
-            let estimated_loss_usdc = (margin_before.aster_available_usd
-                + margin_before.lighter_available_usd
-                - margin_after.aster_available_usd
-                - margin_after.lighter_available_usd)
-                .max(Decimal::ZERO);
+            let estimated_loss_usdc = estimated_recovery_loss(margin_before, margin_after);
             return Ok(RecoveryReport {
                 action_taken,
                 position: final_pos,
@@ -3954,6 +3964,22 @@ async fn recover_if_needed(
             );
         }
     }
+}
+
+/// Estimated realized loss across a recovery window. Prefers the total-equity delta:
+/// closing a position RELEASES available margin, so the available-only delta can report
+/// zero (or a gain) while a loss was realized. Falls back to the available-margin delta
+/// when either snapshot lacks equity. Floored at zero — this feeds loss breakers and must
+/// never book phantom gains.
+fn estimated_recovery_loss(before: MarginSnapshot, after: MarginSnapshot) -> Decimal {
+    let delta = match (before.total_equity_usd(), after.total_equity_usd()) {
+        (Some(before_eq), Some(after_eq)) => before_eq - after_eq,
+        _ => {
+            (before.aster_available_usd + before.lighter_available_usd)
+                - (after.aster_available_usd + after.lighter_available_usd)
+        }
+    };
+    delta.max(Decimal::ZERO)
 }
 
 /// Marketable IOC price bound for an emergency reduce-only close: cross the spread by
@@ -3985,12 +4011,13 @@ async fn refresh_account_snapshot(
     aster: &AsterRest,
     lighter: &LighterVenue,
 ) -> Result<AccountSnapshot> {
-    let (aster_pos, aster_available, lighter_account) = tokio::join!(
+    let (aster_pos, aster_balance, lighter_account) = tokio::join!(
         aster.position_qty(market),
-        aster.available_usdc(),
+        aster.balance_snapshot(),
         lighter.account_snapshot(market)
     );
     let lighter_account = lighter_account?;
+    let aster_balance = aster_balance?;
     let position = PositionSnapshot {
         aster_qty: aster_pos?,
         lighter_qty: lighter_account.position_qty,
@@ -3998,8 +4025,10 @@ async fn refresh_account_snapshot(
     let lighter_ws_qty = lighter.ws_position_qty(market).ok();
     let lighter_ws_rest_divergence_qty = lighter_ws_qty.map(|ws| (ws - position.lighter_qty).abs());
     let margins = MarginSnapshot {
-        aster_available_usd: aster_available?,
+        aster_available_usd: aster_balance.available_usd,
         lighter_available_usd: lighter_account.available_usdc,
+        aster_equity_usd: aster_balance.equity_usd(),
+        lighter_equity_usd: lighter_account.equity_usdc(),
     };
     Ok(AccountSnapshot {
         position,
@@ -4084,10 +4113,15 @@ fn is_rate_limit_error(error: &anyhow::Error) -> bool {
 }
 
 async fn reconcile_margins(aster: &AsterRest, lighter: &LighterVenue) -> Result<MarginSnapshot> {
-    let (a, l) = tokio::join!(aster.available_usdc(), lighter.available_usdc());
+    // Same endpoints as the available-only reads (Aster /fapi/v3/balance, Lighter
+    // account payload), so carrying equity costs no extra REST calls.
+    let (a, l) = tokio::join!(aster.balance_snapshot(), lighter.rest_margin_snapshot());
+    let (a, l) = (a?, l?);
     Ok(MarginSnapshot {
-        aster_available_usd: a?,
-        lighter_available_usd: l?,
+        aster_available_usd: a.available_usd,
+        lighter_available_usd: l.available_usdc,
+        aster_equity_usd: a.equity_usd(),
+        lighter_equity_usd: l.equity_usdc,
     })
 }
 
@@ -4375,6 +4409,8 @@ mod tests {
         MarginSnapshot {
             aster_available_usd: dec!(1000),
             lighter_available_usd: dec!(1000),
+            aster_equity_usd: None,
+            lighter_equity_usd: None,
         }
     }
 
@@ -5456,6 +5492,67 @@ mod tests {
         }
     }
 
+    fn margin_snapshot(
+        aster_avail: Decimal,
+        lighter_avail: Decimal,
+        aster_eq: Option<Decimal>,
+        lighter_eq: Option<Decimal>,
+    ) -> MarginSnapshot {
+        MarginSnapshot {
+            aster_available_usd: aster_avail,
+            lighter_available_usd: lighter_avail,
+            aster_equity_usd: aster_eq,
+            lighter_equity_usd: lighter_eq,
+        }
+    }
+
+    #[test]
+    fn estimated_recovery_loss_uses_equity_even_when_margin_release_masks_it() {
+        // Closing the naked leg RELEASED margin (available rose 200 -> 240) while equity
+        // dropped 300 -> 290: the loss is real and must be reported, not masked.
+        let before = margin_snapshot(dec!(100), dec!(100), Some(dec!(180)), Some(dec!(120)));
+        let after = margin_snapshot(dec!(140), dec!(100), Some(dec!(175)), Some(dec!(115)));
+        assert_eq!(estimated_recovery_loss(before, after), dec!(10));
+    }
+
+    #[test]
+    fn estimated_recovery_loss_falls_back_to_available_delta_without_equity() {
+        let before = margin_snapshot(dec!(100), dec!(100), None, Some(dec!(120)));
+        let after = margin_snapshot(dec!(97), dec!(100), None, Some(dec!(115)));
+        assert_eq!(estimated_recovery_loss(before, after), dec!(3));
+    }
+
+    #[test]
+    fn estimated_recovery_loss_floors_gains_at_zero() {
+        let before = margin_snapshot(dec!(100), dec!(100), Some(dec!(150)), Some(dec!(150)));
+        let after = margin_snapshot(dec!(90), dec!(90), Some(dec!(160)), Some(dec!(150)));
+        assert_eq!(estimated_recovery_loss(before, after), Decimal::ZERO);
+    }
+
+    #[test]
+    fn recovery_loss_row_gets_unique_dedup_id_from_timestamp() {
+        let spec = test_spec();
+        let recovery = RecoveryReport {
+            action_taken: true,
+            position: PositionSnapshot {
+                aster_qty: Decimal::ZERO,
+                lighter_qty: Decimal::ZERO,
+            },
+            lighter_ws_qty: None,
+            margin_after: margins(),
+            estimated_loss_usdc: dec!(1.25),
+            aster_open_orders: 0,
+            lighter_open_orders: 0,
+        };
+        let row = recovery_loss_row(&spec, &recovery);
+        // Deterministic given the row's own timestamp, and nonzero — so the
+        // orchestrator dedup key `taker:<unix_ms>:0` is unique per recovery.
+        assert_eq!(row.aster_order_id, row.timestamp.timestamp_millis());
+        assert_ne!(row.aster_order_id, 0);
+        assert_eq!(row.lighter_client_order_index, 0);
+        assert_eq!(row.actual_net_usd, dec!(-1.25));
+    }
+
     #[test]
     fn emergency_close_bound_crosses_past_mark_per_side() {
         let mark = dec!(100);
@@ -5496,6 +5593,8 @@ mod tests {
         let margins = MarginSnapshot {
             aster_available_usd: dec!(150),
             lighter_available_usd: dec!(120),
+            aster_equity_usd: None,
+            lighter_equity_usd: None,
         };
         let cases = [
             // (aster_qty, lighter_qty, a_sign, l_sign)
