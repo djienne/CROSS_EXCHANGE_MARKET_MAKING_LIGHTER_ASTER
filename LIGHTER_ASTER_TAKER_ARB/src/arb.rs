@@ -2418,15 +2418,20 @@ fn max_qty_by_available_margin_f64(
         let increases_abs = current == 0.0
             || (current > 0.0 && sign > 0.0)
             || (current < 0.0 && sign < 0.0);
-        if !increases_abs {
-            return f64::MAX;
-        }
         let usable = available - buffer;
-        if usable <= 0.0 || ref_px <= 0.0 {
+        let margin_qty = if usable <= 0.0 || ref_px <= 0.0 {
             0.0
         } else {
             usable / ref_px
+        };
+        if !increases_abs {
+            // Reducing is margin-free only up to |current|: qty beyond that CROSSES
+            // through flat and re-opens on the other side, consuming margin like a
+            // fresh increase (the old unconditional f64::MAX let a crossing trade
+            // open a new position with no margin room at all).
+            return current.abs() + margin_qty;
         }
+        margin_qty
     }
     leg(ref_px, aster_qty, a_sign, aster_available, buffer)
         .min(leg(ref_px, lighter_qty, l_sign, lighter_available, buffer))
@@ -2503,15 +2508,18 @@ fn max_qty_by_available_margin(
         let increases_abs = current == Decimal::ZERO
             || (current > Decimal::ZERO && sign > Decimal::ZERO)
             || (current < Decimal::ZERO && sign < Decimal::ZERO);
-        if !increases_abs {
-            return Decimal::MAX;
-        }
         let usable = available - buffer;
-        if usable <= Decimal::ZERO || ref_px <= Decimal::ZERO {
+        let margin_qty = if usable <= Decimal::ZERO || ref_px <= Decimal::ZERO {
             Decimal::ZERO
         } else {
             usable / ref_px
+        };
+        if !increases_abs {
+            // Mirrors the f64 hot path above: reduces are margin-free only up to
+            // |current|; the crossing remainder consumes margin like an increase.
+            return current.abs() + margin_qty;
         }
+        margin_qty
     }
     leg(
         ref_px,
@@ -5431,4 +5439,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn margin_room_reduce_is_position_plus_margin_not_unbounded() {
+        // Long 5 aster / short 5 lighter, both legs reducing (a_sign=-1, l_sign=+1):
+        // room = |current| (margin-free reduce) + usable margin priced at ref_px for
+        // the crossing remainder — never the old unconditional f64::MAX.
+        let room = max_qty_by_available_margin_f64(10.0, 5.0, -5.0, -1.0, 1.0, 150.0, 150.0, 50.0);
+        assert_eq!(room, 5.0 + (150.0 - 50.0) / 10.0);
+    }
+
+    #[test]
+    fn margin_room_crossing_reduce_with_thin_margin_caps_at_position() {
+        // No usable margin beyond the buffer: a reduce may still close the existing
+        // position but cannot cross into a new one.
+        let room = max_qty_by_available_margin_f64(10.0, 5.0, -5.0, -1.0, 1.0, 50.0, 50.0, 50.0);
+        assert_eq!(room, 5.0);
+        // Increases stay fully margin-blocked.
+        let room = max_qty_by_available_margin_f64(10.0, 0.0, 0.0, 1.0, -1.0, 50.0, 50.0, 50.0);
+        assert_eq!(room, 0.0);
+    }
+
+    #[test]
+    fn margin_room_f64_matches_decimal_on_crossing_cases() {
+        let mut cfg = test_cfg();
+        cfg.risk.margin_buffer_usd = dec!(50);
+        let margins = MarginSnapshot {
+            aster_available_usd: dec!(150),
+            lighter_available_usd: dec!(120),
+        };
+        let cases = [
+            // (aster_qty, lighter_qty, a_sign, l_sign)
+            (dec!(5), dec!(-5), dec!(-1), dec!(1)),   // both legs reduce/cross
+            (dec!(5), dec!(-5), dec!(1), dec!(-1)),   // both legs increase
+            (dec!(0.3), dec!(-5), dec!(-1), dec!(1)), // asymmetric crossing
+            (dec!(0), dec!(0), dec!(1), dec!(-1)),    // flat
+        ];
+        for (a, l, a_sign, l_sign) in cases {
+            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
+            let dec_room =
+                max_qty_by_available_margin(&cfg, dec!(10), pos, margins, a_sign, l_sign);
+            let f64_room = max_qty_by_available_margin_f64(
+                10.0,
+                decimal_to_f64(a).unwrap(),
+                decimal_to_f64(l).unwrap(),
+                decimal_to_f64(a_sign).unwrap(),
+                decimal_to_f64(l_sign).unwrap(),
+                150.0,
+                120.0,
+                50.0,
+            );
+            let diff = (decimal_to_f64(dec_room).unwrap() - f64_room).abs();
+            assert!(
+                diff < 1e-9,
+                "margin room drift for pos=({a},{l}) signs=({a_sign},{l_sign}): dec={dec_room} f64={f64_room}"
+            );
+        }
+    }
 }
