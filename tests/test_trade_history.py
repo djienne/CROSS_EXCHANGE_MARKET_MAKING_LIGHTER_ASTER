@@ -26,7 +26,10 @@ class TradeHistoryTests(unittest.TestCase):
         trade_history.init_db(conn)
         return conn
 
-    def test_taker_ingest_uses_policy_fees_not_local_fee_fields(self) -> None:
+    def test_taker_ingest_prefers_producer_actual_fields(self) -> None:
+        # Producer rows carry matched-qty economics in actual_*; the report must
+        # use them instead of recomputing from full per-leg notionals (which
+        # fabricates PnL for unequal fills).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
@@ -39,12 +42,13 @@ class TradeHistoryTests(unittest.TestCase):
                         "timestamp": "2026-01-02T00:00:00.123456789Z",
                         "market": "HYPE",
                         "direction": "SELL_ASTER_BUY_LIGHTER",
-                        "qty": "1",
-                        "actual_gross_usd": "999",
-                        "actual_fees_usd": "999",
-                        "actual_net_usd": "999",
-                        "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "999"},
-                        "lighter_fill": {"qty": "1", "vwap": "99", "notional": "99", "fee_usd": "999"},
+                        "qty": "0.9",
+                        "actual_gross_usd": "0.9",
+                        "actual_fees_usd": "0.04",
+                        "actual_net_usd": "0.86",
+                        # Unequal legs: full-notional recompute would claim 100-99=1.
+                        "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0.04"},
+                        "lighter_fill": {"qty": "0.9", "vwap": "99", "notional": "89.1", "fee_usd": "0"},
                         "aster_order_id": 1,
                         "lighter_client_order_index": 2,
                     }
@@ -61,9 +65,117 @@ class TradeHistoryTests(unittest.TestCase):
                     db_path=db_path,
                 )
             self.assertEqual(report["total"]["trades"], 1)
-            self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("1"))
+            self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("0.9"))
             self.assertEqual(report["total"]["policy_fees_usdc"], Decimal("0.04"))
-            self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("0.96"))
+            self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("0.86"))
+
+    def test_taker_ingests_sell_lighter_buy_aster_direction(self) -> None:
+        # This direction was silently dropped before 2026-07-18 (the matcher
+        # expected a never-emitted BUY_ASTER_SELL_LIGHTER string).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            taker_path = root / "taker.jsonl"
+            orch_path = root / "orchestrator.jsonl"
+            db_path = root / "history.sqlite"
+            write_jsonl(
+                taker_path,
+                [
+                    {
+                        "timestamp": "2026-01-02T00:00:00Z",
+                        "market": "HYPE",
+                        "direction": "SELL_LIGHTER_BUY_ASTER",
+                        "qty": "1",
+                        "actual_gross_usd": "1",
+                        "actual_fees_usd": "0.04",
+                        "actual_net_usd": "0.96",
+                        "aster_fill": {"qty": "1", "vwap": "99", "notional": "99", "fee_usd": "0.04"},
+                        "lighter_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0"},
+                        "aster_order_id": 5,
+                        "lighter_client_order_index": 6,
+                    }
+                ],
+            )
+            write_jsonl(orch_path, [])
+            with self.open_db(db_path) as conn:
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                rows = conn.execute(
+                    "SELECT direction, net_pnl_usdc FROM strategy_trades"
+                ).fetchall()
+            self.assertEqual(1, len(rows))
+            self.assertEqual("SELL_LIGHTER_BUY_ASTER", rows[0][0])
+            self.assertEqual("0.96", rows[0][1])
+
+    def test_taker_recovery_rows_ingested_as_losses_with_distinct_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            taker_path = root / "taker.jsonl"
+            orch_path = root / "orchestrator.jsonl"
+            db_path = root / "history.sqlite"
+
+            def recovery(ts: str) -> dict:
+                return {
+                    "timestamp": ts,
+                    "market": "HYPE",
+                    "direction": "RECOVERY",
+                    "qty": "0",
+                    "actual_gross_usd": "-1.25",
+                    "actual_fees_usd": "0",
+                    "actual_net_usd": "-1.25",
+                    "aster_fill": {"qty": "0", "vwap": "0", "notional": "0"},
+                    "lighter_fill": {"qty": "0", "vwap": "0", "notional": "0"},
+                    "aster_order_id": 0,
+                    "lighter_client_order_index": 0,
+                }
+
+            write_jsonl(
+                taker_path,
+                [recovery("2026-01-02T00:00:00.111111111Z"), recovery("2026-01-02T01:00:00.222222222Z")],
+            )
+            write_jsonl(orch_path, [])
+            with self.open_db(db_path) as conn:
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                rows = conn.execute(
+                    "SELECT trade_key, net_pnl_usdc FROM strategy_trades ORDER BY trade_key"
+                ).fetchall()
+            self.assertEqual(2, len(rows))
+            self.assertNotEqual(rows[0][0], rows[1][0])
+            for key, net in rows:
+                self.assertTrue(key.startswith("taker:recovery:0:0:"))
+                self.assertEqual("-1.25", net)
+
+    def test_refresh_self_heals_previously_miscomputed_rows(self) -> None:
+        # The same trade_key re-ingested overwrites non-preserved columns, so one
+        # ordinary refresh corrects rows written by the old formula.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            taker_path = root / "taker.jsonl"
+            orch_path = root / "orchestrator.jsonl"
+            db_path = root / "history.sqlite"
+            row = {
+                "timestamp": "2026-01-02T00:00:00Z",
+                "market": "HYPE",
+                "direction": "SELL_ASTER_BUY_LIGHTER",
+                "qty": "1",
+                "actual_gross_usd": "0.5",
+                "actual_fees_usd": "0.04",
+                "actual_net_usd": "0.46",
+                "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0.04"},
+                "lighter_fill": {"qty": "1", "vwap": "99.5", "notional": "99.5", "fee_usd": "0"},
+                "aster_order_id": 9,
+                "lighter_client_order_index": 9,
+            }
+            write_jsonl(taker_path, [row])
+            write_jsonl(orch_path, [])
+            with self.open_db(db_path) as conn:
+                # Seed the DB with a wrong historical value under the same key.
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                conn.execute("UPDATE strategy_trades SET net_pnl_usdc = '999' WHERE trade_key = 'taker:9:9'")
+                conn.commit()
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                net = conn.execute(
+                    "SELECT net_pnl_usdc FROM strategy_trades WHERE trade_key = 'taker:9:9'"
+                ).fetchone()[0]
+            self.assertEqual("0.46", net)
 
     def test_refresh_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,7 +189,7 @@ class TradeHistoryTests(unittest.TestCase):
                     {
                         "timestamp": "2026-01-02T00:00:00Z",
                         "market": "HYPE",
-                        "direction": "BUY_ASTER_SELL_LIGHTER",
+                        "direction": "SELL_LIGHTER_BUY_ASTER",
                         "qty": "2",
                         "aster_fill": {"qty": "2", "vwap": "10", "notional": "20"},
                         "lighter_fill": {"qty": "2", "vwap": "11", "notional": "22"},

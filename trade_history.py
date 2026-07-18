@@ -235,10 +235,12 @@ def notional_from_fill(fill: dict[str, Any], qty: Decimal, px: Decimal) -> Decim
 
 
 def taker_sides(direction: Any) -> tuple[str | None, str | None]:
+    # The taker producer emits exactly SELL_ASTER_BUY_LIGHTER and
+    # SELL_LIGHTER_BUY_ASTER (Direction::as_str in arb.rs).
     direction_upper = str(direction or "").upper()
     if direction_upper == "SELL_ASTER_BUY_LIGHTER":
         return "sell", "buy"
-    if direction_upper == "BUY_ASTER_SELL_LIGHTER":
+    if direction_upper == "SELL_LIGHTER_BUY_ASTER":
         return "buy", "sell"
     return None, None
 
@@ -274,6 +276,8 @@ def taker_trade_from_row(
     ts_us = parse_timestamp_us(raw_timestamp)
     market = str(row.get("market") or "")
     direction = row.get("direction")
+    if str(direction or "").upper() == "RECOVERY":
+        return recovery_trade_from_row(row, mode=mode, path=path, line_no=line_no)
     aster_side, lighter_side = taker_sides(direction)
     if not market or aster_side is None or lighter_side is None:
         return None
@@ -283,17 +287,25 @@ def taker_trade_from_row(
     lighter_px = nested_dec(lighter_fill, "vwap")
     aster_notional = notional_from_fill(aster_fill, qty, aster_px)
     lighter_notional = notional_from_fill(lighter_fill, qty, lighter_px)
-    if aster_side == "sell" and lighter_side == "buy":
-        gross = aster_notional - lighter_notional
-    elif aster_side == "buy" and lighter_side == "sell":
-        gross = lighter_notional - aster_notional
+    if row.get("actual_net_usd") is not None:
+        # Producer economics: matched-qty PnL (min of the two legs at their VWAPs)
+        # and actual venue fees. Recomputing from full per-leg notionals fabricates
+        # PnL whenever the fills are unequal.
+        gross = nested_dec(row, "actual_gross_usd")
+        fees = nested_dec(row, "actual_fees_usd")
+        net = nested_dec(row, "actual_net_usd")
+        aster_fee = dec(aster_fill.get("fee_usd"))
+        lighter_fee = dec(lighter_fill.get("fee_usd"))
     else:
-        return None
-
-    aster_fee = abs_fee(aster_notional, ASTER_TAKER_FEE_RATE)
-    lighter_fee = Decimal("0")
-    fees = aster_fee + lighter_fee
-    net = gross - fees
+        # Legacy rows without actual_* fields: policy recompute from leg notionals.
+        if aster_side == "sell":
+            gross = aster_notional - lighter_notional
+        else:
+            gross = lighter_notional - aster_notional
+        aster_fee = abs_fee(aster_notional, ASTER_TAKER_FEE_RATE)
+        lighter_fee = Decimal("0")
+        fees = aster_fee + lighter_fee
+        net = gross - fees
     trade_key = f"taker:{aster_order_id}:{lighter_client_order_index}"
     now = iso(utc_now())
     source = "taker_local_ledger"
@@ -387,6 +399,65 @@ def taker_trade_from_row(
         },
     ]
     return trade, fills
+
+
+def recovery_trade_from_row(
+    row: dict[str, Any],
+    *,
+    mode: str,
+    path: Path,
+    line_no: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    """Emergency-recovery ledger rows: qty 0, no per-venue fills, a booked loss in
+    actual_net_usd. Key mirrors the orchestrator's recovery dedup key (timestamp
+    component) so rows from old binaries stamped 0:0 stay distinct."""
+    aster_order_id = row.get("aster_order_id")
+    lighter_client_order_index = row.get("lighter_client_order_index")
+    if aster_order_id is None or lighter_client_order_index is None:
+        return None
+    raw_timestamp = row.get("timestamp")
+    timestamp = parse_timestamp(raw_timestamp)
+    ts_us = parse_timestamp_us(raw_timestamp)
+    market = str(row.get("market") or "")
+    if not market:
+        return None
+    gross = nested_dec(row, "actual_gross_usd")
+    fees = nested_dec(row, "actual_fees_usd")
+    net = nested_dec(row, "actual_net_usd")
+    trade_key = f"taker:recovery:{aster_order_id}:{lighter_client_order_index}:{raw_timestamp}"
+    now = iso(utc_now())
+    trade = {
+        "trade_key": trade_key,
+        "mode": mode,
+        "strategy": "TAKER",
+        "bot": TAKER_BOT,
+        "market": market,
+        "timestamp": timestamp,
+        "timestamp_us": ts_us,
+        "direction": "RECOVERY",
+        "qty": "0",
+        "gross_pnl_usdc": decimal_str(gross),
+        "policy_fees_usdc": decimal_str(fees),
+        "net_pnl_usdc": decimal_str(net),
+        "aster_fee_usdc": "0",
+        "lighter_fee_usdc": "0",
+        "aster_fee_rate": decimal_str(ASTER_TAKER_FEE_RATE),
+        "lighter_fee_rate": decimal_str(LIGHTER_FEE_RATE),
+        "aster_order_id": str(aster_order_id),
+        "lighter_client_order_index": str(lighter_client_order_index),
+        "cloid": None,
+        "aster_px": None,
+        "lighter_px": None,
+        "confirmation_status": "local_only",
+        "confirmed_at": None,
+        "source": "taker_local_ledger",
+        "source_path": str(path),
+        "source_line": line_no,
+        "raw_json": raw_json(row),
+        "created_at": now,
+        "updated_at": now,
+    }
+    return trade, []
 
 
 def xemm_trade_from_orchestrator_row(
@@ -957,7 +1028,7 @@ def report_from_db(
         "capital_source": capital_source,
         "notes": [
             "LAN mode reads local bot artifacts only and makes no exchange API calls.",
-            "Fees are recomputed from policy: Aster taker 0.04%, Aster maker 0%, Lighter 0%.",
+            "Taker PnL/fees come from the producer's actual_* fields (matched-qty economics) when present; policy recompute (Aster taker 0.04%, Aster maker 0%, Lighter 0%) is the legacy fallback.",
             "confirmation_status stays local_only until exchange-history adapters confirm or repair rows.",
         ],
     }
