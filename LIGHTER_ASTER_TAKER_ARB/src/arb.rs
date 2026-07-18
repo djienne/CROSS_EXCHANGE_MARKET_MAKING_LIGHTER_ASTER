@@ -3845,6 +3845,12 @@ async fn recover_if_needed(
         "residual recovery: aster={} lighter={} net={} ${}",
         pos.aster_qty, pos.lighter_qty, net, net_notional
     );
+    // Close bounds are computed from EACH venue's own mid (falling back to the shared
+    // mark): a dislocation between venues beyond emergency_slippage_bps used to make the
+    // second leg's bound non-executable on its own book after the first already closed.
+    // Notional thresholds and verification keep the shared (aster-preferred) mark.
+    let aster_mark = aster_book.mid().unwrap_or(mark);
+    let lighter_mark = lighter_book.mid().unwrap_or(mark);
     let mut action_taken = false;
     if pos.aster_qty.abs() * mark > cfg.risk.max_position_mismatch_usd {
         let side = if pos.aster_qty > Decimal::ZERO {
@@ -3852,11 +3858,7 @@ async fn recover_if_needed(
         } else {
             Side::Buy
         };
-        let bound = if matches!(side, Side::Buy) {
-            mark * (Decimal::ONE + bps_to_rate(cfg.arb.emergency_slippage_bps))
-        } else {
-            mark * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps))
-        };
+        let bound = emergency_close_bound(aster_mark, side, cfg.arb.emergency_slippage_bps);
         let res = aster
             .submit_ioc_order(&spec.market_id, side, pos.aster_qty.abs(), bound, true)
             .await;
@@ -3869,11 +3871,7 @@ async fn recover_if_needed(
         } else {
             Side::Buy
         };
-        let bound = if matches!(side, Side::Buy) {
-            mark * (Decimal::ONE + bps_to_rate(cfg.arb.emergency_slippage_bps))
-        } else {
-            mark * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps))
-        };
+        let bound = emergency_close_bound(lighter_mark, side, cfg.arb.emergency_slippage_bps);
         let res = lighter
             .submit_market_order(&spec.market_id, side, pos.lighter_qty.abs(), bound, true)
             .await;
@@ -3945,6 +3943,15 @@ async fn recover_if_needed(
                 open_l
             );
         }
+    }
+}
+
+/// Marketable IOC price bound for an emergency reduce-only close: cross the spread by
+/// `bps` past the venue's mark so the order executes, while capping the worst fill.
+fn emergency_close_bound(mark: Decimal, side: Side, bps: Decimal) -> Decimal {
+    match side {
+        Side::Buy => mark * (Decimal::ONE + bps_to_rate(bps)),
+        Side::Sell => mark * (Decimal::ONE - bps_to_rate(bps)),
     }
 }
 
@@ -5437,6 +5444,19 @@ mod tests {
                 "net_mismatch drift for pos=({},{}) bid={} ask={}: dec={} f64={} diff={}",
                 a, l, bid, ask, dec_result, f64_result, diff);
         }
+    }
+
+    #[test]
+    fn emergency_close_bound_crosses_past_mark_per_side() {
+        let mark = dec!(100);
+        // Buy bound above mark, sell bound below, scaled by bps.
+        assert_eq!(emergency_close_bound(mark, Side::Buy, dec!(50)), dec!(100.5));
+        assert_eq!(emergency_close_bound(mark, Side::Sell, dec!(50)), dec!(99.5));
+        assert_eq!(
+            emergency_close_bound(mark, Side::Buy, dec!(100)),
+            dec!(101.0)
+        );
+        assert_eq!(emergency_close_bound(mark, Side::Buy, dec!(0)), mark);
     }
 
     #[test]
