@@ -1179,6 +1179,21 @@ class Orchestrator:
         if decision["target"] == "SAFE_HALT":
             self.safe_halt(decision["reason"], **decision.get("details", {}))
             return
+        if decision["target"] == XEMM_BOT and xemm_status is None:
+            # No XEMM status was polled this tick (taker-active path), so decide()'s
+            # reduce_position_only guard was short-circuited. Fetch it now rather
+            # than starting XEMM unverified; defer the switch if it can't be read.
+            xemm_status = self.read_status(XEMM_BOT, inactive=True)
+            if xemm_status is None:
+                self.event("xemm_switch_deferred_no_status", reason=decision["reason"])
+                self.write_state(taker_status, xemm_status, decision, stats)
+                return
+            if xemm_status.get("reduce_position_only") is not True:
+                self.safe_halt(
+                    "xemm_reduce_position_only_disabled",
+                    reduce_position_only=xemm_status.get("reduce_position_only"),
+                )
+                return
         self.ensure_bot(
             decision["target"],
             decision["reason"],

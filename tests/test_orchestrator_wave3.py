@@ -197,6 +197,58 @@ class ReadyForTakerTests(unittest.TestCase):
             self.assertEqual("near_flat", details["ready_reason"])
 
 
+class XemmSwitchGuardTests(unittest.TestCase):
+    def _orch_for_tick(self, tmp: Path) -> Orchestrator:
+        orch = make_orch(tmp, live=False, allow_existing_writers=True)
+        orch.halts = []
+        orch.safe_halt = lambda reason, **d: (
+            orch.halts.append((reason, d)),
+            setattr(orch, "shutdown_requested", True),
+            setattr(orch, "halted", True),
+        )
+        orch.check_child_exits = lambda: None
+        orch.prune_tapes_if_due = lambda: None
+        orch.active_bot = TAKER_BOT
+        orch.poll_statuses = lambda: (dict(VALID_TAKER_STATUS), None)
+        orch.trades.poll = lambda: []
+        orch.trades.summary = lambda: {"trades": 0}
+        orch.pnl.record = lambda source, active: None
+        orch.note_pnl_sample = lambda sample, taker, xemm: None
+        orch.pnl.breaker_reason = lambda stats: None
+        orch.breaker_starvation_warned = True
+        orch.decide = lambda taker, xemm: {"target": XEMM_BOT, "reason": "taker_margin_limited"}
+        orch.ensured = []
+        orch.ensure_bot = lambda target, reason, details, taker_mode="normal": orch.ensured.append(target)
+        orch.ensure_observer_for = lambda target: None
+        orch.write_state = lambda *a, **k: None
+        return orch
+
+    def test_defers_switch_when_xemm_status_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch_for_tick(Path(tmp))
+            orch.read_status = lambda bot, inactive=False: None
+            orch.tick()
+            self.assertEqual([], orch.ensured)
+            self.assertEqual([], orch.halts)
+            self.assertIn("xemm_switch_deferred_no_status", [k for k, _ in orch.recorded_events])
+
+    def test_halts_when_reduce_only_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch_for_tick(Path(tmp))
+            orch.read_status = lambda bot, inactive=False: {**VALID_XEMM_STATUS, "reduce_position_only": False}
+            orch.tick()
+            self.assertEqual([], orch.ensured)
+            self.assertEqual(["xemm_reduce_position_only_disabled"], [r for r, _ in orch.halts])
+
+    def test_switch_proceeds_when_reduce_only_confirmed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._orch_for_tick(Path(tmp))
+            orch.read_status = lambda bot, inactive=False: dict(VALID_XEMM_STATUS)
+            orch.tick()
+            self.assertEqual([XEMM_BOT], orch.ensured)
+            self.assertEqual([], orch.halts)
+
+
 class PreflightOrderClearTests(unittest.TestCase):
     def _live_orch(self, tmp: Path) -> Orchestrator:
         orch = make_orch(tmp, live=True, allow_existing_writers=False, preflight_kill_existing=False)
