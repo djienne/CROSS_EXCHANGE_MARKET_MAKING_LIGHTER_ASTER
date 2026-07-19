@@ -40,13 +40,22 @@ pub struct TradeSummary {
     pub first_mono_ns: i64,
     pub last_mono_ns: i64,
     pub hedge_side: Side,
+    /// Maker (Aster) fill quantity — the trade's maker volume (also what `total_qty` sums).
+    /// NOT necessarily what got hedged: see `hedged_qty` / `qty_mismatch`.
     pub qty: Decimal,
     pub aster_px: Decimal,
     pub lighter_px: Decimal,
+    /// Two-leg spread PnL on the MATCHED quantity only (`min(qty, hedged_qty)`, zero on a
+    /// side/market-mismatched pairing) — the unhedged remainder has no realized spread.
     pub gross_pnl: Decimal,
     pub aster_fee: Decimal,
     pub lighter_fee: Decimal,
     pub net_pnl: Decimal,
+    /// Lighter hedge quantity actually filled under this cloid.
+    pub hedged_qty: Decimal,
+    /// True when the maker and hedge legs disagree (qty, side, or market) — mirrors the
+    /// summary-level `qty_mismatches` counter, per trade.
+    pub qty_mismatch: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -191,13 +200,22 @@ fn summarize_reader_with_aster_fee<R: BufRead>(
         match (fills.get(&cloid), hedges.get(&cloid)) {
             (Some(fill), Some(hedge)) => {
                 let lighter_px = if hedge.qty > Decimal::ZERO { hedge.notional / hedge.qty } else { Decimal::ZERO };
-                if fill.qty != hedge.qty || fill.hedge_side != hedge.hedge_side || fill.market != hedge.market {
+                let side_or_market_mismatch =
+                    fill.hedge_side != hedge.hedge_side || fill.market != hedge.market;
+                let qty_mismatch = fill.qty != hedge.qty || side_or_market_mismatch;
+                if qty_mismatch {
                     out.qty_mismatches += 1;
                 }
+                // Honest partial-hedge accounting: only the MATCHED quantity realized the
+                // two-leg spread — the unhedged remainder is open exposure, not PnL. A
+                // side- or market-mismatched pairing is not a hedge at all: zero gross,
+                // flagged via qty_mismatch. Fees stay on the ACTUALS (the full maker fill
+                // and the hedge's journaled fee were really paid).
+                let matched_qty = if side_or_market_mismatch { Decimal::ZERO } else { fill.qty.min(hedge.qty) };
                 let gross = match fill.hedge_side {
                     // The journal side is the Lighter hedge side. BUY hedge means Aster sold.
-                    Side::Buy => fill.qty * (fill.aster_px - lighter_px),
-                    Side::Sell => fill.qty * (lighter_px - fill.aster_px),
+                    Side::Buy => matched_qty * (fill.aster_px - lighter_px),
+                    Side::Sell => matched_qty * (lighter_px - fill.aster_px),
                 };
                 let aster_fee = fill.qty * fill.aster_px * aster_fee_rate;
                 let lighter_fee = hedge.fee_usd;
@@ -224,6 +242,8 @@ fn summarize_reader_with_aster_fee<R: BufRead>(
                     aster_fee,
                     lighter_fee,
                     net_pnl: net,
+                    hedged_qty: hedge.qty,
+                    qty_mismatch,
                 });
             }
             (Some(_), None) => out.unmatched_fills += 1,
@@ -323,6 +343,54 @@ mod tests {
         assert_eq!(s.gross_pnl.round_dp(6), dec!(0.017967));
         assert_eq!(s.lighter_fees, dec!(0.000060));
         assert_eq!(s.net_pnl.round_dp(6), dec!(0.017907));
+        assert_eq!(s.qty_mismatches, 0);
+        // Fully-hedged trades: the partial-hedge fields are inert and the output identical.
+        for t in &s.trades {
+            assert_eq!(t.hedged_qty, t.qty);
+            assert!(!t.qty_mismatch);
+        }
+        assert_eq!(s.total_qty, dec!(0.41));
+    }
+
+    #[test]
+    fn partial_hedge_grosses_on_matched_qty_and_fees_on_actuals() {
+        // Maker filled 0.20 but only 0.12 got hedged: the spread is realized on 0.12 ONLY
+        // (the old code grossed the full 0.20 — overstating profit on the unhedged 0.08),
+        // while the fees remain what was actually paid (maker fee on 0.20, journal hedge fee).
+        let text = r#"
+{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"100","cloid":"a","qty":"0.20","side":"SELL"}}
+{"mono_ns":2,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"a","fee_usd":"0.01","px":"101","qty":"0.12","side":"SELL"}}
+"#;
+        let s = summarize_reader_with_aster_fee(Cursor::new(text), dec!(0.001), None, None).unwrap();
+        assert_eq!(s.trades.len(), 1);
+        let t = &s.trades[0];
+        assert_eq!(t.qty, dec!(0.20), "qty keeps meaning maker volume");
+        assert_eq!(t.hedged_qty, dec!(0.12));
+        assert!(t.qty_mismatch);
+        assert_eq!(s.qty_mismatches, 1);
+        // gross on matched 0.12: 0.12 * (101 - 100) = 0.12 (SELL hedge: lighter - aster).
+        assert_eq!(t.gross_pnl, dec!(0.12));
+        // aster fee on the FULL maker fill: 0.20 * 100 * 0.001 = 0.02; lighter fee = journal actual.
+        assert_eq!(t.aster_fee, dec!(0.020000));
+        assert_eq!(t.lighter_fee, dec!(0.01));
+        assert_eq!(t.net_pnl, dec!(0.09));
+        assert_eq!(s.total_qty, dec!(0.20), "total_qty keeps summing maker volume");
+    }
+
+    #[test]
+    fn side_mismatched_pairing_is_not_a_hedge_zero_gross_flagged() {
+        let text = r#"
+{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"100","cloid":"a","qty":"0.20","side":"BUY"}}
+{"mono_ns":2,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"a","fee_usd":"0.01","px":"90","qty":"0.20","side":"SELL"}}
+"#;
+        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
+        assert_eq!(s.trades.len(), 1);
+        let t = &s.trades[0];
+        assert!(t.qty_mismatch);
+        assert_eq!(s.qty_mismatches, 1);
+        assert_eq!(t.gross_pnl, dec!(0), "a same-direction pairing realized no spread");
+        assert_eq!(t.net_pnl, dec!(-0.01), "fees actually paid still count");
+        assert_eq!(t.hedged_qty, dec!(0.20));
     }
 
     #[test]
