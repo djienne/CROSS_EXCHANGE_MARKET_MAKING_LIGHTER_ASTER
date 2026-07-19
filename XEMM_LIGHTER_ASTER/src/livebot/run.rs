@@ -286,7 +286,7 @@ pub async fn run(
     // live: real workers + the account reconciler (clean-start + cold backstop) + the Aster
     // user (fill) stream feeding the maker-fill channel. The initial reconcile gates clean-start.
     let mut aux_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let (worker_task, clean_start, stream_liveness) = if exec_mode.sends_real_orders() {
+    let (worker_task, clean_start, stream_liveness, shutdown_recon) = if exec_mode.sends_real_orders() {
         setup_live_planes(
             cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, shutdown.clone(), &mut aux_tasks,
         )
@@ -295,7 +295,7 @@ pub async fn run(
         let mut snap = AccountSnapshot::empty();
         snap.source_ts_ns = mono_now_ns();
         account.publish(snap);
-        (tokio::spawn(run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx)), true, None)
+        (tokio::spawn(run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx)), true, None, None)
     };
     // (Startup cancel-all + clean-start verification now happen inside `setup_live_planes`
     // BEFORE the initial reconcile via `Reconciler::ensure_clean_start`, so the bot can never
@@ -484,6 +484,15 @@ pub async fn run(
             Err(_) => {
                 warn!("strategy did not stop within 10s of shutdown; stopping workers anyway");
             }
+        }
+    }
+    // Post-drain shutdown verification (live only): confirm the cancel-all landed, sweep for
+    // residual positions (a late fill manifests as a position — no userTrades REST on Aster),
+    // and persist the residual report. Bounded ≤ ~30s total; never blocks shutdown on failure.
+    if exec_mode.sends_real_orders() {
+        if let Some(recon) = &shutdown_recon {
+            let traded: Vec<MarketId> = specs.iter().map(|s| s.market_id.clone()).collect();
+            shutdown_verify(recon, &journal, &db_path, &traded).await;
         }
     }
     send_exec_safety(&exec_tx, ExecCommand::Shutdown, "exec Shutdown").await;
@@ -805,7 +814,12 @@ async fn setup_live_planes(
     maker_fill_tx: mpsc::Sender<AsterFill>,
     shutdown: CancellationToken,
     aux: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> Result<(tokio::task::JoinHandle<()>, bool, Option<Arc<super::userstream::StreamLiveness>>)> {
+) -> Result<(
+    tokio::task::JoinHandle<()>,
+    bool,
+    Option<Arc<super::userstream::StreamLiveness>>,
+    Option<super::reconcile::Reconciler>,
+)> {
     use std::path::Path;
 
     use super::exec::aster::{run_aster_worker, AsterRest};
@@ -865,6 +879,10 @@ async fn setup_live_planes(
     let worker_aster = new_aster()?;
     let worker_hl = hedge.clone();
     let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.simulation.max_book_staleness_ms);
+    // A second reconciler instance reserved for SHUTDOWN verification (cheap: a reqwest client +
+    // the shared signer Arc). The main one is consumed by its cold loop task and dies with the
+    // shutdown token; this one performs the post-drain cancel-confirmation + residual sweep.
+    let shutdown_recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.simulation.max_book_staleness_ms);
     let stream_aster = new_aster()?;
     let mut sym_to_market: HashMap<String, MarketId> = HashMap::new();
     for s in specs {
@@ -955,5 +973,82 @@ async fn setup_live_planes(
     let liveness = Arc::new(StreamLiveness::default());
     aux.push(tokio::spawn(run_aster_user_stream(stream_aster, sym_to_market, maker_fill_tx, liveness.clone(), shutdown.clone())));
 
-    Ok((worker_task, true, Some(liveness)))
+    Ok((worker_task, true, Some(liveness), Some(shutdown_recon)))
+}
+
+/// Post-drain shutdown verification (live only; F3). Confirms the shutdown cancel actually
+/// landed (re-cancels + polls `openOrders` for bot-prefixed strays) and takes one final
+/// snapshot to report/persist any residual positions — there is no Aster userTrades REST
+/// method, so a late fill is detected as a position. Every step is timeout-bounded and
+/// best-effort: the shutdown path must NEVER hang, so any error/timeout logs "verification
+/// incomplete" and moves on. The exit code is deliberately unchanged — a delta-neutral
+/// residual is documented-normal (positions are left open on graceful shutdown), and a NET
+/// imbalance is adopted + recovered by the next start (F2).
+async fn shutdown_verify(
+    recon: &super::reconcile::Reconciler,
+    journal: &Journal,
+    db_path: &std::path::Path,
+    markets: &[MarketId],
+) {
+    // 1. Re-cancel + poll for bot-prefixed strays. require_clean_start=false keeps it non-fatal
+    //    (a still-dirty book is loudly warned inside, and the deadman countdown remains armed).
+    match tokio::time::timeout(Duration::from_secs(20), recon.ensure_clean_start(true, false)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("shutdown verification incomplete: cancel/verify step failed: {e:#}"),
+        Err(_) => warn!("shutdown verification incomplete: cancel/verify step timed out after 20s"),
+    }
+    // 2. One final snapshot: residual positions + open-order check.
+    let snap = match tokio::time::timeout(Duration::from_secs(10), recon.snapshot()).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::error!("shutdown verification incomplete: final snapshot read failed: {e:#}");
+            return;
+        }
+        Err(_) => {
+            tracing::error!("shutdown verification incomplete: final snapshot read timed out after 10s");
+            return;
+        }
+    };
+    let orders_verified_empty = !snap.open_orders.iter().any(|o| o.is_bot_order());
+    if !orders_verified_empty {
+        tracing::error!("CRITICAL: bot orders still resting after shutdown cancel (deadman countdown will reap them)");
+    }
+    let residuals = super::breaker::residual_positions(&snap, markets);
+    let now_ns = mono_now_ns();
+    for line in &residuals {
+        if line.net_qty == rust_decimal::Decimal::ZERO {
+            tracing::error!(
+                "shutdown residual on {}: delta-neutral pair left open (aster={} lighter={}) — \
+                 documented-normal: graceful shutdown cancels orders but leaves positions",
+                line.market, line.aster_qty, line.hl_qty
+            );
+        } else {
+            tracing::error!(
+                "CRITICAL shutdown residual on {}: NET imbalance (aster={} lighter={} net={}) — \
+                 unhedged exposure; the next start adopts and recovers it",
+                line.market, line.aster_qty, line.hl_qty, line.net_qty
+            );
+        }
+        journal.record(
+            now_ns,
+            "shutdown_residual",
+            Some(line.market.clone()),
+            serde_json::json!({
+                "aster_qty": line.aster_qty.to_string(),
+                "hl_qty": line.hl_qty.to_string(),
+                "net_qty": line.net_qty.to_string(),
+                "orders_verified_empty": orders_verified_empty,
+            }),
+        );
+    }
+    // 3. Persist the residual report next to the trip latch (atomic, overwritten per shutdown).
+    let rec = super::breaker::ResidualRecord {
+        ts_utc: Utc::now().to_rfc3339(),
+        orders_verified_empty,
+        residuals,
+    };
+    let path = super::breaker::residual_path(db_path);
+    if let Err(e) = super::breaker::write_residual(&path, &rec) {
+        warn!("failed to write shutdown residual report to {}: {e:#}", path.display());
+    }
 }
