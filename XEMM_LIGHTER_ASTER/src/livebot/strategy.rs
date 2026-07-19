@@ -59,6 +59,11 @@ const BREAKER_BASELINE_SAMPLES: usize = 5;
 /// Consecutive fresh marked samples that must breach the loss limit before the breaker
 /// trips (~4-6s at the 2s reconcile cadence). One anomalous snapshot must not halt the bot.
 const BREAKER_TRIP_STREAK: u32 = 3;
+/// Orphan cross-check escalation threshold: after this many DISTINCT snapshots where predicted
+/// reads balanced but the reported snapshot shows a net imbalance, stop treating the disagreement
+/// as a transient venue read (the cross-check's defer would otherwise repeat forever, leaving the
+/// exposure unhedged with the maker gate closed) and let the persistence gate confirm + recover.
+const ORPHAN_CROSSCHECK_MAX_DEFERS: u32 = 5;
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,6 +875,16 @@ pub struct Strategy {
     /// yet) is filtered out instead of triggering a redundant recovery hedge. This keeps recovery
     /// EXCEPTIONAL (real persistent orphans only), so fast fills are hedged by the primary path.
     orphan_seen: HashMap<MarketId, (Decimal, i64)>,
+    /// Escalation counter for the snapshot-predicted cross-check: `(distinct-snapshot defer
+    /// count, last counted snapshot source_ts_ns)`. The cross-check defers when predicted reads
+    /// balanced but the snapshot shows a net imbalance (likely a transient venue read) — but if
+    /// that disagreement persists across [`ORPHAN_CROSSCHECK_MAX_DEFERS`] DISTINCT snapshots it
+    /// is not transient (e.g. predicted drifted on a missed fill), and deferring forever would
+    /// leave real exposure unhedged with the maker gate closed. Past the threshold the reported
+    /// snapshot is treated as truth and the persistence gate (which still requires confirmation
+    /// in a strictly newer snapshot) takes over. Cleared when the market reads delta-neutral or
+    /// the cross-check condition stops holding.
+    orphan_crosscheck_defers: HashMap<MarketId, (u32, i64)>,
     /// Monotonic ns of the most recent hot action (maker fill processed / primary hedge dispatched)
     /// per market. The orphan backstop ignores any snapshot whose READS BEGAN before this — such a
     /// snapshot cannot yet reflect the action, so acting on it could double-hedge (the fast-network
@@ -1003,6 +1018,7 @@ impl Strategy {
             last_recovery: HashMap::new(),
             recovery_attempt_seq: HashMap::new(),
             orphan_seen: HashMap::new(),
+            orphan_crosscheck_defers: HashMap::new(),
             last_hot_action_ns: HashMap::new(),
             heal_confirm: None,
             aster_stream: None,
@@ -1055,6 +1071,69 @@ impl Strategy {
     pub fn mark_clean_start(&mut self) {
         self.clean_start = true;
         self.account.hot.set_trading_allowed(true);
+    }
+
+    /// Adopt the venue-REPORTED positions from the startup snapshot as the predicted positions.
+    /// Called once from `run.rs` after the initial reconcile published its snapshot, before the
+    /// strategy thread spawns. The predicted maps start empty and prior-session fills are never
+    /// re-attributed (client ids are session-prefixed), so after a NON-neutral restart the old
+    /// code never reached the dust-branch sync: the snapshot-predicted cross-check deferred
+    /// forever ("predicted balanced but snapshot disagrees") while `positions_reconciled` kept
+    /// the maker gate closed — quoting frozen AND the imbalance left unhedged indefinitely.
+    /// Seeding predicted from the reported snapshot lets the normal reconcile/orphan machinery
+    /// (with all its confirmation gates) take over. Requires a FRESH snapshot: if it is absent
+    /// or stale we adopt nothing, which degrades to the old freeze — never trusts stale data.
+    pub fn adopt_reported_positions(&mut self, now_ns: i64) {
+        if !self.exec_mode.sends_real_orders() {
+            return; // paper/record: no real prior-session positions to adopt
+        }
+        let snap = self.account.load();
+        let max_age_ns = self.cfg.live.max_account_snapshot_age_ms.saturating_mul(1_000_000);
+        if snap.source_ts_ns == 0 || now_ns.saturating_sub(snap.source_ts_ns) > max_age_ns {
+            error!(
+                "adopt_reported_positions: startup snapshot absent/stale (age_ms={}); NOT adopting — \
+                 predicted stays empty and the maker gate stays closed until reconciled",
+                self.account.age_ms(now_ns)
+            );
+            return;
+        }
+        let mut adopted = Vec::new();
+        for m in &self.markets {
+            let find = |list: &[super::account::ScaledPosition]| {
+                list.iter()
+                    .find(|p| &p.market == m)
+                    .map(|p| (p.signed_qty, p.entry_px))
+                    .unwrap_or((Decimal::ZERO, Decimal::ZERO))
+            };
+            let (a_qty, a_px) = find(&snap.aster_positions);
+            let (h_qty, h_px) = find(&snap.hl_positions);
+            self.aster_pos.insert(m.clone(), SignedPosition { qty: a_qty, avg_px: a_px });
+            self.hl_pos.insert(m.clone(), SignedPosition { qty: h_qty, avg_px: h_px });
+            if a_qty != Decimal::ZERO || h_qty != Decimal::ZERO {
+                warn!(
+                    "adopted prior-session position on {m}: aster={a_qty}@{a_px} lighter={h_qty}@{h_px} \
+                     (net {}) — recovery machinery will confirm and neutralize any imbalance",
+                    a_qty + h_qty
+                );
+            }
+            adopted.push(serde_json::json!({
+                "market": m.0.clone(),
+                "aster_qty": a_qty.to_string(),
+                "aster_px": a_px.to_string(),
+                "hl_qty": h_qty.to_string(),
+                "hl_px": h_px.to_string(),
+            }));
+        }
+        self.journal.record(
+            now_ns,
+            "adopt_positions",
+            None,
+            serde_json::json!({
+                "snapshot_generation": snap.generation,
+                "snapshot_age_ms": self.account.age_ms(now_ns),
+                "positions": adopted,
+            }),
+        );
     }
 
     /// Wire the Aster user-stream liveness so [`may_quote`](Self::may_quote) can freeze on a
@@ -3216,6 +3295,7 @@ impl Strategy {
                 self.hl_pos.entry(m.clone()).or_default().qty = rep_h;
                 self.hedges.retain(|_, h| !(h.market == m && h.state.is_dangerous()));
                 self.orphan_seen.remove(&m); // orphan resolved — reset the persistence record
+                self.orphan_crosscheck_defers.remove(&m); // neutral again — reset the escalation
                 continue;
             }
             // ── SNAPSHOT-PREDICTED CROSS-CHECK ──
@@ -3229,11 +3309,50 @@ impl Strategy {
             let pred_h = self.hl_pos.get(&m).map(|p| p.qty).unwrap_or_default();
             let predicted_net = pred_a + pred_h + in_flight - pending_signed;
             if predicted_net.abs() * mark <= dust && net_notional > dust {
-                warn!("orphan skip {m}: predicted balanced (pred_a={pred_a} pred_h={pred_h} net={predicted_net}) \
-                       but snapshot disagrees (rep_a={rep_a} rep_h={rep_h} eff={effective_net} ${net_notional}) — \
-                       likely a transient venue read; deferring");
-                self.orphan_seen.remove(&m);
-                continue;
+                // ── ESCALATION BACKSTOP ──
+                // Count DISTINCT snapshots only (the tick cadence re-reads the same snapshot):
+                // a transient venue read clears within a snapshot or two; a disagreement that
+                // persists across ORPHAN_CROSSCHECK_MAX_DEFERS distinct snapshots means the
+                // PREDICTED side drifted (e.g. a missed fill), and deferring forever would leave
+                // real exposure unhedged with the maker gate closed. Past the threshold, treat
+                // reported as truth: fall through into the persistence gate below, which STILL
+                // requires the orphan confirmed in a strictly newer snapshot before acting.
+                let (mut count, last_src) =
+                    self.orphan_crosscheck_defers.get(&m).copied().unwrap_or((0, 0));
+                let distinct = snap.source_ts_ns > last_src;
+                if distinct {
+                    count += 1;
+                }
+                self.orphan_crosscheck_defers
+                    .insert(m.clone(), (count, last_src.max(snap.source_ts_ns)));
+                if count <= ORPHAN_CROSSCHECK_MAX_DEFERS {
+                    warn!("orphan skip {m}: predicted balanced (pred_a={pred_a} pred_h={pred_h} net={predicted_net}) \
+                           but snapshot disagrees (rep_a={rep_a} rep_h={rep_h} eff={effective_net} ${net_notional}) — \
+                           likely a transient venue read; deferring ({count}/{ORPHAN_CROSSCHECK_MAX_DEFERS})");
+                    self.orphan_seen.remove(&m);
+                    continue;
+                }
+                if distinct {
+                    error!("orphan cross-check ESCALATION {m}: predicted balanced (pred_a={pred_a} pred_h={pred_h} \
+                            net={predicted_net}) but {count} distinct snapshots disagree (rep_a={rep_a} rep_h={rep_h} \
+                            eff={effective_net} ${net_notional}) — treating reported as truth; persistence gate \
+                            must still confirm in a newer snapshot before recovery acts");
+                    self.journal.record(now_ns, "orphan_crosscheck_escalation", Some(m.0.clone()), serde_json::json!({
+                        "distinct_snapshots": count,
+                        "pred_a": pred_a.to_string(),
+                        "pred_h": pred_h.to_string(),
+                        "rep_a": rep_a.to_string(),
+                        "rep_h": rep_h.to_string(),
+                        "effective_net": effective_net.to_string(),
+                        "net_notional_usd": net_notional.to_string(),
+                    }));
+                }
+                // FALL THROUGH (no `continue`): the counter stays latched past the threshold so
+                // every subsequent snapshot also reaches the persistence gate — resetting it here
+                // would let the interleaved defers wipe the gate's first-sighting record forever.
+                // It clears via the dust branch / condition-false path once reality is restored.
+            } else {
+                self.orphan_crosscheck_defers.remove(&m);
             }
             // ── PERSISTENCE GATE ──
             // Only ACT once this orphan has persisted into a STRICTLY NEWER snapshot than first
@@ -5155,6 +5274,163 @@ lighter_symbol = "BTC"
             strat.hedges.contains_key(&intent.cloid.to_hex()),
             "new intent must be tracked under the salted cloid"
         );
+    }
+
+    // --- startup position adoption (F2) + cross-check escalation ---
+
+    /// A fresh snapshot reporting positions on BOTH venues for `m`.
+    fn adopt_snapshot_for(
+        m: &MarketId,
+        aster: (Decimal, Decimal),
+        hl: (Decimal, Decimal),
+        src: i64,
+    ) -> crate::livebot::account::AccountSnapshot {
+        use crate::livebot::account::{ScaledPosition, Venue};
+        let mut s = crate::livebot::account::AccountSnapshot::empty();
+        s.aster_available_usd = dec!(1000);
+        s.hl_withdrawable_usd = dec!(1000);
+        s.aster_equity_usd = dec!(1000);
+        s.hl_equity_usd = dec!(1000);
+        if aster.0 != Decimal::ZERO {
+            s.aster_positions =
+                vec![ScaledPosition { venue: Venue::Aster, market: m.clone(), signed_qty: aster.0, entry_px: aster.1 }];
+        }
+        if hl.0 != Decimal::ZERO {
+            s.hl_positions =
+                vec![ScaledPosition { venue: Venue::Hyperliquid, market: m.clone(), signed_qty: hl.0, entry_px: hl.1 }];
+        }
+        s.source_ts_ns = src;
+        s.read_start_ns = src - 1_000_000;
+        s
+    }
+
+    #[test]
+    fn adopt_seeds_predicted_from_snapshot() {
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        let src = 10_000_000_000_i64;
+        account.publish(adopt_snapshot_for(&m, (dec!(0.5), dec!(101)), (dec!(-0.3), dec!(102)), src));
+        strat.adopt_reported_positions(src + 1_000_000); // 1ms later: fresh
+        let a = strat.aster_pos.get(&m).expect("aster leg adopted");
+        assert_eq!((a.qty, a.avg_px), (dec!(0.5), dec!(101)));
+        let h = strat.hl_pos.get(&m).expect("hl leg adopted");
+        assert_eq!((h.qty, h.avg_px), (dec!(-0.3), dec!(102)));
+    }
+
+    #[test]
+    fn adopt_refuses_stale_snapshot() {
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        // No snapshot at all: refuse.
+        strat.adopt_reported_positions(1_000_000_000);
+        assert!(strat.aster_pos.is_empty() && strat.hl_pos.is_empty(), "no snapshot ⇒ no adoption");
+        // Stale snapshot (older than max_account_snapshot_age_ms): refuse.
+        let src = 10_000_000_000_i64;
+        account.publish(adopt_snapshot_for(&m, (dec!(0.5), dec!(101)), (Decimal::ZERO, Decimal::ZERO), src));
+        let stale_now = src + (strat.cfg.live.max_account_snapshot_age_ms + 1) * 1_000_000;
+        strat.adopt_reported_positions(stale_now);
+        assert!(strat.aster_pos.is_empty() && strat.hl_pos.is_empty(), "stale snapshot ⇒ no adoption");
+    }
+
+    #[test]
+    fn adopt_is_noop_in_paper() {
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Paper);
+        let m: MarketId = "BTC".into();
+        let src = 10_000_000_000_i64;
+        account.publish(adopt_snapshot_for(&m, (dec!(0.5), dec!(101)), (dec!(-0.5), dec!(102)), src));
+        strat.adopt_reported_positions(src + 1_000_000);
+        assert!(strat.aster_pos.is_empty() && strat.hl_pos.is_empty(), "paper must not adopt");
+    }
+
+    #[test]
+    fn restart_with_nonneutral_imbalance_recovers() {
+        // THE F2 regression: bot restarts with a prior-session +0.5 Aster leg and no Lighter
+        // hedge. Predicted maps start empty, so the old code hit the snapshot-predicted
+        // cross-check every snapshot ("predicted balanced but snapshot disagrees") and deferred
+        // FOREVER — maker gate closed, exposure unhedged. With adoption, predicted is seeded
+        // from the startup snapshot and the ordinary persistence-gated recovery dispatches.
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        assert!(strat.aster_pos.is_empty(), "precondition: predicted starts empty");
+
+        // Startup snapshot: rep_a=+0.5, rep_h=0. Adopt it (fresh).
+        let src0 = 10_000_000_000_i64;
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), src0, src0 - 1_000_000));
+        strat.adopt_reported_positions(src0 + 1_000_000);
+        assert_eq!(strat.aster_pos.get(&m).map(|p| p.qty), Some(dec!(0.5)));
+
+        // First backstop pass: seeds the persistence gate (no dispatch yet).
+        strat.recover_orphans(src0 + 2_000_000);
+        assert!(hrx.try_recv().is_err(), "first sighting must not dispatch");
+        assert!(strat.orphan_seen.contains_key(&m), "cross-check must NOT defer after adoption");
+
+        // Confirming strictly-newer snapshot: recovery dispatches the neutralizing hedge.
+        let src1 = src0 + 2_000_000_000;
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), src1, src1 - 1_000_000));
+        strat.recover_orphans(src1 + 1_000_000);
+        match hrx.try_recv().expect("confirmed restart imbalance must dispatch recovery") {
+            HedgeCommand::Hedge { intent, .. } => {
+                assert_eq!(intent.market, m);
+                assert_eq!(intent.hedge_side, Side::Sell);
+                assert_eq!(intent.qty, dec!(0.5));
+            }
+            other => panic!("expected a recovery hedge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crosscheck_escalates_after_n_distinct_snapshots() {
+        // Mid-session predicted drift (predicted balanced, snapshot imbalanced) must not defer
+        // forever: after ORPHAN_CROSSCHECK_MAX_DEFERS DISTINCT snapshots the cross-check
+        // escalates and lets the persistence gate confirm + act. Repeated ticks on the SAME
+        // snapshot never consume defers.
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        // Predicted left EMPTY (balanced) while every snapshot reports +0.5 on Aster.
+        let step = 2_000_000_000_i64;
+        let mut src = 10_000_000_000_i64;
+        for i in 1..=ORPHAN_CROSSCHECK_MAX_DEFERS {
+            account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
+            strat.recover_orphans(src + 1_000_000);
+            assert!(hrx.try_recv().is_err(), "defer {i} must not dispatch");
+            assert!(!strat.orphan_seen.contains_key(&m), "defer {i} must clear the persistence gate");
+            assert_eq!(strat.orphan_crosscheck_defers.get(&m), Some(&(i, src)));
+            // Re-tick on the SAME snapshot: must not consume a defer.
+            strat.recover_orphans(src + 1_500_000);
+            assert_eq!(strat.orphan_crosscheck_defers.get(&m), Some(&(i, src)), "same snapshot must not count");
+            src += step;
+        }
+        // Next DISTINCT snapshot escalates: falls through to the persistence gate (seeds it).
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
+        strat.recover_orphans(src + 1_000_000);
+        assert!(hrx.try_recv().is_err(), "escalation snapshot seeds the gate; no dispatch yet");
+        assert!(strat.orphan_seen.contains_key(&m), "escalation must seed the persistence gate");
+        // A further strictly-newer snapshot confirms the orphan and dispatches recovery.
+        src += step;
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
+        strat.recover_orphans(src + 1_000_000);
+        match hrx.try_recv().expect("escalated + confirmed orphan must dispatch recovery") {
+            HedgeCommand::Hedge { intent, .. } => {
+                assert_eq!(intent.hedge_side, Side::Sell);
+                assert_eq!(intent.qty, dec!(0.5));
+            }
+            other => panic!("expected a recovery hedge, got {other:?}"),
+        }
     }
 
     // --- circuit breaker ---

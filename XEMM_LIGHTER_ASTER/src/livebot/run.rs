@@ -315,6 +315,11 @@ pub async fn run(
     if clean_start {
         strat.mark_clean_start();
     }
+    // Seed predicted positions from the startup snapshot (published by the initial reconcile in
+    // setup_live_planes). Without this, a non-neutral restart froze quoting forever with the
+    // imbalance unhedged: predicted started empty, so the orphan cross-check treated every
+    // snapshot as a transient venue read. No-op in paper; refuses stale/absent snapshots.
+    strat.adopt_reported_positions(mono_now_ns());
     // Arm the cumulative-loss circuit breaker: it halts via this same shutdown token and persists a
     // trip latch at this run's per-db path (the startup guard above reads the same path). Inert
     // unless live.circuit_breaker.enabled and running live.
