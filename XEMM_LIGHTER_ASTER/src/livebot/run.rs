@@ -319,6 +319,10 @@ pub async fn run(
     // trip latch at this run's per-db path (the startup guard above reads the same path). Inert
     // unless live.circuit_breaker.enabled and running live.
     strat.arm_circuit_breaker(super::breaker::trip_path(&db_path), shutdown.clone());
+    // In-memory trip backstop: guarantees a nonzero exit at shutdown even if the persistent
+    // latch write fails (unwritable runs/ dir) — see the shutdown check at the end of run().
+    let breaker_tripped_flag = Arc::new(AtomicBool::new(false));
+    strat.set_trip_flag(breaker_tripped_flag.clone());
     strat.set_dirty(dirty);
     if let Some(ls) = stream_liveness {
         strat.set_user_stream(ls); // freeze quoting if the Aster fill stream silently dies
@@ -547,6 +551,30 @@ pub async fn run(
     // pre-existing latch, so "latch exists at shutdown" ⇔ "the breaker fired THIS run".
     if exec_mode.sends_real_orders() {
         super::breaker::check_shutdown(&db_path)?;
+    }
+    // In-memory backstop for the same trip: if the persistent latch write FAILED at trip time
+    // (unwritable runs/ dir), check_shutdown above sees no file and passes — and the supervisor
+    // would restart straight into trading. The strategy sets this flag before attempting the
+    // write, so re-attempt the latch best-effort and exit nonzero regardless.
+    if breaker_tripped_flag.load(Ordering::Acquire) {
+        let trip = super::breaker::trip_path(&db_path);
+        if !trip.exists() {
+            let rec = super::breaker::TripRecord {
+                ts_utc: Utc::now().to_rfc3339(),
+                market: specs.first().map(|s| s.market_id.0.clone()).unwrap_or_default(),
+                baseline_usd: Default::default(),
+                equity_usd: Default::default(),
+                loss_usd: Default::default(),
+                limit_usd: Default::default(),
+                reason: "circuit breaker tripped this run; latch rewritten at shutdown \
+                         (original write failed)"
+                    .to_string(),
+            };
+            if let Err(e) = super::breaker::write_trip(&trip, &rec) {
+                warn!("failed to re-write circuit-breaker trip latch at shutdown ({}): {e:#}", trip.display());
+            }
+        }
+        bail!("circuit breaker tripped during this run (in-memory flag); exiting nonzero so the supervisor halts");
     }
 
     info!("livebot stopped. research tape -> {} ; results db -> {}", tape_path.display(), db_path.display());

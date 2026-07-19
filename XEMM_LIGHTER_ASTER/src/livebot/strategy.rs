@@ -903,6 +903,10 @@ pub struct Strategy {
     breaker_last_generation: u64,
     /// Latched once the breaker fires (prevents re-tripping / duplicate latch writes).
     breaker_tripped: bool,
+    /// In-memory trip flag shared with `run.rs` (set via [`Strategy::set_trip_flag`]). Set BEFORE
+    /// the persistent latch write so a failed/unwritable trip file still forces a nonzero exit at
+    /// shutdown — otherwise the orchestrator would restart straight back into trading.
+    trip_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Per-market maker-gate suppression tracking, for OBSERVABILITY: `(since_ns, reason, logged)`.
     /// A closed maker gate (orphan hedge / unhedged-over-limit / stale snapshot / stale feed / …)
     /// otherwise suppresses quoting with NO log and no `frozen` latch — the exact failure mode that
@@ -1009,6 +1013,7 @@ impl Strategy {
             breaker_breach_streak: 0,
             breaker_last_generation: 0,
             breaker_tripped: false,
+            trip_flag: None,
             quote_suppressed: HashMap::new(),
             margin_suppressed: HashMap::new(),
             aster_touch_guard_blocked: HashMap::new(),
@@ -1034,6 +1039,12 @@ impl Strategy {
     ) {
         self.trip_file_path = Some(trip_file_path);
         self.shutdown = shutdown;
+    }
+
+    /// Wire the in-memory breaker trip flag (read by `run.rs` at shutdown to guarantee a nonzero
+    /// exit even when the persistent trip-latch write failed).
+    pub fn set_trip_flag(&mut self, f: Arc<std::sync::atomic::AtomicBool>) {
+        self.trip_flag = Some(f);
     }
 
     /// Mark startup reconciliation complete — quoting may begin (still gated by feeds/cooldown).
@@ -2988,6 +2999,11 @@ impl Strategy {
         }
         // TRIP — latch, journal, persist, and halt (graceful drain leaves the position open).
         self.breaker_tripped = true;
+        // In-memory flag FIRST (before the fallible latch write below): run.rs turns it into a
+        // guaranteed nonzero exit at shutdown even if write_trip fails on an unwritable path.
+        if let Some(flag) = &self.trip_flag {
+            flag.store(true, std::sync::atomic::Ordering::Release);
+        }
         let market = self.markets.first().map(|m| m.0.clone()).unwrap_or_default();
         error!(
             "CIRCUIT BREAKER TRIPPED on {market}: equity {equity} USD is {loss} USD below baseline \
@@ -5171,6 +5187,8 @@ lighter_symbol = "BTC"
         let trip = tmp_trip_path("trips");
         let _ = std::fs::remove_file(&trip);
         strat.arm_circuit_breaker(trip.clone(), tok.clone());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        strat.set_trip_flag(flag.clone());
 
         let mut t = 1_000_000_000_i64;
         // Baseline arms from the MEDIAN of the first K fresh marked samples; not before.
@@ -5200,6 +5218,7 @@ lighter_symbol = "BTC"
             assert!(!strat.breaker_tripped);
             assert!(!tok.is_cancelled());
         }
+        assert!(!flag.load(std::sync::atomic::Ordering::Acquire), "flag must not be set pre-trip");
         // ...the Nth consecutive breach TRIPS: cancels shutdown + writes the latch.
         account.publish(equity_snap(dec!(94), t));
         strat.check_circuit_breaker(t);
@@ -5207,6 +5226,10 @@ lighter_symbol = "BTC"
         assert!(strat.breaker_tripped);
         assert!(tok.is_cancelled(), "breaker must cancel the shutdown token to halt the process");
         assert!(trip.exists(), "breaker must write the trip latch");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "breaker must set the in-memory trip flag for the shutdown exit-code backstop"
+        );
         assert!(matches!(erx.try_recv().unwrap(), ExecCommand::CancelAllBot));
 
         // Latched: a further reading neither un-trips nor rewrites the latch.
@@ -5216,6 +5239,47 @@ lighter_symbol = "BTC"
         assert!(strat.breaker_tripped);
         assert_eq!(std::fs::read_to_string(&trip).unwrap(), latch, "latch must not be rewritten");
         let _ = std::fs::remove_file(&trip);
+    }
+
+    #[test]
+    fn breaker_trip_flag_and_halt_survive_unwritable_latch_path() {
+        // If write_trip fails (unwritable runs/ dir), the persistent latch never lands and the
+        // shutdown check_shutdown() passes — the in-memory flag is the exit-code backstop. It
+        // (and the halt token) must be set BEFORE / regardless of the latch write outcome.
+        let account = AccountState::new(dec!(5));
+        let (etx, _erx) = tokio::sync::mpsc::channel(64);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(64);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        strat.cfg.live.circuit_breaker.enabled = true;
+        strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
+        let tok = CancellationToken::new();
+        // Point the latch at a CHILD path of an existing regular FILE so create/rename fails.
+        let blocker = std::env::temp_dir().join(format!("xemm_cb_blocker_{}", std::process::id()));
+        std::fs::write(&blocker, b"x").unwrap();
+        let trip = blocker.join("cannot.trip.json");
+        strat.arm_circuit_breaker(trip.clone(), tok.clone());
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        strat.set_trip_flag(flag.clone());
+
+        let mut t = 4_000_000_000_i64;
+        for _ in 0..BREAKER_BASELINE_SAMPLES {
+            account.publish(equity_snap(dec!(100), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        for _ in 0..BREAKER_TRIP_STREAK {
+            account.publish(equity_snap(dec!(94), t));
+            strat.check_circuit_breaker(t);
+            t += 1_000_000;
+        }
+        assert!(strat.breaker_tripped);
+        assert!(!trip.exists(), "precondition: the latch write must actually have failed");
+        assert!(tok.is_cancelled(), "halt must not depend on the latch write succeeding");
+        assert!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            "in-memory flag must be set even when the latch path is unwritable"
+        );
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
