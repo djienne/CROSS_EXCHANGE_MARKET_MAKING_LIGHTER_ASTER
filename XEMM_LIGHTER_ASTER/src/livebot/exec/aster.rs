@@ -26,6 +26,8 @@ use crate::types::{MarketId, Side};
 const ASTER_ORDER_PATH: &str = "/fapi/v3/order";
 const ASTER_ALL_ORDERS_PATH: &str = "/fapi/v3/allOpenOrders";
 const ASTER_DEADMAN_PATH: &str = "/fapi/v3/countdownCancelAll";
+const ASTER_LISTEN_KEY_PATH: &str = "/fapi/v3/listenKey";
+const ASTER_POSITION_SIDE_PATH: &str = "/fapi/v3/positionSide/dual";
 const ASTER_RECV_WINDOW: &str = "50000";
 const USER_AGENT: &str = "xemm-livebot";
 
@@ -264,9 +266,8 @@ impl AsterRest {
     /// assumes one-way (`positionSide=BOTH`); hedge mode would mis-route orders and mis-report
     /// positions, so live trading refuses to start unless this is true.
     pub async fn is_one_way(&self) -> Result<bool> {
-        let body = self.signed_request(Method::GET, "/fapi/v3/positionSide/dual", vec![]).await?;
-        let v: serde_json::Value = serde_json::from_str(&body)?;
-        Ok(!v.get("dualSidePosition").and_then(|d| d.as_bool()).unwrap_or(false))
+        let body = self.signed_request(Method::GET, ASTER_POSITION_SIDE_PATH, vec![]).await?;
+        parse_one_way(&body)
     }
 
     /// Signed open-orders read (`GET /fapi/v3/openOrders`), optionally for one symbol.
@@ -298,12 +299,18 @@ impl AsterRest {
 
     /// Keep the listenKey alive (`PUT /fapi/v3/listenKey`, no params). ~30-min cadence.
     pub async fn keepalive_listen_key(&self) -> Result<()> {
-        self.signed_request(Method::PUT, "/fapi/v3/listenKey", vec![]).await.map(|_| ())
+        self.signed_request(Method::PUT, ASTER_LISTEN_KEY_PATH, vec![])
+            .await
+            .and_then(|body| reject_body_error(ASTER_LISTEN_KEY_PATH, &body))
+            .map(|_| ())
     }
 
     /// Close the listenKey (`DELETE /fapi/v3/listenKey`) — only on graceful shutdown.
     pub async fn close_listen_key(&self) -> Result<()> {
-        self.signed_request(Method::DELETE, "/fapi/v3/listenKey", vec![]).await.map(|_| ())
+        self.signed_request(Method::DELETE, ASTER_LISTEN_KEY_PATH, vec![])
+            .await
+            .and_then(|body| reject_body_error(ASTER_LISTEN_KEY_PATH, &body))
+            .map(|_| ())
     }
 
     /// Place a maker order and classify the response into a place lifecycle event.
@@ -367,7 +374,10 @@ impl AsterRest {
             ("positionSide".into(), "BOTH".into()),
             ("reduceOnly".into(), "true".into()),
         ];
-        self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await.map(|_| ())
+        self.signed_request(Method::POST, ASTER_ORDER_PATH, params)
+            .await
+            .and_then(|body| reject_body_error(ASTER_ORDER_PATH, &body))
+            .map(|_| ())
     }
 
     /// Refresh the Aster dead-man countdown for a symbol (heartbeat; §3.4).
@@ -377,13 +387,19 @@ impl AsterRest {
             ("symbol".into(), w.symbol.clone()),
             ("countdownTime".into(), self.deadman_countdown_ms.to_string()),
         ];
-        self.signed_request(Method::POST, ASTER_DEADMAN_PATH, params).await.map(|_| ())
+        self.signed_request(Method::POST, ASTER_DEADMAN_PATH, params)
+            .await
+            .and_then(|body| reject_body_error(ASTER_DEADMAN_PATH, &body))
+            .map(|_| ())
     }
 
     pub(crate) async fn cancel_all_symbol(&self, market: &MarketId) -> Result<()> {
         let w = self.wire(market)?;
         let params = vec![("symbol".into(), w.symbol.clone())];
-        self.signed_request(Method::DELETE, ASTER_ALL_ORDERS_PATH, params).await.map(|_| ())
+        self.signed_request(Method::DELETE, ASTER_ALL_ORDERS_PATH, params)
+            .await
+            .and_then(|body| reject_body_error(ASTER_ALL_ORDERS_PATH, &body))
+            .map(|_| ())
     }
 
     /// Read the account's CURRENT leverage for a symbol (`GET /fapi/v3/positionRisk?symbol=…`).
@@ -418,6 +434,37 @@ pub(crate) enum CancelOutcome {
     AlreadyGone,
     /// The order is no longer resting because it filled/expired. Safe for cancel, not for replace-place.
     FilledOrExpired,
+}
+
+/// Reject an HTTP-200 body that carries a venue error envelope (`{"code":…,"msg":…}`); pass the
+/// body through on success. Aster returns HTTP 200 for some business errors, so transport success
+/// != venue success. `code == 0` and `code == 200` are success echoes (cancel-all replies
+/// `{"code":200,"msg":"...done."}`); most success bodies carry no `code` at all. Non-JSON,
+/// non-object, and non-integer-code bodies pass through unchanged — strict per-shape
+/// classification for place/cancel stays with `classify_place`/`classify_cancel`.
+fn reject_body_error(path: &str, body: &str) -> Result<String> {
+    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(code) = obj.get("code").and_then(|c| c.as_i64()) {
+            if code != 0 && code != 200 {
+                let msg = obj.get("msg").and_then(|m| m.as_str()).unwrap_or_default();
+                return Err(anyhow!("aster {path} venue error code {code}: {msg}"));
+            }
+        }
+    }
+    Ok(body.to_string())
+}
+
+/// Parse the `GET /fapi/v3/positionSide/dual` body into "is one-way mode". Venue error envelopes
+/// are rejected first, and `dualSidePosition` MUST be present and boolean — a malformed body must
+/// not silently read as "one-way OK" (the startup gate bails instead: fail-closed).
+fn parse_one_way(body: &str) -> Result<bool> {
+    let body = reject_body_error(ASTER_POSITION_SIDE_PATH, body)?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| anyhow!("parse positionSide/dual: {e}: {body}"))?;
+    match v.get("dualSidePosition").and_then(|d| d.as_bool()) {
+        Some(dual) => Ok(!dual),
+        None => Err(anyhow!("positionSide/dual response missing boolean dualSidePosition: {body}")),
+    }
 }
 
 /// Classify a DELETE `/fapi/v3/order` response into cancel success/failure. Aster returns HTTP 200
@@ -1129,6 +1176,49 @@ mod tests {
             ExecEvent::PlaceUnknown { reason, .. } => assert!(reason.contains("missing orderId")),
             other => panic!("expected PlaceUnknown, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reject_body_error_passes_success_shapes_through() {
+        // Order JSON without a code field (normal place/flatten success echo).
+        let order = r#"{"orderId":2037568488,"symbol":"HYPEUSDT","status":"NEW"}"#;
+        assert_eq!(reject_body_error("/p", order).unwrap(), order);
+        // Cancel-all success echo carries code 200.
+        let done = r#"{"code":200,"msg":"The operation of cancel all open order is done."}"#;
+        assert_eq!(reject_body_error("/p", done).unwrap(), done);
+        // code 0 is a success echo too.
+        assert!(reject_body_error("/p", r#"{"code":0}"#).is_ok());
+        // Arrays and non-JSON pass through unchanged (classification belongs elsewhere).
+        assert_eq!(reject_body_error("/p", "[]").unwrap(), "[]");
+        assert_eq!(reject_body_error("/p", "not json").unwrap(), "not json");
+    }
+
+    #[test]
+    fn reject_body_error_rejects_venue_error_codes() {
+        for (code, msg) in [
+            (-1003, "Too many requests."),
+            (-2011, "Unknown order sent."),
+            (-4164, "Order's notional must be no smaller than 5"),
+        ] {
+            let body = format!(r#"{{"code":{code},"msg":"{msg}"}}"#);
+            let err = reject_body_error("/fapi/v3/order", &body).unwrap_err().to_string();
+            assert!(err.contains(&code.to_string()), "error must include code {code}: {err}");
+            assert!(err.contains(msg), "error must include msg: {err}");
+        }
+    }
+
+    #[test]
+    fn parse_one_way_requires_boolean_field() {
+        assert!(parse_one_way(r#"{"dualSidePosition":false}"#).unwrap()); // one-way
+        assert!(!parse_one_way(r#"{"dualSidePosition":true}"#).unwrap()); // hedge mode
+        // Missing / non-boolean field must FAIL (never default to "one-way OK").
+        let err = parse_one_way(r#"{"something":"else"}"#).unwrap_err().to_string();
+        assert!(err.contains("dualSidePosition"), "{err}");
+        assert!(parse_one_way(r#"{"dualSidePosition":"false"}"#).is_err());
+        assert!(parse_one_way("not json").is_err());
+        // Venue error envelope (HTTP 200 body) must FAIL, not read as one-way.
+        let err = parse_one_way(r#"{"code":-1003,"msg":"Too many requests."}"#).unwrap_err().to_string();
+        assert!(err.contains("-1003"), "{err}");
     }
 
     #[test]
