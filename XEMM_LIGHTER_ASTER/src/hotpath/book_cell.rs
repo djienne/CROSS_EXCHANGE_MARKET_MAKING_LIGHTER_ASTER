@@ -80,6 +80,14 @@ pub struct VenueBook {
     /// delivering frames). The watchdog reads it: a divergent cell closes the trading
     /// gate even while frames keep arriving. Orthogonal to staleness (no frames).
     rest_divergent: AtomicBool,
+    /// Set by the venue connector when it KNOWS the stream is down (websocket
+    /// disconnect/error or a sequence-gap resync). The book content may still look fresh
+    /// (within `max_book_staleness_ms`) but is untrustworthy — the maker gate closes on
+    /// this immediately instead of waiting out the age expiry. Single writer (the venue
+    /// ingest thread); cleared ONLY by a raw full-book publish (`publish`/`publish_hot`),
+    /// because a reconnect is trusted only once a full snapshot lands — both venues push
+    /// one promptly on (re)connect. BBO-only publishes and `touch` never clear it.
+    stream_down: AtomicBool,
     /// Monotonically increasing book-version counter, bumped on every [`publish`]. A
     /// strategy loop snapshots `generation()` per market and only recomputes when it
     /// changed — exact change detection without diffing the book or polling on a timer.
@@ -154,6 +162,7 @@ impl VenueBook {
             last_book_exch_ms: AtomicI64::new(0),
             last_bbo_exch_ms: AtomicI64::new(0),
             rest_divergent: AtomicBool::new(false),
+            stream_down: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             bbo_generation: AtomicU64::new(0),
             wake,
@@ -184,6 +193,8 @@ impl VenueBook {
         // opens a window where the strategy passes the has_hot_only_update gate and pairs
         // NEW hot data with the OLD raw book — exactly what the guard exists to prevent.
         self.hot_only_pending.store(false, Ordering::Release);
+        // A full snapshot proves the (re)connected stream is delivering books again.
+        self.stream_down.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_book_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -210,6 +221,8 @@ impl VenueBook {
         self.book.store(Some(Arc::new(book)));
         // Guard cleared only after BOTH stores (see publish()).
         self.hot_only_pending.store(false, Ordering::Release);
+        // A full snapshot proves the (re)connected stream is delivering books again.
+        self.stream_down.store(false, Ordering::Release);
         let ns = mono_now_ns();
         self.last_book_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
@@ -517,6 +530,28 @@ impl VenueBook {
         self.rest_divergent.load(Ordering::Acquire)
     }
 
+    /// Called by the venue connector on a KNOWN disconnect (stream error/close or a
+    /// sequence-gap resync): the stored book may still look fresh but is untrustworthy
+    /// until a new full snapshot lands. Wakes any attached strategy loop so the maker
+    /// gate closes (and a cancel sweep can fire) immediately, not on the next tick.
+    #[inline]
+    pub fn mark_stream_down(&self) {
+        self.stream_down.store(true, Ordering::Release);
+        if let Some((dirty, idx)) = &self.dirty {
+            dirty.mark(*idx);
+        }
+        if let Some(w) = &self.wake {
+            w.notify_one();
+        }
+    }
+
+    /// Whether the venue connector currently knows this stream to be down. Cleared only
+    /// by a raw full-book publish (`publish`/`publish_hot`).
+    #[inline]
+    pub fn stream_down(&self) -> bool {
+        self.stream_down.load(Ordering::Acquire)
+    }
+
     /// True when the latest integer projection has arrived ahead of its matching raw Decimal book.
     /// Strategy code may use such a snapshot for risk-reducing fast cancels, but should skip exact
     /// quote placement until the raw publish clears this guard.
@@ -564,6 +599,10 @@ impl crate::connectors::BookTap for VenueBook {
     #[inline]
     fn publish_bbo_price_wake_hot(&self, book: OrderBook, hot: HotBook) {
         VenueBook::publish_bbo_price_wake_hot(self, book, hot);
+    }
+    #[inline]
+    fn mark_stream_down(&self) {
+        VenueBook::mark_stream_down(self);
     }
 }
 
@@ -636,6 +675,43 @@ mod tests {
         assert!(vb.is_divergent());
         vb.mark_divergent(false);
         assert!(!vb.is_divergent());
+    }
+
+    #[test]
+    fn stream_down_flag_set_by_mark_cleared_only_by_full_book_publish() {
+        use crate::livebot::scale::{build_hot_book, MarketScale};
+        let vb = VenueBook::new();
+        assert!(!vb.stream_down(), "defaults up");
+        vb.mark_stream_down();
+        assert!(vb.stream_down());
+        // touch (liveness frame) must NOT clear it — the stream is known-down.
+        vb.touch();
+        assert!(vb.stream_down());
+        // BBO-only publishes must NOT clear it — only a full snapshot re-earns trust.
+        let now = Utc::now();
+        vb.publish_bbo(OrderBook::from_levels(vec![(dec!(101), dec!(2))], vec![(dec!(102), dec!(2))], now, now));
+        assert!(vb.stream_down(), "publish_bbo must not clear stream_down");
+        // A raw full-book publish clears it.
+        vb.publish(book(dec!(100)));
+        assert!(!vb.stream_down(), "publish must clear stream_down");
+        // publish_hot clears it too.
+        vb.mark_stream_down();
+        assert!(vb.stream_down());
+        let b = book(dec!(100));
+        let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
+        let hot = build_hot_book(&b, &scale, 0, 12345);
+        vb.publish_hot(b, hot);
+        assert!(!vb.stream_down(), "publish_hot must clear stream_down");
+    }
+
+    #[tokio::test]
+    async fn mark_stream_down_wakes_attached_strategy() {
+        let wake = Arc::new(Notify::new());
+        let vb = VenueBook::with_wake(wake.clone());
+        vb.mark_stream_down();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("mark_stream_down must wake an attached strategy loop");
     }
 
     #[test]

@@ -108,6 +108,10 @@ pub trait BookTap: Send + Sync {
     fn publish_bbo_price_wake_hot(&self, book: OrderBook, _hot: crate::hot_types::HotBook) {
         self.publish_bbo_price_wake(book);
     }
+    /// Notify the cell that the venue stream is KNOWN down (disconnect/error/gap-resync),
+    /// so the stored book must not be trusted until a full snapshot lands. Default no-op
+    /// keeps record mode unchanged.
+    fn mark_stream_down(&self) {}
 }
 
 /// The optional hot-path side outputs threaded into a connector reader. Both are
@@ -353,6 +357,14 @@ impl Tap {
     fn touch(&self) {
         if let Some(cell) = &self.book {
             cell.touch();
+        }
+    }
+
+    /// Flag the attached book cell as stream-down (no-op without a cell, e.g. record mode).
+    #[inline]
+    pub(crate) fn mark_stream_down(&self) {
+        if let Some(cell) = &self.book {
+            cell.mark_stream_down();
         }
     }
 

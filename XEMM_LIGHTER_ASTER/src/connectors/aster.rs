@@ -107,6 +107,9 @@ pub async fn run_with_tap(
             Ok(()) => info!("[ASTER {}] stream closed", symbol_lower),
             Err(e) => warn!("[ASTER {}] error: {e:#}", symbol_lower),
         }
+        // Whether closed or errored, the stream is KNOWN down until the next connect's
+        // full snapshot: flag the cell so the maker gate closes now, not at age expiry.
+        tap.mark_stream_down();
         if started.elapsed() >= HEALTHY_AFTER {
             backoff = 1; // the connection was healthy; start the next retry fast
         }

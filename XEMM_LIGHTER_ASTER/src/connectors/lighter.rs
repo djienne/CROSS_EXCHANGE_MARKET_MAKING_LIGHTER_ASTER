@@ -88,6 +88,7 @@ pub async fn run_with_tap(
     let state = Arc::new(Mutex::new(StreamState::default()));
     let state_for_disconnect = state.clone();
     let reconnect_on_gap = reconnect.clone();
+    let tap_for_disconnect = tap.clone();
     subscribe_loop(
         opts,
         Some(reconnect),
@@ -100,6 +101,8 @@ pub async fn run_with_tap(
                     market_id, state.gap_resyncs
                 );
                 state.reset();
+                // The book missed updates: untrustworthy until the post-resync snapshot.
+                tap.mark_stream_down();
                 reconnect_on_gap.notify_one();
             }
         },
@@ -108,6 +111,8 @@ pub async fn run_with_tap(
                 .lock()
                 .expect("Lighter stream book state poisoned")
                 .reset();
+            // KNOWN disconnect: close the maker gate until a fresh snapshot lands.
+            tap_for_disconnect.mark_stream_down();
         },
     )
     .await;

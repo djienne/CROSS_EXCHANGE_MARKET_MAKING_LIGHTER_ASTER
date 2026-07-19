@@ -1725,11 +1725,13 @@ impl Strategy {
             .cell(market, VenueTag::Aster)
             // Aster depth is still the queue/depth source, but a fresh bookTicker/BBO is
             // sufficient for live quote-touch safety on quiet event-driven depth feeds.
-            .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent());
+            // stream_down: the connector KNOWS the stream dropped — the last book may still
+            // read young, but it is blind; close the gate immediately, not at age expiry.
+            .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         let hl_fresh = self
             .registry
             .cell(market, VenueTag::Hyperliquid)
-            .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent());
+            .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         aster_fresh && hl_fresh
     }
 
@@ -3261,6 +3263,17 @@ impl Strategy {
             if self.last_hot_action_ns.get(&m).is_some_and(|&action_ns| snap.read_start_ns <= action_ns) {
                 continue;
             }
+            // Recovery sizes/sides emergency orders off the HL mid: with the HL stream
+            // KNOWN-down that mid is blind (it may predate the disconnect while still
+            // reading young), so defer this tick (mirrors the no-mark skip just below) —
+            // recovery resumes as soon as the reconnect's full snapshot clears the flag.
+            let hl_trusted = self
+                .registry
+                .cell(&m, VenueTag::Hyperliquid)
+                .is_some_and(|c| !c.stream_down());
+            if !hl_trusted {
+                continue;
+            }
             let mark = self
                 .book(&m, VenueTag::Hyperliquid)
                 .and_then(|b| b.mid())
@@ -4653,6 +4666,75 @@ lighter_symbol = "BTC"
         // A latched freeze (e.g. hedge reject) stops quoting even with everything else green.
         strat.freeze(now, "test");
         assert!(!strat.may_quote(&"BTC".into(), now));
+    }
+
+    #[tokio::test]
+    async fn may_quote_closes_on_stream_down_and_reopens_after_fresh_publish() {
+        use crate::hotpath::clock::mono_now_ns;
+        let specs = vec![spec()];
+        let elig: HashMap<MarketId, bool> = [("BTC".into(), true)].into_iter().collect();
+        let reg = Arc::new(VenueRegistry::new(&["BTC".into()]));
+        let (ab, hb) = books();
+        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
+        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
+        let account = AccountState::new(rust_decimal_macros::dec!(5));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = Strategy::new(
+            full_cfg(), &specs, &elig, reg.clone(), account, Journal::null(),
+            SessionId::from_tag("t"), etx, htx, ExecMode::Paper,
+        );
+        strat.mark_clean_start();
+        assert!(strat.may_quote(&"BTC".into(), mono_now_ns()));
+        // A KNOWN disconnect closes the gate immediately, even though the book is still young.
+        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().mark_stream_down();
+        assert!(!strat.may_quote(&"BTC".into(), mono_now_ns()), "known disconnect must close the gate");
+        // Liveness frames alone must not reopen it — only a full snapshot re-earns trust.
+        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().touch();
+        assert!(!strat.may_quote(&"BTC".into(), mono_now_ns()));
+        let (ab2, _) = books();
+        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab2);
+        assert!(strat.may_quote(&"BTC".into(), mono_now_ns()), "fresh snapshot must reopen the gate");
+        // Same per-market behavior for the Lighter cell.
+        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().mark_stream_down();
+        assert!(!strat.may_quote(&"BTC".into(), mono_now_ns()));
+        let (_, hb2) = books();
+        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb2);
+        assert!(strat.may_quote(&"BTC".into(), mono_now_ns()));
+    }
+
+    #[test]
+    fn recovery_defers_on_hl_stream_down_and_resumes_after_publish() {
+        // The orphan backstop prices emergency orders off the HL mid — with the HL stream
+        // known-down that mid is blind, so recovery must DEFER (not act, not seed the gate)
+        // and resume once a fresh snapshot lands.
+        let account = AccountState::new(dec!(50));
+        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let m: MarketId = "BTC".into();
+        strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
+        strat.registry.cell(&m, VenueTag::Hyperliquid).unwrap().mark_stream_down();
+
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 10_000_000, 9_000_000));
+        strat.recover_orphans(11_000_000);
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 20_000_000_000, 19_000_000_000));
+        strat.recover_orphans(21_000_000_000);
+        assert!(hrx.try_recv().is_err(), "recovery must defer while the HL stream is known-down");
+        assert!(!strat.orphan_seen.contains_key(&m), "deferred ticks must not seed the persistence gate");
+
+        // A fresh full snapshot restores trust; the persistence gate then confirms as usual.
+        let (_, hb) = books();
+        strat.registry.cell(&m, VenueTag::Hyperliquid).unwrap().publish(hb);
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 30_000_000_000, 29_000_000_000));
+        strat.recover_orphans(31_000_000_000);
+        assert!(hrx.try_recv().is_err(), "first trusted sighting only seeds the gate");
+        account.publish(orphan_snapshot_for(&m, dec!(0.5), 40_000_000_000, 39_000_000_000));
+        strat.recover_orphans(41_000_000_000);
+        assert!(
+            matches!(hrx.try_recv(), Ok(HedgeCommand::Hedge { .. })),
+            "recovery must resume and dispatch after a fresh publish"
+        );
     }
 
     #[tokio::test]
