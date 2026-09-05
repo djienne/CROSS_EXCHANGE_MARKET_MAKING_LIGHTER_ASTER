@@ -1,540 +1,213 @@
-//! Aggregate a replayed run into the headline evaluator metrics: opportunity
-//! accept/reject distribution, fills, and — the product — realized PnL and
-//! realized edge per latency bucket, with the instant-vs-realized decay that
-//! quantifies adverse selection, plus per-leg capital usage.
-//!
-//! CRITICAL: latency buckets and queue models are *alternative* scenarios, never
-//! additive. We never sum net PnL across buckets (that would multiply a single
-//! scenario by the bucket count) or across models (three hypotheticals over the
-//! same tape). The headline PnL is reported per model at the primary (smallest)
-//! latency bucket; the full per-bucket table shows the decay.
-
+//! Independent scenario ledgers. Execution spread is a diagnostic, not additional P&L.
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
-
 use anyhow::{anyhow, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rust_decimal::Decimal;
 use serde::Serialize;
 
 #[derive(Debug, Serialize)]
 pub struct ReportSummary {
     pub run_id: String,
+    pub semantics_version: i64,
     pub markets: Vec<MarketReport>,
-    /// Fills summed across the queue-model worlds (each model is a separate
-    /// hypothetical over the same tape — NOT additive strategies).
     pub total_fills: i64,
     pub total_hedges: i64,
-    /// The smallest configured latency bucket; the headline PnL is reported here.
     pub primary_bucket_ms: i64,
-    /// Net PnL per queue model, summed across markets, at the primary bucket. The
-    /// three models are alternatives — compare them, never add them.
-    pub net_pnl_by_model: Vec<(String, f64)>,
-    /// Sum of the run's safety buffers (slippage+latency+basis+funding), in bps,
-    /// read from the run's own config snapshot. `instant_edge` is net of fees and
-    /// these buffers; `realized_edge` is net of fees only, so realized sits ≈ this
-    /// much above instant by construction (not a sign bug).
-    pub buffer_bps: f64,
+    pub net_pnl_by_model: Vec<(String, Option<Decimal>)>,
+    pub buffer_bps: Decimal,
 }
-
 #[derive(Debug, Serialize)]
 pub struct MarketReport {
     pub market: String,
-    pub opportunities_accepted: i64,
-    pub opportunities_rejected: i64,
-    pub reject_reasons: Vec<(String, i64)>,
-    /// Fills across all models for this market (sum of the per-model worlds).
-    pub fills: i64,
-    pub fill_notional: f64,
     pub models: Vec<ModelReport>,
-    pub pending_events: Vec<(String, i64)>,
 }
-
 #[derive(Debug, Serialize)]
 pub struct ModelReport {
     pub queue_model: String,
-    pub fills: i64,
-    /// Mean instant edge net of fees AND buffers (the quoting threshold).
-    pub mean_instant_edge_bps: Option<f64>,
-    /// Same, but net of fees ONLY (= mean_instant + buffers). This is the basis
-    /// directly comparable to `mean_realized_edge_bps`, which is also fees-only;
-    /// `realized ≈ instant_gross` at the smallest latency bucket on an unchanged book.
-    pub mean_instant_edge_gross_bps: Option<f64>,
-    /// How deep below the touch our accepted quotes rested (bps).
-    pub mean_quote_distance_bps: Option<f64>,
     pub primary_bucket_ms: i64,
-    /// Net PnL at the primary (smallest) latency bucket. Buckets are alternative
-    /// latency scenarios, never summed.
-    pub net_pnl_primary: f64,
-    pub peak_aster_notional: f64,
-    pub peak_hl_notional: f64,
-    pub aster_cap: f64,
-    pub hl_cap: f64,
-    pub cap_blocked: i64,
-    /// Accepted quotes whose size was clamped UP to the venue minimum lot
-    /// (desired_notional below the minimum, e.g. $50 on BTC).
-    pub size_clamped: i64,
-    /// Fills that landed while the matched feed was stale (stale-window adverse fills
-    /// — a quote hit during its cancel round-trip on a feed we no longer trusted).
-    pub stale_window_fills: i64,
-    /// Fills on quotes resting beyond captured depth20 (queue ahead under-observed, so
-    /// the fill may be optimistic).
-    pub queue_truncated_fills: i64,
+    pub net_pnl_primary: Option<Decimal>,
     pub buckets: Vec<BucketReport>,
 }
-
 #[derive(Debug, Serialize)]
 pub struct BucketReport {
     pub latency_bucket_ms: i64,
+    pub legacy_shared_trajectory: bool,
+    pub fills: i64,
+    pub opportunities_accepted: i64,
+    pub opportunities_rejected: i64,
+    pub mean_instant_edge_bps: Option<f64>,
+    pub mean_quote_distance_bps: Option<f64>,
     pub n_hedges: i64,
-    /// Total net PnL across all fills in this single latency scenario (correct to sum).
-    pub total_net_pnl: f64,
-    pub mean_realized_edge_bps: f64,
+    pub n_censored_hedges: i64,
+    pub n_unpriced_hedges: i64,
+    pub captured_spread_pnl: f64,
+    pub mean_realized_edge_bps: Option<f64>,
     pub n_stale: i64,
     pub n_depth_exhausted: i64,
-    /// Requested-minus-filled hedge base qty summed over this bucket: volume that could
-    /// NOT be hedged (thin or absent HL book). Non-zero => realized edge is on less than
-    /// full size — pair with `n_depth_exhausted`.
     pub underhedged_qty: f64,
+    pub realized_gross: Option<Decimal>,
+    pub fees: Option<Decimal>,
+    pub unrealized_pnl: Option<Decimal>,
+    pub total_net_pnl: Option<Decimal>,
+    pub aster_qty: Option<Decimal>,
+    pub lighter_qty: Option<Decimal>,
+    pub residual_qty: Option<Decimal>,
+    pub reserved_hedge_qty: Option<Decimal>,
+    pub unpriced_hedge_qty: Option<Decimal>,
+    pub peak_aster_notional: Option<Decimal>,
+    pub peak_lighter_notional: Option<Decimal>,
+    pub valuation_complete: bool,
+    pub frozen_reason: Option<String>,
 }
 
-/// Generate the report for `run_id` (or the latest run) from `db_path`, printing
-/// to the console and writing report.json / report.csv into `out_dir`.
-pub fn generate(
-    db_path: impl AsRef<Path>,
-    run_id: Option<String>,
-    out_dir: impl AsRef<Path>,
-) -> Result<ReportSummary> {
-    let conn = Connection::open(db_path.as_ref())
+pub fn generate(db_path: impl AsRef<Path>, run_id: Option<String>, out_dir: impl AsRef<Path>) -> Result<ReportSummary> {
+    let conn = Connection::open_with_flags(db_path.as_ref(), OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening {}", db_path.as_ref().display()))?;
-
-    let run_id = match run_id {
-        Some(r) => r,
-        None => conn
-            .query_row("SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0))
-            .map_err(|_| anyhow!("no runs found in database"))?,
-    };
-
-    // Per-leg capital caps + safety-buffer total from the run's own config snapshot
-    // (same for all markets). Reading from the snapshot — not the current config.toml —
-    // keeps the report self-contained and correct even if config later drifts.
-    let (aster_cap, hl_cap) = caps_from_run(&conn, &run_id);
-    let buffer_bps = buffers_from_run(&conn, &run_id);
-    // Headline latency = the smallest bucket actually present (fallback 0).
-    let primary_bucket_ms: i64 = conn
-        .query_row(
-            "SELECT COALESCE(MIN(latency_bucket_ms), 0) FROM hedges WHERE run_id = ?1",
-            [&run_id],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-
-    let markets = market_list(&conn, &run_id)?;
-    let mut market_reports = Vec::new();
-    for market in markets {
-        market_reports.push(build_market_report(
-            &conn,
-            &run_id,
-            &market,
-            primary_bucket_ms,
-            aster_cap,
-            hl_cap,
-            buffer_bps,
-        )?);
-    }
-
-    let total_fills: i64 = market_reports.iter().map(|m| m.fills).sum();
-    let total_hedges: i64 =
-        conn.query_row("SELECT COUNT(*) FROM hedges WHERE run_id = ?1", [&run_id], |r| r.get(0))?;
-
-    // Net PnL per model = sum ACROSS MARKETS (additive) of each model's primary-bucket
-    // PnL. Never across models or buckets.
-    let mut by_model: BTreeMap<String, f64> = BTreeMap::new();
-    for m in &market_reports {
-        for mr in &m.models {
-            *by_model.entry(mr.queue_model.clone()).or_default() += mr.net_pnl_primary;
-        }
-    }
-    let net_pnl_by_model: Vec<(String, f64)> = by_model.into_iter().collect();
-
-    let summary = ReportSummary {
-        run_id,
-        markets: market_reports,
-        total_fills,
-        total_hedges,
-        primary_bucket_ms,
-        net_pnl_by_model,
-        buffer_bps,
-    };
-
+    let run_id = run_id.or_else(|| conn.query_row(
+        "SELECT run_id FROM runs ORDER BY rowid DESC LIMIT 1", [], |r| r.get(0)).ok())
+        .ok_or_else(|| anyhow!("no runs found in database"))?;
+    let summary = summarize(&conn, &run_id)?;
     print_console(&summary);
     write_artifacts(&summary, out_dir.as_ref())?;
     Ok(summary)
 }
 
-fn caps_from_run(conn: &Connection, run_id: &str) -> (f64, f64) {
-    let config_json: String = conn
-        .query_row("SELECT config_json FROM runs WHERE run_id = ?1", [run_id], |r| r.get(0))
-        .unwrap_or_default();
-    match serde_json::from_str::<crate::config::Config>(&config_json) {
-        Ok(c) => (
-            dec_f64(c.capital.aster_cap_notional()),
-            dec_f64(c.capital.hyperliquid_cap_notional()),
-        ),
-        Err(_) => (0.0, 0.0),
+pub fn summarize(conn: &Connection, run_id: &str) -> Result<ReportSummary> {
+    let version = conn.query_row("SELECT semantics_version FROM runs WHERE run_id=?1", [run_id], |r| r.get::<_, i64>(0)).unwrap_or(1);
+    let modern = version >= 2;
+    let raw_config: String = conn.query_row("SELECT config_json FROM runs WHERE run_id=?1", [run_id], |r| r.get(0))?;
+    let cfg = serde_json::from_str::<crate::config::Config>(&raw_config).ok();
+    let primary = cfg.as_ref().and_then(|c| c.simulation.hedge_latency_buckets_ms.iter().min().copied())
+        .or_else(|| conn.query_row("SELECT MIN(latency_bucket_ms) FROM hedges WHERE run_id=?1", [run_id], |r| r.get(0)).ok()).unwrap_or(0);
+    let mut q = conn.prepare("SELECT market FROM markets WHERE run_id=?1 ORDER BY market")?;
+    let ids = q.query_map([run_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut markets = Vec::new();
+    let mut by_model: BTreeMap<String, Option<Decimal>> = BTreeMap::new();
+    let (mut total_fills, mut total_hedges) = (0, 0);
+    for market in ids {
+        let mut sql = "SELECT queue_model FROM opportunity_stats WHERE run_id=?1 AND market=?2
+            UNION SELECT queue_model FROM opportunity_rejects WHERE run_id=?1 AND market=?2".to_string();
+        if modern { sql.push_str(" UNION SELECT queue_model FROM scenario_results WHERE run_id=?1 AND market=?2"); }
+        sql.push_str(" ORDER BY queue_model");
+        let mut q = conn.prepare(&sql)?;
+        let model_ids = q.query_map(params![run_id, market], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut models = Vec::new();
+        for model in model_ids {
+            let sql = if modern {
+                "SELECT latency_bucket_ms FROM scenario_results WHERE run_id=?1 AND market=?2 AND queue_model=?3
+                 UNION SELECT latency_bucket_ms FROM hedges WHERE run_id=?1 AND market=?2 AND queue_model=?3 ORDER BY latency_bucket_ms"
+            } else {
+                "SELECT DISTINCT latency_bucket_ms FROM hedges WHERE run_id=?1 AND market=?2 AND queue_model=?3 ORDER BY latency_bucket_ms"
+            };
+            let mut q = conn.prepare(sql)?;
+            let mut latencies = q.query_map(params![run_id, market, model], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            if latencies.is_empty() { latencies.push(primary); }
+            let mut buckets = Vec::new();
+            for latency in latencies {
+                let b = scenario(conn, run_id, &market, &model, latency, modern)?;
+                if modern || latency == primary { total_fills += b.fills; }
+                total_hedges += b.n_hedges;
+                buckets.push(b);
+            }
+            let net = buckets.iter().find(|b| b.latency_bucket_ms == primary).and_then(|b| b.total_net_pnl);
+            let aggregate = by_model.entry(model.clone()).or_insert(Some(Decimal::ZERO));
+            *aggregate = aggregate.zip(net).map(|(sum, n)| sum+n);
+            models.push(ModelReport { queue_model: model, primary_bucket_ms: primary, net_pnl_primary: net, buckets });
+        }
+        markets.push(MarketReport { market, models });
     }
+    Ok(ReportSummary { run_id: run_id.into(), semantics_version: version, markets, total_fills, total_hedges,
+        primary_bucket_ms: primary, net_pnl_by_model: by_model.into_iter().collect(),
+        buffer_bps: cfg.map(|c| c.edge.total_buffer_bps()).unwrap_or_default() })
 }
 
-fn dec_f64(d: rust_decimal::Decimal) -> f64 {
-    d.to_string().parse().unwrap_or(0.0)
-}
-
-/// Sum of the run's safety buffers (slippage+latency+basis+funding), in bps, from
-/// the run's config snapshot. 0.0 if the snapshot is missing/unparseable.
-fn buffers_from_run(conn: &Connection, run_id: &str) -> f64 {
-    let config_json: String = conn
-        .query_row("SELECT config_json FROM runs WHERE run_id = ?1", [run_id], |r| r.get(0))
-        .unwrap_or_default();
-    match serde_json::from_str::<crate::config::Config>(&config_json) {
-        Ok(c) => dec_f64(c.edge.total_buffer_bps()),
-        Err(_) => 0.0,
-    }
-}
-
-fn market_list(conn: &Connection, run_id: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT market FROM markets WHERE run_id = ?1 ORDER BY market")?;
-    let rows = stmt.query_map([run_id], |r| r.get::<_, String>(0))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
-}
-
-fn build_market_report(
-    conn: &Connection,
-    run_id: &str,
-    market: &str,
-    primary_bucket_ms: i64,
-    aster_cap: f64,
-    hl_cap: f64,
-    buffer_bps: f64,
-) -> Result<MarketReport> {
-    let accepted: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(accepted),0) FROM opportunity_stats WHERE run_id=?1 AND market=?2",
-        rusqlite::params![run_id, market],
-        |r| r.get(0),
-    )?;
-    let rejected: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM opportunity_rejects WHERE run_id=?1 AND market=?2",
-        rusqlite::params![run_id, market],
-        |r| r.get(0),
-    )?;
-
-    let mut reject_reasons = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT reject_reason, COUNT(*) n FROM opportunity_rejects WHERE run_id=?1 AND market=?2
-             GROUP BY reject_reason ORDER BY n DESC",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![run_id, market], |r| {
-            Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            reject_reasons.push(row?);
+fn scenario(conn: &Connection, run: &str, market: &str, model: &str, latency: i64, modern: bool) -> Result<BucketReport> {
+    let filter = if modern { format!(" AND latency_bucket_ms={latency}") } else { String::new() };
+    let p = params![run, market, model];
+    let fills = conn.query_row(&format!("SELECT COUNT(*) FROM simulated_fills WHERE run_id=?1 AND market=?2 AND queue_model=?3{filter}"), p, |r| r.get(0))?;
+    let (accepted, instant, distance) = conn.query_row(&format!(
+        "SELECT COALESCE(SUM(accepted),0),CASE WHEN SUM(accepted)>0 THEN SUM(sum_instant_edge_bps)/SUM(accepted) END,
+         CASE WHEN SUM(accepted)>0 THEN SUM(sum_distance_bps)/SUM(accepted) END
+         FROM opportunity_stats WHERE run_id=?1 AND market=?2 AND queue_model=?3{filter}"), p,
+        |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+    let rejected = conn.query_row(&format!("SELECT COUNT(*) FROM opportunity_rejects WHERE run_id=?1 AND market=?2 AND queue_model=?3{filter}"), p, |r| r.get(0))?;
+    let (n_hedges, spread, edge, stale, thin, remainder, censored, unpriced) = conn.query_row(
+        "SELECT COALESCE(SUM(CAST(filled_qty AS REAL)>0),0),COALESCE(SUM(CAST(net_pnl AS REAL)),0.0),
+         AVG(CASE WHEN CAST(filled_qty AS REAL)>0 THEN CAST(realized_edge_bps AS REAL) END),
+         COALESCE(SUM(hedged_on_stale_book),0),COALESCE(SUM(CASE WHEN reason IS NULL THEN depth_exhausted ELSE 0 END),0),
+         COALESCE(SUM(CAST(qty AS REAL)-CAST(filled_qty AS REAL)),0.0),
+         COALESCE(SUM(reason='AFTER_OBSERVATION_END'),0),COALESCE(SUM(reason='UNPRICED_HEDGE'),0)
+         FROM hedges WHERE run_id=?1 AND market=?2 AND queue_model=?3 AND latency_bucket_ms=?4",
+        params![run,market,model,latency], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
+    let mut b = BucketReport { latency_bucket_ms: latency, legacy_shared_trajectory: !modern,
+        fills, opportunities_accepted: accepted, opportunities_rejected: rejected,
+        mean_instant_edge_bps: instant, mean_quote_distance_bps: distance,
+        n_hedges, n_censored_hedges: censored, n_unpriced_hedges: unpriced,
+        captured_spread_pnl: spread, mean_realized_edge_bps: edge,
+        n_stale: stale, n_depth_exhausted: thin, underhedged_qty: remainder,
+        realized_gross: None, fees: None, unrealized_pnl: None, total_net_pnl: None,
+        aster_qty: None, lighter_qty: None, residual_qty: None, reserved_hedge_qty: None, unpriced_hedge_qty: None,
+        peak_aster_notional: None, peak_lighter_notional: None, valuation_complete: false, frozen_reason: None };
+    if modern {
+        let values = conn.query_row(
+            "SELECT aster_qty,lighter_qty,realized_gross,fees,unrealized_pnl,net_pnl,residual_qty,
+             reserved_hedge_qty,unpriced_hedge_qty,peak_aster_notional,peak_lighter_notional,valuation_complete,frozen_reason
+             FROM scenario_results WHERE run_id=?1 AND market=?2 AND queue_model=?3 AND latency_bucket_ms=?4",
+            params![run,market,model,latency], |r| {
+                let values = (0..11).map(|i| r.get::<_, Option<String>>(i)).collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((values,r.get::<_,bool>(11)?,r.get::<_,Option<String>>(12)?))
+            }).optional()?;
+        if let Some((raw, complete, reason)) = values {
+            let d = raw.into_iter().map(|s| s.map(|v| v.parse::<Decimal>()).transpose()).collect::<std::result::Result<Vec<_>,_>>()?;
+            b.aster_qty=d[0]; b.lighter_qty=d[1]; b.realized_gross=d[2]; b.fees=d[3]; b.unrealized_pnl=d[4];
+            b.total_net_pnl=d[5].filter(|_| complete); b.residual_qty=d[6]; b.reserved_hedge_qty=d[7];
+            b.unpriced_hedge_qty=d[8]; b.peak_aster_notional=d[9]; b.peak_lighter_notional=d[10];
+            b.valuation_complete=complete && b.total_net_pnl.is_some(); b.frozen_reason=reason;
         }
     }
-
-    let (fills, fill_notional) = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(CAST(fill_qty AS REAL)*CAST(fill_px AS REAL)),0.0)
-         FROM simulated_fills WHERE run_id=?1 AND market=?2",
-        rusqlite::params![run_id, market],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
-    )?;
-
-    // queue models present for this market
-    let models: Vec<String> = {
-        let mut stmt = conn.prepare(
-            "SELECT queue_model FROM opportunity_stats WHERE run_id=?1 AND market=?2
-             UNION
-             SELECT queue_model FROM opportunity_rejects WHERE run_id=?1 AND market=?2
-             ORDER BY queue_model",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![run_id, market], |r| r.get::<_, String>(0))?;
-        rows.collect::<std::result::Result<_, _>>()?
-    };
-
-    let mut model_reports = Vec::new();
-    for qm in models {
-        let p = rusqlite::params![run_id, market, qm];
-
-        let mean_instant: Option<f64> = conn.query_row(
-            "SELECT CASE WHEN SUM(accepted)>0 THEN SUM(sum_instant_edge_bps)/SUM(accepted) END
-             FROM opportunity_stats WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get::<_, Option<f64>>(0),
-        )?;
-        let mean_distance: Option<f64> = conn.query_row(
-            "SELECT CASE WHEN SUM(accepted)>0 THEN SUM(sum_distance_bps)/SUM(accepted) END
-             FROM opportunity_stats WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get::<_, Option<f64>>(0),
-        )?;
-        let fills_m: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM simulated_fills WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-        let peak_aster: f64 = conn.query_row(
-            "SELECT COALESCE(MAX(ABS(CAST(aster_pos_notional AS REAL))),0.0)
-             FROM simulated_fills WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-        let peak_hl: f64 = conn.query_row(
-            "SELECT COALESCE(MAX(ABS(CAST(hl_pos_notional AS REAL))),0.0)
-             FROM simulated_fills WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-        let cap_blocked: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM opportunity_rejects WHERE run_id=?1 AND market=?2 AND queue_model=?3
-             AND reject_reason IN (
-                'ASTER_POSITION_CAP_REACHED',
-                'LIGHTER_POSITION_CAP_REACHED',
-                'HYPERLIQUID_POSITION_CAP_REACHED'
-             )",
-            p,
-            |r| r.get(0),
-        )?;
-        let size_clamped: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(size_clamped),0) FROM opportunity_stats
-             WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-        let stale_window_fills: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(feed_stale_at_fill),0) FROM simulated_fills
-             WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-        let queue_truncated_fills: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(queue_truncated),0) FROM simulated_fills
-             WHERE run_id=?1 AND market=?2 AND queue_model=?3",
-            p,
-            |r| r.get(0),
-        )?;
-
-        let mut buckets = Vec::new();
-        let mut stmt = conn.prepare(
-            "SELECT latency_bucket_ms, COUNT(*), COALESCE(SUM(CAST(net_pnl AS REAL)),0.0),
-                    COALESCE(AVG(CAST(realized_edge_bps AS REAL)),0.0),
-                    COALESCE(SUM(hedged_on_stale_book),0), COALESCE(SUM(depth_exhausted),0),
-                    COALESCE(SUM(CAST(qty AS REAL) - CAST(filled_qty AS REAL)),0.0)
-             FROM hedges WHERE run_id=?1 AND market=?2 AND queue_model=?3
-             GROUP BY latency_bucket_ms ORDER BY latency_bucket_ms",
-        )?;
-        let rows = stmt.query_map(p, |r| {
-            Ok(BucketReport {
-                latency_bucket_ms: r.get(0)?,
-                n_hedges: r.get(1)?,
-                total_net_pnl: r.get(2)?,
-                mean_realized_edge_bps: r.get(3)?,
-                n_stale: r.get(4)?,
-                n_depth_exhausted: r.get(5)?,
-                underhedged_qty: r.get(6)?,
-            })
-        })?;
-        for b in rows {
-            buckets.push(b?);
-        }
-        // Headline = the primary bucket's total (NOT a sum across buckets).
-        let net_pnl_primary = buckets
-            .iter()
-            .find(|b| b.latency_bucket_ms == primary_bucket_ms)
-            .map(|b| b.total_net_pnl)
-            .unwrap_or(0.0);
-
-        model_reports.push(ModelReport {
-            queue_model: qm,
-            fills: fills_m,
-            mean_instant_edge_bps: mean_instant,
-            // Fees-only basis, comparable to realized: instant (net of fees+buffers) + buffers.
-            mean_instant_edge_gross_bps: mean_instant.map(|v| v + buffer_bps),
-            mean_quote_distance_bps: mean_distance,
-            primary_bucket_ms,
-            net_pnl_primary,
-            peak_aster_notional: peak_aster,
-            peak_hl_notional: peak_hl,
-            aster_cap,
-            hl_cap,
-            cap_blocked,
-            size_clamped,
-            stale_window_fills,
-            queue_truncated_fills,
-            buckets,
-        });
-    }
-
-    let mut pending_events = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT event_type, COUNT(*) FROM pending_inventory_events WHERE run_id=?1 AND market=?2
-             GROUP BY event_type ORDER BY event_type",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![run_id, market], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
-        for row in rows {
-            pending_events.push(row?);
-        }
-    }
-
-    Ok(MarketReport {
-        market: market.to_string(),
-        opportunities_accepted: accepted,
-        opportunities_rejected: rejected,
-        reject_reasons,
-        fills,
-        fill_notional,
-        models: model_reports,
-        pending_events,
-    })
+    Ok(b)
 }
 
+fn number(value: Option<Decimal>) -> String {
+    value.map(|d|d.normalize().to_string()).unwrap_or_default()
+}
 fn print_console(s: &ReportSummary) {
-    println!("\n=== XEMM dry-run report  (run {}) ===", s.run_id);
-    println!(
-        "  edge bases: instant_edge is net of fees + {:.1}bps buffers (the quoting threshold); \
-         instant_gross = instant + buffers is net of fees only and is the basis comparable to \
-         realized_edge.",
-        s.buffer_bps
-    );
-    println!(
-        "  realized sits ~+{:.1}bps above instant by construction (expected, NOT a sign bug); \
-         adverse selection shows as realized_edge DECAY across latency buckets (50ms >= 1000ms).",
-        s.buffer_bps
-    );
-    for m in &s.markets {
-        println!("\n## {}", m.market);
-        println!(
-            "  opportunities: {} accepted / {} rejected   fills: {} (notional ~{:.2})",
-            m.opportunities_accepted, m.opportunities_rejected, m.fills, m.fill_notional
-        );
-        if !m.reject_reasons.is_empty() && m.opportunities_accepted == 0 {
-            let top: Vec<String> = m
-                .reject_reasons
-                .iter()
-                .take(4)
-                .map(|(r, n)| format!("{r}={n}"))
-                .collect();
-            println!("  rejects: {}", top.join("  "));
-        }
-        for mr in &m.models {
-            let instant = mr
-                .mean_instant_edge_bps
-                .map(|v| format!("{v:.2}"))
-                .unwrap_or_else(|| "-".into());
-            let instant_gross = mr
-                .mean_instant_edge_gross_bps
-                .map(|v| format!("{v:.2}"))
-                .unwrap_or_else(|| "-".into());
-            let dist = mr
-                .mean_quote_distance_bps
-                .map(|v| format!("{v:.1}"))
-                .unwrap_or_else(|| "-".into());
-            println!(
-                "  [{}]  fills={}  net_pnl@{}ms={:+.5}  instant_edge={}/{} bps (net/gross)  quote_depth={} bps",
-                mr.queue_model,
-                mr.fills,
-                mr.primary_bucket_ms,
-                mr.net_pnl_primary,
-                instant,
-                instant_gross,
-                dist
-            );
-            println!(
-                "       capital: peak_aster=${:.2}  peak_hl=${:.2}  / ${:.0} cap   cap_blocked={}   min_lot_clamped={}",
-                mr.peak_aster_notional, mr.peak_hl_notional, mr.aster_cap, mr.cap_blocked, mr.size_clamped
-            );
-            println!(
-                "       honesty: stale_window_fills={}  queue_truncated_fills={}",
-                mr.stale_window_fills, mr.queue_truncated_fills
-            );
-            if !mr.buckets.is_empty() {
-                println!(
-                    "      {:>8} {:>8} {:>14} {:>16} {:>7} {:>7} {:>10}",
-                    "lat_ms", "hedges", "net_pnl", "real_edge_bps", "stale", "thin", "unhedged"
-                );
-                for b in &mr.buckets {
-                    println!(
-                        "      {:>8} {:>8} {:>+14.5} {:>16.3} {:>7} {:>7} {:>10.4}",
-                        b.latency_bucket_ms,
-                        b.n_hedges,
-                        b.total_net_pnl,
-                        b.mean_realized_edge_bps,
-                        b.n_stale,
-                        b.n_depth_exhausted,
-                        b.underhedged_qty
-                    );
-                }
+    println!("\nXEMM simulation {} (semantics v{})", s.run_id, s.semantics_version);
+    println!("Queue/latency scenarios are alternatives. Funding is excluded from this model.");
+    if s.semantics_version < 2 { println!("Legacy shared trajectories: spread diagnostics only; complete position P&L is unavailable."); }
+    for market in &s.markets {
+        for model in &market.models {
+            for b in &model.buckets {
+                let net = b.total_net_pnl.map(|d|d.to_string()).unwrap_or_else(||"unavailable".into());
+                println!("{} {} {}ms: fills={} hedges={} censored={} unpriced={} net={} realized={} fees={} unrealized={} residual={} frozen={}",
+                    market.market,model.queue_model,b.latency_bucket_ms,b.fills,b.n_hedges,b.n_censored_hedges,b.n_unpriced_hedges,net,
+                    number(b.realized_gross),number(b.fees),number(b.unrealized_pnl),number(b.residual_qty),
+                    b.frozen_reason.as_deref().unwrap_or("-"));
             }
         }
-        if !m.pending_events.is_empty() {
-            let pe: Vec<String> = m.pending_events.iter().map(|(t, n)| format!("{t}={n}")).collect();
-            println!("  pending inventory: {}", pe.join("  "));
-        }
     }
-    println!(
-        "\n== TOTAL ==  fills={} (across models)  hedges={}",
-        s.total_fills, s.total_hedges
-    );
-    for (model, pnl) in &s.net_pnl_by_model {
-        println!("   [{}]  net_pnl@{}ms = {:+.5}", model, s.primary_bucket_ms, pnl);
-    }
-    println!();
 }
 
-fn write_artifacts(s: &ReportSummary, out_dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(out_dir).ok();
-    let json_path = out_dir.join("report.json");
-    std::fs::write(&json_path, serde_json::to_string_pretty(s)?)?;
-
-    let csv_path = out_dir.join("report.csv");
-    let mut w = std::fs::File::create(&csv_path)?;
-    writeln!(
-        w,
-        "market,queue_model,latency_bucket_ms,n_hedges,total_net_pnl,mean_realized_edge_bps,mean_instant_edge_bps,mean_instant_edge_gross_bps,mean_quote_distance_bps,peak_aster_notional,peak_hl_notional,cap_blocked,size_clamped,n_stale,n_depth_exhausted,underhedged_qty,stale_window_fills,queue_truncated_fills"
-    )?;
-    for m in &s.markets {
-        for mr in &m.models {
-            let instant = mr.mean_instant_edge_bps.map(|v| v.to_string()).unwrap_or_default();
-            let instant_gross =
-                mr.mean_instant_edge_gross_bps.map(|v| v.to_string()).unwrap_or_default();
-            let dist = mr.mean_quote_distance_bps.map(|v| v.to_string()).unwrap_or_default();
-            for b in &mr.buckets {
-                writeln!(
-                    w,
-                    "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-                    m.market,
-                    mr.queue_model,
-                    b.latency_bucket_ms,
-                    b.n_hedges,
-                    b.total_net_pnl,
-                    b.mean_realized_edge_bps,
-                    instant,
-                    instant_gross,
-                    dist,
-                    mr.peak_aster_notional,
-                    mr.peak_hl_notional,
-                    mr.cap_blocked,
-                    mr.size_clamped,
-                    b.n_stale,
-                    b.n_depth_exhausted,
-                    b.underhedged_qty,
-                    mr.stale_window_fills,
-                    mr.queue_truncated_fills
-                )?;
+fn write_artifacts(s: &ReportSummary, out: &Path) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    std::fs::write(out.join("report.json"),serde_json::to_string_pretty(s)?)?;
+    let mut csv = csv::Writer::from_path(out.join("report.csv"))?;
+    csv.write_record(["market","queue_model","latency_bucket_ms","fills","n_hedges","total_net_pnl",
+        "realized_gross","fees","unrealized_pnl","residual_qty","reserved_hedge_qty","valuation_complete",
+        "captured_spread_pnl","mean_realized_edge_bps","legacy_shared_trajectory","frozen_reason","n_censored_hedges","n_unpriced_hedges"])?;
+    for market in &s.markets {
+        for model in &market.models {
+            for b in &model.buckets {
+                csv.write_record([market.market.clone(),model.queue_model.clone(),b.latency_bucket_ms.to_string(),
+                    b.fills.to_string(),b.n_hedges.to_string(),number(b.total_net_pnl),number(b.realized_gross),number(b.fees),
+                    number(b.unrealized_pnl),number(b.residual_qty),number(b.reserved_hedge_qty),b.valuation_complete.to_string(),
+                    b.captured_spread_pnl.to_string(),b.mean_realized_edge_bps.map(|v|v.to_string()).unwrap_or_default(),
+                    b.legacy_shared_trajectory.to_string(),b.frozen_reason.clone().unwrap_or_default(),
+                    b.n_censored_hedges.to_string(),b.n_unpriced_hedges.to_string()])?;
             }
         }
     }
-    println!("wrote {} and {}", json_path.display(), csv_path.display());
+    csv.flush()?;
     Ok(())
 }

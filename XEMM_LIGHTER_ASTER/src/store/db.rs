@@ -46,11 +46,11 @@ pub struct Db {
     tx_open: bool,
     writes: usize,
     /// Keyed by (market, side, queue_model); flushed to `opportunity_stats` at run end.
-    opp_aggs: HashMap<(String, String, String), OppAgg>,
+    opp_aggs: HashMap<(String, String, String, i64), OppAgg>,
     /// Requote counts keyed by (market, side, queue_model, reason); flushed to
     /// `quote_revision_stats` at run end. Same firehose-to-aggregate rule as
     /// `opp_aggs` — see the schema comment.
-    rev_aggs: HashMap<(String, String, String, String), i64>,
+    rev_aggs: HashMap<(String, String, String, i64, String), i64>,
 }
 
 /// Per-row telemetry from runs that ended longer ago than this is pruned at open.
@@ -71,6 +71,7 @@ const REBUILD_TABLES: &[&str] = &[
     "simulated_fills",
     "hedges",
     "pending_inventory_events",
+    "scenario_results",
 ];
 
 // --- small conversion helpers ---
@@ -97,6 +98,37 @@ fn sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 impl Db {
+    fn migrate_scenarios(conn: &Connection) -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        let columns = |table: &str| -> Result<Vec<String>> {
+            let mut q = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+            let names = q.query_map([], |r| r.get(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(names)
+        };
+        if !columns("runs")?.iter().any(|c| c == "semantics_version") {
+            tx.execute_batch("ALTER TABLE runs ADD COLUMN semantics_version INTEGER NOT NULL DEFAULT 1")?;
+        }
+        for table in ["opportunity_stats", "opportunity_rejects", "quote_revision_stats", "simulated_fills", "pending_inventory_events"] {
+            let old = columns(table)?;
+            if old.iter().any(|c| c == "latency_bucket_ms") {
+                continue;
+            }
+            if matches!(table, "opportunity_stats" | "quote_revision_stats") {
+                tx.execute_batch(&format!("ALTER TABLE {table} RENAME TO {table}_legacy_v1"))?;
+                tx.execute_batch(SCHEMA)?;
+                let names = old.iter().map(|n| format!("\"{}\"", n.replace('"', "\"\""))).collect::<Vec<_>>().join(",");
+                tx.execute_batch(&format!(
+                    "INSERT INTO {table} ({names}) SELECT {names} FROM {table}_legacy_v1; DROP TABLE {table}_legacy_v1;"
+                ))?;
+            } else {
+                tx.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN latency_bucket_ms INTEGER NOT NULL DEFAULT -1"))?;
+            }
+            tx.execute_batch(&format!("CREATE INDEX IF NOT EXISTS ix_{table}_scenario ON {table}(run_id,market,queue_model,latency_bucket_ms)"))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -113,6 +145,7 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening db {}", path.display()))?;
         conn.execute_batch(PRAGMAS)?;
         conn.execute_batch(SCHEMA)?;
+        Self::migrate_scenarios(&conn)?;
         Ok(Db {
             conn,
             run_id: String::new(),
@@ -138,6 +171,7 @@ impl Db {
         // A db created before this schema existed (or by an older build) may lack
         // some REBUILD_TABLES; make the CREATEs idempotently before touching them.
         conn.execute_batch(SCHEMA)?;
+        Self::migrate_scenarios(&conn)?;
 
         // Prune sparse per-row telemetry from runs that ended past retention. A run
         // with NULL finished_at older than the cutoff crashed without finalizing —
@@ -261,8 +295,8 @@ impl Db {
         self.run_id = run_id.to_string();
         self.ensure_tx()?;
         self.conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, mode, events_path, code_version, config_json)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, mode, events_path, code_version, config_json, semantics_version)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 2)",
             params![run_id, t(started_at), mode, events_path, code_version, config_json],
         )?;
         self.after_write()
@@ -287,14 +321,14 @@ impl Db {
         let aggs = std::mem::take(&mut self.opp_aggs);
         let run_id = self.run_id.clone();
         self.ensure_tx()?;
-        for ((market, side, queue_model), agg) in &aggs {
+        for ((market, side, queue_model, latency), agg) in &aggs {
             self.conn.execute(
                 "INSERT OR REPLACE INTO opportunity_stats
-                 (run_id, market, side, queue_model, accepted, sum_instant_edge_bps, sum_distance_bps, size_clamped, queue_truncated)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                 (run_id, market, side, queue_model, accepted, sum_instant_edge_bps, sum_distance_bps, size_clamped, queue_truncated, latency_bucket_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
                 params![
                     run_id, market, side, queue_model,
-                    agg.accepted, agg.sum_instant_edge_bps, agg.sum_distance_bps, agg.size_clamped, agg.queue_truncated
+                    agg.accepted, agg.sum_instant_edge_bps, agg.sum_distance_bps, agg.size_clamped, agg.queue_truncated, latency
                 ],
             )?;
         }
@@ -308,12 +342,12 @@ impl Db {
         let aggs = std::mem::take(&mut self.rev_aggs);
         let run_id = self.run_id.clone();
         self.ensure_tx()?;
-        for ((market, side, queue_model, reason), revisions) in &aggs {
+        for ((market, side, queue_model, latency, reason), revisions) in &aggs {
             self.conn.execute(
                 "INSERT OR REPLACE INTO quote_revision_stats
-                 (run_id, market, side, queue_model, reason, revisions)
-                 VALUES (?1,?2,?3,?4,?5,?6)",
-                params![run_id, market, side, queue_model, reason, revisions],
+                 (run_id, market, side, queue_model, reason, revisions, latency_bucket_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![run_id, market, side, queue_model, reason, revisions, latency],
             )?;
         }
         Ok(())
@@ -346,6 +380,7 @@ impl Db {
                     r.market.0.clone(),
                     r.side.as_str().to_string(),
                     r.queue_model.as_str().to_string(),
+                    r.latency_bucket_ms,
                 ))
                 .or_default();
             agg.accepted += 1;
@@ -366,11 +401,11 @@ impl Db {
         self.ensure_tx()?;
         self.conn.execute(
             "INSERT INTO opportunity_rejects
-             (run_id, market, side, queue_model, reject_reason, event_ts)
-             VALUES (?1,?2,?3,?4,?5,?6)",
+             (run_id, market, side, queue_model, reject_reason, event_ts, latency_bucket_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![
                 self.run_id, r.market.0, r.side.as_str(), r.queue_model.as_str(),
-                r.reject_reason.map(|x| x.as_str()), t(r.event_ts),
+                r.reject_reason.map(|x| x.as_str()), t(r.event_ts), r.latency_bucket_ms,
             ],
         )?;
         self.after_write()
@@ -387,6 +422,7 @@ impl Db {
                 r.market.0.clone(),
                 r.side.as_str().to_string(),
                 r.queue_model.as_str().to_string(),
+                    r.latency_bucket_ms,
                 r.reason.clone(),
             ))
             .or_default() += 1;
@@ -400,15 +436,15 @@ impl Db {
              (id, run_id, quote_id, market, queue_model, aster_side, fill_px, fill_qty, sweep_print_px,
               quoted_edge_bps, quoted_distance_bps,
               remaining_quote_qty_after_fill, was_trade_through, was_partial, feed_stale_at_fill, queue_truncated,
-              aster_pos_notional, hl_pos_notional, exch_ts, local_recv_ts)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              aster_pos_notional, hl_pos_notional, exch_ts, local_recv_ts, latency_bucket_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 r.id, self.run_id, r.quote_id, r.market.0, r.queue_model.as_str(), r.aster_side.as_str(),
                 s(r.fill_px), s(r.fill_qty), s(r.sweep_print_px), s(r.quoted_edge_bps), s(r.quoted_distance_bps),
                 s(r.remaining_quote_qty_after_fill),
                 bit(r.was_trade_through), bit(r.was_partial), bit(r.feed_stale_at_fill), bit(r.queue_truncated),
                 os(r.aster_pos_notional), os(r.hl_pos_notional),
-                t(r.exch_ts), t(r.local_recv_ts),
+                t(r.exch_ts), t(r.local_recv_ts), r.latency_bucket_ms,
             ],
         )?;
         self.after_write()
@@ -438,13 +474,29 @@ impl Db {
         self.conn.execute(
             "INSERT INTO pending_inventory_events
              (id, run_id, market, queue_model, event_type, signed_qty, avg_aster_px, mark_px, pending_notional,
-              realized_pnl, first_fill_ts, last_fill_ts, event_ts, reason)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+              realized_pnl, first_fill_ts, last_fill_ts, event_ts, reason, latency_bucket_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             params![
                 r.id, self.run_id, r.market.0, r.queue_model.as_str(), r.event_type,
                 s(r.signed_qty), s(r.avg_aster_px), os(r.mark_px), s(r.pending_notional),
-                os(r.realized_pnl), ot(r.first_fill_ts), ot(r.last_fill_ts), t(r.event_ts), r.reason.clone(),
+                os(r.realized_pnl), ot(r.first_fill_ts), ot(r.last_fill_ts), t(r.event_ts), r.reason.clone(), r.latency_bucket_ms,
             ],
+        )?;
+        self.after_write()
+    }
+
+    pub fn insert_scenario_result(&mut self, r: &ScenarioResultRow) -> Result<()> {
+        self.ensure_tx()?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO scenario_results
+             (run_id,market,queue_model,latency_bucket_ms,aster_qty,lighter_qty,realized_gross,fees,
+              unrealized_pnl,net_pnl,residual_qty,reserved_hedge_qty,unpriced_hedge_qty,
+              peak_aster_notional,peak_lighter_notional,valuation_complete,frozen_reason)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![self.run_id,r.market.0,r.queue_model.as_str(),r.latency_bucket_ms,
+                s(r.aster_qty),s(r.lighter_qty),s(r.realized_gross),s(r.fees),os(r.unrealized_pnl),os(r.net_pnl),
+                s(r.aster_qty+r.lighter_qty),s(r.reserved_hedge_qty),s(r.unpriced_hedge_qty),
+                s(r.peak_aster_notional),s(r.peak_lighter_notional),bit(r.net_pnl.is_some()),r.frozen_reason],
         )?;
         self.after_write()
     }
@@ -483,12 +535,30 @@ impl Db {
 // Row structs + constructors mapping domain types -> schema columns.
 // --------------------------------------------------------------------------
 
+pub struct ScenarioResultRow {
+    pub market: MarketId,
+    pub queue_model: QueueModel,
+    pub latency_bucket_ms: i64,
+    pub aster_qty: Decimal,
+    pub lighter_qty: Decimal,
+    pub realized_gross: Decimal,
+    pub fees: Decimal,
+    pub unrealized_pnl: Option<Decimal>,
+    pub net_pnl: Option<Decimal>,
+    pub reserved_hedge_qty: Decimal,
+    pub unpriced_hedge_qty: Decimal,
+    pub peak_aster_notional: Decimal,
+    pub peak_lighter_notional: Decimal,
+    pub frozen_reason: Option<&'static str>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OpportunityRow {
     pub id: String,
     pub market: MarketId,
     pub side: Side,
     pub queue_model: QueueModel,
+    pub latency_bucket_ms: i64,
     pub accepted: bool,
     pub reject_reason: Option<RejectReason>,
     pub ref_px: Option<Decimal>,
@@ -531,6 +601,7 @@ impl OpportunityRow {
     pub fn accepted(
         market: MarketId,
         queue_model: QueueModel,
+        latency_bucket_ms: i64,
         dq: &DesiredQuote,
         edge: &EdgeConfig,
         event_ts: DateTime<Utc>,
@@ -540,6 +611,7 @@ impl OpportunityRow {
             market,
             side: dq.aster_side,
             queue_model,
+            latency_bucket_ms,
             accepted: true,
             reject_reason: None,
             ref_px: Some(dq.ref_px),
@@ -581,6 +653,7 @@ impl OpportunityRow {
         market: MarketId,
         side: Side,
         queue_model: QueueModel,
+        latency_bucket_ms: i64,
         reason: RejectReason,
         event_ts: DateTime<Utc>,
     ) -> Self {
@@ -589,6 +662,7 @@ impl OpportunityRow {
             market,
             side,
             queue_model,
+            latency_bucket_ms,
             accepted: false,
             reject_reason: Some(reason),
             ref_px: None,
@@ -637,6 +711,7 @@ pub struct QuoteRevisionRow {
     pub market: MarketId,
     pub side: Side,
     pub queue_model: QueueModel,
+    pub latency_bucket_ms: i64,
     pub previous_quote_id: Option<String>,
     pub new_quote_id: Option<String>,
     pub reason: String,
@@ -653,6 +728,7 @@ pub struct FillRow {
     pub quote_id: String,
     pub market: MarketId,
     pub queue_model: QueueModel,
+    pub latency_bucket_ms: i64,
     pub aster_side: Side,
     pub fill_px: Decimal,
     pub fill_qty: Decimal,
@@ -675,12 +751,13 @@ pub struct FillRow {
 }
 
 impl FillRow {
-    pub fn from_fill(f: &SimulatedAsterFill, queue_model: QueueModel) -> Self {
+    pub fn from_fill(f: &SimulatedAsterFill, queue_model: QueueModel, latency_bucket_ms: i64) -> Self {
         FillRow {
             id: f.id.to_string(),
             quote_id: f.quote_id.to_string(),
             market: f.market.clone(),
             queue_model,
+            latency_bucket_ms,
             aster_side: f.aster_side,
             fill_px: f.fill_px,
             fill_qty: f.fill_qty,
@@ -791,6 +868,7 @@ pub struct PendingEventRow {
     pub id: String,
     pub market: MarketId,
     pub queue_model: QueueModel,
+    pub latency_bucket_ms: i64,
     pub event_type: String,
     pub signed_qty: Decimal,
     pub avg_aster_px: Decimal,
@@ -807,6 +885,7 @@ impl PendingEventRow {
     pub fn new(
         market: MarketId,
         queue_model: QueueModel,
+        latency_bucket_ms: i64,
         event_type: &str,
         signed_qty: Decimal,
         avg_aster_px: Decimal,
@@ -817,6 +896,7 @@ impl PendingEventRow {
             id: Uuid::new_v4().to_string(),
             market,
             queue_model,
+            latency_bucket_ms,
             event_type: event_type.to_string(),
             signed_qty,
             avg_aster_px,
@@ -868,6 +948,7 @@ mod tests {
             "BTC".into(),
             Side::Buy,
             QueueModel::Optimistic,
+            50,
             RejectReason::NoProfitableAsterBid,
             ts(),
         ))
@@ -890,6 +971,7 @@ mod tests {
             market: "BTC".into(),
             side: Side::Buy,
             queue_model: QueueModel::Optimistic,
+            latency_bucket_ms: 50,
             previous_quote_id: None,
             new_quote_id: None,
             reason: reason.to_string(),
@@ -929,6 +1011,34 @@ mod tests {
     }
 
     #[test]
+    fn legacy_aggregates_keep_their_identity_and_new_latency_keys_are_independent() {
+        let path=std::env::temp_dir().join(format!("xemm_schema_{}.sqlite",Uuid::new_v4()));
+        {
+            let conn=Connection::open(&path).unwrap();
+            conn.execute_batch("CREATE TABLE runs(run_id TEXT PRIMARY KEY,started_at TEXT NOT NULL,finished_at TEXT,mode TEXT NOT NULL,events_path TEXT,code_version TEXT,config_json TEXT NOT NULL);
+                INSERT INTO runs VALUES('old','2099-01-01',NULL,'replay',NULL,'old','{}');
+                CREATE TABLE opportunity_stats(run_id TEXT,market TEXT,side TEXT,queue_model TEXT,accepted INTEGER,sum_instant_edge_bps REAL,sum_distance_bps REAL,size_clamped INTEGER,queue_truncated INTEGER,PRIMARY KEY(run_id,market,side,queue_model));
+                INSERT INTO opportunity_stats VALUES('old','BTC','BUY','optimistic',7,14,21,0,0);
+                CREATE TABLE quote_revision_stats(run_id TEXT,market TEXT,side TEXT,queue_model TEXT,reason TEXT,revisions INTEGER,PRIMARY KEY(run_id,market,side,queue_model,reason));
+                INSERT INTO quote_revision_stats VALUES('old','BTC','BUY','optimistic','PRICE',3);").unwrap();
+        }
+        for _ in 0..2 {
+            let db=Db::open(&path).unwrap();
+            let old:(i64,i64)=db.conn().query_row("SELECT latency_bucket_ms,accepted FROM opportunity_stats WHERE run_id='old'",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+            assert_eq!(old,(-1,7));
+            assert_eq!(db.conn().query_row("SELECT semantics_version FROM runs WHERE run_id='old'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        }
+        {
+            let db=Db::open(&path).unwrap();
+            for latency in [50,100] {
+                db.conn().execute("INSERT INTO opportunity_stats VALUES('new','BTC','BUY','optimistic',?1,1,2,3,0,0)",[latency]).unwrap();
+            }
+            assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM opportunity_stats WHERE run_id='new'",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn open_drops_legacy_table_and_prunes_stale_rejects() {
         let dir = std::env::temp_dir().join(format!("xemm_maint_{}.sqlite", Uuid::new_v4()));
         {
@@ -947,9 +1057,9 @@ mod tests {
                  VALUES ('crashed', '2026-01-01T00:00:00+00:00', NULL, 'livebot-live', '{}');
                  INSERT INTO runs (run_id, started_at, finished_at, mode, config_json)
                  VALUES ('recent', '2099-01-01T00:00:00+00:00', '2099-01-01T01:00:00+00:00', 'livebot-live', '{}');
-                 INSERT INTO opportunity_rejects VALUES ('old', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
-                 INSERT INTO opportunity_rejects VALUES ('crashed', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
-                 INSERT INTO opportunity_rejects VALUES ('recent', 'BTC', 'buy', 'optimistic', 'X', '2099-01-01T00:00:00+00:00');",
+                 INSERT INTO opportunity_rejects (run_id,market,side,queue_model,reject_reason,event_ts) VALUES ('old', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO opportunity_rejects (run_id,market,side,queue_model,reject_reason,event_ts) VALUES ('crashed', 'BTC', 'buy', 'optimistic', 'X', '2026-01-01T00:00:00+00:00');
+                 INSERT INTO opportunity_rejects (run_id,market,side,queue_model,reject_reason,event_ts) VALUES ('recent', 'BTC', 'buy', 'optimistic', 'X', '2099-01-01T00:00:00+00:00');",
             )
             .unwrap();
         }

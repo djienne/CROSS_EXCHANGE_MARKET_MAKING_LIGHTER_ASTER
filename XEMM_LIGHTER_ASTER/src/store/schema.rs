@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS runs (
     mode         TEXT NOT NULL,
     events_path  TEXT,
     code_version TEXT,
-    config_json  TEXT NOT NULL
+    config_json  TEXT NOT NULL,
+    semantics_version INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS markets (
@@ -46,12 +47,13 @@ CREATE TABLE IF NOT EXISTS opportunity_stats (
     market               TEXT NOT NULL,
     side                 TEXT NOT NULL,
     queue_model          TEXT NOT NULL,
+    latency_bucket_ms    INTEGER NOT NULL DEFAULT -1,
     accepted             INTEGER NOT NULL,
     sum_instant_edge_bps REAL NOT NULL,   -- over accepted only; mean = sum/accepted
     sum_distance_bps     REAL NOT NULL,   -- over accepted only; mean = sum/accepted
     size_clamped         INTEGER NOT NULL,
     queue_truncated      INTEGER NOT NULL, -- accepted quotes resting beyond captured depth20
-    PRIMARY KEY (run_id, market, side, queue_model)
+    PRIMARY KEY (run_id, market, side, queue_model, latency_bucket_ms)
 );
 
 -- Rejects, by contrast, are kept per-row with a timestamp: they are sparse (logged
@@ -63,6 +65,7 @@ CREATE TABLE IF NOT EXISTS opportunity_rejects (
     market        TEXT NOT NULL,
     side          TEXT NOT NULL,
     queue_model   TEXT NOT NULL,
+    latency_bucket_ms INTEGER NOT NULL DEFAULT -1,
     reject_reason TEXT NOT NULL,
     event_ts      TEXT NOT NULL
 );
@@ -81,9 +84,10 @@ CREATE TABLE IF NOT EXISTS quote_revision_stats (
     market      TEXT NOT NULL,
     side        TEXT NOT NULL,
     queue_model TEXT NOT NULL,
+    latency_bucket_ms INTEGER NOT NULL DEFAULT -1,
     reason      TEXT NOT NULL,
     revisions   INTEGER NOT NULL,
-    PRIMARY KEY (run_id, market, side, queue_model, reason)
+    PRIMARY KEY (run_id, market, side, queue_model, latency_bucket_ms, reason)
 );
 
 CREATE TABLE IF NOT EXISTS simulated_fills (
@@ -92,6 +96,7 @@ CREATE TABLE IF NOT EXISTS simulated_fills (
     quote_id                       TEXT NOT NULL,
     market                         TEXT NOT NULL,
     queue_model                    TEXT NOT NULL,
+    latency_bucket_ms               INTEGER NOT NULL DEFAULT -1,
     aster_side                     TEXT NOT NULL,
     fill_px                        TEXT NOT NULL,
     fill_qty                       TEXT NOT NULL,
@@ -151,6 +156,7 @@ CREATE TABLE IF NOT EXISTS pending_inventory_events (
     run_id           TEXT NOT NULL,
     market           TEXT NOT NULL,
     queue_model      TEXT NOT NULL,
+    latency_bucket_ms INTEGER NOT NULL DEFAULT -1,
     event_type       TEXT NOT NULL,
     signed_qty       TEXT NOT NULL,
     avg_aster_px     TEXT NOT NULL,
@@ -163,4 +169,26 @@ CREATE TABLE IF NOT EXISTS pending_inventory_events (
     reason           TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_pending_run ON pending_inventory_events(run_id, market, queue_model);
+
+-- One final position ledger per alternative scenario, never additive across scenarios.
+CREATE TABLE IF NOT EXISTS scenario_results (
+    run_id TEXT NOT NULL,
+    market TEXT NOT NULL,
+    queue_model TEXT NOT NULL,
+    latency_bucket_ms INTEGER NOT NULL,
+    aster_qty TEXT NOT NULL,
+    lighter_qty TEXT NOT NULL,
+    realized_gross TEXT NOT NULL,
+    fees TEXT NOT NULL,
+    unrealized_pnl TEXT,
+    net_pnl TEXT,
+    residual_qty TEXT NOT NULL,
+    reserved_hedge_qty TEXT NOT NULL,
+    unpriced_hedge_qty TEXT NOT NULL,
+    peak_aster_notional TEXT NOT NULL,
+    peak_lighter_notional TEXT NOT NULL,
+    valuation_complete INTEGER NOT NULL,
+    frozen_reason TEXT,
+    PRIMARY KEY(run_id, market, queue_model, latency_bucket_ms)
+);
 "#;

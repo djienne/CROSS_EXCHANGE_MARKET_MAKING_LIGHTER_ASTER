@@ -1,9 +1,7 @@
-//! Per-market resolved specification (tick/step/min from Aster `exchangeInfo`
-//! and szDecimals from HL `meta`) and the live per-(market, queue-model) sim
-//! state. `MarketSpec` is serialized into the run-log header so replay needs no
-//! network. `MarketState` is populated by the sim engine (Phase 3).
+//! Resolved Aster/Lighter specifications and independent market/queue/latency
+//! simulation state. Recorded specifications make replay independent of the network.
 
-use std::collections::VecDeque;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -37,15 +35,17 @@ pub struct MarketSpec {
     pub hl_min_notional: Decimal,
 }
 
-/// Live simulation state for one market under one queue model. Books are stored
-/// per (market, model) state; the engine routes each book event to every model.
+/// One independent market/queue/latency simulation. Observations are shared;
+/// hypothetical executions, reservations and ledgers belong only to this scenario.
 #[derive(Debug)]
 pub struct MarketState {
     pub spec: MarketSpec,
     pub queue_model: QueueModel,
-    pub aster_book: Option<OrderBook>,
-    /// Recent HL books (bounded ring) used to resolve hedges at t+latency.
-    pub hl_book_ring: VecDeque<OrderBook>,
+    pub latency_bucket_ms: i64,
+    pub aster_book: Option<Arc<OrderBook>>,
+    pub hl_observation: Option<Arc<OrderBook>>,
+    /// Remaining hypothetical executable depth, reset by a new observation.
+    pub hl_execution_book: Option<OrderBook>,
     pub live_bid: Option<LiveQuote>,
     pub live_ask: Option<LiveQuote>,
     /// Replaced/cancelled quotes still fillable until their cancel takes effect.
@@ -55,10 +55,19 @@ pub struct MarketState {
     pub last_requote_bid: Option<DateTime<Utc>>,
     pub last_requote_ask: Option<DateTime<Utc>>,
     /// Running signed futures position on each leg, used to enforce the capital cap.
-    /// `aster_pos` = net of all Aster maker fills; `hl_pos` = net of all dispatched
-    /// hedges (≈ −aster_pos, differing by the unhedged sub-min `pending_inv`).
+    /// Only confirmed simulated executions change these positions.
     pub aster_pos: SignedPosition,
     pub hl_pos: SignedPosition,
+    pub aster_realized_gross: Decimal,
+    pub hl_realized_gross: Decimal,
+    pub aster_fees: Decimal,
+    pub hl_fees: Decimal,
+    pub reserved_hl_buys: Decimal,
+    pub reserved_hl_sells: Decimal,
+    pub unpriced_hedge_qty: Decimal,
+    pub frozen: Option<&'static str>,
+    pub timer_at: Option<DateTime<Utc>>,
+    pub timer_generation: u64,
     /// Peak |position| notional reached on each leg over the run (for reporting).
     pub max_abs_aster_notional: Decimal,
     pub max_abs_hl_notional: Decimal,
@@ -68,12 +77,14 @@ pub struct MarketState {
 }
 
 impl MarketState {
-    pub fn new(spec: MarketSpec, queue_model: QueueModel) -> Self {
+    pub fn new(spec: MarketSpec, queue_model: QueueModel, latency_bucket_ms: i64) -> Self {
         MarketState {
             spec,
             queue_model,
+            latency_bucket_ms,
             aster_book: None,
-            hl_book_ring: VecDeque::new(),
+            hl_observation: None,
+            hl_execution_book: None,
             live_bid: None,
             live_ask: None,
             dying: Vec::new(),
@@ -82,6 +93,16 @@ impl MarketState {
             last_requote_ask: None,
             aster_pos: SignedPosition::default(),
             hl_pos: SignedPosition::default(),
+            aster_realized_gross: Decimal::ZERO,
+            hl_realized_gross: Decimal::ZERO,
+            aster_fees: Decimal::ZERO,
+            hl_fees: Decimal::ZERO,
+            reserved_hl_buys: Decimal::ZERO,
+            reserved_hl_sells: Decimal::ZERO,
+            unpriced_hedge_qty: Decimal::ZERO,
+            frozen: None,
+            timer_at: None,
+            timer_generation: 0,
             max_abs_aster_notional: Decimal::ZERO,
             max_abs_hl_notional: Decimal::ZERO,
             last_reject_bid: None,
@@ -90,7 +111,7 @@ impl MarketState {
     }
 
     pub fn hl_book(&self) -> Option<&OrderBook> {
-        self.hl_book_ring.back()
+        self.hl_observation.as_deref()
     }
 
     /// Per-side requote throttle stamp.

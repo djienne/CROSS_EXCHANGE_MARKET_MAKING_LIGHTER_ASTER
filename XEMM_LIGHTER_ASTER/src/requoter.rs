@@ -99,8 +99,8 @@ pub struct LiveQuote {
 
     pub remaining_qty: Decimal,
     pub remaining_ahead_qty: Decimal,
-    /// True once the quote has actually rested on the book (reached `Live`). A
-    /// quote cancelled while still being placed never rested, so it is not fillable.
+    /// True once the quote has rested on the book. A cancellation requested during
+    /// placement may still leave a fillable interval before cancellation arrives.
     pub was_live: bool,
 }
 
@@ -171,9 +171,10 @@ impl LiveQuote {
             LiveQuoteState::PendingPlacement => now >= self.active_at && now <= self.expires_at,
             LiveQuoteState::Live => now <= self.expires_at,
             LiveQuoteState::PendingCancel => {
-                // Only fillable if the order actually rested: a quote cancelled while
-                // still being placed (never reached `Live`) never hit the book.
-                self.was_live
+                // A cancel request does not preempt placement that reaches the venue
+                // first. Preserve the active-to-cancel interval, including before ACK.
+                (self.was_live || (now >= self.active_at && self.cancel_effective_at.is_some_and(|t| t > self.active_at)))
+                    && now <= self.expires_at
                     && match self.cancel_effective_at {
                         Some(t) => now < t,
                         None => true,
@@ -185,6 +186,11 @@ impl LiveQuote {
 
     /// Advance time-driven state transitions (placement, expiry, cancel-effective).
     pub fn advance_state(&mut self, now: DateTime<Utc>) {
+        if self.state == LiveQuoteState::PendingCancel && now >= self.active_at
+            && self.cancel_effective_at.is_some_and(|t| t > self.active_at)
+        {
+            self.was_live = true;
+        }
         match self.state {
             LiveQuoteState::PendingPlacement if now >= self.active_at => {
                 self.state = LiveQuoteState::Live;
@@ -192,7 +198,7 @@ impl LiveQuote {
             }
             _ => {}
         }
-        if self.state == LiveQuoteState::Live && now > self.expires_at {
+        if matches!(self.state, LiveQuoteState::Live | LiveQuoteState::PendingCancel) && now > self.expires_at {
             self.state = LiveQuoteState::Expired;
         }
         if self.state == LiveQuoteState::PendingCancel {
@@ -343,11 +349,14 @@ mod tests {
     }
 
     #[test]
-    fn conservative_seeds_more_ahead_than_optimistic() {
-        let d = desired();
-        let opt = LiveQuote::from_desired("BTC".into(), d.clone(), ts(), &cfg(), QueueModel::Optimistic, dec!(1));
-        let cons = LiveQuote::from_desired("BTC".into(), d, ts(), &cfg(), QueueModel::Conservative, dec!(1));
-        assert!(cons.remaining_ahead_qty >= opt.remaining_ahead_qty);
+    fn queue_models_include_their_declared_visible_and_hidden_liquidity() {
+        let mut d = desired();
+        d.better_levels_qty = dec!(3);
+        d.queue_ahead_qty = dec!(5);
+        for (model,expected) in [(QueueModel::Optimistic,dec!(3)),(QueueModel::VisibleQueue,dec!(8)),(QueueModel::Conservative,dec!(13))] {
+            let q = LiveQuote::from_desired("BTC".into(),d.clone(),ts(),&cfg(),model,dec!(1));
+            assert_eq!(q.remaining_ahead_qty,expected);
+        }
     }
 
     #[test]
@@ -365,5 +374,15 @@ mod tests {
         lq.request_cancel(ts(), &cfg(), ReplaceReason::PriceChanged);
         assert_eq!(lq.state, LiveQuoteState::PendingCancel);
         assert!(!lq.is_fillable_at(ts() + Duration::milliseconds(10)));
+    }
+
+    #[test]
+    fn placement_before_cancel_effective_remains_fillable_without_an_ack() {
+        let mut q = LiveQuote::from_desired("BTC".into(),desired(),ts(),&cfg(),QueueModel::Optimistic,dec!(1));
+        q.request_cancel(ts()+Duration::milliseconds(5),&cfg(),ReplaceReason::PriceChanged);
+        assert!(!q.is_fillable_at(ts()+Duration::milliseconds(24)));
+        assert!(q.is_fillable_at(ts()+Duration::milliseconds(25)));
+        assert!(q.is_fillable_at(ts()+Duration::milliseconds(29)));
+        assert!(!q.is_fillable_at(ts()+Duration::milliseconds(30)));
     }
 }

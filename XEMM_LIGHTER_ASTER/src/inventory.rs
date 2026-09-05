@@ -236,7 +236,8 @@ pub fn handle_fill_parts(
 }
 
 /// Flag pending inventory that has aged out or grown too large, with a
-/// mark-to-market PnL. The caller should record the event and clear inventory.
+/// diagnostic mark-to-market PnL. The caller freezes new exposure and retains
+/// the inventory until an actual execution changes the position.
 pub fn check_pending_limits(
     inv: &PendingInventory,
     max_pending_notional: Decimal,

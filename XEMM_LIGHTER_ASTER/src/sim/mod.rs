@@ -1,6 +1,4 @@
-//! Deterministic simulation: the virtual clock helpers and the event-driven engine.
+//! Independent event-driven simulation scenarios.
 
-pub mod clock;
 pub mod engine;
-
 pub use engine::SimEngine;
