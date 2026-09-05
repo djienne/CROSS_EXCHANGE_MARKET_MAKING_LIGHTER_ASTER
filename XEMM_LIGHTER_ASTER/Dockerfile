@@ -14,8 +14,8 @@
 ############################
 # 1) Builder
 ############################
-# MSRV is 1.87 (Cargo.toml rust-version). bookworm so the runtime glibc matches.
-FROM rust:1.87-bookworm AS builder
+# Match Cargo.toml and the verified release toolchain; retain bookworm glibc.
+FROM rust:1.92-bookworm AS builder
 
 WORKDIR /app
 
@@ -25,14 +25,14 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# LIVE requires the DEFAULT features (hotpath -> live signing: k256/keccak/rmp/hex).
+# LIVE requires the DEFAULT features (hotpath -> live signing: k256/keccak/hex).
 # Do NOT pass --no-default-features (livebot hard-bails at runtime without hotpath).
 # BuildKit cache mounts make iterative rebuilds (synced bug fixes) fast; the final
 # binary is copied to a stable, non-cache path so the runtime stage can pull it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --bin xemm_lighter_aster \
+    cargo build --release --locked --bin xemm_lighter_aster \
  && cp /app/target/release/xemm_lighter_aster /usr/local/bin/xemm_lighter_aster
 
 ############################

@@ -38,6 +38,9 @@ services:
       dockerfile: Dockerfile
     image: xemm_lighter_aster:live
     working_dir: /app
+    user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
+    environment:
+      ASTER_NONCE_DIR: /nonce
     volumes:
       # Mount the WHOLE deploy dir read-only at the working dir, so ANY config
       # (config-live-lighter.toml, config-quick.toml, …), signer binaries, and
@@ -48,9 +51,11 @@ services:
       # Persistent + WRITABLE outputs (sqlite + journal + tape + trip latch); this
       # nested mount overrides the read-only parent for the runs/ subtree only.
       - ./runs:/app/runs
+      # Shared with host-side taker/observer/status processes on the Linux deployment.
+      - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
     # Graceful drain on SIGINT (the only signal the bot wires). Positions stay OPEN.
     stop_signal: SIGINT
-    stop_grace_period: 40s
+    stop_grace_period: 90s
     # The test drives runs manually via `docker compose run`; don't auto-restart.
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.

@@ -57,8 +57,10 @@ sync_source() {
   # tar the build inputs + ops files; secrets are handled separately by `secrets`.
   tar czf - \
     Dockerfile docker-compose.yml .dockerignore config-live-lighter.toml \
-    Cargo.toml Cargo.lock src scripts signers DOCKER_DEPLOY.md \
+    Cargo.toml Cargo.lock src scripts signers DOCKER_DEPLOY.md LIVE_RUNBOOK.md \
     | "${SSH[@]}" "tar xzf - -C '$DEST'"
+  # Keep the existing standalone journal CLI on the shared accounting contract.
+  tar czf - -C .. economics.py | "${SSH[@]}" "tar xzf - -C '$DEST/scripts'"
 }
 
 copy_secrets() {
