@@ -148,6 +148,7 @@ pub async fn run(
     let registry = Arc::new(VenueRegistry::with_wake_and_dirty(&market_ids, wake.clone(), dirty.clone()));
     let gate = Arc::new(TradingGate::new());
     let shutdown = CancellationToken::new();
+    let feeds_shutdown = CancellationToken::new();
 
     let (ingest_tx, ingest_rx) = mpsc::channel::<(MarketId, EventKind)>(COLD_INGEST_QUEUE_DEPTH);
     let cold_drop_count = Arc::new(AtomicU64::new(0));
@@ -178,7 +179,7 @@ pub async fn run(
             let notify = handle.notify();
             reconnect_map.insert((id.clone(), venue), handle);
             venue_handles.push(spawn_venue_thread(
-                venue, symbol, id.clone(), ingest_sink.clone(), cell, notify, shutdown.clone(), Some(core_hint),
+                venue, symbol, id.clone(), ingest_sink.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
                 scale.clone(),
             ));
             core_hint += 1;
@@ -227,7 +228,7 @@ pub async fn run(
             aster_base_url: cfg.live.aster.base_url.clone(),
             hl_base_url: cfg.live.hyperliquid.base_url.clone(),
         };
-        let sd = shutdown.clone();
+        let sd = feeds_shutdown.clone();
         Some(
             thread::Builder::new()
                 .name("livebot-book-check".into())
@@ -239,7 +240,7 @@ pub async fn run(
     };
 
     // --- cold plane: account state + journal ---
-    let account = AccountState::new(cfg.live.max_unhedged_notional_usd);
+    let account = AccountState::default();
     let (journal, jrx) = Journal::channel();
     // Journal path is derived from --db so a SEPARATE run (e.g. a live HYPE session alongside the
     // always-on multi-pair paper dry run) never clobbers the other's journal. db `runs/x.sqlite`
@@ -254,15 +255,15 @@ pub async fn run(
         std::fs::create_dir_all(&dir).ok();
         dir.join(format!("{stem}-journal.jsonl"))
     };
-    let journal_task = {
-        match std::fs::OpenOptions::new().create(true).append(true).open(&journal_path) {
-            Ok(f) => Some(tokio::spawn(run_journal_writer(jrx, std::io::BufWriter::new(f)))),
-            Err(e) => {
-                warn!("could not open journal {}: {e}; journaling to a sink", journal_path.display());
-                None
-            }
-        }
-    };
+    let journal_file = std::fs::OpenOptions::new().create(true).append(true).open(&journal_path)?;
+    let (journal_done_tx, journal_done_rx) = oneshot::channel();
+    let journal_thread = thread::Builder::new().name("livebot-journal".into()).spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            .map_err(|e| e.to_string()).and_then(|rt| {
+                rt.block_on(run_journal_writer(jrx, std::io::BufWriter::new(journal_file))).map_err(|e| e.to_string())
+            });
+        let _ = journal_done_tx.send(result);
+    })?;
 
     // --- execution plane: bounded command queues ---
     let (exec_tx, exec_rx) = mpsc::channel::<ExecCommand>(CMD_QUEUE_DEPTH);
@@ -280,6 +281,7 @@ pub async fn run(
     // Refuse to start (bail) until an operator clears it (scripts/reset_breaker.py) — checked BEFORE
     // any live execution setup so a tripped bot can never resume trading. No-op for a fresh db stem.
     super::breaker::check_startup(&db_path)?;
+    if exec_mode.sends_real_orders() { super::breaker::check_active_session(&db_path)?; }
 
     // --- bootstrap + execution/cold planes (mode-specific) ---
     // paper: synthesize a flat snapshot; the simulated worker fabricates acks/fills.
@@ -288,14 +290,14 @@ pub async fn run(
     let mut aux_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     let (worker_task, clean_start, stream_liveness, shutdown_recon) = if exec_mode.sends_real_orders() {
         setup_live_planes(
-            cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, shutdown.clone(), &mut aux_tasks,
+            cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, feeds_shutdown.clone(), &mut aux_tasks, &journal,
         )
         .await?
     } else {
         let mut snap = AccountSnapshot::empty();
         snap.source_ts_ns = mono_now_ns();
         account.publish(snap);
-        (tokio::spawn(run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx)), true, None, None)
+        (tokio::spawn(async move { run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx).await; Ok::<(), anyhow::Error>(()) }), true, None, None)
     };
     // (Startup cancel-all + clean-start verification now happen inside `setup_live_planes`
     // BEFORE the initial reconcile via `Reconciler::ensure_clean_start`, so the bot can never
@@ -304,6 +306,8 @@ pub async fn run(
 
     // --- strategy ---
     let session = SessionId::random();
+    if exec_mode.sends_real_orders() { super::breaker::start_active_session(&db_path, session.as_str(), &market_ids)?; }
+    let drain_control = Arc::new(super::exec::command::DrainControl::default());
     // The global TradingGate stays wired to the watchdog (reconnect nudging + the OPEN/CLOSED
     // gauge log); the strategy gates per-market off each pair's own feed freshness, so one
     // stale feed no longer halts quoting on every pair.
@@ -312,6 +316,8 @@ pub async fn run(
         journal.clone(), session, exec_tx.clone(), hedge_tx.clone(), exec_mode,
     );
     strat.set_exec_prio_lane(exec_prio_tx.clone());
+    strat.set_drain_control(drain_control.clone());
+    if let Some(recon) = &shutdown_recon { strat.set_hedge_readiness(recon.hedge_readiness()); }
     if clean_start {
         strat.mark_clean_start();
     }
@@ -349,9 +355,10 @@ pub async fn run(
                     .enable_all()
                     .build()
                     .expect("strategy runtime");
-                rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown));
+                rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown))
             }))
-            .map_err(|panic| panic_payload_message(panic.as_ref()));
+            .map_err(|panic| panic_payload_message(panic.as_ref()))
+            .and_then(|result| result.map_err(|e| e.to_string()));
             let _ = strat_done_tx.send(result);
         })
         .expect("spawn strategy thread");
@@ -450,19 +457,24 @@ pub async fn run(
         }
     }
 
-    // --- shutdown: stop the bot's planes, then let cold recorder finalize ---
-    // Stop strategy/reconcile/userstream from creating new work before cancelling orders.
+    // Quiesce first; private streams/reconciliation remain alive through execution drain.
     shutdown.cancel();
-    if cfg.live.shutdown_cancel_all {
-        send_exec_safety(&exec_tx, ExecCommand::CancelAllBot, "shutdown CancelAllBot").await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+    if !strategy_done_seen {
+        let acknowledged = tokio::time::timeout(Duration::from_secs(5), async {
+            while !drain_control.quiesced.load(Ordering::Acquire) { tokio::time::sleep(Duration::from_millis(5)).await; }
+        }).await.is_ok();
+        if !acknowledged && strategy_error.is_none() {
+            strategy_error = Some(anyhow::anyhow!("strategy did not acknowledge quiescence"));
+        }
     }
+    if cfg.live.shutdown_cancel_all { send_exec_safety(&exec_tx, ExecCommand::CancelAllBot, "shutdown CancelAllBot").await; }
+    send_exec_safety(&exec_tx, ExecCommand::Barrier { completion: drain_control.maker_barrier.clone() }, "maker command barrier").await;
     // Wait (bounded) for the strategy's shutdown fill-drain before stopping the workers:
     // a fill queued at ctrl-c raced the old immediate worker Shutdown and could be dropped
-    // unhedged. The strategy's own drain is capped at 3s; a panic fires the supervision
+    // unhedged. The strategy's execution drain is bounded at 65s; a panic fires the supervision
     // channel immediately (the send is outside the unwind), so crash paths don't wait.
     if !strategy_done_seen {
-        match tokio::time::timeout(Duration::from_secs(10), &mut strat_done_rx).await {
+        match tokio::time::timeout(Duration::from_secs(70), &mut strat_done_rx).await {
             Ok(res) => {
                 strategy_done_seen = true;
                 match res {
@@ -482,21 +494,22 @@ pub async fn run(
                 }
             }
             Err(_) => {
-                warn!("strategy did not stop within 10s of shutdown; stopping workers anyway");
+                warn!("strategy did not finish its bounded execution drain");
+                if strategy_error.is_none() { strategy_error = Some(anyhow::anyhow!("execution drain deadline exceeded")); }
             }
-        }
-    }
-    // Post-drain shutdown verification (live only): confirm the cancel-all landed, sweep for
-    // residual positions (a late fill manifests as a position — no userTrades REST on Aster),
-    // and persist the residual report. Bounded ≤ ~30s total; never blocks shutdown on failure.
-    if exec_mode.sends_real_orders() {
-        if let Some(recon) = &shutdown_recon {
-            let traded: Vec<MarketId> = specs.iter().map(|s| s.market_id.clone()).collect();
-            shutdown_verify(recon, &journal, &db_path, &traded).await;
         }
     }
     send_exec_safety(&exec_tx, ExecCommand::Shutdown, "exec Shutdown").await;
     send_hedge_safety(&hedge_tx, HedgeCommand::Shutdown, "hedge Shutdown").await;
+    let workers_ok = matches!(tokio::time::timeout(Duration::from_secs(65), worker_task).await, Ok(Ok(Ok(()))));
+    if !workers_ok && strategy_error.is_none() { strategy_error = Some(anyhow::anyhow!("execution worker drain incomplete")); }
+    let mut final_verified = !exec_mode.sends_real_orders();
+    if exec_mode.sends_real_orders() && workers_ok {
+        if let Some(recon) = &shutdown_recon {
+            final_verified = shutdown_verify(recon, &journal, &db_path, &market_ids).await;
+        }
+    }
+    feeds_shutdown.cancel();
     watchdog_stop.store(true, Ordering::Release);
     // Joining venue threads drops their ingest_tx senders → cold recorder's recv() returns
     // None → cold thread drains, finalizes SimEngine, and writes the report.
@@ -547,14 +560,29 @@ pub async fn run(
             }
         }
     }
-    let _ = worker_task.await;
     for h in aux_tasks {
         let _ = h.await;
     }
+    let journal_healthy = journal.healthy();
+    let trip_backup = journal.clone();
     drop(journal);
-    if let Some(j) = journal_task {
-        let _ = j.await;
+    // The backup must not keep the record sender open during the writer drain.
+    let retry_trip = trip_backup.detached_control();
+    drop(trip_backup);
+    let journal_ok = match tokio::time::timeout(Duration::from_secs(5), journal_done_rx).await {
+        Ok(Ok(Ok(()))) => { let _ = journal_thread.join(); true }
+        _ => { drop(journal_thread); false }
+    };
+    if breaker_tripped_flag.load(Ordering::Acquire) && !journal_ok {
+        let (done_tx, done_rx) = oneshot::channel();
+        thread::spawn(move || { let _ = done_tx.send(retry_trip.persist_trip_cold()); });
+        let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
     }
+    if exec_mode.sends_real_orders() && final_verified && workers_ok && strategy_error.is_none() && journal_ok && journal_healthy {
+        super::breaker::finish_active_session(&db_path)?;
+    }
+    if !journal_ok || !journal_healthy { bail!("journal did not drain cleanly; active-session marker retained"); }
+    if !final_verified { bail!("final positions/orders could not be verified neutral; active-session marker retained"); }
 
     if let Some(e) = strategy_error {
         return Err(e);
@@ -566,30 +594,7 @@ pub async fn run(
     if exec_mode.sends_real_orders() {
         super::breaker::check_shutdown(&db_path)?;
     }
-    // In-memory backstop for the same trip: if the persistent latch write FAILED at trip time
-    // (unwritable runs/ dir), check_shutdown above sees no file and passes — and the supervisor
-    // would restart straight into trading. The strategy sets this flag before attempting the
-    // write, so re-attempt the latch best-effort and exit nonzero regardless.
-    if breaker_tripped_flag.load(Ordering::Acquire) {
-        let trip = super::breaker::trip_path(&db_path);
-        if !trip.exists() {
-            let rec = super::breaker::TripRecord {
-                ts_utc: Utc::now().to_rfc3339(),
-                market: specs.first().map(|s| s.market_id.0.clone()).unwrap_or_default(),
-                baseline_usd: Default::default(),
-                equity_usd: Default::default(),
-                loss_usd: Default::default(),
-                limit_usd: Default::default(),
-                reason: "circuit breaker tripped this run; latch rewritten at shutdown \
-                         (original write failed)"
-                    .to_string(),
-            };
-            if let Err(e) = super::breaker::write_trip(&trip, &rec) {
-                warn!("failed to re-write circuit-breaker trip latch at shutdown ({}): {e:#}", trip.display());
-            }
-        }
-        bail!("circuit breaker tripped during this run (in-memory flag); exiting nonzero so the supervisor halts");
-    }
+    if breaker_tripped_flag.load(Ordering::Acquire) { bail!("circuit breaker tripped during this run"); }
 
     info!("livebot stopped. research tape -> {} ; results db -> {}", tape_path.display(), db_path.display());
     Ok(())
@@ -814,8 +819,9 @@ async fn setup_live_planes(
     maker_fill_tx: mpsc::Sender<AsterFill>,
     shutdown: CancellationToken,
     aux: &mut Vec<tokio::task::JoinHandle<()>>,
+    journal: &Journal,
 ) -> Result<(
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<Result<()>>,
     bool,
     Option<Arc<super::userstream::StreamLiveness>>,
     Option<super::reconcile::Reconciler>,
@@ -937,10 +943,12 @@ async fn setup_live_planes(
     // supervisor that only awaits the two real tasks at shutdown.
     let etx = events_tx.clone();
     let aster_worker_task = tokio::spawn(run_aster_worker(exec_rx, exec_prio_rx, etx, worker_aster));
-    let hl_worker_task = tokio::spawn(run_hl_worker(hedge_rx, events_tx, worker_hl));
+    let hl_worker_task = tokio::spawn(run_hl_worker(hedge_rx, events_tx.clone(), worker_hl, journal.clone()));
     let worker_task = tokio::spawn(async move {
-        let _ = aster_worker_task.await;
-        let _ = hl_worker_task.await;
+        let (aster, hedge) = tokio::join!(aster_worker_task, hl_worker_task);
+        aster.map_err(|e| anyhow::anyhow!("Aster worker failed: {e}"))?;
+        hedge.map_err(|e| anyhow::anyhow!("hedge worker failed: {e}"))?;
+        Ok(())
     });
 
     // Refuse to trade live in hedge mode (the bot assumes one-way).
@@ -966,7 +974,7 @@ async fn setup_live_planes(
 
     // Cold reconcile loop: refresh well inside `max_account_snapshot_age_ms`.
     let interval = Duration::from_millis((cfg.live.max_account_snapshot_age_ms / 2).clamp(500, 2000) as u64);
-    aux.push(tokio::spawn(recon.run(account.clone(), shutdown.clone(), interval)));
+    aux.push(tokio::spawn(recon.run(account.clone(), shutdown.clone(), interval, events_tx)));
 
     // Aster user (fill) stream → maker-fill channel. Keep a clone of the liveness stamp to hand
     // to the strategy so it can freeze quoting if the stream silently dies.
@@ -989,7 +997,7 @@ async fn shutdown_verify(
     journal: &Journal,
     db_path: &std::path::Path,
     markets: &[MarketId],
-) {
+) -> bool {
     // 1. Re-cancel + poll for bot-prefixed strays. require_clean_start=false keeps it non-fatal
     //    (a still-dirty book is loudly warned inside, and the deadman countdown remains armed).
     match tokio::time::timeout(Duration::from_secs(20), recon.ensure_clean_start(true, false)).await {
@@ -1002,11 +1010,11 @@ async fn shutdown_verify(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::error!("shutdown verification incomplete: final snapshot read failed: {e:#}");
-            return;
+            return false;
         }
         Err(_) => {
             tracing::error!("shutdown verification incomplete: final snapshot read timed out after 10s");
-            return;
+            return false;
         }
     };
     let orders_verified_empty = !snap.open_orders.iter().any(|o| o.is_bot_order());
@@ -1017,7 +1025,7 @@ async fn shutdown_verify(
     let now_ns = mono_now_ns();
     for line in &residuals {
         if line.net_qty == rust_decimal::Decimal::ZERO {
-            tracing::error!(
+            tracing::info!(
                 "shutdown residual on {}: delta-neutral pair left open (aster={} lighter={}) — \
                  documented-normal: graceful shutdown cancels orders but leaves positions",
                 line.market, line.aster_qty, line.hl_qty
@@ -1025,7 +1033,7 @@ async fn shutdown_verify(
         } else {
             tracing::error!(
                 "CRITICAL shutdown residual on {}: NET imbalance (aster={} lighter={} net={}) — \
-                 unhedged exposure; the next start adopts and recovers it",
+                 unhedged exposure; automatic restart remains blocked",
                 line.market, line.aster_qty, line.hl_qty, line.net_qty
             );
         }
@@ -1050,5 +1058,7 @@ async fn shutdown_verify(
     let path = super::breaker::residual_path(db_path);
     if let Err(e) = super::breaker::write_residual(&path, &rec) {
         warn!("failed to write shutdown residual report to {}: {e:#}", path.display());
+        return false;
     }
+    orders_verified_empty && rec.residuals.iter().all(|r| r.net_qty == rust_decimal::Decimal::ZERO)
 }

@@ -9,6 +9,18 @@ use crate::types::Side;
 /// Number of book levels carried on the hot path (matches Aster `@depth20` / HL l2Book).
 pub const HOT_LEVELS: usize = 20;
 
+/// Source age at receipt, computed once by ingest. Missing timestamps and clocks
+/// over one second in the future are unusable; small exchange clock lead is tolerated.
+#[inline]
+pub fn source_age_at_receive_ms(source_ms: i64, receive_ms: i64) -> i64 {
+    if source_ms <= 0 || source_ms > receive_ms.saturating_add(1_000) {
+        i64::MAX
+    } else {
+        receive_ms.saturating_sub(source_ms).max(0)
+    }
+}
+
+
 /// One book level in scaled-integer form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HotLevel {
@@ -32,6 +44,7 @@ pub struct HotBook {
     /// merge independent BBO/depth feeds without letting a locally-late older BBO override
     /// a newer L2 book. Zero means "unknown" and is treated conservatively by callers.
     pub exch_ms: i64,
+    pub source_age_at_recv_ms: i64,
 }
 
 impl HotBook {
@@ -46,7 +59,8 @@ impl HotBook {
         recv_ns: i64,
         exch_ms: i64,
     ) -> Self {
-        HotBook { bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms }
+        HotBook { bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms,
+            source_age_at_recv_ms: if exch_ms > 0 { 0 } else { i64::MAX } }
     }
 
     #[inline]
@@ -99,9 +113,26 @@ impl HotBook {
         }
     }
 
-    /// Milliseconds since this book was received, at monotonic `now_ns`.
+    /// Source age plus monotonic time since receipt; no wall-clock call on the strategy path.
     #[inline]
     pub fn age_ms(&self, now_ns: i64) -> i64 {
-        now_ns.saturating_sub(self.recv_ns) / 1_000_000
+        (now_ns.saturating_sub(self.recv_ns).max(0) / 1_000_000).saturating_add(self.source_age_at_recv_ms)
+    }
+}
+
+#[cfg(test)]
+mod source_time_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_or_unknown_source_does_not_become_fresh_on_receipt() {
+        assert_eq!(source_age_at_receive_ms(1_700_000_000_000, 1_700_000_010_000), 10_000);
+        assert_eq!(source_age_at_receive_ms(0, 1_700_000_010_000), i64::MAX);
+        assert_eq!(source_age_at_receive_ms(1_700_000_010_500, 1_700_000_010_000), 0);
+        assert_eq!(source_age_at_receive_ms(1_700_000_011_001, 1_700_000_010_000), i64::MAX);
+        let mut book = HotBook::new([HotLevel::default(); HOT_LEVELS], [HotLevel::default(); HOT_LEVELS],
+            0, 0, 0, 1_000_000_000, 1_700_000_000_000);
+        book.source_age_at_recv_ms = 10_000;
+        assert_eq!(book.age_ms(1_005_000_000), 10_005);
     }
 }

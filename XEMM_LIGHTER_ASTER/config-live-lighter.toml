@@ -1,21 +1,13 @@
-# Dedicated config for the LIVE HYPE acceptance run using Aster + Lighter. Kept SEPARATE from
-# config.toml so the always-on multi-pair paper dry run (a different process, different config)
-# is completely unaffected. Small clips, generous timing for the slow dev network.
+# Live Aster maker / Lighter hedge configuration. Select exactly one market.
 #
 # Run with:
 #   xemm_lighter_aster --config config-live-lighter.toml livebot --mode live --markets HYPE \
 #       --db runs/livebot-live.sqlite --out runs/livebot-live.jsonl.zst --secs <N>
 
 [edge]
-# NORMAL OPERATING MODE (profit-seeking, not acceptance): a positive edge with cost buffers so each
-# maker fill is priced to be profitable after fees + slippage/latency/basis cushions. Post-only (GTX)
-# throughout. required_bps = min_net_profit + the four buffers = 14.0 + 1.5 + 2.0 + 1.0 + 0.0 = 18.5 bps
-# reserved on top of the round-trip fees => the Aster quote rests off the Lighter hedge
-# (see docs/aster_buy_spread_explainer.svg). Wider than the old -50 acceptance pin ⇒ fewer, profitable
-# fills. The circuit breaker below is the safety stop for unattended live runs.
-# 2026-06-16: bumped min_net_profit 3.0 -> 5.0 -> 7.0 -> 9.0 -> 11.0 -> 14.0
-# (required edge 18.5 bps)
-# for wider spread / fewer fills / more profit per fill.
+# The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured
+# fees. This is an admission estimate; realized outcomes depend on fills and
+# subsequent hedge prices. The loss breaker uses marked account equity.
 min_net_profit_bps   = "14.0"
 slippage_buffer_bps  = "1.5"
 latency_buffer_bps   = "2.0"
@@ -50,11 +42,9 @@ halt_trading_on_stale_feed        = true
 
 [partials]
 strict_all_partials_must_be_hedgeable = false
-accumulate_sub_min_fills              = true
 lighter_min_notional              = "10"
 max_pending_inventory_notional        = "25"
 max_pending_inventory_age_ms          = 1000
-mark_pending_inventory_to_market      = true
 
 [capital]
 aster_capital_usd       = "200"
@@ -80,7 +70,7 @@ depth_limit          = 20
 [live]
 enabled                       = true
 mode                          = "live"       # this config is FOR the live run (CLI also passes --mode live)
-post_trade_cooldown_ms        = 3000         # short cooldown so the 4 sequences don't take forever
+post_trade_cooldown_ms        = 3000
 cooldown_scope                = "per_market"
 startup_cancel_all            = true
 shutdown_cancel_all           = true
@@ -100,24 +90,17 @@ use_hot_integer_math               = true
 reduce_position_only               = true
 replace_immediately_if_unprofitable = true
 min_requote_interval_ms            = 150
-price_change_ticks_to_requote      = 2
 # Live safety cap for per-symbol replace churn. The separate Aster command budget below protects
 # the global REST write path and reserves room for cancels/sweeps.
 max_replaces_per_minute_per_symbol = 100
 
 [live.partials]
-# accumulate_sub_min: admits Class-B pairs like HYPE (full ~$12 clip is Lighter-hedgeable, but a
-# tiny partial could be sub-$10). Sub-min partials are NOT orphaned — they're flattened
-# reduce-only on Aster in the hot path, and the cold reconciler backstop neutralizes any
-# residual. The common case is a single full fill that hedges immediately on Lighter.
-# A pending sub-min residual flushes to a hedge as soon as the next fill pushes it past $10, so
-# it rarely lingers. These bounds only trigger the exceptional flatten if it genuinely sticks:
-# allow it to grow to ~$15 (just over one clip) and live ~6s while accumulating before we give up
-# and flatten it reduce-only on Aster.
+# Accumulate sub-minimum maker fills until hedgeable. Expired/oversized residuals
+# enter tracked, rounded-down reduce-only correction (at most two attempts).
+# Quantization remainders and ambiguous orders remain reserved and explicit.
 policy                  = "accumulate_sub_min"
 max_pending_notional_usd = "15"
 max_pending_age_ms       = 6000
-max_pending_count        = 3
 
 [live.aster]
 base_url             = "https://fapi.asterdex.com"
@@ -135,29 +118,18 @@ rate_limit_backoff_ms             = 5000
 base_url              = "https://mainnet.zklighter.elliot.ai"
 signers_dir           = "signers"
 hedge_order_type      = "aggressive_ioc"
-# 2026-06-16: widened the FIRST-try IOC buffer so the hedge crosses immediately and avoids the
-# ~1s reject->retry path. Still ~26x tighter than Lighter's own 8% market-order default; the IOC limit
-# is a ceiling, not the fill price (small hedges fill at the touch), so the wider cap rarely costs
-# extra. emergency is the escalation for an extreme adverse move and should now seldom trigger.
+# IOC limit bounds adverse execution; fresh remaining quantities govern any retry.
 normal_slippage_bps   = "60"
 emergency_slippage_bps = "90"
-expires_after_ms      = 60000
 fill_timeout_ms       = 2000
 
 [live.margin_guard]
-# Proactive Aster margin cap. The position cap fed to the quote engine is dynamically lowered to
-# min(aster_capital_usd, (real_collateral - aster_safety_buffer_usd) * leverage), so the
-# position-INCREASING side stops quoting before Aster rejects with -2019 ("Margin is insufficient").
-# Real collateral ~= the deposited USDC (~$124), NOT the $200 aster_capital_usd soft cap. The buffer
-# (~2x the $13 clip) absorbs one in-flight/stale quote + mark movement over the reconcile cadence.
-# Requires capital.leverage = 1 and enforce_position_cap = true (validated at startup).
-# NOTE: the cap is account-aware (other CONFIGURED markets' Aster notional is deducted), but the buffer
-# size and the ~2s forced-tick application latency are tuned for the single-market (--markets HYPE) run;
-# raise the buffer if ever running multiple Aster markets live simultaneously. IMPORTANT: only Aster
-# positions in symbols mapped from the SELECTED specs are deducted, so run this on an account DEDICATED
-# to the configured markets — unrelated Aster exposure would consume collateral without being counted.
+# Opening capacity is bounded by the static 1x cap and actual free margin on
+# each venue after buffers and outstanding directional obligations. Reductions
+# remain eligible. Requires leverage=1 and enforce_position_cap=true.
 enabled                 = true
 aster_safety_buffer_usd = "26"
+lighter_safety_buffer_usd = "26"
 
 [live.circuit_breaker]
 # Unattended-run safety stop. Measures TOTAL cross-venue account equity (Aster wallet+unrealized + Lighter
@@ -175,10 +147,6 @@ lighter_symbol      = "HYPE"
 aster_symbol = "BNBUSDT"
 lighter_symbol      = "BNB"
 
-# ETH added for the docker live test. desired_notional=13 (global) -> ~0.007 ETH
-# (step 0.001) ~= $12.90/leg at ETH~$1842: clears Lighter's $10 floor (margin ~$2.90;
-# >=$11.14 even under adverse rounding) and Aster's $5. Specs: Aster tick 0.01 /
-# step 0.001 / minQty 0.001 / MIN_NOTIONAL $5. Select with --markets ETH.
 [[markets]]
 aster_symbol = "ETHUSDT"
 lighter_symbol      = "ETH"

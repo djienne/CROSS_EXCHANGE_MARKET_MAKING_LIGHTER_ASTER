@@ -15,6 +15,7 @@ use crate::config::{Config, MarketCfg};
 use crate::connectors::{rest_book, rest_specs};
 use crate::markets::MarketSpec;
 use crate::types::Side;
+use crate::decimal::common_qty_step;
 use crate::venues::lighter::LighterVenue;
 
 #[derive(Debug, Serialize)]
@@ -70,6 +71,10 @@ pub struct BookStatus {
     pub lighter_ask: Option<LevelStatus>,
     pub aster_age_ms: i64,
     pub lighter_age_ms: i64,
+    pub aster_source_age_ms: Option<i64>,
+    pub lighter_source_age_ms: Option<i64>,
+    pub aster_engine_age_ms: Option<i64>,
+    pub lighter_engine_age_ms: Option<i64>,
     pub aster_crossed: bool,
     pub lighter_crossed: bool,
 }
@@ -350,6 +355,10 @@ fn book_status(now: chrono::DateTime<Utc>, aster: &OrderBook, lighter: &OrderBoo
         }),
         aster_age_ms: aster.age_ms(now),
         lighter_age_ms: lighter.age_ms(now),
+        aster_source_age_ms: aster.source_age_ms(now),
+        lighter_source_age_ms: lighter.source_age_ms(now),
+        aster_engine_age_ms: aster.engine_age_ms(now),
+        lighter_engine_age_ms: lighter.engine_age_ms(now),
         aster_crossed: aster.is_crossed(),
         lighter_crossed: lighter.is_crossed(),
     }
@@ -379,7 +388,9 @@ fn direction_status(
     let Some(ref_px) = aster.mid().or_else(|| lighter.mid()) else {
         return empty_direction(direction, "depth");
     };
-    if ref_px <= Decimal::ZERO || aster.is_crossed() || lighter.is_crossed() {
+    if ref_px <= Decimal::ZERO || aster.is_crossed() || lighter.is_crossed()
+        || !aster.is_fresh(Utc::now(), cfg.arb.max_book_staleness_ms)
+        || !lighter.is_fresh(Utc::now(), cfg.arb.max_book_staleness_ms) {
         return empty_direction(direction, "stale_book");
     }
 
@@ -692,22 +703,11 @@ fn min_trade_qty(
 }
 
 fn floor_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
-    floor_to_step(floor_to_step(qty, aster_step), lighter_step)
+    common_qty_step(aster_step,lighter_step).map(|step|floor_to_step(qty,step)).unwrap_or(Decimal::ZERO)
 }
 
 fn ceil_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    let mut out = qty;
-    for _ in 0..8 {
-        let next = ceil_to_step(ceil_to_step(out, aster_step), lighter_step);
-        if next == out && is_step_multiple(out, aster_step) && is_step_multiple(out, lighter_step) {
-            return out;
-        }
-        out = next;
-    }
-    out
+    common_qty_step(aster_step,lighter_step).map(|step|ceil_to_step(qty,step)).unwrap_or(Decimal::ZERO)
 }
 
 fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
@@ -722,13 +722,6 @@ fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
         return Decimal::ZERO;
     }
     (qty / step).ceil() * step
-}
-
-fn is_step_multiple(qty: Decimal, step: Decimal) -> bool {
-    if qty < Decimal::ZERO || step <= Decimal::ZERO {
-        return false;
-    }
-    (qty / step).fract() == Decimal::ZERO
 }
 
 #[cfg(test)]
@@ -752,7 +745,7 @@ mod tests {
     #[test]
     fn common_step_ceil_reaches_common_multiple() {
         assert_eq!(
-            ceil_to_common_step(dec!(0.171), dec!(0.01), dec!(0.01)),
+            ceil_to_common_step(dec!(0.171), dec!(0.02), dec!(0.03)),
             dec!(0.18)
         );
     }

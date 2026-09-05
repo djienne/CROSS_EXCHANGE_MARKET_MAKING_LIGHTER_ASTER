@@ -9,10 +9,68 @@
 //! [`MarketScale`](crate::livebot::scale::MarketScale).
 
 use rust_decimal::Decimal;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use crate::livebot::fills::{AsterFill, HedgeIntent};
+use crate::livebot::fills::{Admission, AsterFill, HedgeIntent, WireProof};
+use crate::livebot::account::Venue;
 use crate::livebot::ids::Cloid;
 use crate::types::{MarketId, Side};
+
+#[derive(Debug, Default)]
+pub struct CommandBarrier {
+    completed_ns: AtomicI64,
+    wake: tokio::sync::Notify,
+}
+impl CommandBarrier {
+    pub fn complete(&self, now_ns: i64) { self.completed_ns.store(now_ns, Ordering::Release); self.wake.notify_one(); }
+    pub fn completed_ns(&self) -> i64 { self.completed_ns.load(Ordering::Acquire) }
+    pub async fn wait(&self) { while self.completed_ns() == 0 { self.wake.notified().await; } }
+}
+
+#[derive(Debug, Default)]
+pub struct DrainControl {
+    pub quiesced: AtomicBool,
+    pub maker_barrier: Arc<CommandBarrier>,
+}
+
+/// A queued quote is valid only for the exact published books and risk epoch
+/// used to calculate it. The worker claims it after all rate-limit waiting.
+#[derive(Clone)]
+pub struct MakerPermit {
+    pub admission: Arc<Admission>,
+    books: Option<[(Arc<crate::hotpath::VenueBook>, u64); 2]>,
+    epoch: Arc<AtomicU64>,
+    expected_epoch: u64,
+    hedge_readiness: Option<super::hyperliquid::HedgeReadiness>,
+}
+impl std::fmt::Debug for MakerPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MakerPermit").field("admission", &self.admission).finish()
+    }
+}
+impl MakerPermit {
+    pub fn new(books: [(Arc<crate::hotpath::VenueBook>, u64); 2], epoch: Arc<AtomicU64>, deadline_ns: i64,
+        hedge_readiness: Option<super::hyperliquid::HedgeReadiness>) -> Self {
+        let expected_epoch = epoch.load(Ordering::Acquire);
+        Self { admission: Admission::new(deadline_ns), books: Some(books), epoch, expected_epoch, hedge_readiness }
+    }
+    pub fn try_claim(&self, now_ns: i64) -> bool {
+        let valid = self.epoch.load(Ordering::Acquire) == self.expected_epoch
+            && self.hedge_readiness.as_ref().is_none_or(|ready| ready.is_ready())
+            && self.books.as_ref().is_none_or(|books| books.iter().all(|(cell, expected)|
+                expected % 2 == 0 && cell.content_version() == *expected
+                    && !cell.stream_down() && !cell.is_divergent() && !cell.has_hot_only_update()));
+        if !valid { self.admission.cancel_queued(); return false; }
+        self.admission.try_claim(now_ns)
+    }
+    pub fn is_cancelled(&self) -> bool { self.admission.is_cancelled() }
+    pub fn cancel_queued(&self) -> bool { self.admission.cancel_queued() }
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self { admission: Admission::new(i64::MAX), books: None, epoch: Arc::new(AtomicU64::new(0)), expected_epoch: 0, hedge_readiness: None }
+    }
+}
 
 /// Strategy → Aster execution worker. Maker placement / cancel / replace / safety cancels +
 /// the dead-man heartbeat.
@@ -20,6 +78,7 @@ use crate::types::{MarketId, Side};
 pub enum ExecCommand {
     /// Rest a post-only (GTX) maker order.
     Place {
+        permit: MakerPermit,
         market: MarketId,
         side: Side,
         price_ticks: i64,
@@ -35,6 +94,7 @@ pub enum ExecCommand {
     },
     /// Atomic replace (modify) when supported, else the worker does cancel+place.
     Replace {
+        permit: MakerPermit,
         market: MarketId,
         side: Side,
         old_client_id: String,
@@ -51,9 +111,11 @@ pub enum ExecCommand {
     /// `side` closes the leg (SELL to close a long, BUY to close a short), `qty` base units.
     /// `client_id` is a session-prefixed id (OrderManager::next_flatten_client_id) so the
     /// resulting reduce-only fill passes the strategy's own-order attribution.
-    FlattenAster { market: MarketId, side: Side, qty: Decimal, client_id: String },
+    FlattenAster { intent: HedgeIntent, client_id: String },
     /// Refresh the per-symbol dead-man countdown (plan §3.4).
     RefreshDeadman { market: MarketId },
+    /// FIFO barrier: all earlier maker commands finished before this timestamp.
+    Barrier { completion: Arc<CommandBarrier> },
     /// Drain and stop the worker.
     Shutdown,
 }
@@ -91,8 +153,28 @@ pub enum HedgeCommand {
     },
     /// Reduce-only IOC to flatten an HL position (orphan resolution): `side` closes the leg,
     /// `qty` base units. `aggressive_px` crosses the book; `slippage_bps` caps it.
-    Flatten { market: MarketId, side: Side, qty: Decimal, aggressive_px: Decimal, slippage_bps: Decimal },
     Shutdown,
+}
+
+/// Native per-trade evidence, formatted only by the cold journal writer.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExecutionTrade {
+    pub attempt_id: String,
+    pub logical_id: String,
+    pub venue: Venue,
+    pub market: String,
+    pub side: Side,
+    pub trade_id: String,
+    pub identity_complete: bool,
+    pub event_time_ms: Option<i64>,
+    pub order_id: Option<String>,
+    pub client_order_index: i64,
+    pub qty: Decimal,
+    pub px: Decimal,
+    pub notional_usd: Decimal,
+    pub maker: Option<bool>,
+    pub fee_ticks: Option<Decimal>,
+    pub fee_usd: Option<Decimal>,
 }
 
 /// Worker / venue → strategy + risk reactor. Order/hedge lifecycle notifications. Aster
@@ -115,17 +197,21 @@ pub enum ExecEvent {
     CancelReject { client_id: String, reason: String },
     /// A maker fill detected (from the Aster user stream, or synthesized in paper mode).
     MakerFill(AsterFill),
+    MakerOrderProgress { market: MarketId, side: Side, client_id: String, order_id: String,
+        cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, terminal: bool, event_time_ms: i64 },
     HedgeAck { cloid: Cloid, hl_oid: String },
+    AttemptStarted { cloid: Cloid, proof: WireProof },
+    AttemptNotSent { cloid: Cloid, reason: String },
+    ExecutionProgress { cloid: Cloid, cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, cumulative_fee_usd: Option<Decimal>, terminal: bool, venue_order_id: Option<String>, event_time_ms: Option<i64> },
+    ExecutionTrade(ExecutionTrade),
     HedgeFill { cloid: Cloid, filled_qty: Decimal, px: Decimal, fee_usd: Decimal },
     HedgeReject { cloid: Cloid, reason: String },
     /// Hedge outcome is ambiguous: the request may have reached Hyperliquid, but
     /// the worker did not receive a definitive response. The strategy must freeze
     /// and reconcile by deterministic cloid/position before any retry.
     HedgeUnknown { cloid: Cloid, reason: String },
-    AsterFlattenAck { market: MarketId, side: Side, qty: Decimal },
-    AsterFlattenReject { market: MarketId, side: Side, qty: Decimal, reason: String },
-    HlFlattenFill { market: MarketId, side: Side, filled_qty: Decimal, px: Decimal },
-    HlFlattenReject { market: MarketId, side: Side, qty: Decimal, reason: String },
+    AsterFlattenAck { cloid: Cloid, market: MarketId, side: Side, qty: Decimal },
+    AsterFlattenReject { cloid: Cloid, market: MarketId, side: Side, qty: Decimal, reason: String, terminal: bool },
 }
 
 /// Default bounded depth of each command queue. Deep enough to absorb a quoting burst, small

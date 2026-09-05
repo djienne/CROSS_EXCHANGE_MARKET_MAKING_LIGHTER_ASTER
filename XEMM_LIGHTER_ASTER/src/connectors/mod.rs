@@ -167,7 +167,7 @@ impl Tap {
         let scale = self.scale.as_ref()?;
         let t0 = crate::hotpath::clock::mono_now_ns();
         let recv_ns = crate::hotpath::clock::mono_now_ns();
-        let hot = crate::livebot::scale::build_hot_book_from_strs_with_qty_scale(
+        let mut hot = crate::livebot::scale::build_hot_book_from_strs_with_qty_scale(
             bids,
             asks,
             scale,
@@ -176,6 +176,8 @@ impl Tap {
             recv_ns,
             exch_ts.timestamp_millis(),
         );
+        hot.source_age_at_recv_ms = crate::hot_types::source_age_at_receive_ms(
+            exch_ts.timestamp_millis(), Utc::now().timestamp_millis());
         let done_ns = crate::hotpath::clock::mono_now_ns();
         crate::metrics::BOOK_BUILD.record((done_ns - t0).max(0) as u64);
         Some((hot, recv_ns))
@@ -195,7 +197,7 @@ impl Tap {
         let scale = self.scale.as_ref()?;
         let t0 = crate::hotpath::clock::mono_now_ns();
         let recv_ns = crate::hotpath::clock::mono_now_ns();
-        let hot = crate::livebot::scale::build_hot_book_from_dec_levels_with_qty_scale(
+        let mut hot = crate::livebot::scale::build_hot_book_from_dec_levels_with_qty_scale(
             bids,
             asks,
             scale,
@@ -204,6 +206,8 @@ impl Tap {
             recv_ns,
             exch_ts.timestamp_millis(),
         );
+        hot.source_age_at_recv_ms = crate::hot_types::source_age_at_receive_ms(
+            exch_ts.timestamp_millis(), Utc::now().timestamp_millis());
         let done_ns = crate::hotpath::clock::mono_now_ns();
         crate::metrics::BOOK_BUILD.record((done_ns - t0).max(0) as u64);
         Some((hot, recv_ns))

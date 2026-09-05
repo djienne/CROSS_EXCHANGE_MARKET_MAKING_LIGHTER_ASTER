@@ -44,6 +44,13 @@ pub struct AsterBookFeed {
 #[derive(Default)]
 struct AsterBookState {
     book: ArcSwapOption<OrderBook>,
+    scan_notify: ArcSwapOption<Notify>,
+}
+impl AsterBookState {
+    fn publish(&self, book: Option<Arc<OrderBook>>) {
+        self.book.store(book);
+        if let Some(notify) = self.scan_notify.load().as_ref() { notify.notify_one(); }
+    }
 }
 
 impl AsterBookFeed {
@@ -63,6 +70,10 @@ impl AsterBookFeed {
             state,
             reconnect,
         }
+    }
+
+    pub fn set_scan_notify(&self, notify: Arc<Notify>) {
+        self.state.scan_notify.store(Some(notify));
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -93,7 +104,7 @@ impl AsterBookFeed {
     }
 
     pub fn request_reconnect(&self) {
-        self.state.book.store(None);
+        self.state.publish(None);
         self.reconnect.notify_one();
     }
 }
@@ -110,7 +121,7 @@ async fn depth_loop(
             Ok(()) => {}
             Err(e) => tracing::warn!("Aster depth websocket disconnected: {e:#}"),
         }
-        state.book.store(None);
+        state.publish(None);
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }
@@ -154,7 +165,7 @@ async fn depth_session(
                 match msg {
                     Message::Text(text) => {
                         if let Some(book) = parse_depth(&text)? {
-                            state.book.store(Some(Arc::new(book)));
+                            state.publish(Some(Arc::new(book)));
                         }
                     }
                     Message::Ping(payload) => {
@@ -182,6 +193,8 @@ struct CombinedRef<'a> {
 
 #[derive(Debug, Deserialize)]
 struct DepthMsgRef<'a> {
+    #[serde(rename = "e", default)]
+    event_type: Option<&'a str>,
     #[serde(rename = "E", default)]
     event_time_ms: i64,
     #[serde(rename = "T", default)]
@@ -206,15 +219,22 @@ fn parse_depth(text: &str) -> Result<Option<OrderBook>> {
     let bids = parse_levels(&msg.bids)?;
     let asks = parse_levels(&msg.asks)?;
     if bids.is_empty() || asks.is_empty() {
+        if msg.event_type == Some("depthUpdate") {
+            anyhow::bail!("Aster depth update is missing one or both book sides");
+        }
         return Ok(None);
     }
-    let exch_ts = ms_to_dt(msg.transaction_time_ms.max(msg.event_time_ms));
-    Ok(Some(OrderBook::from_levels(
+    let source_ms = if msg.event_time_ms > 0 { msg.event_time_ms } else { msg.transaction_time_ms };
+    if source_ms <= 0 { anyhow::bail!("Aster depth update is missing its source timestamp"); }
+    let exch_ts = ms_to_dt(source_ms);
+    let mut book = OrderBook::from_levels(
         bids,
         asks,
         exch_ts,
         Utc::now(),
-    )))
+    );
+    book.engine_ts = (msg.transaction_time_ms > 0).then(|| ms_to_dt(msg.transaction_time_ms));
+    Ok(Some(book))
 }
 
 fn parse_levels(raw: &[[&str; 2]]) -> Result<Vec<(Decimal, Decimal)>> {
@@ -222,9 +242,10 @@ fn parse_levels(raw: &[[&str; 2]]) -> Result<Vec<(Decimal, Decimal)>> {
     for [px, qty] in raw {
         let px = parse_dec(px)?;
         let qty = parse_dec(qty)?;
-        if px > Decimal::ZERO && qty > Decimal::ZERO {
-            out.push((px, qty));
+        if px <= Decimal::ZERO || qty < Decimal::ZERO {
+            anyhow::bail!("invalid Aster depth price or size");
         }
+        if qty > Decimal::ZERO { out.push((px, qty)); }
     }
     Ok(out)
 }
@@ -246,11 +267,7 @@ fn futures_depth_url(rest_base_url: &str, symbol_upper: &str) -> String {
 }
 
 fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
-    if ms > 0 {
-        chrono::DateTime::from_timestamp_millis(ms).unwrap_or_else(Utc::now)
-    } else {
-        Utc::now()
-    }
+    chrono::DateTime::from_timestamp_millis(ms.max(0)).unwrap_or(chrono::DateTime::UNIX_EPOCH)
 }
 
 #[cfg(test)]
@@ -282,10 +299,8 @@ mod tests {
     fn ack_frames_yield_no_book_and_malformed_frames_error() {
         // Subscription acks have no depth payload: all-default parse -> empty -> None.
         assert!(parse_depth(r#"{"result":null,"id":1}"#).unwrap().is_none());
-        // An empty-book depth frame is also None (never publish a one-sided book).
-        assert!(parse_depth(r#"{"e":"depthUpdate","E":1,"T":2,"b":[],"a":[]}"#)
-            .unwrap()
-            .is_none());
+        // An incomplete real depth update invalidates the old cached book immediately.
+        assert!(parse_depth(r#"{"e":"depthUpdate","E":1,"T":2,"b":[],"a":[]}"#).is_err());
         // Malformed depth data must still ERROR -> session teardown (fail-closed).
         assert!(parse_depth(r#"{"b":[["10"]],"a":[["11","2"]]}"#).is_err());
         assert!(parse_depth("not json").is_err());

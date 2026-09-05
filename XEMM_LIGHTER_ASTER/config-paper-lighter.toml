@@ -44,11 +44,9 @@ halt_trading_on_stale_feed        = true
 
 [partials]
 strict_all_partials_must_be_hedgeable = false
-accumulate_sub_min_fills              = true
 lighter_min_notional              = "10"
 max_pending_inventory_notional        = "25"
 max_pending_inventory_age_ms          = 1000
-mark_pending_inventory_to_market      = true
 
 [capital]
 aster_capital_usd       = "200"
@@ -74,7 +72,7 @@ depth_limit          = 20
 [live]
 enabled                       = true
 mode                          = "paper"      # PAPER: places NO real orders even if --mode is omitted
-post_trade_cooldown_ms        = 3000         # short cooldown so the 4 sequences don't take forever
+post_trade_cooldown_ms        = 3000
 cooldown_scope                = "per_market"
 startup_cancel_all            = true
 shutdown_cancel_all           = true
@@ -94,24 +92,17 @@ use_hot_integer_math               = true
 reduce_position_only               = true
 replace_immediately_if_unprofitable = true
 min_requote_interval_ms            = 50
-price_change_ticks_to_requote      = 1
 # Live safety cap for per-symbol replace churn. The separate Aster command budget below protects
 # the global REST write path and reserves room for cancels/sweeps.
 max_replaces_per_minute_per_symbol = 100
 
 [live.partials]
-# accumulate_sub_min: admits Class-B pairs like HYPE (full ~$12 clip is Lighter-hedgeable, but a
-# tiny partial could be sub-$10). Sub-min partials are NOT orphaned — they're flattened
-# reduce-only on Aster in the hot path, and the cold reconciler backstop neutralizes any
-# residual. The common case is a single full fill that hedges immediately on Lighter.
-# A pending sub-min residual flushes to a hedge as soon as the next fill pushes it past $10, so
-# it rarely lingers. These bounds only trigger the exceptional flatten if it genuinely sticks:
-# allow it to grow to ~$15 (just over one clip) and live ~6s while accumulating before we give up
-# and flatten it reduce-only on Aster.
+# Accumulate sub-minimum maker fills until hedgeable. Expired/oversized residuals
+# enter tracked, rounded-down reduce-only correction (at most two attempts).
+# Quantization remainders and ambiguous orders remain reserved and explicit.
 policy                  = "accumulate_sub_min"
 max_pending_notional_usd = "15"
 max_pending_age_ms       = 6000
-max_pending_count        = 3
 
 [live.aster]
 base_url             = "https://fapi.asterdex.com"
@@ -135,23 +126,15 @@ hedge_order_type      = "aggressive_ioc"
 # extra. emergency is the escalation for an extreme adverse move and should now seldom trigger.
 normal_slippage_bps   = "60"
 emergency_slippage_bps = "90"
-expires_after_ms      = 60000
 fill_timeout_ms       = 2000
 
 [live.margin_guard]
-# Proactive Aster margin cap. The position cap fed to the quote engine is dynamically lowered to
-# min(aster_capital_usd, (real_collateral - aster_safety_buffer_usd) * leverage), so the
-# position-INCREASING side stops quoting before Aster rejects with -2019 ("Margin is insufficient").
-# Real collateral ~= the deposited USDC (~$124), NOT the $200 aster_capital_usd soft cap. The buffer
-# (~2x the $13 clip) absorbs one in-flight/stale quote + mark movement over the reconcile cadence.
-# Requires capital.leverage = 1 and enforce_position_cap = true (validated at startup).
-# NOTE: the cap is account-aware (other CONFIGURED markets' Aster notional is deducted), but the buffer
-# size and the ~2s forced-tick application latency are tuned for the single-market (--markets HYPE) run;
-# raise the buffer if ever running multiple Aster markets live simultaneously. IMPORTANT: only Aster
-# positions in symbols mapped from the SELECTED specs are deducted, so run this on an account DEDICATED
-# to the configured markets — unrelated Aster exposure would consume collateral without being counted.
+# Opening capacity is bounded by the static 1x cap and actual free margin on
+# each venue after buffers and outstanding directional obligations. Reductions
+# remain eligible. Requires leverage=1 and enforce_position_cap=true.
 enabled                 = true
 aster_safety_buffer_usd = "26"
+lighter_safety_buffer_usd = "26"
 
 [live.circuit_breaker]
 # Unattended-run safety stop. Measures TOTAL cross-venue account equity (Aster wallet+unrealized + Lighter

@@ -8,7 +8,8 @@ use tokio::sync::Notify;
 use tracing::warn;
 
 use super::{EventSink, Tap};
-use crate::decimal::dec_from_f64_book;
+use crate::decimal::parse_dec;
+use rust_decimal::Decimal;
 use crate::events::{EventKind, PriceLevel};
 use crate::lighter::local_book::LocalBook;
 use crate::lighter::messages::{BookUpdateContiguity, OrderBookMsgRef, PriceLevelRef};
@@ -24,10 +25,6 @@ struct StreamState {
     /// Lifetime count of gap-forced resyncs on this stream — surfaced in the gap warn so
     /// reconnect churn (e.g. from wrong sequence assumptions) is visible in logs.
     gap_resyncs: u64,
-    /// Highest publish stamp (ms) handed to the accept gate on this stream. NOT cleared by
-    /// `reset()`: the VenueBook's monotone gate persists across reconnects, so the clamp
-    /// must persist too or a post-reconnect wall-clock step would still freeze the book.
-    last_pub_ms: i64,
 }
 
 impl StreamState {
@@ -36,16 +33,6 @@ impl StreamState {
         self.last_nonce = None;
     }
 
-    /// Monotone publish stamp. Lighter frames are stamped with local wall time, and the
-    /// book cell's accept gate rejects non-monotone stamps — so a backwards wall-clock
-    /// step (NTP) would silently freeze the book while `touch()` keeps the watchdog
-    /// satisfied. Clamp to the previous stamp instead: equal-ms stamps are accepted by
-    /// the gate, and the deviation is conservative (book looks older, never fresher).
-    fn stamp_ms(&mut self, wall_ms: i64) -> i64 {
-        let stamped = wall_ms.max(self.last_pub_ms);
-        self.last_pub_ms = stamped;
-        stamped
-    }
 }
 
 pub async fn run(
@@ -128,6 +115,12 @@ fn handle_value(
     tap: &Tap,
     state: &mut StreamState,
 ) -> bool {
+    // Sequence tests supply a valid emission timestamp; missing-source behavior is
+    // exercised separately through handle_raw without this fixture convenience.
+    let mut data = data.clone();
+    if data.get("timestamp").is_none() {
+        data["timestamp"] = serde_json::json!(Utc::now().timestamp_millis());
+    }
     handle_raw(&data.to_string(), market, tx, tap, state)
 }
 
@@ -142,8 +135,13 @@ fn handle_raw(
     // clone, no per-level String allocations on the hedge-source ingest thread.
     let msg = match serde_json::from_str::<OrderBookMsgRef<'_>>(raw) {
         Ok(m) => m,
-        Err(_) => return true,
+        Err(_) => return false,
     };
+    let source_ms = msg.source_time_ms().unwrap_or(0);
+    let wall = Utc::now();
+    if crate::hot_types::source_age_at_receive_ms(source_ms, wall.timestamp_millis()) == i64::MAX {
+        return false;
+    }
     if !msg.is_snapshot() {
         if !state.book.initialized {
             // A delta before the subscribe snapshot has nothing to apply to; seeding the
@@ -174,27 +172,23 @@ fn handle_raw(
     if !state.book.initialized {
         return true;
     }
-    let wall = Utc::now();
-    let exch_ts = chrono::DateTime::<Utc>::from_timestamp_millis(state.stamp_ms(wall.timestamp_millis()))
-        .unwrap_or(wall);
+    let Some(exch_ts) = chrono::DateTime::<Utc>::from_timestamp_millis(source_ms) else {
+        return false;
+    };
     // Same publishability gate as the old string path: both sides non-empty.
     if state.book.bids.is_empty() || state.book.asks.is_empty() {
         return true;
     }
-    // Numeric top-20 straight off the local book: dec_from_f64_book reproduces the
-    // legacy format!("{v:.12}")+trim string path bit-for-bit (pinned by tests), so
-    // the tape stays byte-identical while skipping ~80 String allocations per frame.
+    // Publish the exact decimal wire values; do not reconstruct them from f64.
     let bid_levels: Vec<PriceLevel> = state
         .book
         .bids
         .top_descending(PUBLISH_LEVELS)
-        .filter_map(|(p, q)| Some((dec_from_f64_book(p)?, dec_from_f64_book(q)?)))
         .collect();
     let ask_levels: Vec<PriceLevel> = state
         .book
         .asks
         .top_ascending(PUBLISH_LEVELS)
-        .filter_map(|(p, q)| Some((dec_from_f64_book(p)?, dec_from_f64_book(q)?)))
         .collect();
     #[cfg(feature = "hotpath")]
     let prebuilt_hot = tap.hot_book_from_levels(&bid_levels, &ask_levels, exch_ts);
@@ -241,14 +235,16 @@ fn handle_raw(
 
 /// `None` when any level is unparseable — the caller must resync rather than apply
 /// (a size coerced to 0.0 would DELETE the level; a dropped price desyncs the book).
-/// Otherwise today's filter semantics: `q == 0` deletions kept, `p <= 0 || q < 0` dropped.
-fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Option<Vec<(f64, f64)>> {
+/// Explicit zero sizes are deletions; impossible numeric values invalidate the delta.
+fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Option<Vec<(Decimal, Decimal)>> {
     let mut out = Vec::with_capacity(levels.len());
     for l in levels {
-        let (p, q) = l.parsed_opt()?;
-        if p > 0.0 && q >= 0.0 {
-            out.push((p, q));
+        let p = parse_dec(&l.price).ok()?;
+        let q = parse_dec(&l.size).ok()?;
+        if p <= Decimal::ZERO || q < Decimal::ZERO {
+            return None;
         }
+        out.push((p, q));
     }
     Some(out)
 }
@@ -259,13 +255,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     #[test]
-    fn published_levels_match_legacy_string_formatting() {
-        // The numeric Decimal path must serialize exactly like the old
-        // format!("{v:.12}")+trim string path, byte for byte on the tape.
-        let legacy = |v: f64| {
-            let s = format!("{v:.12}");
-            s.trim_end_matches('0').trim_end_matches('.').to_string()
-        };
+    fn published_levels_preserve_exchange_tick_values() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let sink = EventSink::lossless(tx);
         let tap = Tap::none();
@@ -290,15 +280,16 @@ mod tests {
         };
         // Bids best-first (highest price), asks best-first (lowest price).
         assert_eq!(bids.len(), 2);
-        assert_eq!(bids[0].0.to_string(), legacy(64820.2)); // "64820.199999999997"
-        assert_eq!(bids[0].1.to_string(), legacy(0.00051));
-        assert_eq!(bids[1].0.to_string(), legacy(0.30000000000000004)); // "0.3"
+        assert_eq!(bids[0].0.to_string(), "64820.2");
+        assert_eq!(bids[0].1.to_string(), "0.00051");
+        assert_eq!(bids[1].0.to_string(), "0.30000000000000004");
         assert_eq!(bids[1].1.to_string(), "1");
-        assert_eq!(asks[0].0.to_string(), legacy(64820.3));
-        assert_eq!(asks[0].1.to_string(), legacy(0.19283));
+        assert_eq!(asks[0].0.to_string(), "64820.3");
+        assert_eq!(asks[0].1.to_string(), "0.19283");
     }
 
     #[test]
+    #[cfg(feature = "hotpath")]
     fn handle_value_mirrors_l2_top_into_bbo_slot() {
         // Lighter has no bookTicker stream; the connector mirrors the L2 top-of-book
         // into the BBO slot so the hedge fast path can engage and qdiag stops showing
@@ -314,7 +305,7 @@ mod tests {
         let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
         let market = MarketId("BTC".to_string());
         let mut state = StreamState::default();
-        // Prices chosen exactly representable in f64 so the dec_from_f64_book path
+        // Decimal prices and quantities retain the exact wire values.
         // yields clean strings.
         let snapshot = serde_json::json!({
             "type": "subscribed/order_book",
@@ -614,17 +605,24 @@ mod tests {
     }
 
     #[test]
-    fn stamp_ms_clamps_backwards_wall_clock_steps() {
+    fn preserves_source_time_and_rejects_missing_or_future_source() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let sink = EventSink::lossless(tx);
+        let market = MarketId("BTC".into());
+        let tap = Tap::none();
+        let source = Utc::now().timestamp_millis() - 10_000;
+        let mut frame = serde_json::json!({
+            "type":"subscribed/order_book","timestamp":source,"order_book":{
+                "nonce":1,"bids":[{"price":"100","size":"1"}],"asks":[{"price":"101","size":"1"}]
+            }
+        });
         let mut state = StreamState::default();
-        assert_eq!(state.stamp_ms(1_000), 1_000);
-        // Backwards NTP step: the stamp must not go backwards or the book cell's
-        // monotone accept gate would silently reject every publish.
-        assert_eq!(state.stamp_ms(900), 1_000);
-        // Equal-ms stamps are accepted by the gate, so publishing continues through
-        // the step; once the wall clock passes the clamp, normal stamping resumes.
-        assert_eq!(state.stamp_ms(1_100), 1_100);
-        // The clamp survives a gap-resync reset — the VenueBook gate does too.
-        state.reset();
-        assert_eq!(state.stamp_ms(500), 1_100);
+        assert!(handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
+        let (_, EventKind::HlL2Book { exch_ts, .. }) = rx.try_recv().unwrap() else { panic!("book expected"); };
+        assert_eq!(exch_ts.timestamp_millis(), source);
+        frame.as_object_mut().unwrap().remove("timestamp");
+        assert!(!handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
+        frame["timestamp"] = serde_json::json!(Utc::now().timestamp_millis() + 2_000);
+        assert!(!handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
     }
 }

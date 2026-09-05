@@ -8,12 +8,67 @@
 //! already hedge?" instead of double-hedging.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use rust_decimal::Decimal;
 
 use crate::types::{MarketId, Side};
 
 use super::ids::Cloid;
+use super::account::Venue;
+
+const QUEUED: u8 = 0;
+const CLAIMED: u8 = 1;
+const CANCELLED: u8 = 2;
+
+/// One atomic admission decision shared by the strategy and execution worker.
+/// A cancelled queued request can never subsequently reserve a nonce or write.
+#[derive(Debug)]
+pub struct Admission {
+    state: AtomicU8,
+    pub deadline_ns: i64,
+}
+
+impl Admission {
+    pub fn new(deadline_ns: i64) -> Arc<Self> {
+        Arc::new(Self { state: AtomicU8::new(QUEUED), deadline_ns })
+    }
+
+    pub fn try_claim(&self, now_ns: i64) -> bool {
+        if now_ns >= self.deadline_ns {
+            self.cancel_queued();
+            return false;
+        }
+        self.state.compare_exchange(QUEUED, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    pub fn cancel_queued(&self) -> bool {
+        self.state.compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    pub fn is_claimed(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CLAIMED
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CANCELLED
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentPurpose {
+    Hedge,
+    ReduceDelta,
+}
+
+#[derive(Debug, Clone)]
+pub struct WireProof {
+    pub tx_hash: Option<String>,
+    pub nonce: Option<i64>,
+    pub client_order_index: Option<i64>,
+    pub sent_ns: i64,
+}
 
 /// A parsed Aster maker fill (from `ORDER_TRADE_UPDATE` with `x = TRADE`). Field names
 /// mirror the venue: `z` cumulative filled, `l` last filled qty, `L` last filled price.
@@ -40,6 +95,19 @@ pub struct AsterFill {
     /// flatten/recovery closes — it REDUCES delta, so it must update the predicted position but
     /// must NOT trigger a new hedge (which would loop: hedge → flatten → its fill → hedge → …).
     pub reduce_only: bool,
+    pub commission: Option<Decimal>,
+    pub commission_asset: Option<String>,
+}
+
+impl AsterFill {
+    pub fn usd_fee(&self) -> Option<Decimal> {
+        let fee = self.commission?;
+        if fee == Decimal::ZERO { return Some(fee); }
+        match self.commission_asset.as_deref()?.to_ascii_uppercase().as_str() {
+            "USD" | "USDT" | "USDC" | "BUSD" | "FDUSD" | "DAI" | "USDF" => Some(fee),
+            _ => None,
+        }
+    }
 }
 
 /// The dedup key for a fill. Prefers `(order_id, trade_id)`; when the trade id is absent or
@@ -161,7 +229,21 @@ impl HedgeState {
 #[derive(Debug, Clone)]
 pub struct HedgeIntent {
     pub cloid: Cloid,
+    pub logical_id: Cloid,
     pub market: MarketId,
+    pub venue: Venue,
+    pub purpose: IntentPurpose,
+    pub admission: Arc<Admission>,
+    /// True only on execution-terminal evidence, never from an observation timeout.
+    pub terminal: bool,
+    pub terminal_ns: Option<i64>,
+    pub wire: Option<WireProof>,
+    pub client_id: Option<String>,
+    pub filled_quote_usd: Option<Decimal>,
+    pub fee_usd: Option<Decimal>,
+    pub event_time_ms: Option<i64>,
+    pub book_source: Option<&'static str>,
+    pub book_age_ms: Option<i64>,
     /// HL hedge side (opposite the Aster fill).
     pub hedge_side: Side,
     pub qty: Decimal,
@@ -195,20 +277,8 @@ impl HedgeIntent {
     /// **session-independent** (derived only from the exchange fill identity), so a restart
     /// re-processing the same fill computes the SAME cloid and recovery-by-cloid works (§8.2).
     pub fn from_fill(fill: &AsterFill, now_ns: i64) -> Self {
-        HedgeIntent {
-            cloid: Cloid::hedge(&fill.order_id, &fill.trade_id, cum_scaled(fill.cum_filled_qty)),
-            market: fill.market.clone(),
-            hedge_side: fill.aster_side.opposite(),
-            qty: fill.last_fill_qty,
-            aster_fill_px: fill.last_fill_px,
-            state: HedgeState::Created,
-            created_ns: now_ns,
-            submitted_ns: None,
-            hl_oid: None,
-            filled_qty: Decimal::ZERO,
-            attempts: 0,
-            recovery: false,
-        }
+        Self::with_qty(Cloid::hedge(&fill.order_id, &fill.trade_id, cum_scaled(fill.cum_filled_qty)),
+            fill.market.clone(), fill.aster_side.opposite(), fill.last_fill_qty, fill.last_fill_px, now_ns)
     }
 
     /// A hedge intent for a given `qty` not tied 1:1 to a single fill — used both for an
@@ -219,7 +289,20 @@ impl HedgeIntent {
     pub fn with_qty(cloid: Cloid, market: MarketId, hedge_side: Side, qty: Decimal, ref_px: Decimal, now_ns: i64) -> Self {
         HedgeIntent {
             cloid,
+            logical_id: cloid,
             market,
+            venue: Venue::Hyperliquid,
+            purpose: IntentPurpose::Hedge,
+            admission: Admission::new(i64::MAX),
+            terminal: false,
+            terminal_ns: None,
+            wire: None,
+            client_id: None,
+            filled_quote_usd: Some(Decimal::ZERO),
+            fee_usd: Some(Decimal::ZERO),
+            event_time_ms: None,
+            book_source: None,
+            book_age_ms: None,
             hedge_side,
             qty,
             aster_fill_px: ref_px,
@@ -258,9 +341,11 @@ impl HedgeIntent {
     }
 
     pub fn mark_reconciled(&mut self) {
+        self.terminal = true;
         self.state = HedgeState::Reconciled;
     }
     pub fn mark_rejected(&mut self) {
+        self.terminal = true;
         self.state = HedgeState::Rejected;
     }
     pub fn mark_unknown(&mut self) {
@@ -269,11 +354,42 @@ impl HedgeIntent {
 
     /// Mark timed-out if it has been in flight longer than `timeout_ns` without resolving.
     pub fn check_timeout(&mut self, now_ns: i64, timeout_ns: i64) {
-        if self.state.is_in_flight()
+        if !self.terminal && self.state.is_in_flight()
             && now_ns.saturating_sub(self.created_ns) > timeout_ns
         {
             self.state = HedgeState::TimedOut;
+            // Claim and cancellation are mutually exclusive. A claimed timeout
+            // remains uncertain until the worker supplies terminal evidence.
+            self.terminal = self.admission.cancel_queued() || self.admission.is_cancelled();
+            if self.terminal { self.terminal_ns = Some(now_ns); }
         }
+    }
+
+    pub fn arm_admission(&mut self, max_age_ms: i64) {
+        self.admission = Admission::new(self.created_ns.saturating_add(max_age_ms.max(0).saturating_mul(1_000_000)));
+    }
+
+    pub fn unresolved(&self) -> bool {
+        !self.terminal && !self.state.is_resolved()
+    }
+
+    /// Cumulative execution evidence is idempotent across WS and REST recovery.
+    pub fn apply_progress(&mut self, qty: Decimal, quote: Option<Decimal>, fee: Option<Decimal>, terminal: bool, now_ns: i64) -> (Decimal, Option<Decimal>) {
+        if qty < self.filled_qty || qty > self.qty || quote.is_some_and(|q| q < Decimal::ZERO) {
+            self.mark_unknown();
+            return (Decimal::ZERO, None);
+        }
+        let delta_qty = qty - self.filled_qty;
+        let delta_quote = quote.zip(self.filled_quote_usd).map(|(q, old)| q - old);
+        if delta_qty > Decimal::ZERO || quote.is_some() { self.filled_quote_usd = quote; }
+        if delta_qty > Decimal::ZERO || fee.is_some() { self.fee_usd = fee; }
+        self.filled_qty = qty;
+        self.terminal |= terminal;
+        if terminal && self.terminal_ns.is_none() { self.terminal_ns = Some(now_ns); }
+        self.state = if qty == self.qty { HedgeState::Filled }
+            else if self.terminal { HedgeState::PartiallyFilled }
+            else { HedgeState::Acked };
+        (delta_qty, delta_quote)
     }
 
     pub fn remaining_qty(&self) -> Decimal {
@@ -298,6 +414,8 @@ mod tests {
             cum_filled_qty: cum,
             event_time_ms: 1,
             reduce_only: false,
+            commission: None,
+            commission_asset: None,
         }
     }
 
@@ -406,4 +524,28 @@ mod tests {
         assert_eq!(h.state, HedgeState::TimedOut);
         assert!(h.state.is_dangerous());
     }
+    #[test]
+    fn admission_claim_and_cancellation_are_mutually_exclusive() {
+        for _ in 0..16 {
+            let ticket=Admission::new(100); let start=Arc::new(std::sync::Barrier::new(3));
+            let a=ticket.clone(); let a_start=start.clone();
+            let claim=std::thread::spawn(move || {a_start.wait();a.try_claim(99)});
+            let b=ticket.clone(); let b_start=start.clone();
+            let cancel=std::thread::spawn(move || {b_start.wait();b.cancel_queued()});
+            start.wait(); assert_ne!(claim.join().unwrap(),cancel.join().unwrap());
+            assert!(!ticket.try_claim(99));
+        }
+        let expired=Admission::new(100); assert!(!expired.try_claim(100)); assert!(expired.is_cancelled());
+    }
+
+    #[test]
+    fn cumulative_progress_is_idempotent_and_terminal_time_does_not_slide() {
+        let mut h=HedgeIntent::with_qty(Cloid::recovery(&"BTC".into(),1),"BTC".into(),Side::Sell,Decimal::new(5,1),Decimal::from(100),0);
+        assert_eq!(h.apply_progress(Decimal::new(2,1),Some(Decimal::from(20)),Some(Decimal::new(1,3)),false,10).0,Decimal::new(2,1));
+        assert_eq!(h.apply_progress(Decimal::new(2,1),Some(Decimal::from(20)),Some(Decimal::new(1,3)),false,11).0,Decimal::ZERO);
+        assert_eq!(h.apply_progress(Decimal::new(5,1),Some(Decimal::from(50)),Some(Decimal::new(25,4)),true,12).0,Decimal::new(3,1));
+        assert_eq!(h.apply_progress(Decimal::new(5,1),Some(Decimal::from(50)),Some(Decimal::new(25,4)),true,100).0,Decimal::ZERO);
+        assert_eq!(h.terminal_ns,Some(12)); assert_eq!(h.fee_usd,Some(Decimal::new(25,4)));
+    }
+
 }

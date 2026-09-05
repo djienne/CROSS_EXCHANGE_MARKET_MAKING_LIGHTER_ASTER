@@ -20,7 +20,6 @@ pub struct HotCurrentOrder {
 #[derive(Debug, Clone)]
 pub struct HotPrecheckConfig {
     pub max_book_stale_ns: i64,
-    pub requote_threshold_ticks: i64,
 }
 
 pub fn hot_precheck_side(
@@ -77,13 +76,6 @@ pub fn hot_precheck_side(
         }
     }
 
-    // Keep these reads for cheap diagnostics / future conservative fast-hold work, but do not
-    // fast-hold today. Holding must still pass `evaluate_side` so profitability and depth are
-    // checked with the exact Decimal engine.
-    let _aster_move = aster_touch.unwrap().abs_diff(current.px_ticks) as i64;
-    let _hl_move = hl_hedge_touch.unwrap().abs_diff(current.px_ticks) as i64;
-    let _threshold = cfg.requote_threshold_ticks;
-
     HotPrecheck::NeedExactQuote
 }
 
@@ -112,7 +104,7 @@ mod tests {
     }
 
     fn pcfg() -> HotPrecheckConfig {
-        HotPrecheckConfig { max_book_stale_ns: 5_000_000_000, requote_threshold_ticks: 2 }
+        HotPrecheckConfig { max_book_stale_ns: 5_000_000_000 }
     }
 
     #[test]

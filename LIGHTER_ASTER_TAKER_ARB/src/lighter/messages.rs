@@ -46,7 +46,6 @@ pub struct NextNonceResponse {
 /// Response shape shared by REST sendTx[Batch] and the tx WebSocket.
 #[derive(Debug, Deserialize, Default)]
 pub struct TxResponse {
-    #[serde(default)]
     pub code: i64,
     #[serde(default)]
     pub message: String,
@@ -56,13 +55,17 @@ pub struct TxResponse {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct AccountActiveOrdersResponse {
-    #[serde(default)]
+    pub code: i64,
     pub orders: Vec<RemoteOrder>,
 }
 
 /// A live order as reported by the exchange (REST or account_orders WS).
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct RemoteOrder {
+    #[serde(default)]
+    pub market_index: Option<u32>,
+    #[serde(default)]
+    pub owner_account_index: Option<i64>,
     #[serde(default)]
     pub client_order_index: Option<i64>,
     #[serde(default)]
@@ -80,16 +83,18 @@ pub struct RemoteOrder {
 }
 
 impl RemoteOrder {
-    /// Live = order still resting. `accountActiveOrders` rows may omit `status` entirely
-    /// (every row there is by definition active) — treat a missing status as LIVE so the
-    /// reconcile poller never mass-clears tracked slots (codex review). Only an explicit
-    /// terminal status (filled/cancelled/expired) marks an order dead.
-    pub fn is_live(&self) -> bool {
-        match self.status.as_deref() {
-            None => true,
-            Some(s) => matches!(s, "open" | "partial_filled" | "pending" | "in-progress"),
-        }
+    /// Only documented terminal order states release an unresolved attempt.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_deref(),
+            Some("filled" | "canceled" | "canceled-post-only" | "canceled-reduce-only"
+                | "canceled-position-not-allowed" | "canceled-margin-not-allowed"
+                | "canceled-too-much-slippage" | "canceled-not-enough-liquidity"
+                | "canceled-self-trade" | "canceled-expired" | "canceled-oco"
+                | "canceled-child" | "canceled-liquidation" | "canceled-invalid-balance"))
     }
+
+    /// Missing/new status values are conservatively potentially live.
+    pub fn is_live(&self) -> bool { !self.is_terminal() }
 }
 
 // ----------------------------- WebSocket -----------------------------
@@ -118,6 +123,8 @@ impl PriceLevel {
 #[derive(Debug, Deserialize)]
 pub struct OrderBookPayload {
     #[serde(default)]
+    pub last_updated_at: Option<i64>,
+    #[serde(default)]
     pub bids: Vec<PriceLevel>,
     #[serde(default)]
     pub asks: Vec<PriceLevel>,
@@ -134,6 +141,12 @@ pub struct OrderBookPayload {
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct OrderBookMsg {
+    /// Server emission time, milliseconds since Unix epoch.
+    #[serde(default)]
+    pub timestamp: Option<i64>,
+    /// Matching-engine update time, microseconds since Unix epoch.
+    #[serde(default)]
+    pub last_updated_at: Option<i64>,
     #[serde(rename = "type")]
     pub msg_type: String,
     #[serde(default)]
@@ -192,6 +205,15 @@ pub fn classify_book_update(
 
 #[allow(dead_code)]
 impl OrderBookMsg {
+    pub fn source_time_ms(&self) -> Option<i64> {
+        self.timestamp.filter(|ts| *ts > 0).or_else(|| self.engine_time_ms())
+    }
+
+    pub fn engine_time_ms(&self) -> Option<i64> {
+        self.last_updated_at.or(self.order_book.last_updated_at)
+            .filter(|ts| *ts > 0).map(|ts| ts / 1_000)
+    }
+
     pub fn is_snapshot(&self) -> bool {
         self.msg_type.contains("subscribed")
     }
@@ -230,6 +252,8 @@ pub struct PriceLevelRef<'a> {
 
 #[derive(Debug, Deserialize)]
 pub struct OrderBookPayloadRef<'a> {
+    #[serde(default)]
+    pub last_updated_at: Option<i64>,
     #[serde(borrow, default)]
     pub bids: Vec<PriceLevelRef<'a>>,
     #[serde(borrow, default)]
@@ -246,6 +270,12 @@ pub struct OrderBookPayloadRef<'a> {
 /// raw WS text borrows every string instead of allocating two `String`s per level.
 #[derive(Debug, Deserialize)]
 pub struct OrderBookMsgRef<'a> {
+    /// Server emission time, milliseconds since Unix epoch.
+    #[serde(default)]
+    pub timestamp: Option<i64>,
+    /// Matching-engine update time, microseconds since Unix epoch.
+    #[serde(default)]
+    pub last_updated_at: Option<i64>,
     #[serde(rename = "type", borrow)]
     pub msg_type: std::borrow::Cow<'a, str>,
     #[serde(default)]
@@ -255,6 +285,15 @@ pub struct OrderBookMsgRef<'a> {
 }
 
 impl OrderBookMsgRef<'_> {
+    pub fn source_time_ms(&self) -> Option<i64> {
+        self.timestamp.filter(|ts| *ts > 0).or_else(|| self.engine_time_ms())
+    }
+
+    pub fn engine_time_ms(&self) -> Option<i64> {
+        self.last_updated_at.or(self.order_book.last_updated_at)
+            .filter(|ts| *ts > 0).map(|ts| ts / 1_000)
+    }
+
     pub fn is_snapshot(&self) -> bool {
         self.msg_type.contains("subscribed")
     }
@@ -391,9 +430,9 @@ pub struct TradePayload {
     pub ask_account_pnl: Option<String>,
     #[serde(default)]
     pub bid_account_pnl: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_json")]
     pub maker_fee: Option<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "present_json")]
     pub taker_fee: Option<serde_json::Value>,
     #[serde(default)]
     pub timestamp: Option<i64>,
@@ -401,6 +440,12 @@ pub struct TradePayload {
     pub transaction_time: Option<i64>,
     #[serde(default)]
     pub trade_id: Option<i64>,
+}
+
+// serde's ordinary Option<Value> conflates a missing field with explicit null.
+// The fee contract omits zero; explicit null is malformed evidence and must survive.
+fn present_json<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 impl TradePayload {
@@ -493,6 +538,42 @@ impl StatsPayload {
 mod tests {
     use super::*;
 
+
+    #[test]
+    fn sequence_verdicts_match_explicit_gap_replay_and_overlap_cases() {
+        use BookUpdateContiguity::{Apply, Gap, SkipStale};
+        for (begin, end, last, expected) in [
+            (10, 11, 10, Apply),
+            (9, 11, 10, Apply),
+            (11, 12, 10, Gap),
+            (8, 9, 10, SkipStale),
+        ] {
+            assert_eq!(classify_book_update(Some(begin), Some(end), None, Some(last), None), expected);
+        }
+        assert_eq!(classify_book_update(None, None, None, None, None), Gap);
+    }
+
+    #[test]
+    fn fee_presence_and_source_time_have_explicit_contracts() {
+        let omitted: TradePayload = serde_json::from_str("{}").unwrap();
+        let null: TradePayload = serde_json::from_str(r#"{"taker_fee":null}"#).unwrap();
+        let zero: TradePayload = serde_json::from_str(r#"{"taker_fee":0,"maker_fee":40}"#).unwrap();
+        assert!(omitted.taker_fee.is_none());
+        assert_eq!(null.taker_fee, Some(serde_json::Value::Null));
+        assert_eq!(zero.taker_fee, Some(serde_json::json!(0)));
+        let message: OrderBookMsgRef<'_> = serde_json::from_str(
+            r#"{"type":"update/order_book","timestamp":1774884082326,"last_updated_at":1774884082309144,"order_book":{"nonce":2,"begin_nonce":1}}"#
+        ).unwrap();
+        assert_eq!(message.source_time_ms(), Some(1774884082326));
+        assert_eq!(message.engine_time_ms(), Some(1774884082309));
+        for (status, terminal) in [("filled", true), ("canceled-expired", true), ("pending", false), ("brand-new-status", false)] {
+            let order: RemoteOrder = serde_json::from_value(serde_json::json!({"status":status})).unwrap();
+            assert_eq!(order.is_terminal(), terminal);
+        }
+        assert!(!RemoteOrder::default().is_terminal());
+    }
+
+
     #[test]
     fn parse_orderbook_snapshot() {
         let raw = r#"{"type":"subscribed/order_book","offset":405053,
@@ -581,13 +662,6 @@ mod tests {
                 "offset":7,"nonce":12,"begin_nonce":10}}"#,
             r#"{"type":"update/order_book","order_book":{"bids":[],"asks":[]}}"#,
         ];
-        let seq_positions = [
-            (None, None),
-            (Some(10i64), Some(6u64)),
-            (Some(11), Some(7)),
-            (Some(12), Some(8)),
-            (Some(9), Some(3)),
-        ];
         for raw in cases {
             let owned: OrderBookMsg = serde_json::from_str(raw).unwrap();
             let borrowed: OrderBookMsgRef<'_> = serde_json::from_str(raw).unwrap();
@@ -597,13 +671,6 @@ mod tests {
             for (o, b) in owned.order_book.bids.iter().zip(&borrowed.order_book.bids) {
                 assert_eq!(o.price, b.price.as_ref());
                 assert_eq!(o.size, b.size.as_ref());
-            }
-            for (last_nonce, last_offset) in seq_positions {
-                assert_eq!(
-                    owned.contiguity(last_nonce, last_offset),
-                    borrowed.contiguity(last_nonce, last_offset),
-                    "contiguity diverged for {raw} at {last_nonce:?}/{last_offset:?}"
-                );
             }
         }
     }

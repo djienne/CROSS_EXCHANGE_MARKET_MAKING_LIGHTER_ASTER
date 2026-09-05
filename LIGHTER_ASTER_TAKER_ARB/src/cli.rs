@@ -14,6 +14,9 @@ use crate::connectors::rest_specs;
 use crate::decimal::bps_to_rate;
 use crate::types::Side;
 use crate::venues::lighter::LighterVenue;
+use crate::markets::MarketSpec;
+use crate::pnl::ActiveSession;
+use std::time::Duration;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -95,6 +98,11 @@ pub enum Commands {
         i_understand_live: bool,
         #[arg(long)]
         max_usd: Decimal,
+    },
+    /// Resolve an inactive session using matching terminal order evidence; never submits orders.
+    ResolveSession {
+        #[arg(long, default_value = "HYPE")]
+        market: Option<String>,
     },
     /// Archive an active per-market loss circuit breaker so trading can be restarted manually.
     ResetCircuitBreaker {
@@ -252,6 +260,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let acreds = AsterCreds::load(std::path::Path::new(&aster_env))?;
             let signer: Arc<dyn AsterSigner> =
                 Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
+            let aster_account_id = signer.user_address().to_string();
             let aster = AsterRest::new(
                 cfg.venues.aster_base_url.clone(),
                 signer,
@@ -305,36 +314,20 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let bal_before = aster.available_usdc().await?;
             println!("balance_before={bal_before}");
 
-            let buy = aster
-                .submit_market_order(&spec.market_id, Side::Buy, qty, false)
-                .await;
+            let session = diagnostic_session(&cfg, &spec, serde_json::json!({"aster_account": aster_account_id}));
+            session.arm().await?;
+            let buy = aster.submit_market_order(&spec.market_id, Side::Buy, qty, false).await;
             println!("buy_result={buy:?}");
-            ensure_accepted("buy", &buy)?;
-            let buy_fill = wait_aster_fill("buy", &aster, &spec.market_id, &buy, qty).await?;
-            println!("buy_fill={buy_fill:?}");
-            let after_buy =
-                wait_position_after_buy(&aster, &spec.market_id, qty, spec.step).await?;
-            let bal_after_buy = aster.available_usdc().await?;
-            println!("position_after_buy={after_buy}");
-            println!("balance_after_buy={bal_after_buy}");
-
-            let sell_qty = floor_to_step(after_buy.abs(), spec.step);
-            if sell_qty <= Decimal::ZERO {
-                bail!("buy accepted but no positive position visible to sell");
-            }
-            let sell = aster
-                .submit_market_order(&spec.market_id, Side::Sell, sell_qty, true)
-                .await;
-            println!("sell_result={sell:?}");
-            ensure_accepted("sell", &sell)?;
-            let sell_fill =
-                wait_aster_fill("sell", &aster, &spec.market_id, &sell, sell_qty).await?;
-            println!("sell_fill={sell_fill:?}");
-            let final_pos = wait_position_flat(&aster, &spec.market_id, Decimal::ZERO).await?;
-            let bal_after_sell = aster.available_usdc().await?;
-            println!("position_final={final_pos}");
-            println!("balance_after_sell={bal_after_sell}");
-            Ok(())
+            let operation = async {
+                ensure_accepted("buy", &buy)?;
+                let fill = wait_aster_fill("buy", &aster, &spec.market_id, &buy, qty).await?;
+                println!("buy_fill={fill:?}");
+                let position = wait_position_after_buy(&aster, &spec.market_id, qty, spec.step).await?;
+                let balance = aster.available_usdc().await?;
+                println!("position_after_buy={position} balance_after_buy={balance}");
+                Ok(())
+            };
+            run_diagnostic(&cfg,&spec,&session,operation,cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,qty)).await
         }
         Commands::LighterMarketRoundtrip {
             market,
@@ -421,43 +414,109 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let bal_before = lighter.available_usdc().await?;
             println!("balance_before={bal_before}");
 
-            let buy = lighter
-                .submit_market_order(&spec.market_id, Side::Buy, qty, buy_bound, false)
-                .await;
+            let session = diagnostic_session(&cfg, &spec,
+                serde_json::json!({"lighter_account_index": lighter.account_index()}));
+            session.arm().await?;
+            let buy = lighter.submit_market_order(&spec.market_id, Side::Buy, qty, buy_bound, false).await;
             println!("buy_result={buy:?}");
-            ensure_lighter_accepted("buy", &buy)?;
-            ensure_lighter_fill("buy", &buy)?;
-            let after_buy = wait_lighter_position_after_buy(
-                &lighter,
-                &spec.market_id,
-                qty,
-                spec.lighter_qty_step,
-            )
-            .await?;
-            let bal_after_buy = lighter.available_usdc().await?;
-            println!("position_after_buy={after_buy}");
-            println!("balance_after_buy={bal_after_buy}");
-
-            let sell_qty = floor_to_step(after_buy.abs(), spec.lighter_qty_step);
-            if sell_qty <= Decimal::ZERO {
-                bail!("buy accepted but no positive Lighter position visible to sell");
+            let operation = async {
+                ensure_lighter_accepted("buy", &buy)?;
+                let fill = ensure_lighter_fill("buy", &buy)?;
+                println!("buy_fill={fill:?}");
+                let position = wait_lighter_position_after_buy(&lighter, &spec.market_id, qty, spec.lighter_qty_step).await?;
+                let balance = lighter.available_usdc().await?;
+                println!("position_after_buy={position} balance_after_buy={balance}");
+                Ok(())
+            };
+            run_diagnostic(&cfg,&spec,&session,operation,cleanup_lighter_diagnostic(&cfg,&spec,&lighter,&buy,qty)).await
+        }
+        Commands::ResolveSession { market } => {
+            let selected = cfg.select_markets(market.as_deref());
+            anyhow::ensure!(selected.len() == 1, "resolve-session requires one market");
+            let spec = rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)
+                .await?.into_iter().next().context("market specification missing")?;
+            let path = crate::pnl::session_path(&cfg.pnl, &spec.market_id);
+            let _ownership = crate::pnl::lock_inactive_session(&path)?;
+            let marker: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            anyhow::ensure!(marker.get("market").and_then(serde_json::Value::as_str) == Some(spec.market_id.0.as_str()),
+                "session market does not match the requested configuration");
+            let evidence = marker.get("unresolved_execution").context(
+                "session has no complete scoped order identities; flat positions alone cannot resolve a crash-before-receipt gap")?;
+            anyhow::ensure!(evidence.get("orders_complete").and_then(serde_json::Value::as_bool) == Some(true),
+                "session order identity coverage is incomplete; primary venue evidence is required");
+            let orders = evidence.get("orders").and_then(serde_json::Value::as_array).context("session orders missing")?;
+            anyhow::ensure!(!orders.is_empty(), "session has no scoped orders to verify");
+            let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
+            let lighter_env = std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
+            let acreds = AsterCreds::load(std::path::Path::new(&aster_env))?;
+            let lcreds = LighterCreds::load(std::path::Path::new(&lighter_env))?;
+            if let Some(account) = marker.get("aster_account").and_then(serde_json::Value::as_str) {
+                anyhow::ensure!(account.eq_ignore_ascii_case(&acreds.user), "Aster session account mismatch");
             }
-            let sell = lighter
-                .submit_market_order(&spec.market_id, Side::Sell, sell_qty, sell_bound, true)
-                .await;
-            println!("sell_result={sell:?}");
-            ensure_lighter_accepted("sell", &sell)?;
-            ensure_lighter_fill("sell", &sell)?;
-            let final_pos =
-                wait_lighter_position_flat(&lighter, &spec.market_id, Decimal::ZERO).await?;
-            let bal_after_sell = lighter.available_usdc().await?;
-            let final_open_orders = lighter.open_orders_count(&spec.market_id).await?;
-            println!("position_final={final_pos}");
-            println!("balance_after_sell={bal_after_sell}");
-            println!("open_orders_final={final_open_orders}");
-            if final_open_orders > 0 {
-                bail!("Lighter roundtrip left {final_open_orders} open order(s)");
+            let signer: Arc<dyn AsterSigner> = Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
+            let aster = AsterRest::new(cfg.venues.aster_base_url.clone(), signer, std::slice::from_ref(&spec))?;
+            let lighter = LighterVenue::new_read_only(&cfg.venues.lighter_base_url,
+                std::path::Path::new(&cfg.venues.signers_dir), lcreds, std::slice::from_ref(&spec))?;
+            if let Some(account) = marker.get("lighter_account_index").and_then(serde_json::Value::as_i64) {
+                anyhow::ensure!(account == lighter.account_index(), "Lighter session account mismatch");
             }
+            let baseline = evidence.get("pre_positions").context("session position baseline missing")?;
+            let mut expected_aster = baseline.get("aster_qty").and_then(serde_json::Value::as_str)
+                .context("Aster baseline quantity unavailable")?.parse::<Decimal>()?;
+            let mut expected_lighter = baseline.get("lighter_qty").and_then(serde_json::Value::as_str)
+                .context("Lighter baseline quantity unavailable")?.parse::<Decimal>()?;
+            let mut verified = Vec::new();
+            for order in orders {
+                if order.get("submitted").and_then(serde_json::Value::as_bool) == Some(false) { continue; }
+                let side = match order.get("side").and_then(serde_json::Value::as_str) {
+                    Some("BUY") => Side::Buy, Some("SELL") => Side::Sell,
+                    _ => bail!("session order side unavailable"),
+                };
+                let qty = order.get("qty").and_then(serde_json::Value::as_str)
+                    .context("session order quantity missing")?.parse::<Decimal>()?;
+                match order.get("venue").and_then(serde_json::Value::as_str) {
+                    Some("aster") => {
+                        let client = order.get("client_order_id").and_then(serde_json::Value::as_str)
+                            .context("Aster client identity missing")?;
+                        let result = aster.query_order(&spec.market_id, client).await?;
+                        anyhow::ensure!(result.get("clientOrderId").and_then(serde_json::Value::as_str) == Some(client), "Aster order identity mismatch");
+                        anyhow::ensure!(crate::aster::rest::order_response_is_terminal(&serde_json::to_string(&result)?)?, "Aster order is not terminal");
+                        let fill = crate::aster::rest::immediate_fill_from_order_response(&serde_json::to_string(&result)?)?;
+                        expected_aster += if side == Side::Buy { fill.qty } else { -fill.qty };
+                        verified.push(serde_json::json!({"venue":"aster", "order": result}));
+                    }
+                    Some("lighter") => {
+                        let client = order.get("client_order_index").and_then(serde_json::Value::as_i64)
+                            .context("Lighter client identity missing")?;
+                        let result = lighter.resolve_order_terminal(&spec.market_id, client, side, qty, Duration::from_secs(10)).await?;
+                        anyhow::ensure!(result.terminal_order.as_ref().is_some_and(|order| order.is_terminal()), "Lighter terminal order unavailable");
+                        expected_lighter += if side == Side::Buy { result.filled_qty } else { -result.filled_qty };
+                        verified.push(serde_json::json!({"venue":"lighter", "client_order_index":client,
+                            "terminal_order":format!("{:?}",result.terminal_order), "fill":result.fill}));
+                    }
+                    _ => bail!("unknown venue in session evidence"),
+                }
+            }
+            let (a_pos, l_pos, a_open, l_open) = tokio::join!(aster.position_qty(&spec.market_id),
+                lighter.rest_position_qty(&spec.market_id), aster.open_orders(&spec.market_id),
+                lighter.rest_open_orders_count(&spec.market_id));
+            let (a_pos, l_pos) = (a_pos?, l_pos?);
+            anyhow::ensure!(a_open?.is_empty() && l_open? == 0, "session still has open orders");
+            let http = rest_book::client()?;
+            let book = rest_book::fetch_aster_book(&http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20).await?;
+            let mark = book.mid().context("resolution mark unavailable")?;
+            anyhow::ensure!((a_pos + l_pos).abs() * mark <= cfg.risk.max_position_mismatch_usd,
+                "session positions are not balanced; read-only resolver cannot close exposure");
+            anyhow::ensure!((a_pos - expected_aster).abs() * mark <= cfg.risk.max_position_mismatch_usd
+                && (l_pos - expected_lighter).abs() * mark <= cfg.risk.max_position_mismatch_usd,
+                "session positions do not reflect the terminal fill evidence");
+            let session_id = marker.get("session_id").and_then(serde_json::Value::as_str).context("session id missing")?.to_string();
+            let artifact = crate::pnl::retire_session_verified(path, session_id.clone(), serde_json::json!({
+                "schema_version":2, "session_id":session_id, "resolved_at":chrono::Utc::now(),
+                "terminal_evidence":verified, "aster_position":a_pos, "lighter_position":l_pos,
+                "open_orders":0, "source_marker":marker,
+            })).await?;
+            println!("session_resolved artifact={}", artifact.display());
             Ok(())
         }
         Commands::ResetCircuitBreaker { market } => {
@@ -490,6 +549,154 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             }
             crate::status::run(&cfg, selected, json).await
         }
+    }
+}
+
+fn diagnostic_session(cfg: &Config, spec: &MarketSpec, account: serde_json::Value) -> ActiveSession {
+    let id = format!("diagnostic-{}-{}", std::process::id(), chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
+    let mut metadata = serde_json::json!({
+        "schema_version": 2, "session_id": id, "started_at": chrono::Utc::now(), "status": "active",
+        "market": spec.market_id.to_string(),
+    });
+    if let Some(account) = account.as_object() {
+        for (key,value) in account { metadata[key] = value.clone(); }
+    }
+    ActiveSession::new(crate::pnl::session_path(&cfg.pnl, &spec.market_id), metadata)
+}
+
+struct DiagnosticCleanup {
+    orders: Vec<serde_json::Value>,
+    verified: bool,
+    identity_complete: bool,
+    error: Option<String>,
+}
+
+async fn cleanup_aster_diagnostic(
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest,
+    buy: &crate::aster::rest::SubmitOutcome, quantity: Decimal,
+) -> DiagnosticCleanup {
+    let mut orders = vec![crate::arb::aster_order_identity(buy, Side::Buy, quantity)];
+    let mut in_flight = false;
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let buy_evidence = crate::arb::resolve_aster_evidence(spec, aster, buy, Duration::from_secs(10)).await;
+        anyhow::ensure!(buy_evidence.terminal, "initial Aster buy is unresolved");
+        let mut expected = buy_evidence.qty.context("Aster buy quantity unavailable")?;
+        let http = rest_book::client()?;
+        let mut attempts = 0;
+        loop {
+            let position = match aster.position_qty(&spec.market_id).await {
+                Ok(position) => position,
+                Err(_) => { tokio::time::sleep(Duration::from_millis(250)).await; continue; }
+            };
+            // A pre-fill flat response is not a completed roundtrip.
+            if position != expected {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            if position == Decimal::ZERO {
+                anyhow::ensure!(aster.open_orders(&spec.market_id).await?.is_empty(), "Aster diagnostic has open orders");
+                println!("position_final=0 cleanup_verified=true");
+                return Ok::<_, anyhow::Error>(());
+            }
+            anyhow::ensure!(position > Decimal::ZERO && attempts < 3, "Aster diagnostic close failed after three attempts");
+            let qty = floor_to_step(position, spec.step);
+            anyhow::ensure!(qty > Decimal::ZERO, "Aster diagnostic residual below quantity step");
+            let book = rest_book::fetch_aster_book(&http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20).await?;
+            let bid = book.best_bid().context("Aster cleanup bid missing")?.px;
+            let bound = bid * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps));
+            in_flight = true;
+            let close = aster.submit_ioc_order(&spec.market_id, Side::Sell, qty, bound, true).await;
+            orders.push(crate::arb::aster_order_identity(&close, Side::Sell, qty));
+            in_flight = false;
+            attempts += 1;
+            let evidence = crate::arb::resolve_aster_evidence(spec, aster, &close, Duration::from_secs(5)).await;
+            anyhow::ensure!(evidence.terminal, "Aster diagnostic close remains unresolved");
+            expected -= evidence.qty.context("Aster close quantity unavailable")?;
+            println!("cleanup_close={close:?} fill={:?}", evidence.fill);
+        }
+    }).await;
+    let error = match result { Ok(Ok(())) => None, Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(_) => Some("Aster diagnostic cleanup exceeded thirty seconds".to_string()) };
+    DiagnosticCleanup { orders, verified: error.is_none(), identity_complete: !in_flight, error }
+}
+
+async fn cleanup_lighter_diagnostic(
+    cfg: &Config, spec: &MarketSpec, lighter: &LighterVenue,
+    buy: &crate::venues::lighter::SubmitOutcome, quantity: Decimal,
+) -> DiagnosticCleanup {
+    let mut orders = vec![crate::arb::lighter_order_identity(buy, Side::Buy, quantity)];
+    let mut in_flight = false;
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let buy_evidence = crate::arb::resolve_lighter_evidence(spec, lighter, buy, None, Side::Buy,
+            quantity, Duration::from_secs(10)).await;
+        anyhow::ensure!(buy_evidence.terminal, "initial Lighter buy is unresolved");
+        let mut expected = buy_evidence.qty.context("Lighter buy quantity unavailable")?;
+        let http = rest_book::client()?;
+        let mut attempts = 0;
+        loop {
+            let position = match lighter.position_qty(&spec.market_id).await {
+                Ok(position) => position,
+                Err(_) => { tokio::time::sleep(Duration::from_millis(250)).await; continue; }
+            };
+            if position != expected {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            }
+            if position == Decimal::ZERO {
+                anyhow::ensure!(lighter.rest_open_orders_count(&spec.market_id).await? == 0, "Lighter diagnostic has open orders");
+                println!("position_final=0 cleanup_verified=true");
+                return Ok::<_, anyhow::Error>(());
+            }
+            anyhow::ensure!(position > Decimal::ZERO && attempts < 3, "Lighter diagnostic close failed after three attempts");
+            let qty = floor_to_step(position, spec.lighter_qty_step);
+            anyhow::ensure!(qty > Decimal::ZERO, "Lighter diagnostic residual below quantity step");
+            let book = rest_book::fetch_lighter_book(&http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20).await?;
+            let bid = book.best_bid().context("Lighter cleanup bid missing")?.px;
+            let bound = bid * (Decimal::ONE - bps_to_rate(cfg.arb.emergency_slippage_bps));
+            in_flight = true;
+            let (close, pending) = lighter.submit_market_order_deferred_fill(&spec.market_id, Side::Sell, qty, bound, true).await;
+            orders.push(crate::arb::lighter_order_identity(&close, Side::Sell, qty));
+            in_flight = false;
+            attempts += 1;
+            let evidence = crate::arb::resolve_lighter_evidence(spec, lighter, &close, pending, Side::Sell,
+                qty, Duration::from_secs(5)).await;
+            anyhow::ensure!(evidence.terminal, "Lighter diagnostic close remains unresolved");
+            expected -= evidence.qty.context("Lighter close quantity unavailable")?;
+            println!("cleanup_close={close:?} fill={:?}", evidence.fill);
+        }
+    }).await;
+    let error = match result { Ok(Ok(())) => None, Ok(Err(error)) => Some(format!("{error:#}")),
+        Err(_) => Some("Lighter diagnostic cleanup exceeded thirty seconds".to_string()) };
+    DiagnosticCleanup { orders, verified: error.is_none(), identity_complete: !in_flight, error }
+}
+
+async fn run_diagnostic<O,C>(cfg: &Config, spec: &MarketSpec, session: &ActiveSession,
+    operation: O, cleanup: C) -> Result<()>
+where O: std::future::Future<Output=Result<()>>, C: std::future::Future<Output=DiagnosticCleanup> {
+    let operation = operation.await;
+    let cleanup = cleanup.await;
+    finish_diagnostic(cfg,spec,session,operation,cleanup).await
+}
+
+async fn finish_diagnostic(cfg: &Config, spec: &MarketSpec, session: &ActiveSession,
+    operation: Result<()>, cleanup: DiagnosticCleanup) -> Result<()> {
+    let row = serde_json::json!({ "schema_version": 2, "economic_status": "incomplete",
+        "timestamp": chrono::Utc::now(), "session_id": session.id(), "market": spec.market_id.to_string(),
+        "outcome": if cleanup.verified { "diagnostic_complete" } else { "diagnostic_unresolved" },
+        "orders": cleanup.orders, "orders_complete": cleanup.identity_complete,
+        "pre_positions":{"aster_qty":"0","lighter_qty":"0"},
+        "diagnostic_error": operation.as_ref().err().map(|error| format!("{error:#}")), "cleanup_error": cleanup.error });
+    if !cleanup.verified { session.record_unresolved(row.clone()).await?; }
+    let path = PathBuf::from(&cfg.pnl.persist_dir).join(format!("diagnostics_{}.jsonl", spec.market_id));
+    tokio::task::spawn_blocking(move || crate::pnl::append_json_line(&path, &row, true)).await??;
+    if cleanup.verified {
+        session.resolve_execution().await?;
+        session.clear_verified().await?;
+        operation.context("diagnostic error; cleanup nevertheless verified the position flat")
+    } else {
+        bail!("diagnostic cleanup unresolved: {}; original diagnostic error: {}",
+            cleanup.error.unwrap_or_else(|| "unknown".to_string()),
+            operation.err().map(|error| format!("{error:#}")).unwrap_or_else(|| "none".to_string()))
     }
 }
 
@@ -576,23 +783,6 @@ async fn wait_position_after_buy(
     }
 }
 
-async fn wait_position_flat(
-    aster: &AsterRest,
-    market: &crate::types::MarketId,
-    tolerance: Decimal,
-) -> Result<Decimal> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let pos = aster.position_qty(market).await?;
-        if pos.abs() <= tolerance {
-            return Ok(pos);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for Aster flat position; last={}", pos);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
 
 async fn wait_lighter_position_after_buy(
     lighter: &LighterVenue,
@@ -624,23 +814,6 @@ async fn wait_lighter_position_after_buy(
     }
 }
 
-async fn wait_lighter_position_flat(
-    lighter: &LighterVenue,
-    market: &crate::types::MarketId,
-    tolerance: Decimal,
-) -> Result<Decimal> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let pos = lighter.position_qty(market).await?;
-        if pos.abs() <= tolerance {
-            return Ok(pos);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("timed out waiting for Lighter flat position; last={}", pos);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-}
 
 fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
     if qty <= Decimal::ZERO || step <= Decimal::ZERO {
@@ -654,4 +827,95 @@ fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
         return Decimal::ZERO;
     }
     (qty / step).ceil() * step
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+    use std::sync::atomic::{AtomicBool,AtomicUsize,Ordering};
+    use tokio::io::{AsyncReadExt,AsyncWriteExt};
+
+    #[tokio::test]
+    async fn balance_failure_still_executes_and_verifies_reduce_only_cleanup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}",listener.local_addr().unwrap());
+        let closed = Arc::new(AtomicBool::new(false));
+        let closes = Arc::new(AtomicUsize::new(0));
+        let reduce_only = Arc::new(AtomicBool::new(true));
+        let (server_closed,server_closes,server_reduce) = (closed.clone(),closes.clone(),reduce_only.clone());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream,_) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (header_end,length) = loop {
+                    let mut buffer = [0u8;4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 { break (0,0); }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if let Some(end) = bytes.windows(4).position(|part|part==b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        let length = header.lines().find_map(|line|line.to_ascii_lowercase().strip_prefix("content-length:")
+                            .and_then(|value|value.trim().parse::<usize>().ok())).unwrap_or(0);
+                        break (end+4,length);
+                    }
+                };
+                if header_end == 0 { continue; }
+                while bytes.len() < header_end+length {
+                    let mut buffer = [0u8;4096];
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count==0 { break; }
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                let request = String::from_utf8_lossy(&bytes);
+                let first = request.lines().next().unwrap_or("");
+                let body = String::from_utf8_lossy(&bytes[header_end..]);
+                let mut status = "200 OK";
+                let response = if first.starts_with("POST /fapi/v3/order") {
+                    server_reduce.fetch_and(body.contains("reduceOnly=true") && body.contains("side=SELL"),Ordering::SeqCst);
+                    server_closes.fetch_add(1,Ordering::SeqCst);
+                    server_closed.store(true,Ordering::SeqCst);
+                    let client = body.split('&').find_map(|part|part.strip_prefix("newClientOrderId=")).unwrap_or("missing");
+                    serde_json::json!({"orderId":2,"clientOrderId":client,"status":"FILLED","executedQty":"1","cumQuote":"100","avgPrice":"100"})
+                } else if first.contains("/positionRisk") {
+                    serde_json::json!([{"symbol":"HYPEUSDT","positionAmt":if server_closed.load(Ordering::SeqCst){"0"}else{"1"}}])
+                } else if first.contains("/userTrades") {
+                    serde_json::json!([
+                        {"id":1,"orderId":1,"price":"100","qty":"1","quoteQty":"100","commission":"0.04","commissionAsset":"USDT"},
+                        {"id":2,"orderId":2,"price":"100","qty":"1","quoteQty":"100","commission":"0.04","commissionAsset":"USDT"}
+                    ])
+                } else if first.contains("/depth") {
+                    serde_json::json!({"bids":[["100","10"]],"asks":[["101","10"]]})
+                } else if first.contains("/openOrders") { serde_json::json!([]) }
+                else { status="500 Internal Server Error"; serde_json::json!({"error":"injected balance failure"}) };
+                let body = response.to_string();
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        let mut cfg: Config = toml::from_str("[[markets]]\naster_symbol=\"HYPEUSDT\"\nlighter_symbol=\"HYPE\"").unwrap();
+        cfg.venues.aster_base_url = url.clone();
+        let dir = std::env::temp_dir().join(format!("taker_diagnostic_{}_{}",std::process::id(),chrono::Utc::now().timestamp_micros()));
+        cfg.pnl.persist_dir = dir.to_string_lossy().into_owned();
+        let spec = MarketSpec {market_id:"HYPE".into(),aster_symbol:"HYPEUSDT".to_string(),lighter_symbol:"HYPE".to_string(),
+            lighter_market_id:24,lighter_price_decimals:4,lighter_size_decimals:2,lighter_price_tick:dec!(0.0001),
+            tick:dec!(0.01),step:dec!(0.01),aster_min_qty:dec!(0.01),aster_min_notional:dec!(10),
+            lighter_qty_step:dec!(0.01),lighter_min_notional:dec!(10)};
+        let aster = AsterRest::new(url,Arc::new(crate::aster::sign::test_support::TestSigner::new()),std::slice::from_ref(&spec)).unwrap();
+        let buy = crate::aster::rest::SubmitOutcome::Accepted {venue_order_id:Some(1),client_order_id:"buy-fixture".to_string(),
+            raw:serde_json::json!({"orderId":1,"clientOrderId":"buy-fixture","status":"FILLED","executedQty":"1","cumQuote":"100"}).to_string()};
+        let session = diagnostic_session(&cfg,&spec,serde_json::json!({"fixture":true}));
+        session.arm().await.unwrap();
+        let result = run_diagnostic(&cfg,&spec,&session,
+            async { aster.available_usdc().await?; Ok(()) },
+            cleanup_aster_diagnostic(&cfg,&spec,&aster,&buy,dec!(1))).await;
+        assert!(result.is_err());
+        assert!(format!("{:#}",result.unwrap_err()).contains("cleanup nevertheless verified"));
+        assert_eq!(closes.load(Ordering::SeqCst),1);
+        assert!(reduce_only.load(Ordering::SeqCst));
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(!crate::pnl::session_path(&cfg.pnl,&spec.market_id).exists());
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

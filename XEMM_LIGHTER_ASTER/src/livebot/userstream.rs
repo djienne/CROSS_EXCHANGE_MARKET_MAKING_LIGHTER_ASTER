@@ -77,6 +77,8 @@ struct AsterTradeUpdate<'a> {
 
 #[derive(Deserialize)]
 struct AsterOrderInfo<'a> {
+    #[serde(rename = "T", default)]
+    trade_time_ms: i64,
     #[serde(rename = "s", default)]
     symbol: &'a str,
     #[serde(rename = "c", default)]
@@ -97,6 +99,10 @@ struct AsterOrderInfo<'a> {
     trade_id: Option<IntOrString<'a>>,
     #[serde(rename = "R", default)]
     reduce_only: bool,
+    #[serde(rename = "n", default)]
+    commission: Option<&'a str>,
+    #[serde(rename = "N", default)]
+    commission_asset: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -379,8 +385,10 @@ fn fill_from_update(update: AsterTradeUpdate<'_>, sym_to_market: &HashMap<String
         last_fill_qty,
         last_fill_px,
         cum_filled_qty: o.cum_filled_qty.parse().unwrap_or(last_fill_qty),
-        event_time_ms: update.event_time_ms,
+        event_time_ms: if o.trade_time_ms > 0 { o.trade_time_ms } else { update.event_time_ms },
         reduce_only: o.reduce_only,
+        commission: o.commission.and_then(|value| value.parse::<Decimal>().ok()),
+        commission_asset: o.commission_asset.map(str::to_owned),
     })
 }
 
@@ -397,7 +405,7 @@ mod tests {
 
     #[test]
     fn parses_maker_trade_fill() {
-        let text = r#"{"e":"ORDER_TRADE_UPDATE","E":1700000000123,"o":{"s":"HYPEUSDT","c":"Xsess-HYPE-B-0","S":"BUY","x":"TRADE","X":"PARTIALLY_FILLED","i":2037568488,"l":"0.05","z":"0.05","L":"64.5","t":99887766,"m":true}}"#;
+        let text = r#"{"e":"ORDER_TRADE_UPDATE","E":1700000000123,"o":{"s":"HYPEUSDT","c":"Xsess-HYPE-B-0","S":"BUY","x":"TRADE","X":"PARTIALLY_FILLED","i":2037568488,"l":"0.05","z":"0.05","L":"64.5","t":99887766,"m":true,"T":1700000000100,"n":"0.000645","N":"USDT"}}"#;
         let f = parse_order_trade_update(text, &map()).unwrap();
         assert_eq!(f.market, MarketId("HYPE".into()));
         assert_eq!(f.aster_side, Side::Buy);
@@ -407,7 +415,9 @@ mod tests {
         assert_eq!(f.last_fill_qty, dec!(0.05));
         assert_eq!(f.last_fill_px, dec!(64.5));
         assert_eq!(f.cum_filled_qty, dec!(0.05));
-        assert_eq!(f.event_time_ms, 1700000000123);
+        assert_eq!(f.event_time_ms, 1700000000100);
+        assert_eq!(f.commission, Some(dec!(0.000645)));
+        assert_eq!(f.commission_asset.as_deref(), Some("USDT"));
     }
 
     #[test]

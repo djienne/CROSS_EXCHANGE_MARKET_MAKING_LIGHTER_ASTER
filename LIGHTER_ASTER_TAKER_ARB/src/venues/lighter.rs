@@ -26,7 +26,7 @@ use crate::lighter::signer::{
 use crate::lighter::tx_ws::TxWebSocket;
 use crate::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions};
 use crate::markets::MarketSpec;
-use crate::types::{FillSummary, MarketId, Side, TxSendStatus};
+use crate::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side, TxSendStatus};
 
 const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
 static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
@@ -39,6 +39,8 @@ pub enum SubmitOutcome {
     Accepted {
         raw: String,
         client_order_index: i64,
+        tx_hash: String,
+        nonce: i64,
         fill: Option<FillSummary>,
     },
     Rejected {
@@ -49,6 +51,9 @@ pub enum SubmitOutcome {
     },
     Unknown {
         reason: String,
+        client_order_index: i64,
+        tx_hash: String,
+        nonce: i64,
     },
 }
 
@@ -131,6 +136,7 @@ impl LighterFillStatus {
 
 #[derive(Debug, Clone)]
 pub struct LighterFillConfirmation {
+    pub fee_evidence: Vec<FeeEvidence>,
     pub fill: Option<FillSummary>,
     pub status: LighterFillStatus,
     pub terminal_order: Option<RemoteOrder>,
@@ -197,14 +203,33 @@ impl FillTracker {
     }
 }
 
+struct FillProgress {
+    fee_evidence: Vec<FeeEvidence>,
+    seen: HashSet<u128>,
+    qty: Decimal,
+    notional: Decimal,
+    fee: Decimal,
+    fee_known: bool,
+    matched_seen: u64,
+}
+
+impl Default for FillProgress {
+    fn default() -> Self {
+        Self { fee_evidence: Vec::new(), seen: HashSet::new(), qty: Decimal::ZERO, notional: Decimal::ZERO,
+            fee: Decimal::ZERO, fee_known: true, matched_seen: 0 }
+    }
+}
+
 pub struct PendingFill {
     fills: Arc<FillTracker>,
     account_feed: Arc<AccountFeedState>,
     market_id: u32,
+    account_index: i64,
     client_order_index: i64,
     side: Side,
     expected_qty: Decimal,
     rx: mpsc::UnboundedReceiver<TradePayload>,
+    progress: FillProgress,
 }
 
 impl PendingFill {
@@ -213,34 +238,41 @@ impl PendingFill {
     }
 
     pub async fn wait_confirmed(mut self, timeout: Duration) -> LighterFillConfirmation {
+        self.observe_confirmed(timeout).await
+    }
+
+    pub async fn observe_confirmed(&mut self, timeout: Duration) -> LighterFillConfirmation {
         let deadline = tokio::time::Instant::now() + timeout;
-        let min_expected = self.expected_qty * Decimal::from(999u32) / Decimal::from(1000u32);
-        let mut seen = HashSet::new();
-        let mut qty = Decimal::ZERO;
-        let mut notional = Decimal::ZERO;
-        let mut fee = Decimal::ZERO;
-        let mut matched_seen = 0u64;
+        let min_expected = self.expected_qty;
+        let progress = &mut self.progress;
         loop {
-            if qty >= min_expected {
-                break;
-            }
-            match tokio::time::timeout_at(deadline, self.rx.recv()).await {
+            if progress.qty >= min_expected { break; }
+            if self.account_feed.order_by_client(self.client_order_index)
+                .filter(|order| remote_matches(order, self.account_index, self.market_id, self.client_order_index, self.side))
+                .filter(RemoteOrder::is_terminal).and_then(|order| remote_order_filled_qty(&order))
+                .is_some_and(|filled| progress.qty >= filled) { break; }
+            let next_poll = (tokio::time::Instant::now() + Duration::from_millis(100)).min(deadline);
+            match tokio::time::timeout_at(next_poll, self.rx.recv()).await {
                 Ok(Some(trade)) => {
-                    let key = fill_identity(&trade);
-                    if !seen.insert(key) {
+                    let Some(key) = fill_identity(&trade) else {
+                        progress.fee_known = false;
+                        continue;
+                    };
+                    if !progress.seen.insert(key) {
                         self.fills.record_duplicate();
                         continue;
                     }
-                    if !trade_matches_side(&trade, self.client_order_index, self.side) {
+                    let account = match self.side { Side::Sell => trade.ask_account_id, Side::Buy => trade.bid_account_id };
+                    if !trade_matches_side(&trade, self.client_order_index, self.side)
+                        || account.is_some_and(|account| account != self.account_index) {
                         continue;
                     }
-                    matched_seen += 1;
+                    progress.matched_seen += 1;
                     let q = trade
                         .size
                         .as_deref()
                         .and_then(|s| s.parse::<Decimal>().ok())
-                        .unwrap_or(Decimal::ZERO)
-                        .abs();
+                        .unwrap_or(Decimal::ZERO);
                     let p = trade
                         .price
                         .as_deref()
@@ -255,33 +287,40 @@ impl PendingFill {
                         .and_then(|s| s.parse::<Decimal>().ok())
                         .unwrap_or(Decimal::ZERO)
                         .abs();
-                    qty += q;
-                    notional += if quote > Decimal::ZERO { quote } else { q * p };
-                    fee += trade_fee_usd(&trade);
+                    let trade_notional = if quote > Decimal::ZERO { quote } else { q * p };
+                    progress.qty += q;
+                    progress.notional += trade_notional;
+                    let evidence = trade_fee_evidence(&trade, self.side, self.client_order_index, trade_notional, "account_all_trades");
+                    match evidence.fee_usd {
+                        Some(amount) => progress.fee += amount,
+                        None => progress.fee_known = false,
+                    }
+                    progress.fee_evidence.push(evidence);
                 }
+                Err(_) if tokio::time::Instant::now() < deadline => continue,
                 _ => break,
             }
         }
-        self.fills.unregister(self.client_order_index);
-        let terminal_order = self.account_feed.order_by_client(self.client_order_index);
+        let terminal_order = self.account_feed.order_by_client(self.client_order_index)
+            .filter(|order| remote_matches(order, self.account_index, self.market_id, self.client_order_index, self.side));
         let terminal_filled_qty = terminal_order
             .as_ref()
             .and_then(remote_order_filled_qty)
             .unwrap_or(Decimal::ZERO);
-        let effective_filled_qty = qty.max(terminal_filled_qty);
+        let effective_filled_qty = progress.qty.max(terminal_filled_qty);
         let status = if effective_filled_qty >= min_expected {
             LighterFillStatus::Filled
         } else if effective_filled_qty > Decimal::ZERO {
             LighterFillStatus::PartialFill
         } else if terminal_order
             .as_ref()
-            .is_some_and(|order| !order.is_live())
+            .is_some_and(RemoteOrder::is_terminal)
         {
             LighterFillStatus::ExpiredNoFill
         } else {
             LighterFillStatus::LiveOrUnknown
         };
-        if qty < min_expected {
+        if progress.qty < min_expected {
             self.fills.record_timeout();
             tracing::warn!(
                 "Lighter fill wait incomplete client_order_index={} market_id={} side={} expected_qty={} min_expected_qty={} filled_qty={} terminal_filled_qty={} status={} terminal_status={:?} matched_trades_seen={} tracker_stats={:?}",
@@ -290,11 +329,11 @@ impl PendingFill {
                 self.side,
                 self.expected_qty,
                 min_expected,
-                qty,
+                progress.qty,
                 terminal_filled_qty,
                 status.as_str(),
                 terminal_order.as_ref().and_then(|order| order.status.as_deref()),
-                matched_seen,
+                progress.matched_seen,
                 self.fills.stats()
             );
         } else {
@@ -304,17 +343,20 @@ impl PendingFill {
                 self.market_id,
                 self.side,
                 self.expected_qty,
-                qty,
+                progress.qty,
                 status.as_str(),
-                matched_seen,
+                progress.matched_seen,
                 self.fills.stats()
             );
         }
         LighterFillConfirmation {
-            fill: FillSummary::from_qty_notional(qty, notional, fee),
+            fee_evidence: progress.fee_evidence.clone(),
+            fill: if status == LighterFillStatus::ExpiredNoFill { Some(FillSummary::zero()) }
+                else { FillSummary::from_qty_notional(progress.qty, progress.notional, progress.fee).map(|fill|
+                    fill.with_fee_provenance(if progress.fee_known { FeeProvenance::Venue } else { FeeProvenance::Unknown })) },
             status,
             terminal_order,
-            matched_trades_seen: matched_seen,
+            matched_trades_seen: progress.matched_seen,
             filled_qty: effective_filled_qty,
         }
     }
@@ -334,6 +376,7 @@ const TERMINAL_ORDER_TTL: std::time::Duration = std::time::Duration::from_secs(6
 
 #[derive(Default)]
 struct AccountFeedState {
+    account_index: Option<i64>,
     positions: Mutex<HashMap<u32, Decimal>>,
     available_balance: Mutex<Option<Decimal>>,
     portfolio_value: Mutex<Option<Decimal>>,
@@ -436,14 +479,20 @@ impl AccountFeedState {
                 .map(|rows| {
                     rows.iter()
                         .filter_map(|row| serde_json::from_value::<RemoteOrder>(row.clone()).ok())
-                        .map(|order| {
+                        .filter_map(|mut order| {
+                            if order.market_index.is_some_and(|id| id != market_id)
+                                || order.owner_account_index.zip(self.account_index).is_some_and(|(reported, expected)| reported != expected) {
+                                return None;
+                            }
+                            order.market_index = Some(market_id);
+                            if order.owner_account_index.is_none() { order.owner_account_index = self.account_index; }
                             if let Some(client_order_index) = order.client_order_index {
                                 if order.is_live() {
                                     seen_live_client_ids.insert(client_order_index);
                                 }
                                 parsed_orders.push((market_id, order.clone()));
                             }
-                            order
+                            Some(order)
                         })
                         .filter(RemoteOrder::is_live)
                         .count()
@@ -562,6 +611,7 @@ impl AccountFeedState {
 
 #[derive(Default)]
 struct BookFeedState {
+    scan_notify: ArcSwapOption<Notify>,
     books: Mutex<HashMap<u32, LighterBook>>,
     reconnects: Mutex<HashMap<u32, Arc<Notify>>>,
 }
@@ -577,7 +627,10 @@ impl BookFeedState {
     fn apply(&self, market_id: u32, msg: &OrderBookMsgRef<'_>) -> bool {
         let mut books = self.books.lock().expect("Lighter book state poisoned");
         let book = books.entry(market_id).or_default();
-        book.apply(msg)
+        let applied = book.apply(msg);
+        drop(books);
+        if let Some(notify) = self.scan_notify.load_full() { notify.notify_one(); }
+        applied
     }
 
     fn reset(&self, market_id: u32) {
@@ -591,6 +644,7 @@ impl BookFeedState {
         {
             book.reset_in_place();
         }
+        if let Some(notify) = self.scan_notify.load_full() { notify.notify_one(); }
     }
 
     /// The lock-free published-book cell for a market (created on first use). Readers
@@ -635,6 +689,8 @@ struct LighterBook {
     asks: BTreeMap<Decimal, Decimal>,
     initialized: bool,
     updated_at: Option<DateTime<Utc>>,
+    source_at: Option<DateTime<Utc>>,
+    engine_at: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
     last_offset: Option<u64>,
     /// Published snapshot cell. Behind an Arc so scan-path readers can hold the cell
@@ -664,6 +720,8 @@ impl LighterBook {
         apply_levels(&mut self.bids, &msg.order_book.bids);
         apply_levels(&mut self.asks, &msg.order_book.asks);
         self.updated_at = Some(Utc::now());
+        self.source_at = msg.source_time_ms().and_then(DateTime::from_timestamp_millis);
+        self.engine_at = msg.engine_time_ms().and_then(DateTime::from_timestamp_millis);
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
         self.last_offset = msg.effective_offset().or(self.last_offset);
         self.refresh_cache();
@@ -690,7 +748,8 @@ impl LighterBook {
             .iter()
             .take(MAX_BOOK_LEVELS)
             .map(|(p, q)| (*p, *q));
-        let book = OrderBook::from_levels(bids, asks, ts, ts);
+        let mut book = OrderBook::from_levels(bids, asks, self.source_at.unwrap_or(DateTime::<Utc>::UNIX_EPOCH), ts);
+        book.engine_ts = self.engine_at;
         self.cached.store(Some(Arc::new(book)));
     }
 
@@ -705,6 +764,8 @@ impl LighterBook {
         self.asks.clear();
         self.initialized = false;
         self.updated_at = None;
+        self.source_at = None;
+        self.engine_at = None;
         self.last_nonce = None;
         self.last_offset = None;
         self.cached.store(None);
@@ -737,6 +798,10 @@ pub struct LighterVenue {
 }
 
 impl LighterVenue {
+    pub fn set_scan_notify(&self, notify: Arc<Notify>) { self.book_feed.scan_notify.store(Some(notify)); }
+    pub fn tx_ready(&self) -> bool { !self.read_only && self.tx_ws.is_ready() }
+    pub fn account_index(&self) -> i64 { self.account_index }
+
     pub async fn new(
         base_url: &str,
         signers_dir: &Path,
@@ -761,7 +826,7 @@ impl LighterVenue {
             .await
             .with_context(|| format!("preconnect Lighter tx websocket {ws_url}"))?;
         let fills = Arc::new(FillTracker::default());
-        let account_feed = Arc::new(AccountFeedState::default());
+        let account_feed = Arc::new(AccountFeedState { account_index: Some(creds.account_index), ..Default::default() });
         let book_feed = Arc::new(BookFeedState::default());
         let known_markets: Vec<u32> = specs.iter().map(|s| s.lighter_market_id).collect();
         spawn_order_book_stream(ws_url.clone(), specs, book_feed.clone());
@@ -848,7 +913,7 @@ impl LighterVenue {
         let ws_url = lighter_ws_url(base_url);
         let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
         let fills = Arc::new(FillTracker::default());
-        let account_feed = Arc::new(AccountFeedState::default());
+        let account_feed = Arc::new(AccountFeedState { account_index: Some(creds.account_index), ..Default::default() });
         let book_feed = Arc::new(BookFeedState::default());
         let markets = specs
             .iter()
@@ -958,6 +1023,8 @@ impl LighterVenue {
                 SubmitOutcome::Accepted {
                     raw,
                     client_order_index,
+                    tx_hash,
+                    nonce,
                     ..
                 },
                 Some(pending_fill),
@@ -966,6 +1033,8 @@ impl LighterVenue {
                 SubmitOutcome::Accepted {
                     raw,
                     client_order_index,
+                    tx_hash,
+                    nonce,
                     fill,
                 }
             }
@@ -1029,7 +1098,7 @@ impl LighterVenue {
                 );
             }
         };
-        let result = {
+        let (result, tx_hash, reserved_nonce) = {
             // Keep nonce reservation, native signing and websocket write in the same critical
             // section. Lighter nonces are consumed in send order; allowing two callers to sign
             // concurrently can invert nonce order before they reach `TxWebSocket::send_batch`.
@@ -1061,21 +1130,20 @@ impl LighterVenue {
                     );
                 }
             };
+            let tx_hash = signed.tx_hash.clone();
             let result = self
                 .tx_ws
                 .send_batch(&[signed.tx_type], &[signed.tx_info])
                 .await;
             match result.status {
                 TxSendStatus::NotSent => self.nonce.rollback(1),
-                TxSendStatus::Unknown => {
-                    let _ = self.nonce.hard_refresh(&self.rest).await;
-                }
+                TxSendStatus::Unknown => {}
                 TxSendStatus::Rejected if lighter_nonce_reject(result.code, &result.message) => {
                     let _ = self.nonce.hard_refresh(&self.rest).await;
                 }
                 TxSendStatus::Ok | TxSendStatus::Rejected => {}
             }
-            result
+            (result, tx_hash, nonce)
         };
         match result.status {
             TxSendStatus::Ok => {
@@ -1083,10 +1151,12 @@ impl LighterVenue {
                     fills: self.fills.clone(),
                     account_feed: self.account_feed.clone(),
                     market_id: wire.market_index as u32,
+                    account_index: self.account_index,
                     client_order_index,
                     side,
                     expected_qty: qty,
                     rx: fill_rx,
+                    progress: FillProgress::default(),
                 };
                 (
                     SubmitOutcome::Accepted {
@@ -1098,6 +1168,8 @@ impl LighterVenue {
                         })
                         .to_string(),
                         client_order_index,
+                        tx_hash,
+                        nonce: reserved_nonce,
                         fill: None,
                     },
                     Some(pending_fill),
@@ -1122,13 +1194,11 @@ impl LighterVenue {
                 )
             }
             TxSendStatus::Unknown => {
-                self.fills.unregister(client_order_index);
-                (
-                    SubmitOutcome::Unknown {
-                        reason: format!("Lighter tx unknown: {}", result.message),
-                    },
-                    None,
-                )
+                let pending = PendingFill { fills: self.fills.clone(), account_feed: self.account_feed.clone(),
+                    market_id: wire.market_index as u32, account_index: self.account_index,
+                    client_order_index, side, expected_qty: qty, rx: fill_rx, progress: FillProgress::default() };
+                (SubmitOutcome::Unknown { reason: format!("Lighter tx unknown: {}", result.message),
+                    client_order_index, tx_hash, nonce: reserved_nonce }, Some(pending))
             }
         }
     }
@@ -1235,10 +1305,119 @@ impl LighterVenue {
             .ok_or_else(|| anyhow!("Lighter account_all_orders websocket not ready for {market}"))
     }
 
+    /// Cold, identity-matched resolution. Exhausted/missing history is never no-fill evidence.
+    pub async fn resolve_order_terminal(
+        &self, market: &MarketId, client_order_index: i64, side: Side,
+        expected_qty: Decimal, timeout: Duration,
+    ) -> Result<LighterFillConfirmation> {
+        let market_index = self.wire(market)?.market_index as u32;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let cached = self.account_feed.order_by_client(client_order_index)
+                    .filter(|order| remote_matches(order, self.account_index, market_index, client_order_index, side));
+                let mut terminal = cached.filter(RemoteOrder::is_terminal);
+                if terminal.is_none() {
+                    let mut cursor: Option<String> = None;
+                    let mut cursors = HashSet::new();
+                    loop {
+                        let page = self.rest.account_inactive_orders(self.account_index, market_index,
+                            &auth, cursor.as_deref()).await?;
+                        let rows = page.get("orders").and_then(serde_json::Value::as_array)
+                            .context("Lighter inactive-order history has no orders array")?;
+                        for row in rows {
+                            let order: RemoteOrder = serde_json::from_value(row.clone())?;
+                            if remote_matches(&order, self.account_index, market_index, client_order_index, side)
+                                && order.is_terminal() { terminal = Some(order); break; }
+                        }
+                        if terminal.is_some() { break; }
+                        cursor = next_history_cursor(&page);
+                        let Some(next) = cursor.as_ref() else { break; };
+                        anyhow::ensure!(cursors.insert(next.clone()), "repeated Lighter order-history cursor");
+                    }
+                }
+                if let Some(order) = terminal {
+                    let filled = remote_order_filled_qty(&order).context("terminal Lighter order lacks filled quantity")?;
+                    anyhow::ensure!(filled >= Decimal::ZERO, "negative terminal filled quantity");
+                    if filled == Decimal::ZERO {
+                        return Ok(LighterFillConfirmation { fee_evidence:Vec::new(), fill: Some(FillSummary::zero()),
+                            status: LighterFillStatus::ExpiredNoFill, terminal_order: Some(order),
+                            matched_trades_seen: 0, filled_qty: Decimal::ZERO });
+                    }
+                    let order_index = order.order_index.context("terminal Lighter order lacks order index")?;
+                    let mut cursor: Option<String> = None;
+                    let mut cursors = HashSet::new();
+                    let mut seen = HashSet::new();
+                    let (mut qty, mut notional, mut fees) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+                    let mut known_fee = true;
+                    let mut fee_evidence = Vec::new();
+                    let mut rows_seen = 0;
+                    loop {
+                        let page = self.rest.trades_by_order(self.account_index, order_index, &auth, cursor.as_deref()).await?;
+                        let trades = page.get("trades").and_then(serde_json::Value::as_array)
+                            .context("Lighter trade history has no trades array")?;
+                        for row in trades {
+                            let trade: TradePayload = serde_json::from_value(row.clone())?;
+                            let (account, own_id) = match side {
+                                Side::Sell => (trade.ask_account_id, trade.ask_id),
+                                Side::Buy => (trade.bid_account_id, trade.bid_id),
+                            };
+                            if account.is_some_and(|account| account != self.account_index)
+                                || !(own_id == Some(order_index) || trade_matches_side(&trade, client_order_index, side)) { continue; }
+                            let Some(key) = fill_identity(&trade) else { known_fee=false; continue; };
+                            if !seen.insert(key) { continue; }
+                            let q = trade.size.as_deref().and_then(|q| q.parse::<Decimal>().ok())
+                                .filter(|q| *q > Decimal::ZERO).context("invalid Lighter historical fill size")?;
+                            let price = trade.price.as_deref().and_then(|p| p.parse::<Decimal>().ok())
+                                .filter(|p| *p > Decimal::ZERO).context("invalid Lighter historical fill price")?;
+                            let amount = match trade.usd_amount.as_deref() {
+                                Some(value) => value.parse::<Decimal>().context("invalid Lighter historical notional")?,
+                                None => q * price,
+                            };
+                            anyhow::ensure!(amount > Decimal::ZERO, "nonpositive Lighter historical notional");
+                            qty += q;
+                            notional += amount;
+                            rows_seen += 1;
+                            let evidence = trade_fee_evidence(&trade,side,client_order_index,amount,"rest_trades");
+                            match evidence.fee_usd {
+                                Some(fee) => fees += fee,
+                                None => known_fee = false,
+                            }
+                            fee_evidence.push(evidence);
+                        }
+                        cursor = next_history_cursor(&page);
+                        let Some(next) = cursor.as_ref() else { break; };
+                        anyhow::ensure!(cursors.insert(next.clone()), "repeated Lighter trade-history cursor");
+                    }
+                    let fill = if qty == filled {
+                        FillSummary::from_qty_notional(qty, notional, fees).map(|fill| fill.with_fee_provenance(
+                            if known_fee { FeeProvenance::Venue } else { FeeProvenance::Unknown }))
+                    } else { None };
+                    return Ok(LighterFillConfirmation { fee_evidence, fill,
+                        status: if filled >= expected_qty { LighterFillStatus::Filled } else { LighterFillStatus::PartialFill },
+                        terminal_order: Some(order), matched_trades_seen: rows_seen, filled_qty: filled });
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }).await.context("Lighter order remains unresolved at confirmation deadline")?
+    }
+
     pub async fn refresh_nonce(&self) -> Result<()> {
         let _write_guard = self.write_lock.lock().await;
         self.nonce.hard_refresh(&self.rest).await
     }
+}
+
+fn remote_matches(order: &RemoteOrder, account: i64, market: u32, client: i64, side: Side) -> bool {
+    order.client_order_index == Some(client) && order.market_index == Some(market)
+        && order.owner_account_index == Some(account)
+        && order.is_ask == Some(matches!(side, Side::Sell))
+}
+
+fn next_history_cursor(page: &serde_json::Value) -> Option<String> {
+    page.get("next_cursor").and_then(serde_json::Value::as_str)
+        .filter(|cursor| !cursor.is_empty()).map(str::to_string)
 }
 
 fn lighter_nonce_reject(code: i64, message: &str) -> bool {
@@ -1529,7 +1708,7 @@ fn remote_order_filled_qty(order: &RemoteOrder) -> Option<Decimal> {
         .filled_base_amount
         .as_deref()
         .and_then(|s| s.parse::<Decimal>().ok())
-        .map(|qty| qty.abs())
+        .filter(|qty| *qty >= Decimal::ZERO)
 }
 
 fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'_>]) {
@@ -1593,41 +1772,20 @@ fn trade_matches_side(trade: &TradePayload, client_order_index: i64, side: Side)
     }
 }
 
-fn fill_identity(trade: &TradePayload) -> u128 {
-    if let Some(id) = trade.trade_id {
-        return (id as u128) | (1u128 << 64);
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    trade.ask_client_id.hash(&mut hasher);
-    trade.bid_client_id.hash(&mut hasher);
-    trade.price.hash(&mut hasher);
-    trade.size.hash(&mut hasher);
-    hasher.finish() as u128
+fn fill_identity(trade: &TradePayload) -> Option<u128> {
+    // Price/quantity hashes collapse distinct identical fills and cannot establish identity.
+    trade.trade_id.filter(|id| *id >= 0).map(|id| id as u128)
 }
 
-fn trade_fee_usd(trade: &TradePayload) -> Decimal {
-    let fee = value_dec(trade.taker_fee.as_ref())
-        .or_else(|| value_dec(trade.maker_fee.as_ref()))
-        .map(|v| v / Decimal::from(1_000_000u64))
-        .unwrap_or(Decimal::ZERO)
-        .abs();
-    // Sanity canary for the assumed 1e-6 raw scaling: a per-trade fee above 1% of the
-    // trade notional almost certainly means the venue changed the fee units, which would
-    // silently mis-value net PnL feeding the breaker.
-    let notional = trade
-        .usd_amount
-        .as_deref()
-        .and_then(|s| s.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO)
-        .abs();
-    if notional > Decimal::ZERO && fee > notional / Decimal::from(100u32) {
-        tracing::warn!(
-            "Lighter trade fee {fee} exceeds 1% of notional {notional}: fee scaling assumption (1e-6 raw) may be wrong"
-        );
-    }
-    fee
+fn trade_fee_evidence(trade: &TradePayload, side: Side, client: i64, notional: Decimal, source: &str) -> FeeEvidence {
+    let maker = trade.is_maker_ask.map(|ask| match side { Side::Sell=>ask, Side::Buy=>!ask });
+    let rate = maker.and_then(|maker| value_dec(if maker { trade.maker_fee.as_ref() } else { trade.taker_fee.as_ref() }));
+    FeeEvidence { trade_id:trade.trade_id, order_id:match side {Side::Sell=>trade.ask_id,Side::Buy=>trade.bid_id},
+        client_order_index:client,maker,notional_usd:notional,fee_ticks:rate,
+        fee_usd:rate.map(|rate|notional*rate/Decimal::from(1_000_000)),
+        event_time_ms:trade.event_time_ms(),source:source.to_string() }
 }
+
 
 fn raw_amount(qty: Decimal, decimals: u32) -> Result<i64> {
     if qty <= Decimal::ZERO {
@@ -1698,6 +1856,7 @@ fn random_client_order_index(_market: &MarketId, side: Side) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal_macros::dec;
     use super::*;
 
     #[test]
@@ -2124,13 +2283,15 @@ mod tests {
                 {"client_order_index": 3}
             ],
             "25": [
-                {"status": "cancelled", "client_order_index": 4}
-            ]
+                {"status": "canceled", "client_order_index": 4}
+            ],
+            "27": [{"status":"new-unknown-status","client_order_index":5}]
         });
-        state.set_open_orders_for_markets(&[24, 25, 26], &orders, true);
+        state.set_open_orders_for_markets(&[24, 25, 26, 27], &orders, true);
         assert_eq!(state.open_orders_count(24), Some(2));
         assert_eq!(state.open_orders_count(25), Some(0));
         assert_eq!(state.open_orders_count(26), Some(0));
+        assert_eq!(state.open_orders_count(27), Some(1));
         assert_eq!(
             state
                 .order_by_client(2)
@@ -2199,10 +2360,12 @@ mod tests {
             fills: fills.clone(),
             account_feed: Arc::new(AccountFeedState::default()),
             market_id: 24,
+            account_index: 1,
             client_order_index,
             side: Side::Buy,
             expected_qty: Decimal::new(200, 2),
             rx,
+            progress: FillProgress::default(),
         };
 
         fills.on_trade(TradePayload {
@@ -2243,4 +2406,47 @@ mod tests {
         assert_eq!(stats.duplicate_trades, 1);
         assert_eq!(stats.timeouts, 1);
     }
+    #[test]
+    fn fees_use_each_fills_notional_and_own_liquidity_role() {
+        let trade = TradePayload { is_maker_ask: Some(true),
+            maker_fee: Some(serde_json::json!(-25)), taker_fee: Some(serde_json::json!(200)),
+            ..Default::default() };
+        assert_eq!(trade_fee_evidence(&trade, Side::Buy, 11, dec!(1000), "fixture").fee_usd, Some(dec!(0.2)));
+        assert_eq!(trade_fee_evidence(&trade, Side::Buy, 11, dec!(10), "fixture").fee_usd, Some(dec!(0.002)));
+        assert_eq!(trade_fee_evidence(&trade, Side::Sell, 11, dec!(1000), "fixture").fee_usd, Some(dec!(-0.025)));
+        let mut unknown = trade.clone();
+        unknown.taker_fee = None;
+        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
+        unknown.taker_fee = Some(serde_json::Value::Null);
+        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
+        unknown.taker_fee = Some(serde_json::json!(0));
+        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, Some(dec!(0)));
+        unknown.is_maker_ask = None;
+        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fill_progress_and_fee_evidence_survive_cold_resolution_waits() {
+        let fills = Arc::new(FillTracker::default());
+        let rx = fills.register(11);
+        let mut pending = PendingFill {fills:fills.clone(),account_feed:Arc::new(AccountFeedState::default()),
+            market_id:24,account_index:1,client_order_index:11,side:Side::Buy,expected_qty:dec!(0.2),rx,
+            progress:FillProgress::default()};
+        let trade = |id| TradePayload {trade_id:Some(id),bid_client_id:Some(11),bid_account_id:Some(1),
+            size:Some("0.1".to_string()),price:Some("100".to_string()),usd_amount:Some("10".to_string()),
+            is_maker_ask:Some(true),taker_fee:Some(serde_json::json!(200)),..Default::default()};
+        fills.on_trade(trade(1));
+        let first = pending.observe_confirmed(Duration::from_millis(1)).await;
+        assert_eq!(first.filled_qty,dec!(0.1));
+        // The waiter is still registered, and an old replay must not become a second fill.
+        fills.on_trade(trade(1));
+        fills.on_trade(trade(2));
+        let second = pending.observe_confirmed(Duration::from_millis(1)).await;
+        assert_eq!(second.filled_qty,dec!(0.2));
+        assert_eq!(second.fill.unwrap().fee_usd,dec!(0.004));
+        assert_eq!(second.fee_evidence.len(),2);
+        assert_eq!(second.fee_evidence[0].fee_usd,Some(dec!(0.002)));
+        assert_eq!(fills.stats().duplicate_trades,1);
+    }
+
 }

@@ -10,6 +10,7 @@
 //! and the startup guard in `run.rs` can never disagree) and the record schema.
 
 use std::path::{Path, PathBuf};
+use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
@@ -32,6 +33,57 @@ pub struct TripRecord {
     pub limit_usd: Decimal,
     /// Short human reason.
     pub reason: String,
+}
+
+/// Hot-side capture; timestamp formatting and persistence happen on the writer thread.
+#[derive(Debug, Clone)]
+pub struct TripSnapshot {
+    pub ts_ms: i64,
+    pub market: String,
+    pub baseline_usd: Decimal,
+    pub equity_usd: Decimal,
+    pub loss_usd: Decimal,
+    pub limit_usd: Decimal,
+}
+
+impl TripSnapshot {
+    pub fn record(&self) -> TripRecord {
+        TripRecord { ts_utc: chrono::DateTime::from_timestamp_millis(self.ts_ms)
+                .unwrap_or_default().to_rfc3339(), market: self.market.clone(),
+            baseline_usd: self.baseline_usd, equity_usd: self.equity_usd,
+            loss_usd: self.loss_usd, limit_usd: self.limit_usd,
+            reason: "cumulative loss exceeded max_cumulative_loss_usdc".into() }
+    }
+}
+
+pub fn active_path(db_path: &Path) -> PathBuf {
+    let mut path = trip_path(db_path);
+    let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
+    path.set_file_name(format!("{stem}.active.json"));
+    path
+}
+
+pub fn check_active_session(db_path: &Path) -> Result<()> {
+    let path = active_path(db_path);
+    if path.exists() {
+        bail!("previous session was not verified clean ({}); resolve outstanding execution from venue records before clearing this marker", path.display());
+    }
+    Ok(())
+}
+
+pub fn start_active_session(db_path: &Path, session: &str, markets: &[crate::types::MarketId]) -> Result<()> {
+    let path = active_path(db_path);
+    if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+    let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)
+        .with_context(|| format!("create active-session marker {}", path.display()))?;
+    serde_json::to_writer(&mut file, &serde_json::json!({"schema_version":2,"session":session,
+        "markets":markets.iter().map(|m| &m.0).collect::<Vec<_>>(),"started_at":chrono::Utc::now().to_rfc3339()}))?;
+    file.sync_all()?;
+    Ok(())
+}
+
+pub fn finish_active_session(db_path: &Path) -> Result<()> {
+    std::fs::remove_file(active_path(db_path)).context("clear verified active-session marker")
 }
 
 /// The trip-latch path for a given run DB path: `<runs_dir>/<db_stem>.trip.json`.
@@ -94,8 +146,11 @@ pub fn write_trip(path: &Path, rec: &TripRecord) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(rec).context("serialize trip record")?;
     // `runs/live-eth.trip.json` -> `runs/live-eth.trip.json.tmp` (extension is the final `.json`).
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json.as_bytes()).with_context(|| format!("write {}", tmp.display()))?;
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut file = std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
+    file.write_all(json.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
     std::fs::rename(&tmp, path).with_context(|| format!("rename trip latch into place: {}", path.display()))?;
     Ok(())
 }

@@ -24,7 +24,7 @@ pub use command::{ExecCommand, ExecEvent, HedgeCommand, CMD_QUEUE_DEPTH};
 pub use creds::AsterCreds;
 pub use paper::PaperExec;
 pub use sign::{
-    AsterNonce, AsterSigner, EvmAsterSigner, EvmHlSigner, HlNonce, HlSigner, MonotonicMs, SignError,
+    AsterNonce, AsterSigner, EvmAsterSigner, SignError,
 };
 
 /// Which executor backs this run. Selected once at startup from [`crate::config::LiveMode`];

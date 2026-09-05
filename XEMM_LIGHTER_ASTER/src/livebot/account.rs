@@ -1,16 +1,7 @@
 //! Live account state: capital + positions + open orders, reconciled from both venues
-//! (plan §2). Two layers, as the plan prescribes:
-//!
-//! 1. **`AccountSnapshot`** — a full, immutable snapshot published through
-//!    `ArcSwap<AccountSnapshot>`. The strategy reads a consistent picture without locking.
-//! 2. **`HotRisk`** — a handful of scaled-integer atomics for the few values checked on
-//!    *every* quote (trading-allowed flag, cooldown deadline, account generation), read
-//!    wait-free on the hot path.
-//!
-//! `Decimal` is kept for the snapshot (config / reporting / reconciliation precision);
-//! the hot atomics carry only what the quote loop must consult per iteration.
+//! Published atomically for the strategy and cold diagnostics.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -19,9 +10,11 @@ use rust_decimal::Decimal;
 use crate::types::{MarketId, Side};
 
 /// Which venue a position / order belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Venue {
     Aster,
+    #[serde(rename = "lighter")]
     Hyperliquid,
 }
 
@@ -69,6 +62,9 @@ impl OpenOrderSnapshot {
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     pub aster_available_usd: Decimal,
+    pub aster_wallet_usd: Decimal,
+    pub aster_margin_source_ns: i64,
+    pub hl_margin_source_ns: i64,
     pub hl_withdrawable_usd: Decimal,
     /// Aster total equity = wallet balance + unrealized PnL (mark-to-market), NOT the free-margin
     /// `aster_available_usd`. Used by the circuit breaker so opening a hedge (which locks margin)
@@ -105,6 +101,9 @@ impl AccountSnapshot {
     pub fn empty() -> Self {
         AccountSnapshot {
             aster_available_usd: Decimal::ZERO,
+            aster_wallet_usd: Decimal::ZERO,
+            aster_margin_source_ns: 0,
+            hl_margin_source_ns: 0,
             hl_withdrawable_usd: Decimal::ZERO,
             aster_equity_usd: Decimal::ZERO,
             hl_equity_usd: Decimal::ZERO,
@@ -153,117 +152,53 @@ impl AccountSnapshot {
     }
 }
 
-/// Scaled-integer fixed-point used by the hot atomics: USD micro-dollars (1e-6 USD) so a
-/// `Decimal` USD value fits an `i64` with sub-cent resolution up to ~9.2e12 USD.
-pub const USD_SCALE: i64 = 1_000_000;
-
-/// Convert a `Decimal` USD amount to scaled `i64` micro-dollars (saturating).
-pub fn usd_to_scaled(v: Decimal) -> i64 {
-    use rust_decimal::prelude::ToPrimitive;
-    (v * Decimal::from(USD_SCALE)).round().to_i64().unwrap_or(i64::MAX)
-}
-
-/// The few values consulted on EVERY quote, as lock-free atomics (plan §2.5 `HotRisk`).
-/// Updated by the single account/risk reactor; read wait-free by the strategy loop.
-pub struct HotRisk {
-    /// Master "may place new maker quotes" flag (gate AND risk both open).
-    trading_allowed: AtomicBool,
-    /// Monotonic-clock nanos until which the post-trade cooldown suppresses new quotes.
-    cooldown_until_ns: AtomicI64,
-    /// Max tolerated unhedged notional, scaled micro-dollars (mirror of config for the loop).
-    max_unhedged_notional: AtomicI64,
-    /// Bumped whenever a new account snapshot is published.
-    account_generation: AtomicU64,
-}
-
-impl Default for HotRisk {
-    fn default() -> Self {
-        HotRisk {
-            trading_allowed: AtomicBool::new(false), // closed until bootstrap completes
-            cooldown_until_ns: AtomicI64::new(0),
-            max_unhedged_notional: AtomicI64::new(0),
-            account_generation: AtomicU64::new(0),
-        }
-    }
-}
-
-impl HotRisk {
-    pub fn new(max_unhedged_notional_usd: Decimal) -> Self {
-        let hr = HotRisk::default();
-        hr.max_unhedged_notional
-            .store(usd_to_scaled(max_unhedged_notional_usd), Ordering::Release);
-        hr
-    }
-
-    #[inline]
-    pub fn set_trading_allowed(&self, v: bool) {
-        self.trading_allowed.store(v, Ordering::Release);
-    }
-    #[inline]
-    pub fn trading_allowed(&self) -> bool {
-        self.trading_allowed.load(Ordering::Acquire)
-    }
-    #[inline]
-    pub fn set_cooldown_until_ns(&self, ns: i64) {
-        self.cooldown_until_ns.store(ns, Ordering::Release);
-    }
-    #[inline]
-    pub fn cooldown_until_ns(&self) -> i64 {
-        self.cooldown_until_ns.load(Ordering::Acquire)
-    }
-    /// Whether the cooldown is active at monotonic `now_ns`.
-    #[inline]
-    pub fn in_cooldown(&self, now_ns: i64) -> bool {
-        now_ns < self.cooldown_until_ns()
-    }
-    #[inline]
-    pub fn max_unhedged_notional_scaled(&self) -> i64 {
-        self.max_unhedged_notional.load(Ordering::Acquire)
-    }
-    #[inline]
-    pub fn bump_account_generation(&self) -> u64 {
-        self.account_generation.fetch_add(1, Ordering::Release) + 1
-    }
-    #[inline]
-    pub fn account_generation(&self) -> u64 {
-        self.account_generation.load(Ordering::Acquire)
-    }
-
-    /// May the strategy place a NEW maker quote right now? True only when trading is
-    /// allowed AND the cooldown has expired. Risk-reducing actions (cancel/hedge) ignore
-    /// this and are always allowed.
-    #[inline]
-    pub fn may_quote(&self, now_ns: i64) -> bool {
-        self.trading_allowed() && !self.in_cooldown(now_ns)
-    }
-}
-
-/// The published account state: an `ArcSwap` snapshot plus the hot atomics. Cloneable
+/// The published account state: an ArcSwap snapshot and a single-writer generation. Cloneable
 /// handle (shares the inner `Arc`s), so each plane holds one.
 #[derive(Clone)]
 pub struct AccountState {
     snapshot: Arc<ArcSwap<AccountSnapshot>>,
-    pub hot: Arc<HotRisk>,
+    generation: Arc<AtomicU64>,
+    pending_exec: Arc<ArcSwap<Vec<super::fills::HedgeIntent>>>,
+    maker_queries: Arc<ArcSwap<Vec<MakerQuery>>>,
 }
 
-impl AccountState {
-    pub fn new(max_unhedged_notional_usd: Decimal) -> Self {
+#[derive(Debug, Clone)]
+pub struct MakerQuery {
+    pub market: MarketId,
+    pub side: Side,
+    pub client_id: String,
+    pub qty_lots: i64,
+}
+
+impl Default for AccountState {
+    fn default() -> Self {
         AccountState {
             snapshot: Arc::new(ArcSwap::from_pointee(AccountSnapshot::empty())),
-            hot: Arc::new(HotRisk::new(max_unhedged_notional_usd)),
+            generation: Arc::new(AtomicU64::new(0)),
+            pending_exec: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            maker_queries: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 
-    /// Publish a new snapshot and bump the account generation atomic.
-    ///
-    /// Store the snapshot first and then publish the hot generation, so a strategy reader that sees
-    /// generation `N` can never still load snapshot `N - 1`. The reconciler is the single writer.
+}
+
+impl AccountState {
+    /// Publish one immutable snapshot and its generation; the reconciler is the single writer.
     pub fn publish(&self, mut snap: AccountSnapshot) {
-        let next_generation = self.hot.account_generation.load(Ordering::Acquire).saturating_add(1);
+        let next_generation = self.generation.load(Ordering::Acquire).saturating_add(1);
         snap.generation = next_generation;
         self.snapshot.store(Arc::new(snap));
-        self.hot.account_generation.store(next_generation, Ordering::Release);
+        self.generation.store(next_generation, Ordering::Release);
     }
+
+    pub fn publish_pending_exec(&self, intents: Vec<super::fills::HedgeIntent>) {
+        self.pending_exec.store(Arc::new(intents));
+    }
+
+    pub fn pending_exec(&self) -> Arc<Vec<super::fills::HedgeIntent>> { self.pending_exec.load_full() }
+
+    pub fn publish_maker_queries(&self, queries: Vec<MakerQuery>) { self.maker_queries.store(Arc::new(queries)); }
+    pub fn maker_queries(&self) -> Arc<Vec<MakerQuery>> { self.maker_queries.load_full() }
 
     /// Wait-free read of the current snapshot.
     pub fn load(&self) -> Arc<AccountSnapshot> {
@@ -290,6 +225,9 @@ mod tests {
     fn snap() -> AccountSnapshot {
         AccountSnapshot {
             aster_available_usd: dec!(1000),
+            aster_wallet_usd: dec!(1000),
+            aster_margin_source_ns: 1,
+            hl_margin_source_ns: 1,
             hl_withdrawable_usd: dec!(900),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(900),
@@ -356,16 +294,13 @@ mod tests {
 
     #[test]
     fn account_state_publish_and_generation() {
-        let st = AccountState::new(dec!(5));
-        assert_eq!(st.hot.account_generation(), 0);
-        assert_eq!(st.load().generation, 0); // empty
-        assert!(!st.hot.trading_allowed()); // closed pre-bootstrap
+        let st = AccountState::default();
+        assert_eq!(st.load().generation, 0);
         st.publish(snap());
-        assert_eq!(st.hot.account_generation(), 1);
+        assert_eq!(st.load().generation, 1);
         assert_eq!(st.load().generation, 1);
         assert_eq!(st.load().aster_available_usd, dec!(1000));
         // max_unhedged mirror is scaled into micro-dollars.
-        assert_eq!(st.hot.max_unhedged_notional_scaled(), 5_000_000);
     }
 
     #[test]
@@ -378,24 +313,4 @@ mod tests {
         assert_eq!(s.total_equity_usd(), dec!(1896.75));
     }
 
-    #[test]
-    fn hot_risk_may_quote_respects_cooldown_and_flag() {
-        let hr = HotRisk::new(dec!(5));
-        // closed by default
-        assert!(!hr.may_quote(1000));
-        hr.set_trading_allowed(true);
-        assert!(hr.may_quote(1000));
-        // cooldown until ns=2000 suppresses quoting before then
-        hr.set_cooldown_until_ns(2000);
-        assert!(hr.in_cooldown(1500));
-        assert!(!hr.may_quote(1500));
-        assert!(hr.may_quote(2000)); // expired (>=)
-    }
-
-    #[test]
-    fn usd_scaling_round_trips_within_resolution() {
-        assert_eq!(usd_to_scaled(dec!(5)), 5_000_000);
-        assert_eq!(usd_to_scaled(dec!(0.000001)), 1);
-        assert_eq!(usd_to_scaled(dec!(1234.56)), 1_234_560_000);
-    }
 }

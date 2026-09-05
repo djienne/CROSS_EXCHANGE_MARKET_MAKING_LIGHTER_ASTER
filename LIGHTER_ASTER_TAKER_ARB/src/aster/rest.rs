@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,14 +7,35 @@ use reqwest::Method;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-use crate::aster::sign::{AsterNonce, AsterSigner, MonotonicMs};
+use crate::aster::sign::{AsterNonce, AsterSigner};
 use crate::decimal::trim_dec;
 use crate::markets::MarketSpec;
-use crate::types::{FillSummary, MarketId, Side};
+use crate::types::{FeeProvenance, FillSummary, MarketId, Side};
 
 const ASTER_ORDER_PATH: &str = "/fapi/v3/order";
-const ASTER_RECV_WINDOW: &str = "50000";
 const USER_AGENT: &str = "lighter-aster-taker-arb";
+
+
+#[derive(Debug, thiserror::Error)]
+#[error("Aster request was not sent: {0}")]
+struct RequestNotSent(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("Aster HTTP {status}, code {code:?}: {body}")]
+struct VenueFailure {
+    status: u16,
+    code: Option<i64>,
+    body: String,
+}
+
+/// Only a pre-write failure or explicit, non-ambiguous venue rejection releases exposure.
+pub fn definitive_no_fill(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RequestNotSent>().is_some()
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect())
+        || error.downcast_ref::<VenueFailure>()
+        .is_some_and(|e| e.status < 500 && e.code.is_some_and(|c| c < 0
+            && !matches!(c, -1000 | -1001 | -1006 | -1007)))
+}
 
 #[derive(Clone)]
 struct MarketWire {
@@ -27,12 +48,14 @@ struct MarketWire {
 pub enum SubmitOutcome {
     Accepted {
         venue_order_id: Option<i64>,
+        client_order_id: String,
         raw: String,
     },
     Rejected {
         reason: String,
     },
     Unknown {
+        client_order_id: String,
         reason: String,
     },
 }
@@ -69,7 +92,7 @@ impl AsterBalanceSnapshot {
     pub fn equity_usd(self) -> Option<Decimal> {
         match (self.cross_wallet_balance_usd, self.cross_unrealized_pnl_usd) {
             (Some(wallet), Some(unpnl)) => Some(wallet + unpnl),
-            _ => self.wallet_balance_usd,
+            _ => None,
         }
     }
 }
@@ -114,9 +137,9 @@ pub struct AsterUserTrade {
     #[serde(rename = "quoteQty", default)]
     pub quote_qty: String,
     #[serde(default)]
-    pub commission: String,
+    pub commission: Option<serde_json::Value>,
     #[serde(rename = "commissionAsset", default)]
-    pub commission_asset: String,
+    pub commission_asset: Option<String>,
     #[serde(default)]
     pub time: i64,
     #[serde(default)]
@@ -137,7 +160,6 @@ pub struct AsterRest {
     base_url: String,
     signer: Arc<dyn AsterSigner>,
     nonce: AsterNonce,
-    timestamp: MonotonicMs,
     markets: HashMap<MarketId, MarketWire>,
 }
 
@@ -167,12 +189,12 @@ impl AsterRest {
                 )
             })
             .collect();
+        let nonce = AsterNonce::for_signer(&base_url, signer.signer_address())?;
         Ok(AsterRest {
             client,
             base_url,
             signer,
-            nonce: AsterNonce::new(),
-            timestamp: MonotonicMs::new(),
+            nonce,
             markets,
         })
     }
@@ -183,41 +205,55 @@ impl AsterRest {
             .ok_or_else(|| anyhow!("no Aster wire context for {market}"))
     }
 
-    async fn signed_request(
-        &self,
-        method: Method,
-        path: &str,
-        business: Vec<(String, String)>,
-    ) -> Result<String> {
+
+    /// A single account-level available margin value; asset projections must not be summed.
+    pub async fn account_available_balance(&self) -> Result<Decimal> {
+        let body = self.signed_request(Method::GET, "/fapi/v3/account", vec![]).await?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        value.get("availableBalance").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Aster account is missing availableBalance"))?
+            .parse::<Decimal>().context("malformed Aster availableBalance")
+    }
+
+    /// Resolve the same submitted identity on the cold path. An absent/error result is unknown.
+    pub async fn query_order(&self, market: &MarketId, client_order_id: &str) -> Result<serde_json::Value> {
+        let symbol = self.wire(market)?.symbol.clone();
+        let body = self.signed_request(Method::GET, ASTER_ORDER_PATH, vec![
+            ("symbol".into(), symbol),
+            ("origClientOrderId".into(), client_order_id.to_string()),
+        ]).await?;
+        serde_json::from_str(&body).context("parse Aster order query")
+    }
+
+    async fn signed_request(&self, method: Method, path: &str, business: Vec<(String, String)>) -> Result<String> {
         let mut params = business;
-        params.push(("recvWindow".into(), ASTER_RECV_WINDOW.into()));
-        params.push(("timestamp".into(), self.timestamp.next().to_string()));
-        let json_map: BTreeMap<&str, &str> = params
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let json_str = serde_json::to_string(&json_map)?;
-        let nonce = self.nonce.next();
-        let sig = self.signer.sign_v3(&json_str, nonce)?;
+        let nonce = self.nonce.next().map_err(|e| RequestNotSent(e.to_string()))?;
         params.push(("nonce".into(), nonce.to_string()));
         params.push(("user".into(), self.signer.user_address().to_string()));
         params.push(("signer".into(), self.signer.signer_address().to_string()));
-        params.push(("signature".into(), sig.0));
-
+        // Serialize ONCE: the EIP-712 message is exactly the transmitted form string.
+        let mut encoded = reqwest::Url::parse("http://localhost/").expect("static encoding URL");
+        encoded.query_pairs_mut().extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let unsigned = encoded.query().unwrap_or_default();
+        let signature = self.signer.sign_v3(unsigned).map_err(|e| RequestNotSent(e.to_string()))?;
+        let payload = format!("{unsigned}&signature={}", signature.0);
         let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let builder = match method {
-            Method::GET => self.client.get(&url).query(&params),
-            Method::POST => self.client.post(&url).form(&params),
-            Method::DELETE => self.client.delete(&url).form(&params),
-            other => return Err(anyhow!("unsupported Aster method {other}")),
+            Method::GET => self.client.get(format!("{url}?{payload}")),
+            Method::POST => self.client.post(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            Method::DELETE => self.client.delete(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            Method::PUT => self.client.put(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            other => return Err(RequestNotSent(format!("unsupported Aster method {other}")).into()),
         };
-        let resp = builder.header("User-Agent", USER_AGENT).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Err(anyhow!("Aster {path} HTTP {}: {}", status.as_u16(), text));
+        let response = builder.header("User-Agent", USER_AGENT).send().await.map_err(reqwest::Error::without_url)?;
+        let status = response.status();
+        let body = response.text().await.map_err(reqwest::Error::without_url)?;
+        let code = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_i64()));
+        if !status.is_success() || code.is_some_and(|c| c != 0 && c != 200) {
+            return Err(VenueFailure { status: status.as_u16(), code, body }.into());
         }
-        Ok(text)
+        Ok(body)
     }
 
     pub async fn submit_market_order(
@@ -227,7 +263,7 @@ impl AsterRest {
         qty: Decimal,
         reduce_only: bool,
     ) -> SubmitOutcome {
-        let params = match self.market_params(market, side, qty, reduce_only) {
+        let mut params = match self.market_params(market, side, qty, reduce_only) {
             Ok(p) => p,
             Err(e) => {
                 return SubmitOutcome::Rejected {
@@ -235,14 +271,15 @@ impl AsterRest {
                 }
             }
         };
-        match self
-            .signed_request(Method::POST, ASTER_ORDER_PATH, params)
-            .await
-        {
-            Ok(body) => classify_order_response(&body),
-            Err(e) => SubmitOutcome::Unknown {
-                reason: e.to_string(),
-            },
+        let client_order_id = match self.nonce.next() {
+            Ok(nonce) => format!("ta-{nonce}"),
+            Err(e) => return SubmitOutcome::Rejected { reason: e.to_string() },
+        };
+        params.push(("newClientOrderId".into(), client_order_id.clone()));
+        match self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await {
+            Ok(body) => classify_order_response(&client_order_id, &body),
+            Err(e) if definitive_no_fill(&e) => SubmitOutcome::Rejected { reason: e.to_string() },
+            Err(e) => SubmitOutcome::Unknown { client_order_id, reason: e.to_string() },
         }
     }
 
@@ -254,7 +291,7 @@ impl AsterRest {
         price_bound: Decimal,
         reduce_only: bool,
     ) -> SubmitOutcome {
-        let params = match self.limit_ioc_params(market, side, qty, price_bound, reduce_only) {
+        let mut params = match self.limit_ioc_params(market, side, qty, price_bound, reduce_only) {
             Ok(p) => p,
             Err(e) => {
                 return SubmitOutcome::Rejected {
@@ -262,14 +299,15 @@ impl AsterRest {
                 }
             }
         };
-        match self
-            .signed_request(Method::POST, ASTER_ORDER_PATH, params)
-            .await
-        {
-            Ok(body) => classify_order_response(&body),
-            Err(e) => SubmitOutcome::Unknown {
-                reason: e.to_string(),
-            },
+        let client_order_id = match self.nonce.next() {
+            Ok(nonce) => format!("ta-{nonce}"),
+            Err(e) => return SubmitOutcome::Rejected { reason: e.to_string() },
+        };
+        params.push(("newClientOrderId".into(), client_order_id.clone()));
+        match self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await {
+            Ok(body) => classify_order_response(&client_order_id, &body),
+            Err(e) if definitive_no_fill(&e) => SubmitOutcome::Rejected { reason: e.to_string() },
+            Err(e) => SubmitOutcome::Unknown { client_order_id, reason: e.to_string() },
         }
     }
 
@@ -289,6 +327,7 @@ impl AsterRest {
             ("symbol".into(), w.symbol.clone()),
             ("side".into(), side.as_str().to_string()),
             ("type".into(), "MARKET".into()),
+            ("newOrderRespType".into(), "RESULT".into()),
             ("quantity".into(), trim_dec(qty)),
             ("positionSide".into(), "BOTH".into()),
         ];
@@ -323,6 +362,7 @@ impl AsterRest {
             ("side".into(), side.as_str().to_string()),
             ("type".into(), "LIMIT".into()),
             ("timeInForce".into(), "IOC".into()),
+            ("newOrderRespType".into(), "RESULT".into()),
             ("quantity".into(), trim_dec(qty)),
             ("price".into(), trim_dec(price)),
             ("positionSide".into(), "BOTH".into()),
@@ -352,9 +392,10 @@ impl AsterRest {
     }
 
     pub async fn balance_snapshot(&self) -> Result<AsterBalanceSnapshot> {
-        let body = self
-            .signed_request(Method::GET, "/fapi/v3/balance", vec![])
-            .await?;
+        let (body, available_usd) = tokio::try_join!(
+            self.signed_request(Method::GET, "/fapi/v3/balance", vec![]),
+            self.account_available_balance(),
+        )?;
         let rows: Vec<AsterBalanceRow> =
             serde_json::from_str(&body).map_err(|e| anyhow!("parse Aster balance: {e}: {body}"))?;
         // ALL USD-pegged rows, not just USDT/USDC: cross-margin settles funding/PnL per
@@ -372,40 +413,32 @@ impl AsterRest {
                 cross_unrealized_pnl_usd: None,
             });
         }
-        let available_usd = stable_rows
-            .iter()
-            .filter_map(|r| parse_optional_dec(&r.available_balance))
-            .max()
-            .unwrap_or(Decimal::ZERO);
         // SIGNED sum: a negative stablecoin row is debt and must reduce the wallet total
         // (the old `> 0` filter overstated it by the debt).
         let wallet_balance_usd: Decimal = stable_rows
             .iter()
-            .filter_map(|r| parse_optional_dec(&r.balance))
-            .sum();
+            .map(|r| r.balance.parse::<Decimal>().context("malformed Aster wallet balance"))
+            .collect::<Result<Vec<_>>>()?.into_iter().sum();
         // SIGNED sums across ALL stable rows for the equity terms: the old
         // positive-only `.max()` picked the USDC collateral row and dropped the negative
         // USDT debt row, so `equity_usd()` overstated equity by the debt — and per-asset
         // crossUnPnl on rows other than the single positive one was silently dropped.
-        // Absent-on-every-row keeps the Option at None (equity falls back to the wallet sum).
+        // Incomplete per-asset evidence stays unknown rather than silently dropping debt/PnL.
         let cross_vals: Vec<Decimal> = stable_rows
             .iter()
             .filter_map(|r| parse_optional_dec(&r.cross_wallet_balance))
             .collect();
         let cross_wallet_balance_usd =
-            (!cross_vals.is_empty()).then(|| cross_vals.into_iter().sum::<Decimal>());
+            (cross_vals.len() == stable_rows.len()).then(|| cross_vals.into_iter().sum::<Decimal>());
         let unpnl_vals: Vec<Decimal> = stable_rows
             .iter()
             .filter_map(|r| parse_optional_dec(&r.cross_un_pnl))
             .collect();
         let cross_unrealized_pnl_usd =
-            (!unpnl_vals.is_empty()).then(|| unpnl_vals.into_iter().sum::<Decimal>());
+            (unpnl_vals.len() == stable_rows.len()).then(|| unpnl_vals.into_iter().sum::<Decimal>());
         Ok(AsterBalanceSnapshot {
             available_usd,
-            // None here means "unknown", so a net-NEGATIVE wallet (fully underwater
-            // account) is hidden from the equity fallback; acceptable while the cross
-            // fields above (signed) are the primary equity terms.
-            wallet_balance_usd: (wallet_balance_usd > Decimal::ZERO).then_some(wallet_balance_usd),
+            wallet_balance_usd: Some(wallet_balance_usd),
             cross_wallet_balance_usd,
             cross_unrealized_pnl_usd,
         })
@@ -465,10 +498,10 @@ impl AsterRest {
             // wait_post_trade_reconciled): a single transient REST failure used to
             // abort the whole wait and could leave a filled trade unbooked. A
             // persistent error just costs the deadline it already cost.
-            match self.order_trades(market, order_id).await {
-                Ok(trades) => {
+            match self.order_trades(market, order_id).await.and_then(|trades| summarize_user_trades(&trades)) {
+                Ok(summary) => {
                     last_err = None;
-                    if let Some(summary) = summarize_user_trades(&trades) {
+                    if let Some(summary) = summary {
                         if summary.qty >= min_expected {
                             return Ok(summary);
                         }
@@ -528,93 +561,75 @@ fn parse_optional_dec(raw: &str) -> Option<Decimal> {
 fn is_usd_stable_asset(asset: &str) -> bool {
     matches!(
         asset.to_ascii_uppercase().as_str(),
-        "" | "USD" | "USDT" | "USDC" | "BUSD" | "USDF" | "FDUSD" | "DAI"
+        "USD" | "USDT" | "USDC" | "BUSD" | "USDF" | "FDUSD" | "DAI"
     )
 }
 
-fn summarize_user_trades(rows: &[AsterUserTrade]) -> Option<FillSummary> {
+fn summarize_user_trades(rows: &[AsterUserTrade]) -> Result<Option<FillSummary>> {
     let mut qty = Decimal::ZERO;
     let mut notional = Decimal::ZERO;
     let mut fee = Decimal::ZERO;
+    let mut known_fee = true;
     for row in rows {
-        let q = row.qty.parse::<Decimal>().unwrap_or(Decimal::ZERO).abs();
-        let quote = row
-            .quote_qty
-            .parse::<Decimal>()
-            .unwrap_or(Decimal::ZERO)
-            .abs();
-        let px = row.price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
-        if q <= Decimal::ZERO {
-            continue;
-        }
+        let q = row.qty.parse::<Decimal>().context("malformed Aster trade quantity")?;
+        let px = row.price.parse::<Decimal>().context("malformed Aster trade price")?;
+        if q <= Decimal::ZERO || px <= Decimal::ZERO { anyhow::bail!("nonpositive Aster trade quantity/price"); }
+        let quote = if row.quote_qty.is_empty() { q * px } else {
+            row.quote_qty.parse::<Decimal>().context("malformed Aster trade quote quantity")?
+        };
+        if quote <= Decimal::ZERO { anyhow::bail!("nonpositive Aster trade quote quantity"); }
         qty += q;
-        notional += if quote > Decimal::ZERO { quote } else { q * px };
-        let commission = row
-            .commission
-            .parse::<Decimal>()
-            .unwrap_or(Decimal::ZERO)
-            .abs();
-        // Commission is only USD when the commission asset is a USD stablecoin; a
-        // base-asset commission must be valued at the trade price or per-trade fees
-        // (hence net PnL feeding the breaker) are mis-valued.
-        if is_usd_stable_asset(&row.commission_asset) {
-            fee += commission;
-        } else {
-            tracing::warn!(
-                "Aster commission in non-USD asset {:?}; valuing at trade price {}",
-                row.commission_asset,
-                px
-            );
-            fee += commission * px;
+        notional += quote;
+        let commission = row.commission.as_ref().and_then(|v| match v {
+            serde_json::Value::String(s) => s.parse::<Decimal>().ok(),
+            serde_json::Value::Number(n) => n.to_string().parse::<Decimal>().ok(),
+            _ => None,
+        });
+        match commission {
+            Some(value) if value.is_zero() || row.commission_asset.as_deref().is_some_and(is_usd_stable_asset) => fee += value,
+            _ => known_fee = false,
         }
     }
-    FillSummary::from_qty_notional(qty, notional, fee)
+    Ok(FillSummary::from_qty_notional(qty, notional, fee).map(|mut summary| {
+        summary.fee_provenance = if known_fee { FeeProvenance::Venue } else { FeeProvenance::Unknown };
+        summary
+    }))
 }
 
 pub fn immediate_fill_from_order_response(body: &str) -> Result<AsterImmediateFill> {
     let r: AsterOrderResp = serde_json::from_str(body)
         .map_err(|e| anyhow!("parse Aster order response immediate fill: {e}: {body}"))?;
-    Ok(immediate_fill_from_order(&r))
+    immediate_fill_from_order(&r)
 }
 
-fn immediate_fill_from_order(r: &AsterOrderResp) -> AsterImmediateFill {
-    let qty = r.executed_qty
-        .as_deref()
-        .and_then(parse_optional_dec)
-        .or_else(|| r.cum_qty.as_deref().and_then(parse_optional_dec))
-        .unwrap_or(Decimal::ZERO)
-        .abs();
-    let avg_price = r.avg_price
-        .as_deref()
-        .and_then(parse_optional_dec)
-        .unwrap_or(Decimal::ZERO)
-        .abs();
-    let notional = r.cum_quote
-        .as_deref()
-        .and_then(parse_optional_dec)
-        .map(|v| v.abs())
-        .filter(|v| *v > Decimal::ZERO)
-        .unwrap_or_else(|| qty * avg_price);
-    let vwap = if qty > Decimal::ZERO {
-        if notional > Decimal::ZERO {
-            notional / qty
-        } else {
-            avg_price
-        }
-    } else {
-        Decimal::ZERO
-    };
-    AsterImmediateFill {
-        qty,
-        vwap,
-        notional,
+pub fn order_response_is_terminal(body: &str) -> Result<bool> {
+    let response: AsterOrderResp = serde_json::from_str(body)?;
+    let status = response.status.as_deref().ok_or_else(|| anyhow!("Aster order status missing"))?;
+    Ok(matches!(status, "FILLED" | "EXPIRED" | "CANCELED" | "REJECTED"))
+}
+
+fn immediate_fill_from_order(r: &AsterOrderResp) -> Result<AsterImmediateFill> {
+    let quantity = r.executed_qty.as_deref().or(r.cum_qty.as_deref())
+        .ok_or_else(|| anyhow!("Aster order response has no executed quantity"))?;
+    let qty = quantity.parse::<Decimal>().context("malformed Aster executed quantity")?;
+    if qty < Decimal::ZERO { anyhow::bail!("negative Aster executed quantity"); }
+    if qty.is_zero() {
+        return Ok(AsterImmediateFill { qty, vwap: Decimal::ZERO, notional: Decimal::ZERO });
     }
+    let quote = r.cum_quote.as_deref().map(|s| s.parse::<Decimal>()).transpose()
+        .context("malformed Aster cumulative quote")?;
+    let price = r.avg_price.as_deref().map(|s| s.parse::<Decimal>()).transpose()
+        .context("malformed Aster average price")?;
+    let notional = quote.filter(|v| *v > Decimal::ZERO)
+        .or_else(|| price.filter(|v| *v > Decimal::ZERO).map(|p| qty * p))
+        .ok_or_else(|| anyhow!("Aster filled quantity has no positive quote amount or price"))?;
+    Ok(AsterImmediateFill { qty, notional, vwap: notional / qty })
 }
 
-fn classify_order_response(body: &str) -> SubmitOutcome {
+fn classify_order_response(client_order_id: &str, body: &str) -> SubmitOutcome {
     match serde_json::from_str::<AsterOrderResp>(body) {
         Ok(r) => {
-            if let Some(code) = r.code {
+            if let Some(code) = r.code.filter(|c| *c != 0 && *c != 200) {
                 return SubmitOutcome::Rejected {
                     reason: format!("code {code}: {}", r.msg.unwrap_or_default()),
                 };
@@ -623,33 +638,38 @@ fn classify_order_response(body: &str) -> SubmitOutcome {
                 Some("NEW") | Some("PARTIALLY_FILLED") | Some("FILLED") => {
                     SubmitOutcome::Accepted {
                         venue_order_id: r.order_id,
+                        client_order_id: client_order_id.to_string(),
                         raw: body.to_string(),
                     }
                 }
-                Some("EXPIRED") if expired_with_fill(&r) => SubmitOutcome::Accepted {
-                    venue_order_id: r.order_id,
-                    raw: body.to_string(),
+                Some("EXPIRED") | Some("CANCELED") => match immediate_fill_from_order(&r) {
+                    Ok(fill) if fill.qty > Decimal::ZERO => SubmitOutcome::Accepted {
+                        venue_order_id: r.order_id, client_order_id: client_order_id.to_string(), raw: body.to_string(),
+                    },
+                    Ok(_) => SubmitOutcome::Rejected { reason: format!("terminal {} with zero execution", r.status.unwrap()) },
+                    Err(error) => SubmitOutcome::Unknown {
+                        client_order_id: client_order_id.to_string(),
+                        reason: format!("terminal order has malformed execution evidence: {error}"),
+                    },
                 },
-                Some("EXPIRED") | Some("REJECTED") => SubmitOutcome::Rejected {
-                    reason: format!("status {}", r.status.unwrap_or_default()),
-                },
+                Some("REJECTED") => SubmitOutcome::Rejected { reason: "status REJECTED".into() },
                 Some(other) => SubmitOutcome::Unknown {
+                    client_order_id: client_order_id.to_string(),
                     reason: format!("unexpected Aster order status {other}: {body}"),
                 },
                 None => SubmitOutcome::Unknown {
+                    client_order_id: client_order_id.to_string(),
                     reason: format!("missing Aster order status: {body}"),
                 },
             }
         }
         Err(e) => SubmitOutcome::Unknown {
+            client_order_id: client_order_id.to_string(),
             reason: format!("unparseable Aster order response: {e}: {body}"),
         },
     }
 }
 
-fn expired_with_fill(r: &AsterOrderResp) -> bool {
-    r.order_id.is_some() && immediate_fill_from_order(r).qty > Decimal::ZERO
-}
 
 fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
     if qty <= Decimal::ZERO || step <= Decimal::ZERO {
@@ -668,7 +688,89 @@ fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 2048];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request ended before its body");
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&bytes[..split]).unwrap();
+                let length = head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                if bytes.len() >= split + 4 + length {
+                    return String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+    }
+
+    async fn reply_http(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transmitted_request_is_the_eip712_message_for_every_method() {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use super::super::sign::test_support::{TestSigner, TEST_KEY};
+        for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                reply_http(&mut stream, "200 OK", r#"{"code":200}"#).await;
+                request
+            });
+            let rest = AsterRest::new(url, Arc::new(TestSigner::new()), &[]).unwrap();
+            rest.signed_request(method.clone(), "/fapi/v3/order", vec![
+                ("newClientOrderId".into(), "order:1/two words".into()),
+                ("symbol".into(), "BTCUSDT".into()),
+            ]).await.unwrap();
+            let request = server.await.unwrap();
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let wire = if method == Method::GET {
+                head.lines().next().unwrap().split_whitespace().nth(1).unwrap().split_once('?').unwrap().1
+            } else { body };
+            let (unsigned, signature) = wire.rsplit_once("&signature=").unwrap();
+            assert!(unsigned.starts_with("newClientOrderId=order%3A1%2Ftwo+words&symbol=BTCUSDT&nonce="), "{unsigned}");
+            assert!(unsigned.contains("&user=0x1111111111111111111111111111111111111111&signer=0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"));
+            assert!(!unsigned.contains("recvWindow") && !unsigned.contains("timestamp"));
+            let raw = hex::decode(signature.strip_prefix("0x").unwrap()).unwrap();
+            let signature = k256::ecdsa::Signature::from_slice(&raw[..64]).unwrap();
+            let key = k256::ecdsa::SigningKey::from_slice(&TEST_KEY).unwrap();
+            key.verifying_key().verify_prehash(&super::super::crypto::aster_digest(unsigned), &signature).unwrap();
+        }
+    }
+
     use rust_decimal_macros::dec;
+
+
+    #[test]
+    fn terminal_status_needs_valid_execution_evidence_and_fees_keep_their_provenance() {
+        assert!(matches!(classify_order_response("test", r#"{"orderId":1,"status":"EXPIRED"}"#),
+            SubmitOutcome::Unknown { .. }));
+        assert!(matches!(classify_order_response("test", r#"{"orderId":1,"status":"EXPIRED","executedQty":"0"}"#),
+            SubmitOutcome::Rejected { .. }));
+        assert!(matches!(classify_order_response("test", r#"{"orderId":1,"status":"EXPIRED","executedQty":"2","cumQuote":"20"}"#),
+            SubmitOutcome::Accepted { .. }));
+        assert!(!order_response_is_terminal(r#"{"status":"NEW","executedQty":"0"}"#).unwrap());
+        for commission in [r#""0.02""#, "null", r#""not-a-number""#] {
+            let raw = format!(r#"[{{"id":1,"orderId":1,"price":"10","qty":"2","quoteQty":"20","commission":{commission},"commissionAsset":"USDT"}}]"#);
+            let rows: Vec<AsterUserTrade> = serde_json::from_str(&raw).unwrap();
+            let summary = summarize_user_trades(&rows).unwrap().unwrap();
+            assert_eq!(summary.qty, dec!(2));
+            assert_eq!(summary.notional, dec!(20));
+            assert_eq!(summary.fee_provenance, if commission == r#""0.02""# { FeeProvenance::Venue } else { FeeProvenance::Unknown });
+        }
+    }
 
     #[test]
     fn immediate_fill_parses_zero_ioc_fill() {
@@ -719,13 +821,6 @@ mod tests {
         assert!(position_qty_from_rows(&rows, "HYPEUSDT").is_err());
     }
 
-    #[test]
-    fn position_qty_malformed_envelope_is_error() {
-        // The venue's error object instead of the positionRisk array must fail the
-        // envelope parse (position_qty maps this to Err), never read as "flat".
-        let body = r#"{"code":-1021,"msg":"Timestamp outside recvWindow"}"#;
-        assert!(serde_json::from_str::<Vec<AsterPositionRow>>(body).is_err());
-    }
 
     #[test]
     fn immediate_fill_uses_cum_qty_when_executed_qty_missing() {

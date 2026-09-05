@@ -467,85 +467,30 @@ mod tests {
         }
     }
 
-    /// The legacy connector formatting the Decimal path replaces.
-    fn legacy_format_float(v: f64) -> String {
-        let s = format!("{v:.12}");
-        s.trim_end_matches('0').trim_end_matches('.').to_string()
-    }
-
     #[test]
-    fn dec_units_match_str_units() {
-        let s = MarketScale::from_spec(&spec());
-        let corpus: [f64; 12] = [
-            100.0, 0.001, 0.06, 0.1, 64820.2, 0.3, 0.0059, 42.4242, 0.05, 0.15, 99999.9999,
-            0.30000000000000004,
-        ];
-        for v in corpus {
-            let as_str = legacy_format_float(v);
-            let as_dec = crate::decimal::dec_from_f64_book(v).unwrap();
-            assert_eq!(
-                s.price_dec_to_ticks(as_dec),
-                s.price_str_to_ticks(&as_str),
-                "price ticks diverged for {v}"
-            );
-            assert_eq!(
-                s.qty_dec_to_lots(as_dec),
-                s.qty_str_to_lots(&as_str),
-                "qty lots diverged for {v}"
-            );
-            assert_eq!(
-                s.hl_qty_dec_to_lots(as_dec),
-                s.hl_qty_str_to_lots(&as_str),
-                "hl qty lots diverged for {v}"
-            );
+    fn decimal_and_wire_units_have_independent_expected_values() {
+        let scale = MarketScale::from_spec(&spec());
+        for (text, ticks, lots) in [("100.04", 1000, 100040), ("100.06", 1001, 100060), ("0.0059", 0, 5)] {
+            let value: Decimal = text.parse().unwrap();
+            assert_eq!(scale.price_to_ticks(value), ticks);
+            assert_eq!(scale.qty_to_lots(value), lots);
+            assert_eq!(scale.qty_str_to_lots(text), Some(lots));
         }
-        // Non-positive inputs: both entry points refuse.
-        assert_eq!(s.price_dec_to_ticks(dec!(0)), None);
-        assert_eq!(s.price_dec_to_ticks(dec!(-1)), None);
-        assert_eq!(s.price_str_to_ticks("-1"), None);
+        assert_eq!(scale.price_dec_to_ticks(dec!(0)), None);
+        assert_eq!(scale.price_str_to_ticks("-1"), None);
     }
 
     #[test]
-    fn dec_levels_hot_book_matches_strs_hot_book() {
-        let s = MarketScale::from_spec(&spec());
-        // Includes a duplicate-after-rounding price pair (100.04 / 100.041 -> same tick)
-        // to pin the aggregation semantics, and a sub-lot qty that must be dropped.
-        let raw: [(f64, f64); 5] = [
-            (100.04, 0.005),
-            (100.041, 0.003),
-            (99.9, 1.5),
-            (99.8, 0.0004), // floors to 0 lots -> dropped by both paths
-            (98.15, 0.25),
-        ];
-        let strs: Vec<(String, String)> = raw
-            .iter()
-            .map(|&(p, q)| (legacy_format_float(p), legacy_format_float(q)))
-            .collect();
-        let decs: Vec<(Decimal, Decimal)> = raw
-            .iter()
-            .map(|&(p, q)| {
-                (
-                    crate::decimal::dec_from_f64_book(p).unwrap(),
-                    crate::decimal::dec_from_f64_book(q).unwrap(),
-                )
-            })
-            .collect();
-        let from_strs = build_hot_book_from_strs_with_qty_scale(
-            strs.iter().map(|(p, q)| (p.as_str(), q.as_str())),
-            strs.iter().map(|(p, q)| (p.as_str(), q.as_str())),
-            &s,
-            HotQtyScale::Hyperliquid,
-            7,
-            123,
-            456,
-        );
-        let from_decs = build_hot_book_from_dec_levels_with_qty_scale(
-            &decs, &decs, &s, HotQtyScale::Hyperliquid, 7, 123, 456,
-        );
-        assert_eq!(from_strs.bids(), from_decs.bids());
-        assert_eq!(from_strs.asks(), from_decs.asks());
-        // The duplicate-tick pair aggregated and the sub-lot level dropped: 3 levels.
-        assert_eq!(from_strs.bids().len(), 3);
+    fn exact_decimal_levels_aggregate_ticks_and_drop_sublots() {
+        let scale = MarketScale::from_spec(&spec());
+        let raw = [("100.04", "0.005"), ("100.041", "0.003"), ("99.9", "1.5"), ("99.8", "0.0004"), ("98.15", "0.25")];
+        let decimals: Vec<(Decimal, Decimal)> = raw.iter().map(|(p,q)| (p.parse().unwrap(), q.parse().unwrap())).collect();
+        let decimal_book = build_hot_book_from_dec_levels_with_qty_scale(&decimals, &decimals, &scale, HotQtyScale::Hyperliquid, 7, 123, 456);
+        let wire_book = build_hot_book_from_strs_with_qty_scale(raw, raw, &scale, HotQtyScale::Hyperliquid, 7, 123, 456);
+        for book in [decimal_book, wire_book] {
+            let bids: Vec<_> = book.bids().iter().map(|l| (l.px_ticks, l.qty_lots)).collect();
+            assert_eq!(bids, vec![(1000, 8), (999, 1500), (982, 250)]);
+        }
     }
 
     #[test]

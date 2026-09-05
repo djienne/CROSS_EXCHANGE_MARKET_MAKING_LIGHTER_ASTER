@@ -1,25 +1,19 @@
-//! Aster V3 live execution worker (plan §3). Builds correct V3 signed-request payloads
-//! (post-only GTX maker orders, per-order + bulk cancels, dead-man countdown), manages the
-//! microsecond nonce / millisecond timestamp, signs via [`AsterSigner`] (ABI-encode + EIP-191,
-//! confirmed live), POSTs them, and parses the response into lifecycle [`ExecEvent`]s.
-//!
-//! The signing scheme is the working Passivbot recipe (NOT the EIP-712 typed-data the docs
-//! described) — verified against the live API: a real post-only place returned HTTP 200/`NEW`
-//! and a cancel returned `CANCELED`. See `scripts/aster_probe.py` for the byte-for-byte oracle.
+//! Aster V3 execution worker. Signs the exact transmitted query with EIP-712,
+//! keeps request I/O off the strategy loop, and preserves ambiguous order outcomes.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Method;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tracing::{info, warn};
 
-use super::command::{ExecCommand, ExecEvent};
-use super::sign::{AsterNonce, AsterSigner, MonotonicMs};
+use super::command::{ExecCommand, ExecEvent, MakerPermit};
+use super::sign::{AsterNonce, AsterSigner};
 use crate::livebot::scale::MarketScale;
 use crate::types::{MarketId, Side};
 
@@ -28,10 +22,29 @@ const ASTER_ALL_ORDERS_PATH: &str = "/fapi/v3/allOpenOrders";
 const ASTER_DEADMAN_PATH: &str = "/fapi/v3/countdownCancelAll";
 const ASTER_LISTEN_KEY_PATH: &str = "/fapi/v3/listenKey";
 const ASTER_POSITION_SIDE_PATH: &str = "/fapi/v3/positionSide/dual";
-const ASTER_RECV_WINDOW: &str = "50000";
 const USER_AGENT: &str = "xemm-livebot";
 
-/// Per-market wire context: the scale (ticks/lots → Decimal) and the Aster symbol.
+#[derive(Debug, thiserror::Error)]
+#[error("Aster request was not sent: {0}")]
+struct RequestNotSent(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("Aster HTTP {status}, code {code:?}: {body}")]
+struct VenueFailure {
+    status: u16,
+    code: Option<i64>,
+    body: String,
+}
+
+/// Only a pre-write failure or explicit, non-ambiguous venue rejection releases exposure.
+pub fn definitive_no_fill(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RequestNotSent>().is_some()
+        || error.downcast_ref::<reqwest::Error>().is_some_and(|e| e.is_connect())
+        || error.downcast_ref::<VenueFailure>()
+        .is_some_and(|e| e.status < 500 && e.code.is_some_and(|c| c < 0
+            && !matches!(c, -1000 | -1001 | -1006 | -1007)))
+}
+
 #[derive(Clone)]
 struct MarketWire {
     scale: MarketScale,
@@ -103,7 +116,6 @@ pub struct AsterRest {
     base_url: String,
     signer: Arc<dyn AsterSigner>,
     nonce: AsterNonce,
-    timestamp: MonotonicMs,
     markets: HashMap<MarketId, MarketWire>,
     deadman_countdown_ms: i64,
     rate_limit_backoff_ms: i64,
@@ -136,12 +148,12 @@ impl AsterRest {
             .into_iter()
             .map(|(m, (scale, symbol))| (m, MarketWire { scale, symbol }))
             .collect();
+        let nonce = AsterNonce::for_signer(&base_url, signer.signer_address())?;
         Ok(AsterRest {
             client,
             base_url,
             signer,
-            nonce: AsterNonce::new(),
-            timestamp: MonotonicMs::new(),
+            nonce,
             markets,
             deadman_countdown_ms: deadman_countdown_ms.max(1000),
             rate_limit_backoff_ms: rate_limit_backoff_ms.max(1000),
@@ -188,41 +200,56 @@ impl AsterRest {
         Ok(p)
     }
 
-    /// Inject auth (recvWindow/timestamp/nonce/user/signer/signature), sign the canonical
-    /// `json_str`, send, and return the response body. Reads use GET (query string); writes use
-    /// the body form. FAILS only on transport/HTTP error — a `200` with a venue error code is
-    /// returned for the caller to classify.
+    /// A single account-level available margin value, independent of wallet/equity.
+    pub async fn account_available_balance(&self) -> Result<Decimal> {
+        let body = self.signed_request(Method::GET, "/fapi/v3/account", vec![]).await?;
+        let value: serde_json::Value = serde_json::from_str(&body)?;
+        value.get("availableBalance").and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Aster account is missing availableBalance"))?
+            .parse::<Decimal>().context("malformed Aster availableBalance")
+    }
+
+    /// Resolve the original identity on the cold path; an absent/error result is unknown.
+    pub async fn query_order(&self, market: &MarketId, client_order_id: &str) -> Result<serde_json::Value> {
+        let symbol = self.wire(market)?.symbol.clone();
+        let body = self.signed_request(Method::GET, ASTER_ORDER_PATH, vec![
+            ("symbol".into(), symbol),
+            ("origClientOrderId".into(), client_order_id.to_string()),
+        ]).await?;
+        serde_json::from_str(&body).context("parse Aster order query")
+    }
+
+    /// Encode authentication and business parameters once, sign those bytes, and send.
+    /// Explicit venue errors stay distinct from potentially executed transport failures.
     async fn signed_request(&self, method: Method, path: &str, business: Vec<(String, String)>) -> Result<String> {
-        // The signed params = business params + recvWindow + timestamp (NOT nonce/user/signer).
         let mut params = business;
-        params.push(("recvWindow".into(), ASTER_RECV_WINDOW.into()));
-        params.push(("timestamp".into(), self.timestamp.next().to_string()));
-        // Canonical json_str: sorted keys, compact separators — must match the signer's ABI input.
-        let json_map: std::collections::BTreeMap<&str, &str> =
-            params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let json_str = serde_json::to_string(&json_map)?;
-        let nonce = self.nonce.next();
-        let sig = self.signer.sign_v3(&json_str, nonce)?;
+        let nonce = self.nonce.next().map_err(|e| RequestNotSent(e.to_string()))?;
         params.push(("nonce".into(), nonce.to_string()));
         params.push(("user".into(), self.signer.user_address().to_string()));
         params.push(("signer".into(), self.signer.signer_address().to_string()));
-        params.push(("signature".into(), sig.0));
-
-        let url = format!("{}{}", self.base_url, path);
+        // Serialize ONCE: the EIP-712 message is exactly the transmitted form string.
+        let mut encoded = reqwest::Url::parse("http://localhost/").expect("static encoding URL");
+        encoded.query_pairs_mut().extend_pairs(params.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        let unsigned = encoded.query().unwrap_or_default();
+        let signature = self.signer.sign_v3(unsigned).map_err(|e| RequestNotSent(e.to_string()))?;
+        let payload = format!("{unsigned}&signature={}", signature.0);
+        let url = format!("{}{}", self.base_url.trim_end_matches('/'), path);
         let builder = match method {
-            Method::GET => self.client.get(&url).query(&params),
-            Method::POST => self.client.post(&url).form(&params),
-            Method::DELETE => self.client.delete(&url).form(&params),
-            Method::PUT => self.client.put(&url).form(&params),
-            other => return Err(anyhow!("unsupported method {other}")),
+            Method::GET => self.client.get(format!("{url}?{payload}")),
+            Method::POST => self.client.post(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            Method::DELETE => self.client.delete(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            Method::PUT => self.client.put(&url).header("Content-Type", "application/x-www-form-urlencoded").body(payload),
+            other => return Err(RequestNotSent(format!("unsupported Aster method {other}")).into()),
         };
-        let resp = builder.header("User-Agent", USER_AGENT).send().await?;
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Err(anyhow!("aster {path} HTTP {}: {}", status.as_u16(), text));
+        let response = builder.header("User-Agent", USER_AGENT).send().await.map_err(reqwest::Error::without_url)?;
+        let status = response.status();
+        let body = response.text().await.map_err(reqwest::Error::without_url)?;
+        let code = serde_json::from_str::<serde_json::Value>(&body).ok()
+            .and_then(|v| v.get("code").and_then(|c| c.as_i64()));
+        if !status.is_success() || code.is_some_and(|c| c != 0 && c != 200) {
+            return Err(VenueFailure { status: status.as_u16(), code, body }.into());
         }
-        Ok(text)
+        Ok(body)
     }
 
     /// Place a maker order from `Decimal` price/qty (rounds passively: buy floors, sell ceils
@@ -329,9 +356,11 @@ impl AsterRest {
         };
         match self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await {
             Ok(body) => classify_place(client_id, &body),
+            Err(e) if definitive_no_fill(&e) => ExecEvent::PlaceReject {
+                client_id: client_id.to_string(), reason: e.to_string(),
+            },
             Err(e) => ExecEvent::PlaceUnknown {
-                client_id: client_id.to_string(),
-                reason: e.to_string(),
+                client_id: client_id.to_string(), reason: e.to_string(),
             },
         }
     }
@@ -348,7 +377,7 @@ impl AsterRest {
             // Aster returns HTTP 200 even for some venue errors ({code,msg} in the body), so
             // transport success != cancel success — classify the body (plan: no false CancelAck).
             Ok(body) => classify_cancel(&body),
-            Err(e) if e.to_string().contains("-2011") => Ok(CancelOutcome::AlreadyGone),
+            Err(e) if e.downcast_ref::<VenueFailure>().is_some_and(|e| e.status < 500 && e.code == Some(-2011)) => Ok(CancelOutcome::AlreadyGone),
             Err(e) => Err(e),
         }
     }
@@ -356,28 +385,23 @@ impl AsterRest {
     /// Reduce-only MARKET (taker) order to flatten an orphaned position (recovery path).
     /// Reduce-only orders are exempt from the min-notional filter, so a sub-min residual can
     /// still be closed. `side` = SELL to close a long, BUY to close a short.
-    pub(crate) async fn flatten(&self, market: &MarketId, side: Side, qty: Decimal, client_id: &str) -> Result<()> {
+    async fn flatten_result(&self, market: &MarketId, side: Side, qty: Decimal, client_id: &str) -> Result<String> {
         let w = self.wire(market)?;
         let qty_lots = w.scale.qty_to_lots(qty);
         if qty_lots <= 0 {
-            return Ok(()); // sub-lot dust: nothing to flatten
+            return Err(RequestNotSent("reduce-only residual is below one lot".into()).into());
         }
-        let q = w.scale.lots_to_qty(qty_lots);
-        // The session-prefixed client id is what lets the strategy attribute the resulting
-        // reduce-only fill to itself (is_own_client_id) and update predicted position.
         let params = vec![
             ("symbol".into(), w.symbol.clone()),
-            ("side".into(), side.as_str().to_string()),
+            ("side".into(), side.as_str().into()),
             ("type".into(), "MARKET".into()),
-            ("quantity".into(), trim_dec(q)),
+            ("quantity".into(), trim_dec(w.scale.lots_to_qty(qty_lots))),
             ("newClientOrderId".into(), client_id.to_string()),
+            ("newOrderRespType".into(), "RESULT".into()),
             ("positionSide".into(), "BOTH".into()),
             ("reduceOnly".into(), "true".into()),
         ];
-        self.signed_request(Method::POST, ASTER_ORDER_PATH, params)
-            .await
-            .and_then(|body| reject_body_error(ASTER_ORDER_PATH, &body))
-            .map(|_| ())
+        self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await
     }
 
     /// Refresh the Aster dead-man countdown for a symbol (heartbeat; §3.4).
@@ -402,11 +426,7 @@ impl AsterRest {
             .map(|_| ())
     }
 
-    /// Read the account's CURRENT leverage for a symbol (`GET /fapi/v3/positionRisk?symbol=…`).
-    /// Aster has no EVM-signed SET-leverage endpoint (`/fapi/v1/leverage` is legacy HMAC-only and
-    /// rejects EVM auth with `-2014`), so the startup gate VERIFIES leverage rather than setting it —
-    /// the operator sets it once on the Aster UI. The `symbol` param makes the row present even when
-    /// the position is flat.
+    /// Read current leverage for startup validation; do not change account preferences.
     pub(crate) async fn get_leverage(&self, market: &MarketId) -> Result<u32> {
         let w = self.wire(market)?;
         let body = self
@@ -436,19 +456,14 @@ pub(crate) enum CancelOutcome {
     FilledOrExpired,
 }
 
-/// Reject an HTTP-200 body that carries a venue error envelope (`{"code":…,"msg":…}`); pass the
-/// body through on success. Aster returns HTTP 200 for some business errors, so transport success
-/// != venue success. `code == 0` and `code == 200` are success echoes (cancel-all replies
-/// `{"code":200,"msg":"...done."}`); most success bodies carry no `code` at all. Non-JSON,
-/// non-object, and non-integer-code bodies pass through unchanged — strict per-shape
-/// classification for place/cancel stays with `classify_place`/`classify_cancel`.
+/// Validate a JSON object acknowledgement and reject explicit venue errors.
 fn reject_body_error(path: &str, body: &str) -> Result<String> {
-    if let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(body) {
-        if let Some(code) = obj.get("code").and_then(|c| c.as_i64()) {
-            if code != 0 && code != 200 {
-                let msg = obj.get("msg").and_then(|m| m.as_str()).unwrap_or_default();
-                return Err(anyhow!("aster {path} venue error code {code}: {msg}"));
-            }
+    let value: serde_json::Value = serde_json::from_str(body).context("invalid Aster acknowledgement JSON")?;
+    let object = value.as_object().ok_or_else(|| anyhow!("Aster {path} acknowledgement is not an object"))?;
+    if let Some(raw) = object.get("code") {
+        let code = raw.as_i64().ok_or_else(|| anyhow!("Aster {path} acknowledgement code is not an integer"))?;
+        if code != 0 && code != 200 {
+            return Err(VenueFailure { status: 200, code: Some(code), body: body.to_string() }.into());
         }
     }
     Ok(body.to_string())
@@ -571,29 +586,39 @@ async fn notify_rate_limited(tx: &Sender<ExecEvent>, reason: String, backoff_ms:
     let _ = tx.send(ExecEvent::AsterRateLimited { reason, backoff_ms }).await;
 }
 
+async fn reject_unsent_maker(tx: &Sender<ExecEvent>, permit: &MakerPermit, client_id: String, reason: String) {
+    permit.cancel_queued();
+    // A duplicate of a claimed command cannot prove the original was not sent.
+    if permit.is_cancelled() {
+        let _ = tx.send(ExecEvent::PlaceReject { client_id, reason }).await;
+    }
+}
+
 async fn send_backoff_reject(tx: &Sender<ExecEvent>, cmd: ExecCommand, reason: String, backoff_ms: i64) {
     match cmd {
-        ExecCommand::Place { client_id, .. } => {
-            let _ = tx.send(ExecEvent::PlaceReject { client_id, reason: reason.clone() }).await;
+        ExecCommand::Place { client_id, permit, .. } => {
+            reject_unsent_maker(tx, &permit, client_id, reason.clone()).await;
         }
         ExecCommand::Cancel { client_id, .. } => {
             let _ = tx.send(ExecEvent::CancelReject { client_id, reason: reason.clone() }).await;
         }
-        ExecCommand::Replace { old_client_id, new_client_id, .. } => {
+        ExecCommand::Replace { old_client_id, new_client_id, permit, .. } => {
             let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason: reason.clone() }).await;
-            let _ = tx
-                .send(ExecEvent::PlaceReject {
-                    client_id: new_client_id,
-                    reason: "replace skipped because Aster REST backoff is active".into(),
-                })
-                .await;
+            reject_unsent_maker(tx, &permit, new_client_id, "replace skipped because Aster REST backoff is active".into()).await;
         }
-        ExecCommand::FlattenAster { market, side, qty, .. } => {
-            let _ = tx.send(ExecEvent::AsterFlattenReject { market, side, qty, reason: reason.clone() }).await;
+        ExecCommand::FlattenAster { intent, .. } => {
+            intent.admission.cancel_queued();
+            if intent.admission.is_cancelled() {
+                let _ = tx.send(ExecEvent::AttemptNotSent { cloid: intent.cloid, reason: reason.clone() }).await;
+            }
         }
         ExecCommand::CancelMarket { .. }
         | ExecCommand::CancelAllBot
         | ExecCommand::RefreshDeadman { .. } => {}
+        ExecCommand::Barrier { completion } => {
+            completion.complete(crate::hotpath::clock::mono_now_ns());
+            return;
+        }
         ExecCommand::Shutdown => {}
     }
     notify_rate_limited(tx, reason, backoff_ms).await;
@@ -609,22 +634,16 @@ impl RestCommandLimiter {
         RestCommandLimiter { max_per_minute: max_per_minute.max(1), sent: VecDeque::new() }
     }
 
-    async fn acquire(&mut self) {
+    fn next_ready_at(&mut self) -> Option<tokio::time::Instant> {
         let window = Duration::from_secs(60);
-        loop {
-            let now = tokio::time::Instant::now();
-            while self.sent.front().is_some_and(|&t| now.saturating_duration_since(t) >= window) {
-                self.sent.pop_front();
-            }
-            if (self.sent.len() as u32) < self.max_per_minute {
-                self.sent.push_back(now);
-                return;
-            }
-            if let Some(&oldest) = self.sent.front() {
-                tokio::time::sleep_until(oldest + window).await;
-            } else {
-                return;
-            }
+        let now = tokio::time::Instant::now();
+        while self.sent.front().is_some_and(|&t| now.saturating_duration_since(t) >= window) {
+            self.sent.pop_front();
+        }
+        if self.sent.len() >= self.max_per_minute as usize {
+            self.sent.front().map(|t| *t + window)
+        } else {
+            None
         }
     }
 
@@ -642,14 +661,6 @@ impl RestCommandLimiter {
         self.sent.push_back(now);
     }
 
-    /// Gate for one venue request: priority commands record-and-go, normal commands wait.
-    async fn gate(&mut self, from_prio: bool) {
-        if from_prio {
-            self.record();
-        } else {
-            self.acquire().await;
-        }
-    }
 }
 
 /// The Aster execution worker loop: drain commands, perform venue I/O, publish events.
@@ -660,10 +671,11 @@ pub async fn run_aster_worker(
     tx: Sender<ExecEvent>,
     rest: AsterRest,
 ) {
-    info!("aster live exec worker started (real signing wired; ABI+EIP-191, live-verified)");
+    info!("aster live exec worker started (Aster V3 EIP-712)");
     let mut backoff_until: Option<tokio::time::Instant> = None;
     let mut limiter = RestCommandLimiter::new(rest.max_rest_requests_per_minute);
     let mut prio_open = true;
+    let mut pending_normal = None;
     loop {
         // Priority lane first (acked cancels + flattens — see is_priority_cmd): drain
         // without waiting, then block on both lanes biased toward priority. A cancel
@@ -674,6 +686,9 @@ pub async fn run_aster_worker(
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     prio_open = false;
                     continue;
+                }
+                Err(mpsc::error::TryRecvError::Empty) if pending_normal.is_some() => {
+                    (pending_normal.take().unwrap(), false)
                 }
                 Err(mpsc::error::TryRecvError::Empty) => {
                     tokio::select! {
@@ -692,28 +707,62 @@ pub async fn run_aster_worker(
                     }
                 }
             }
+        } else if let Some(pending) = pending_normal.take() {
+            (pending, false)
         } else {
             match rx.recv().await {
                 Some(c) => (c, false),
                 None => break,
             }
         };
+        if let ExecCommand::Barrier { completion } = &cmd {
+            completion.complete(crate::hotpath::clock::mono_now_ns());
+            continue;
+        }
         if matches!(cmd, ExecCommand::Shutdown) {
-            // Execute commands already queued behind Shutdown (the strategy's shutdown
-            // fill-drain may have enqueued fast-cancels) instead of dropping them.
-            while let Ok(late) = prio_rx.try_recv() {
-                if !matches!(late, ExecCommand::Shutdown) {
-                    process_cmd(late, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
-                }
-            }
-            while let Ok(late) = rx.try_recv() {
-                if !matches!(late, ExecCommand::Shutdown) {
-                    process_cmd(late, false, &tx, &rest, &mut limiter, &mut backoff_until).await;
+            // Drain safety work; stale optional placements must not appear after shutdown.
+            for late in pending_normal.take().into_iter()
+                .chain(std::iter::from_fn(|| prio_rx.try_recv().ok()))
+                .chain(std::iter::from_fn(|| rx.try_recv().ok())) {
+                match late {
+                    ExecCommand::Place { client_id, permit, .. } => {
+                        reject_unsent_maker(&tx, &permit, client_id, "worker shutdown before send".into()).await;
+                    }
+                    ExecCommand::Replace { old_client_id, new_client_id, permit, .. } => {
+                        let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason: "replace not sent during shutdown".into() }).await;
+                        reject_unsent_maker(&tx, &permit, new_client_id, "worker shutdown before send".into()).await;
+                    }
+                    ExecCommand::Shutdown => {}
+                    other => { let _ = process_cmd(other, true, &tx, &rest, &mut limiter, &mut backoff_until).await; }
                 }
             }
             break;
         }
-        process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+        if backoff_until.is_some_and(|until| tokio::time::Instant::now() < until) {
+            let _ = process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await;
+            continue;
+        }
+        if !from_prio {
+            if let Some(ready_at) = limiter.next_ready_at() {
+                pending_normal = Some(cmd);
+                tokio::select! {
+                    biased;
+                    priority = prio_rx.recv(), if prio_open => {
+                        match priority {
+                            Some(priority) => {
+                                let _ = process_cmd(priority, true, &tx, &rest, &mut limiter, &mut backoff_until).await;
+                            }
+                            None => prio_open = false,
+                        }
+                    }
+                    _ = tokio::time::sleep_until(ready_at) => {}
+                }
+                continue;
+            }
+        }
+        if let Some(followup) = process_cmd(cmd, from_prio, &tx, &rest, &mut limiter, &mut backoff_until).await {
+            pending_normal = Some(followup);
+        }
     }
     info!("aster live exec worker stopped");
 }
@@ -723,12 +772,13 @@ pub async fn run_aster_worker(
 /// lane and the shutdown drain share the exact same semantics.
 async fn process_cmd(
     cmd: ExecCommand,
-    from_prio: bool,
+    _from_prio: bool,
     tx: &Sender<ExecEvent>,
     rest: &AsterRest,
     limiter: &mut RestCommandLimiter,
     backoff_until: &mut Option<tokio::time::Instant>,
-) {
+) -> Option<ExecCommand> {
+    let mut followup = None;
     {
         if let Some(until) = *backoff_until {
             let now = tokio::time::Instant::now();
@@ -741,7 +791,7 @@ async fn process_cmd(
                     remaining_ms.max(1),
                 )
                 .await;
-                return;
+                return None;
             }
             *backoff_until = None;
         }
@@ -749,8 +799,14 @@ async fn process_cmd(
 
         let mut rate_limit_reason: Option<String> = None;
         match cmd {
-            ExecCommand::Place { market, side, price_ticks, qty_lots, client_id } => {
-                limiter.gate(from_prio).await;
+            ExecCommand::Place { market, side, price_ticks, qty_lots, client_id, permit } => {
+                // This runs after every rate-limit wait and after a Replace's cancel.
+                // Revalidate the captured books, rights, and deadline at send ownership.
+                if !permit.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    reject_unsent_maker(tx, &permit, client_id, "maker admission revoked or expired before send".into()).await;
+                    return None;
+                }
+                limiter.record();
                 let ev = rest.place(&market, side, price_ticks, qty_lots, &client_id, false).await;
                 if let Some(reason) = exec_event_rate_limit_reason(&ev) {
                     rate_limit_reason = Some(reason.to_string());
@@ -760,7 +816,7 @@ async fn process_cmd(
             ExecCommand::Cancel { client_id, market, .. } => {
                 // Only ack a cancel that actually succeeded — a failed cancel must NOT close the
                 // strategy's slot (the order may still be resting). Report the real outcome.
-                limiter.gate(from_prio).await;
+                limiter.record();
                 let ev = match rest.cancel_order(&market, &client_id).await {
                     Ok(CancelOutcome::Canceled | CancelOutcome::AlreadyGone) => ExecEvent::CancelAck { client_id },
                     Ok(CancelOutcome::FilledOrExpired) => {
@@ -782,19 +838,17 @@ async fn process_cmd(
                 }
                 let _ = tx.send(ev).await;
             }
-            ExecCommand::Replace { old_client_id, new_client_id, market, side, price_ticks, qty_lots, .. } => {
+            ExecCommand::Replace { old_client_id, new_client_id, market, side, price_ticks, qty_lots, permit, .. } => {
                 // Safe path: cancel-then-place (atomic PUT modify is a [VERIFY] item). NEVER place
                 // the new order unless the old cancel is VERIFIED — else both could rest at once.
-                limiter.gate(from_prio).await;
+                limiter.record();
                 match rest.cancel_order(&market, &old_client_id).await {
                     Ok(CancelOutcome::Canceled) => {
                         let _ = tx.send(ExecEvent::CancelAck { client_id: old_client_id }).await;
-                        limiter.gate(from_prio).await;
-                        let ev = rest.place(&market, side, price_ticks, qty_lots, &new_client_id, false).await;
-                        if let Some(reason) = exec_event_rate_limit_reason(&ev) {
-                            rate_limit_reason = Some(reason.to_string());
-                        }
-                        let _ = tx.send(ev).await;
+                        // Re-enter the worker select between cancel and optional replacement.
+                        followup = Some(ExecCommand::Place {
+                            market, side, price_ticks, qty_lots, client_id: new_client_id, permit,
+                        });
                     }
                     Ok(outcome) => {
                         warn!(
@@ -814,12 +868,8 @@ async fn process_cmd(
                             }
                             CancelOutcome::Canceled => unreachable!("handled above"),
                         }
-                        let _ = tx
-                            .send(ExecEvent::PlaceReject {
-                                client_id: new_client_id,
-                                reason: format!("replace skipped after old cancel outcome {outcome:?}"),
-                            })
-                            .await;
+                        reject_unsent_maker(tx, &permit, new_client_id,
+                            format!("replace skipped after old cancel outcome {outcome:?}")).await;
                     }
                     Err(e) => {
                         let reason = e.to_string();
@@ -829,17 +879,13 @@ async fn process_cmd(
                         warn!("aster replace: cancel {old_client_id} failed ({e:#}); NOT placing new order");
                         // Old order may still rest; keep the slot and let the strategy freeze/recover.
                         let _ = tx.send(ExecEvent::CancelReject { client_id: old_client_id, reason }).await;
-                        let _ = tx
-                            .send(ExecEvent::PlaceReject {
-                                client_id: new_client_id,
-                                reason: "replace skipped because old cancel failed".into(),
-                            })
-                            .await;
+                        reject_unsent_maker(tx, &permit, new_client_id,
+                            "replace skipped because old cancel failed".into()).await;
                     }
                 }
             }
             ExecCommand::CancelMarket { market } => {
-                limiter.gate(from_prio).await;
+                limiter.record();
                 if let Err(e) = rest.cancel_all_symbol(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {
@@ -850,7 +896,7 @@ async fn process_cmd(
             }
             ExecCommand::CancelAllBot => {
                 for market in rest.markets.keys().cloned().collect::<Vec<_>>() {
-                    limiter.gate(from_prio).await;
+                    limiter.record();
                     if let Err(e) = rest.cancel_all_symbol(&market).await {
                         let reason = e.to_string();
                         if is_aster_rate_limit_reason(&reason) {
@@ -862,25 +908,51 @@ async fn process_cmd(
                     }
                 }
             }
-            ExecCommand::FlattenAster { market, side, qty, client_id } => {
-                limiter.gate(from_prio).await;
-                let ev = match rest.flatten(&market, side, qty, &client_id).await {
-                    Ok(()) => {
-                        info!("aster flatten sent: {side:?} {qty} {market}");
-                        ExecEvent::AsterFlattenAck { market, side, qty }
+            ExecCommand::FlattenAster { intent, client_id } => {
+                let now_ns = crate::hotpath::clock::mono_now_ns();
+                if !intent.admission.try_claim(now_ns) {
+                    // A duplicate of an already-claimed command cannot prove the
+                    // original was not sent; only the cancelled state permits that event.
+                    if intent.admission.is_cancelled() {
+                        let _ = tx.send(ExecEvent::AttemptNotSent {
+                            cloid: intent.cloid, reason: "correction cancelled or expired before send".into(),
+                        }).await;
                     }
-                    Err(e) => {
-                        warn!("aster flatten ({side:?} {qty} {market}) failed: {e:#}");
-                        ExecEvent::AsterFlattenReject { market, side, qty, reason: e.to_string() }
-                    }
-                };
-                if let Some(reason) = exec_event_rate_limit_reason(&ev) {
-                    rate_limit_reason = Some(reason.to_string());
+                    return None;
                 }
-                let _ = tx.send(ev).await;
+                let market = intent.market.clone();
+                let side = intent.hedge_side;
+                let qty = intent.qty;
+                limiter.record();
+                let _ = tx.send(ExecEvent::AttemptStarted {
+                    cloid: intent.cloid,
+                    proof: crate::livebot::fills::WireProof {
+                        tx_hash: None, nonce: None, client_order_index: None, sent_ns: now_ns,
+                    },
+                }).await;
+                match rest.flatten_result(&market, side, qty, &client_id).await {
+                    Ok(body) => {
+                        let _ = tx.send(ExecEvent::AsterFlattenAck {
+                            cloid: intent.cloid, market, side, qty,
+                        }).await;
+                        if let Some((filled, quote, terminal, order_id, event_time_ms)) = order_progress(&body) {
+                            let _ = tx.send(ExecEvent::ExecutionProgress {
+                                cloid: intent.cloid, cumulative_qty: filled, cumulative_quote_usd: quote,
+                                cumulative_fee_usd: None, terminal, venue_order_id: order_id, event_time_ms,
+                            }).await;
+                        }
+                    }
+                    Err(error) => {
+                        let reason = error.to_string();
+                        if is_aster_rate_limit_reason(&reason) { rate_limit_reason = Some(reason.clone()); }
+                        let _ = tx.send(ExecEvent::AsterFlattenReject {
+                            cloid: intent.cloid, market, side, qty, reason, terminal: definitive_no_fill(&error),
+                        }).await;
+                    }
+                }
             }
             ExecCommand::RefreshDeadman { market } => {
-                limiter.gate(from_prio).await;
+                limiter.record();
                 if let Err(e) = rest.refresh_deadman(&market).await {
                     let reason = e.to_string();
                     if is_aster_rate_limit_reason(&reason) {
@@ -888,6 +960,9 @@ async fn process_cmd(
                     }
                     warn!("aster deadman refresh failed: {e:#}");
                 }
+            }
+            ExecCommand::Barrier { completion } => {
+                completion.complete(crate::hotpath::clock::mono_now_ns());
             }
             ExecCommand::Shutdown => {
                 debug_assert!(false, "Shutdown is intercepted by the worker loop");
@@ -898,6 +973,20 @@ async fn process_cmd(
             *backoff_until = Some(tokio::time::Instant::now() + Duration::from_millis(rest.rate_limit_backoff_ms as u64));
             notify_rate_limited(tx, reason, rest.rate_limit_backoff_ms).await;
         }
+    followup
+}
+
+fn order_progress(body: &str) -> Option<(Decimal, Option<Decimal>, bool, Option<String>, Option<i64>)> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let status = value.get("status")?.as_str()?;
+    let qty = value.get("executedQty").or_else(|| value.get("cumQty"))?.as_str()?.parse::<Decimal>().ok()?;
+    if qty < Decimal::ZERO { return None; }
+    let quote = value.get("cumQuote").and_then(|v| v.as_str()).and_then(|s| s.parse::<Decimal>().ok())
+        .filter(|v| *v >= Decimal::ZERO);
+    let terminal = matches!(status, "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED");
+    let order_id = value.get("orderId").and_then(|v| v.as_i64()).map(|n| n.to_string());
+    let event_time_ms = value.get("updateTime").and_then(serde_json::Value::as_i64).filter(|time| *time > 0);
+    Some((qty, quote, terminal, order_id, event_time_ms))
 }
 
 /// Format a Decimal for the wire without scientific notation or trailing-zero noise.
@@ -908,6 +997,68 @@ fn trim_dec(d: Decimal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 2048];
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "HTTP request ended before its body");
+            bytes.extend_from_slice(&chunk[..n]);
+            if let Some(split) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = std::str::from_utf8(&bytes[..split]).unwrap();
+                let length = head.lines().find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().unwrap())
+                }).unwrap_or(0);
+                if bytes.len() >= split + 4 + length {
+                    return String::from_utf8(bytes).unwrap();
+                }
+            }
+        }
+    }
+
+    async fn reply_http(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        use tokio::io::AsyncWriteExt;
+        let reply = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        stream.write_all(reply.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn transmitted_request_is_the_eip712_message_for_every_method() {
+        use k256::ecdsa::signature::hazmat::PrehashVerifier;
+        use super::super::sign::test_support::{TestSigner, TEST_KEY};
+        for method in [Method::GET, Method::POST, Method::DELETE, Method::PUT] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await;
+                reply_http(&mut stream, "200 OK", r#"{"code":200}"#).await;
+                request
+            });
+            let rest = AsterRest::new(url, Arc::new(TestSigner::new()), HashMap::new(), 5_000, 10_000, 1_200, None).unwrap();
+            rest.signed_request(method.clone(), "/fapi/v3/order", vec![
+                ("newClientOrderId".into(), "order:1/two words".into()),
+                ("symbol".into(), "BTCUSDT".into()),
+            ]).await.unwrap();
+            let request = server.await.unwrap();
+            let (head, body) = request.split_once("\r\n\r\n").unwrap();
+            let wire = if method == Method::GET {
+                head.lines().next().unwrap().split_whitespace().nth(1).unwrap().split_once('?').unwrap().1
+            } else { body };
+            let (unsigned, signature) = wire.rsplit_once("&signature=").unwrap();
+            assert!(unsigned.starts_with("newClientOrderId=order%3A1%2Ftwo+words&symbol=BTCUSDT&nonce="), "{unsigned}");
+            assert!(unsigned.contains("&user=0x1111111111111111111111111111111111111111&signer=0x7e5f4552091a69125d5dfcb7b8c2659029395bdf"));
+            assert!(!unsigned.contains("recvWindow") && !unsigned.contains("timestamp"));
+            let raw = hex::decode(signature.strip_prefix("0x").unwrap()).unwrap();
+            let signature = k256::ecdsa::Signature::from_slice(&raw[..64]).unwrap();
+            let key = k256::ecdsa::SigningKey::from_slice(&TEST_KEY).unwrap();
+            key.verifying_key().verify_prehash(&super::super::crypto::aster_digest(unsigned), &signature).unwrap();
+        }
+    }
+
     use crate::livebot::exec::sign::test_support::TestSigner;
     use crate::markets::MarketSpec;
     use rust_decimal_macros::dec;
@@ -981,12 +1132,6 @@ mod tests {
             client_id: "c".into(),
             venue_order_id: Some("42".into()),
         }));
-        assert!(is_priority_cmd(&ExecCommand::FlattenAster {
-            market: m.clone(),
-            side: Side::Sell,
-            qty: dec!(0.1),
-            client_id: "f".into(),
-        }));
         // Un-acked cancel: a Place for this id may still be queued — must stay FIFO (I1).
         assert!(!is_priority_cmd(&ExecCommand::Cancel {
             market: m.clone(),
@@ -1002,7 +1147,7 @@ mod tests {
             side: Side::Buy,
             price_ticks: 1,
             qty_lots: 1,
-            client_id: "p".into(),
+            client_id: "p".into(), permit: MakerPermit::for_test(),
         }));
         assert!(!is_priority_cmd(&ExecCommand::RefreshDeadman { market: m }));
         assert!(!is_priority_cmd(&ExecCommand::Shutdown));
@@ -1017,11 +1162,109 @@ mod tests {
         limiter.record(); // over the cap: still returns without yielding
         assert_eq!(tokio::time::Instant::now(), t0, "record() must never sleep");
         // A following acquire() must see the recorded stamps and wait out the window.
-        limiter.acquire().await;
+        let ready_at = limiter.next_ready_at().expect("normal request must wait");
+        tokio::time::sleep_until(ready_at).await;
+        assert!(limiter.next_ready_at().is_none());
         assert!(
             tokio::time::Instant::now().duration_since(t0) >= Duration::from_secs(60),
             "acquire() must honor timestamps recorded by the priority lane"
         );
+    }
+
+
+    #[tokio::test]
+    async fn priority_cancel_interrupts_a_normal_rate_limit_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut first).await;
+            reply_http(&mut first, "200 OK", r#"{"orderId":1,"status":"NEW","clientOrderId":"P0"}"#).await;
+            drop(first);
+            let _ = first_tx.send(());
+            let (mut next, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut next).await;
+            reply_http(&mut next, "200 OK", r#"{"orderId":2,"status":"CANCELED","clientOrderId":"urgent"}"#).await;
+            request
+        });
+        let mut rest = rest_at(&url);
+        rest.max_rest_requests_per_minute = 1;
+        let (events_tx, _events_rx) = tokio::sync::mpsc::channel(32);
+        let (normal_tx, normal_rx) = tokio::sync::mpsc::channel(32);
+        let (priority_tx, priority_rx) = tokio::sync::mpsc::channel(32);
+        for id in ["P0", "P1"] {
+            normal_tx.send(ExecCommand::Place {
+                market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
+                qty_lots: 10, client_id: id.into(), permit: MakerPermit::for_test(),
+            }).await.unwrap();
+        }
+        let worker = tokio::spawn(run_aster_worker(normal_rx, priority_rx, events_tx, rest));
+        first_rx.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        priority_tx.send(ExecCommand::Cancel {
+            market: "BTC".into(), side: Side::Buy, client_id: "urgent".into(),
+            venue_order_id: Some("2".into()),
+        }).await.unwrap();
+        let request = tokio::time::timeout(Duration::from_secs(1), server).await
+            .expect("priority cancel waited behind the 60-second normal limiter").unwrap();
+        assert!(request.contains("origClientOrderId=urgent"), "{request}");
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn maker_cancelled_during_rate_limit_wait_is_never_sent() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut stream).await;
+            reply_http(&mut stream, "200 OK", r#"{"orderId":1,"status":"NEW","clientOrderId":"first"}"#).await;
+            listener
+        });
+        let mut rest = rest_at(&url);
+        rest.max_rest_requests_per_minute = 1;
+        let (events_tx, mut events_rx) = mpsc::channel(8);
+        let (normal_tx, normal_rx) = mpsc::channel(8);
+        let (_priority_tx, priority_rx) = mpsc::channel(8);
+        let queued = MakerPermit::for_test();
+        for (id, permit) in [("first", MakerPermit::for_test()), ("queued", queued.clone())] {
+            normal_tx.send(ExecCommand::Place {
+                market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
+                qty_lots: 10, client_id: id.into(), permit,
+            }).await.unwrap();
+        }
+        let worker = tokio::spawn(run_aster_worker(normal_rx, priority_rx, events_tx, rest));
+        assert!(matches!(events_rx.recv().await, Some(ExecEvent::PlaceAck { client_id, .. }) if client_id == "first"));
+        let listener = server.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(queued.cancel_queued(), "queued maker was claimed before its rate-limit wait ended");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let event = tokio::time::timeout(Duration::from_secs(1), events_rx.recv()).await.unwrap();
+        assert!(matches!(event, Some(ExecEvent::PlaceReject { client_id, .. }) if client_id == "queued"));
+        assert!(tokio::time::timeout(Duration::from_millis(1), listener.accept()).await.is_err(),
+            "revoked maker reached the HTTP transport");
+        worker.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_claimed_maker_cannot_emit_a_false_unsent_rejection() {
+        let permit = MakerPermit::for_test();
+        assert!(permit.try_claim(crate::hotpath::clock::mono_now_ns()));
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut limiter = RestCommandLimiter::new(100);
+        let mut backoff = None;
+        let cmd = ExecCommand::Place {
+            market: "BTC".into(), side: Side::Buy, price_ticks: 1000,
+            qty_lots: 10, client_id: "claimed".into(), permit: permit.clone(),
+        };
+        assert!(process_cmd(cmd.clone(), false, &tx, &rest_at("http://127.0.0.1:9"),
+            &mut limiter, &mut backoff).await.is_none());
+        send_backoff_reject(&tx, cmd, "backoff".into(), 1).await;
+        assert!(matches!(rx.try_recv(), Ok(ExecEvent::AsterRateLimited { .. })));
+        assert!(rx.try_recv().is_err(), "duplicate must retain the original unresolved ownership");
+        assert!(!permit.is_cancelled());
     }
 
     #[tokio::test]
@@ -1039,7 +1282,7 @@ mod tests {
                     side: Side::Buy,
                     price_ticks: 1000 + i,
                     qty_lots: 10,
-                    client_id: format!("P{i}"),
+                    client_id: format!("P{i}"), permit: MakerPermit::for_test(),
                 })
                 .await
                 .unwrap();
@@ -1062,10 +1305,10 @@ mod tests {
             matches!(first, ExecEvent::CancelReject { ref client_id, .. } if client_id == "C-prio"),
             "priority cancel must be processed before the queued places, got {first:?}"
         );
-        // The queued places still execute (PlaceUnknown via refused transport).
+        // The queued places still execute (known pre-send rejection via refused transport).
         let mut places = 0;
         while let Some(ev) = ev_rx.recv().await {
-            if matches!(ev, ExecEvent::PlaceUnknown { .. }) {
+            if matches!(ev, ExecEvent::PlaceReject { .. }) {
                 places += 1;
             }
         }
@@ -1189,8 +1432,8 @@ mod tests {
         // code 0 is a success echo too.
         assert!(reject_body_error("/p", r#"{"code":0}"#).is_ok());
         // Arrays and non-JSON pass through unchanged (classification belongs elsewhere).
-        assert_eq!(reject_body_error("/p", "[]").unwrap(), "[]");
-        assert_eq!(reject_body_error("/p", "not json").unwrap(), "not json");
+        assert!(reject_body_error("/p", "[]").is_err());
+        assert!(reject_body_error("/p", "not json").is_err());
     }
 
     #[test]
@@ -1221,19 +1464,4 @@ mod tests {
         assert!(err.contains("-1003"), "{err}");
     }
 
-    #[test]
-    fn signed_request_builds_real_signature() {
-        // Smoke: building the signed params for a place must not error at the signer.
-        let r = rest();
-        let p = r.place_params(&"BTC".into(), Side::Buy, 1000, 5, "Xs-BTC-B-0", false).unwrap();
-        // We can't hit the network in a unit test, but we can confirm signing succeeds by
-        // re-creating the json_str + nonce path the way signed_request does.
-        let mut params = p;
-        params.push(("recvWindow".into(), ASTER_RECV_WINDOW.into()));
-        params.push(("timestamp".into(), "1700000000000".into()));
-        let map: std::collections::BTreeMap<&str, &str> = params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        let json_str = serde_json::to_string(&map).unwrap();
-        let sig = r.signer.sign_v3(&json_str, 1_700_000_000_000_000).unwrap();
-        assert!(sig.0.starts_with("0x") && sig.0.len() == 132); // 0x + 130 hex (65 bytes)
-    }
 }

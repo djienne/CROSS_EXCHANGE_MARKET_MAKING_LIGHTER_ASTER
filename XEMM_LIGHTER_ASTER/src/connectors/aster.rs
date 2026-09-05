@@ -195,6 +195,10 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
                 return;
             }
             let exch_ts = ms_to_dt(t.ts_ms());
+            if crate::hot_types::source_age_at_receive_ms(t.ts_ms(), chrono::Utc::now().timestamp_millis()) == i64::MAX {
+                tap.mark_stream_down();
+                return;
+            }
             #[cfg(feature = "hotpath")]
             let prebuilt_hot = tap.hot_book_from_raw(
                 std::iter::once((t.bid_px, t.bid_qty)),
@@ -217,6 +221,10 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
     } else if stream.contains("@depth") {
         if let Ok(d) = serde_json::from_str::<DepthMsg<'_>>(data.get()) {
             let exch_ts = ms_to_dt(d.event_time);
+            if crate::hot_types::source_age_at_receive_ms(d.event_time, chrono::Utc::now().timestamp_millis()) == i64::MAX {
+                tap.mark_stream_down();
+                return;
+            }
             #[cfg(feature = "hotpath")]
             let prebuilt_hot = tap.hot_book_from_raw(
                 d.bids.iter().map(|r| (r[0], r[1])),
@@ -250,7 +258,7 @@ fn to_levels(rows: &[[&str; 2]]) -> Vec<PriceLevel> {
 }
 
 fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
-    if ms > 0 { chrono::DateTime::from_timestamp_millis(ms).unwrap_or_else(chrono::Utc::now) } else { chrono::Utc::now() }
+    chrono::DateTime::from_timestamp_millis(ms.max(0)).unwrap_or(chrono::DateTime::UNIX_EPOCH)
 }
 
 #[cfg(test)]
@@ -258,6 +266,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    #[cfg(feature = "hotpath")]
     async fn invalid_book_ticker_never_latches_the_hot_only_guard() {
         // A crossed/zero-qty bookTicker frame must be a complete no-op. Before the
         // validate-first reorder, the hot-only publish fired before validation and the

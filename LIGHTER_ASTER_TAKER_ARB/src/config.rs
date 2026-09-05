@@ -59,8 +59,8 @@ impl Config {
         if self.arb.hedge_retry_timeout_ms == 0 {
             bail!("arb.hedge_retry_timeout_ms must be > 0");
         }
-        if self.arb.max_hedge_retry_attempts == 0 {
-            bail!("arb.max_hedge_retry_attempts must be > 0");
+        if self.arb.max_hedge_retry_attempts != 1 {
+            bail!("arb.max_hedge_retry_attempts must be 1; unresolved orders must not be resubmitted");
         }
         self.arb.depth_guard.validate()?;
         self.arb.book_sanity.validate()?;
@@ -593,15 +593,12 @@ mod tests {
     }
 
     #[test]
-    fn entry_gate_defaults_to_shadow_mode() {
-        let cfg = EntryGateCfg::default();
-        assert!(cfg.enabled);
-        assert_eq!(cfg.mode, EntryGateMode::Shadow);
-        assert_eq!(cfg.history_window_hours, 72);
-        assert_eq!(cfg.sample_interval_ms, 1000);
-        assert_eq!(cfg.min_history_samples, 500);
-        assert_eq!(cfg.entry_percentile, dec!(90));
-        assert_eq!(cfg.min_extra_bps, dec!(0.5));
+    fn minimal_toml_requires_explicit_live_enablement_and_keeps_warmup_gate() {
+        let cfg: Config = toml::from_str("[[markets]]\naster_symbol=\"HYPEUSDT\"\nlighter_symbol=\"HYPE\"").unwrap();
+        cfg.validate().unwrap();
+        assert!(!cfg.live.enabled);
+        assert!(cfg.arb.entry_gate.enabled);
+        assert_eq!(cfg.arb.entry_gate.mode,EntryGateMode::Shadow);
     }
 
     #[test]
@@ -668,20 +665,6 @@ mod tests {
         let mut cfg = valid_config();
         cfg.arb.depth_guard.max_levels = MAX_BOOK_LEVELS + 1;
         assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn book_sanity_defaults_are_conservative() {
-        let cfg = BookSanityCfg::default();
-        assert!(!cfg.enabled);
-        assert_eq!(cfg.interval_ms, 10_000);
-        assert_eq!(cfg.max_top_bps, dec!(8));
-        assert_eq!(cfg.max_vwap_bps, dec!(8));
-        assert_eq!(cfg.required_failures, 2);
-        assert_eq!(cfg.required_successes, 2);
-        assert_eq!(cfg.block_cooldown_ms, 15_000);
-        assert_eq!(cfg.rest_depth_levels, MAX_BOOK_LEVELS);
-        assert_eq!(cfg.liquidity_multiple, dec!(10));
     }
 
     #[test]

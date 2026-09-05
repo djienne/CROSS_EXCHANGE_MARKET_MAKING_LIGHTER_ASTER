@@ -16,7 +16,10 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::command::{ExecEvent, HedgeCommand};
+use super::command::{ExecEvent, HedgeCommand, ExecutionTrade};
+use crate::livebot::fills::{HedgeIntent, WireProof, IntentPurpose};
+use crate::livebot::account::Venue;
+use crate::livebot::journal::Journal;
 use super::creds::LighterCreds;
 use crate::book::OrderBook;
 use crate::connectors::rest_book;
@@ -74,196 +77,156 @@ pub struct LighterOrderPlan {
     pub reduce_only: bool,
 }
 
+fn order_plan(wire: &LighterMarketWire, side: Side, price: Decimal, qty: Decimal,
+    client_order_index: i64, reduce_only: bool, order_type: i32) -> Result<LighterOrderPlan> {
+    Ok(LighterOrderPlan { market_index: wire.market_index, client_order_index,
+        base_amount: raw_amount(qty, wire.size_decimals)?, price: raw_price(price, wire.price_decimals, side)?,
+        order_expiry: DEFAULT_IOC_EXPIRY, is_ask: side == Side::Sell, order_type,
+        time_in_force: TIF_IMMEDIATE_OR_CANCEL, reduce_only })
+}
+
+const FILL_ROUTE_CAPACITY: usize = 256;
+const RESOLUTION_BUDGET: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone)]
-struct LighterFill {
-    qty: Decimal,
-    px: Decimal,
-    fee_usd: Decimal,
+enum FillUpdate {
+    Trade(TradePayload),
+    Order(RemoteOrder),
+}
+
+struct FillSink {
+    token: u64,
+    tx: mpsc::Sender<FillUpdate>,
+    overflow: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
 struct FillTracker {
-    pending: Mutex<HashMap<i64, (u64, mpsc::UnboundedSender<TradePayload>)>>,
+    pending: Mutex<HashMap<i64, FillSink>>,
     next_token: std::sync::atomic::AtomicU64,
 }
 
 impl FillTracker {
-    /// Register a fill listener for `client_order_index`. Returns a registration token:
-    /// `unregister` removes the route only while the token still matches, so a stale or
-    /// aborted waiter can never delete a NEWER order's fill route. A colliding register
-    /// (same index while one is pending) should be unreachable now that recovery/flatten
-    /// cloids are salted — if it ever happens it is logged at error and the newer order
-    /// wins; the older waiter degrades to a fill-timeout (HedgeUnknown, fail-closed),
-    /// never to fill mis-attribution.
-    fn register(&self, client_order_index: i64) -> (u64, mpsc::UnboundedReceiver<TradePayload>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let token = self
-            .next_token
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1;
-        let prev = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(client_order_index, (token, tx));
-        if prev.is_some() {
-            tracing::error!(
-                "FillTracker register collision on client_order_index {client_order_index}; \
-                 replacing the older listener (it will report Unknown)"
-            );
+    fn register(&self, client_order_index: i64) -> Result<(u64, Receiver<FillUpdate>, Arc<AtomicBool>)> {
+        let (tx, rx) = mpsc::channel(FILL_ROUTE_CAPACITY);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains_key(&client_order_index) {
+            bail!("fill route identity already outstanding: {client_order_index}");
         }
-        (token, rx)
+        let token = self.next_token.fetch_add(1, Ordering::Relaxed) + 1;
+        pending.insert(client_order_index, FillSink { token, tx, overflow: overflow.clone() });
+        Ok((token, rx, overflow))
     }
 
     fn unregister(&self, client_order_index: i64, token: u64) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        if pending
-            .get(&client_order_index)
-            .is_some_and(|(t, _)| *t == token)
-        {
+        if pending.get(&client_order_index).is_some_and(|s| s.token == token) {
             pending.remove(&client_order_index);
         }
     }
 
-    fn on_trade(&self, trade: TradePayload) {
-        let ids = [trade.ask_client_id, trade.bid_client_id];
+    fn deliver(&self, client_order_index: i64, update: FillUpdate) {
         let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        for id in ids.into_iter().flatten() {
-            if let Some((_, tx)) = pending.get(&id) {
-                let _ = tx.send(trade.clone());
+        if let Some(sink) = pending.get(&client_order_index) {
+            if sink.tx.try_send(update).is_err() {
+                sink.overflow.store(true, Ordering::Release);
             }
+        }
+    }
+
+    fn on_trade(&self, trade: TradePayload) {
+        for id in [trade.ask_client_id, trade.bid_client_id].into_iter().flatten() {
+            self.deliver(id, FillUpdate::Trade(trade.clone()));
+        }
+    }
+
+    fn on_order(&self, order: &RemoteOrder) {
+        if let Some(id) = order.client_order_index {
+            self.deliver(id, FillUpdate::Order(order.clone()));
         }
     }
 }
 
 fn lighter_trade_key(trade: &TradePayload) -> String {
-    if let Some(id) = trade.trade_id {
-        return format!("id:{id}");
-    }
-    format!(
-        "fallback:{:?}",
-        (
-            trade.ask_id,
-            trade.bid_id,
-            trade.ask_client_id,
-            trade.bid_client_id,
-            trade.price.as_deref(),
-            trade.size.as_deref(),
-            trade.usd_amount.as_deref(),
-            trade.timestamp,
-            trade.transaction_time,
-            &trade.maker_fee,
-            &trade.taker_fee,
-        )
-    )
+    if let Some(id) = trade.trade_id { return format!("id:{id}"); }
+    format!("fallback:{:?}", (trade.ask_id, trade.bid_id, trade.ask_client_id,
+        trade.bid_client_id, &trade.price, &trade.size, trade.timestamp, trade.transaction_time))
 }
 
-fn record_lighter_fill_trade(
-    trade: &TradePayload,
-    seen: &mut HashSet<String>,
-    qty: &mut Decimal,
-    notional: &mut Decimal,
-    fee_usd: &mut Decimal,
-) -> bool {
-    if !seen.insert(lighter_trade_key(trade)) {
-        return false;
-    }
-    let q = trade
-        .size
-        .as_deref()
-        .and_then(|s| s.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO);
-    let p = trade
-        .price
-        .as_deref()
-        .and_then(|s| s.parse::<Decimal>().ok())
-        .unwrap_or(Decimal::ZERO);
-    if q > Decimal::ZERO && p > Decimal::ZERO {
-        *qty += q;
-        *notional += q * p;
-        *fee_usd += trade_fee_usd(trade);
-        return true;
-    }
-    false
+/// A fill's selected fee is a signed rate in millionths of USD notional.
+/// Omission means zero; explicit null/malformed data stays unknown.
+fn own_trade_evidence(tr: &TradePayload, intent: &HedgeIntent, account: i64, order_id: Option<i64>) -> Option<ExecutionTrade> {
+    let index = intent.cloid.to_lighter_client_order_index();
+    let ask = tr.ask_client_id == Some(index) || order_id.is_some_and(|id| tr.ask_id == Some(id));
+    let bid = tr.bid_client_id == Some(index) || order_id.is_some_and(|id| tr.bid_id == Some(id));
+    if ask == bid { return None; }
+    if (ask && tr.ask_account_id.is_some_and(|a| a != account))
+        || (bid && tr.bid_account_id.is_some_and(|a| a != account)) { return None; }
+    let side = if ask { Side::Sell } else { Side::Buy };
+    if side != intent.hedge_side { return None; }
+    let qty = tr.size.as_deref()?.parse::<Decimal>().ok()?;
+    let px = tr.price.as_deref()?.parse::<Decimal>().ok()?;
+    if qty <= Decimal::ZERO || px <= Decimal::ZERO { return None; }
+    let notional = qty * px;
+    let maker = tr.is_maker_ask.map(|m| m == ask).unwrap_or(false); // known IOC provenance
+    let selected = if maker { tr.maker_fee.as_ref() } else { tr.taker_fee.as_ref() };
+    let fee_ticks = match selected { None => Some(Decimal::ZERO), Some(v) => value_dec(Some(v)) };
+    // A submitted IOC cannot be the maker: preserve the fill but flag contradictory fee evidence.
+    let fee_usd = if maker { None } else { fee_ticks.map(|r| notional * r / Decimal::from(1_000_000)) };
+    Some(ExecutionTrade {
+        attempt_id: intent.cloid.to_hex(), logical_id: intent.logical_id.to_hex(), venue: Venue::Hyperliquid,
+        market: intent.market.0.clone(), side, trade_id: lighter_trade_key(tr), identity_complete: tr.trade_id.is_some_and(|id| id > 0), event_time_ms: if tr.transaction_time.or(tr.timestamp).is_some_and(|t| t > 0) { tr.event_time_ms().filter(|t| *t > 0) } else { None },
+        order_id: (if ask { tr.ask_id } else { tr.bid_id }).map(|x| x.to_string()),
+        client_order_index: index, qty, px, notional_usd: notional,
+        maker: Some(maker), fee_ticks, fee_usd,
+    })
 }
 
-/// Outcome of the SEND PHASE of a hedge/flatten IOC (see `send_hedge_tx`).
-enum HedgeSendOutcome {
-    /// The dispatch resolved at send time (build/sign failure, venue reject, not-sent,
-    /// unknown). Emit this event; there is nothing to wait for.
-    /// `refresh_nonce_after_emit`: run the nonce `hard_refresh` (REST, up to ~10s) in
-    /// the worker loop AFTER forwarding the event — the strategy's freeze decision must
-    /// not wait behind a REST round trip during exactly the degraded-venue window, and
-    /// nonce serialization only requires the refresh to complete before the NEXT
-    /// command reserves a nonce (which the serial loop guarantees).
-    Terminal {
-        ev: ExecEvent,
-        refresh_nonce_after_emit: bool,
-    },
-    /// The venue accepted the tx: run the wait phase (fill aggregation) — safe to do OFF
-    /// the worker loop, it touches neither the nonce manager nor the tx socket.
-    AwaitFills {
-        client_order_index: i64,
-        token: u64,
-        rx: mpsc::UnboundedReceiver<TradePayload>,
-        requested_qty: Decimal,
-    },
+#[derive(Default)]
+struct FillTotals {
+    trades: HashMap<String, ExecutionTrade>,
 }
 
-/// Cancellation-safe unregister for a spawned wait task: if the task is aborted (bounded
-/// shutdown drain), the fill route is still removed. Token-scoped, so a double unregister
-/// (guard + `wait_fill`'s own) is a harmless no-op and can never evict a newer route.
-struct FillRouteGuard {
-    fills: Arc<FillTracker>,
-    client_order_index: i64,
-    token: u64,
-}
-
-impl Drop for FillRouteGuard {
-    fn drop(&mut self) {
-        self.fills.unregister(self.client_order_index, self.token);
-    }
-}
-
-/// Collect `account_all` fill events for one IOC dispatch until the venue-visible requested
-/// quantity is reached (an IOC cannot overfill, so this is the fully-filled fast path — no
-/// artificial grace delay) or `fill_timeout` expires. Partials that trickle in late are
-/// still counted right up to the timeout, so a slow multi-trade IOC is never under-reported
-/// as PartiallyFilled while the venue actually filled it.
-///
-/// Free function (not `&self`) so a spawned waiter task can run it without borrowing the
-/// exchange; `token` scopes the unregister to THIS registration (see [`FillTracker`]).
-async fn wait_fill(
-    fills: &FillTracker,
-    client_order_index: i64,
-    token: u64,
-    mut rx: mpsc::UnboundedReceiver<TradePayload>,
-    requested_qty: Decimal,
-    fill_timeout: Duration,
-) -> Option<LighterFill> {
-    let deadline = tokio::time::Instant::now() + fill_timeout;
-    let mut seen = HashSet::new();
-    let mut qty = Decimal::ZERO;
-    let mut notional = Decimal::ZERO;
-    let mut fee_usd = Decimal::ZERO;
-    while !(requested_qty > Decimal::ZERO && qty >= requested_qty) {
-        match tokio::time::timeout_at(deadline, rx.recv()).await {
-            Ok(Some(tr)) => {
-                record_lighter_fill_trade(&tr, &mut seen, &mut qty, &mut notional, &mut fee_usd);
-            }
-            _ => break, // timeout, or the fill route was closed
+impl FillTotals {
+    fn observe(&mut self, tr: &TradePayload, intent: &HedgeIntent, account: i64, order_id: Option<i64>) -> Option<ExecutionTrade> {
+        let evidence = own_trade_evidence(tr, intent, account, order_id)?;
+        // Without a venue trade ID a repeat cannot be distinguished from a second
+        // identical fill. Keep the raw evidence, but wait for terminal/history
+        // quantity instead of treating this as uniquely counted execution.
+        if !evidence.identity_complete { return Some(evidence); }
+        if let Some(old) = self.trades.get(&evidence.trade_id) {
+            if old.qty != evidence.qty || old.px != evidence.px { return None; }
+            if old.fee_usd.is_some() || evidence.fee_usd.is_none() { return None; }
         }
+        self.trades.insert(evidence.trade_id.clone(), evidence.clone());
+        Some(evidence)
     }
-    fills.unregister(client_order_index, token);
-    if qty > Decimal::ZERO {
-        Some(LighterFill {
-            qty,
-            px: notional / qty,
-            fee_usd,
-        })
-    } else {
-        None
+
+    fn values(&self) -> (Decimal, Decimal, Option<Decimal>) {
+        let mut qty = Decimal::ZERO;
+        let mut quote = Decimal::ZERO;
+        let mut fee = Some(Decimal::ZERO);
+        for tr in self.trades.values() {
+            qty += tr.qty;
+            quote += tr.notional_usd;
+            fee = fee.zip(tr.fee_usd).map(|(a, b)| a + b);
+        }
+        (qty, quote, fee)
     }
+}
+
+enum HedgeSendOutcome {
+    Terminal { ev: ExecEvent, refresh_nonce_after_emit: bool, proof: Option<WireProof> },
+    AwaitFills {
+        token: u64, rx: Receiver<FillUpdate>, overflow: Arc<AtomicBool>,
+        requested_qty: Decimal, proof: WireProof, ambiguous: bool,
+    },
+}
+
+struct FillRouteGuard { fills: Arc<FillTracker>, client_order_index: i64, token: u64 }
+impl Drop for FillRouteGuard {
+    fn drop(&mut self) { self.fills.unregister(self.client_order_index, self.token); }
 }
 
 #[derive(Default)]
@@ -441,6 +404,7 @@ struct LighterBook {
     asks: BTreeMap<Decimal, Decimal>,
     initialized: bool,
     updated_at: Option<DateTime<Utc>>,
+    source_ts: Option<DateTime<Utc>>,
     last_nonce: Option<i64>,
     last_offset: Option<u64>,
 }
@@ -471,6 +435,7 @@ impl LighterBook {
             return false;
         }
         self.updated_at = Some(Utc::now());
+        self.source_ts = msg.source_time_ms().and_then(DateTime::from_timestamp_millis);
         self.last_nonce = msg.order_book.nonce.or(self.last_nonce);
         self.last_offset = msg.effective_offset().or(self.last_offset);
         true
@@ -484,9 +449,20 @@ impl LighterBook {
         Some(OrderBook::from_levels(
             self.bids.iter().rev().map(|(p, q)| (*p, *q)),
             self.asks.iter().map(|(p, q)| (*p, *q)),
-            ts,
+            self.source_ts.unwrap_or_default(),
             ts,
         ))
+    }
+}
+
+#[derive(Clone)]
+pub struct HedgeReadiness {
+    socket: Arc<TxWebSocket>,
+    nonce_uncertain: Arc<AtomicBool>,
+}
+impl HedgeReadiness {
+    pub fn is_ready(&self) -> bool {
+        self.socket.is_ready() && !self.nonce_uncertain.load(Ordering::Acquire)
     }
 }
 
@@ -498,6 +474,7 @@ pub struct HlExchange {
     tx_ws: Arc<TxWebSocket>,
     signer: Arc<Signer>,
     nonce: Arc<NonceManager>,
+    nonce_uncertain: Arc<AtomicBool>,
     account_index: i64,
     api_key_index: i32,
     base_url: String,
@@ -560,6 +537,7 @@ impl HlExchange {
             tx_ws,
             signer,
             nonce,
+            nonce_uncertain: Arc::new(AtomicBool::new(false)),
             account_index: creds.account_index,
             api_key_index: creds.api_key_index,
             base_url,
@@ -572,6 +550,12 @@ impl HlExchange {
             fill_timeout: Duration::from_millis(fill_timeout_ms.max(250) as u64),
             ws_account_max_age: Duration::from_millis(ws_account_max_age_ms.max(250) as u64),
         })
+    }
+
+    pub fn tx_ready(&self) -> bool { self.tx_ws.is_ready() && !self.nonce_uncertain.load(Ordering::Acquire) }
+
+    pub fn readiness(&self) -> HedgeReadiness {
+        HedgeReadiness { socket: self.tx_ws.clone(), nonce_uncertain: self.nonce_uncertain.clone() }
     }
 
     fn wire(&self, market: &MarketId) -> Result<&LighterMarketWire> {
@@ -708,6 +692,7 @@ impl HlExchange {
         opts.reconnect_base = 0.5;
         let known_markets = self.known_lighter_markets();
         let state = self.account_feed.clone();
+        let fills = self.fills.clone();
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
@@ -716,6 +701,7 @@ impl HlExchange {
                     move || auth_map(&signer, api_key_index, &auth_channel),
                     move |frame| {
                         if let Ok(msg) = serde_json::from_str::<AccountOrdersMsg>(frame.raw) {
+                            for order in msg.orders.values().flatten() { fills.on_order(order); }
                             state.set_open_orders_for_markets(&known_markets, &msg.orders);
                         }
                     },
@@ -783,52 +769,14 @@ impl HlExchange {
         })
     }
 
-    pub fn build_ioc_limit_plan(
-        &self,
-        market: &MarketId,
-        side: Side,
-        px: Decimal,
-        sz: Decimal,
-        client_order_index: i64,
-        reduce_only: bool,
-    ) -> Result<LighterOrderPlan> {
-        let w = self.wire(market)?;
-        Ok(LighterOrderPlan {
-            market_index: w.market_index,
-            client_order_index,
-            base_amount: raw_amount(sz, w.size_decimals)?,
-            price: raw_price(px, w.price_decimals, side)?,
-            order_expiry: DEFAULT_IOC_EXPIRY,
-            is_ask: matches!(side, Side::Sell),
-            order_type: ORDER_TYPE_LIMIT,
-            time_in_force: TIF_IMMEDIATE_OR_CANCEL,
-            reduce_only,
-        })
+    pub fn build_ioc_limit_plan(&self, market: &MarketId, side: Side, px: Decimal, sz: Decimal,
+        client_order_index: i64, reduce_only: bool) -> Result<LighterOrderPlan> {
+        order_plan(self.wire(market)?, side, px, sz, client_order_index, reduce_only, ORDER_TYPE_LIMIT)
     }
 
-    pub fn build_market_plan(
-        &self,
-        market: &MarketId,
-        side: Side,
-        px_bound: Decimal,
-        sz: Decimal,
-        client_order_index: i64,
-        reduce_only: bool,
-    ) -> Result<LighterOrderPlan> {
-        let w = self.wire(market)?;
-        Ok(LighterOrderPlan {
-            market_index: w.market_index,
-            client_order_index,
-            base_amount: raw_amount(sz, w.size_decimals)?,
-            // Native MARKET orders still require a positive marketable price bound.
-            // A non-marketable bound can be accepted by sendtx without opening a position.
-            price: raw_price(px_bound, w.price_decimals, side)?,
-            order_expiry: DEFAULT_IOC_EXPIRY,
-            is_ask: matches!(side, Side::Sell),
-            order_type: ORDER_TYPE_MARKET,
-            time_in_force: TIF_IMMEDIATE_OR_CANCEL,
-            reduce_only,
-        })
+    pub fn build_market_plan(&self, market: &MarketId, side: Side, px_bound: Decimal, sz: Decimal,
+        client_order_index: i64, reduce_only: bool) -> Result<LighterOrderPlan> {
+        order_plan(self.wire(market)?, side, px_bound, sz, client_order_index, reduce_only, ORDER_TYPE_MARKET)
     }
 
     pub fn sign_order_plan(&self, plan: &LighterOrderPlan, nonce: i64) -> Result<SignedTx> {
@@ -859,127 +807,73 @@ impl HlExchange {
     /// `hard_refresh`), which must observe the outcome before the next command's nonce is
     /// reserved. Only a wire-accepted order returns `AwaitFills`; the caller runs the wait
     /// phase (which touches neither nonce nor socket) off the worker's critical path.
-    async fn send_hedge_tx(
-        &self,
-        market: &MarketId,
-        side: Side,
-        px: Decimal,
-        sz: Decimal,
-        cloid: Cloid,
-        reduce_only: bool,
-    ) -> HedgeSendOutcome {
+    async fn send_hedge_tx(&self, intent: &HedgeIntent, px: Decimal) -> HedgeSendOutcome {
+        let cloid = intent.cloid;
         let client_order_index = cloid.to_lighter_client_order_index();
-        let plan = match self.build_ioc_limit_plan(
-            market,
-            side,
-            px,
-            sz,
-            client_order_index,
-            reduce_only,
-        ) {
-            Ok(p) => p,
-            Err(e) => {
-                return HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeReject {
-                        cloid,
-                        reason: e.to_string(),
-                    },
-                    refresh_nonce_after_emit: false,
-                }
-            }
+        let plan = match self.build_ioc_limit_plan(&intent.market, intent.hedge_side, px, intent.qty,
+            client_order_index, intent.purpose == IntentPurpose::ReduceDelta) {
+            Ok(plan) => plan,
+            Err(e) => return HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent {
+                cloid, reason: e.to_string() }, refresh_nonce_after_emit: false, proof: None },
         };
-        // The venue-visible quantity: raw_amount FLOORS sz to the size step, so comparing
-        // fills against the raw `sz` would make a fully-filled order look partial and burn
-        // the whole fill timeout on the happy path.
-        let requested_qty = match self.wire(market) {
+        let requested_qty = match self.wire(&intent.market) {
             Ok(w) => Decimal::new(plan.base_amount, w.size_decimals),
-            Err(e) => {
-                return HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeReject {
-                        cloid,
-                        reason: e.to_string(),
-                    },
-                    refresh_nonce_after_emit: false,
-                }
-            }
+            Err(e) => return HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent {
+                cloid, reason: e.to_string() }, refresh_nonce_after_emit: false, proof: None },
         };
-        let (fill_token, fill_rx) = self.fills.register(client_order_index);
+        let (token, rx, overflow) = match self.fills.register(client_order_index) {
+            Ok(route) => route,
+            Err(e) => return HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent {
+                cloid, reason: e.to_string() }, refresh_nonce_after_emit: false, proof: None },
+        };
         let nonce = self.nonce.next();
         let sign_start_ns = crate::hotpath::clock::mono_now_ns();
         let signed = match self.sign_order_plan(&plan, nonce) {
             Ok(tx) => tx,
             Err(e) => {
                 self.nonce.acknowledge_failure();
-                self.fills.unregister(client_order_index, fill_token);
-                return HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeReject {
-                        cloid,
-                        reason: e.to_string(),
-                    },
-                    refresh_nonce_after_emit: false,
-                };
+                self.fills.unregister(client_order_index, token);
+                return HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent {
+                    cloid, reason: e.to_string() }, refresh_nonce_after_emit: true, proof: None };
             }
         };
-        let sign_ns = crate::hotpath::clock::mono_now_ns() - sign_start_ns;
-        let send_start_ns = crate::hotpath::clock::mono_now_ns();
-        let send_result = self.send_signed(signed).await;
-        // Cold (post-wire): per-hedge sign + wire-accept cost, stamped BEFORE outcome
-        // handling so send_us measures the wire round trip only (reject classification
-        // or a nonce refresh must not inflate the latency telemetry). The FFI sign was
-        // the one unmeasured term in the fill->hedge latency budget; hedges are sparse
-        // enough that one line per dispatch is free.
-        info!(
-            "hedge timing: coi={} sign_us={} send_us={}",
-            client_order_index,
-            sign_ns / 1_000,
-            (crate::hotpath::clock::mono_now_ns() - send_start_ns) / 1_000
-        );
-        match send_result {
-            r if r.status == TxSendStatus::Ok => HedgeSendOutcome::AwaitFills {
-                client_order_index,
-                token: fill_token,
-                rx: fill_rx,
-                requested_qty,
-            },
-            r if r.status == TxSendStatus::Rejected => {
-                self.fills.unregister(client_order_index, fill_token);
-                // A nonce-shaped reject means the local optimistic counter desynced from
-                // the venue (the reject consumed nothing); without a refresh EVERY
-                // subsequent hedge would reject the same way and the recovery path (same
-                // nonce manager) could not execute either. Cold path — REST is fine; the
-                // worker runs it after forwarding the event (see HedgeSendOutcome).
-                let nonce_shaped = r.message.to_ascii_lowercase().contains("nonce");
-                if nonce_shaped {
-                    warn!("Lighter nonce-shaped reject ({}); hard-refreshing nonce after emit", r.message);
-                }
-                HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeReject {
-                        cloid,
-                        reason: format!("Lighter reject code={} {}", r.code, r.message),
-                    },
-                    refresh_nonce_after_emit: nonce_shaped,
-                }
+        let sent_ns = crate::hotpath::clock::mono_now_ns();
+        let proof = WireProof { tx_hash: Some(signed.tx_hash.clone()), nonce: Some(nonce),
+            client_order_index: Some(client_order_index), sent_ns };
+        if sent_ns >= intent.admission.deadline_ns {
+            self.nonce.rollback(1);
+            self.fills.unregister(client_order_index, token);
+            return HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent {
+                cloid, reason: "execution deadline elapsed before write".into() },
+                refresh_nonce_after_emit: false, proof: Some(proof) };
+        }
+        let result = self.send_signed(signed).await;
+        info!("hedge timing: coi={} queue_us={} sign_us={} response_us={}", client_order_index,
+            sign_start_ns.saturating_sub(intent.created_ns) / 1_000,
+            sent_ns.saturating_sub(sign_start_ns) / 1_000,
+            crate::hotpath::clock::mono_now_ns().saturating_sub(sent_ns) / 1_000);
+        match result.status {
+            TxSendStatus::Ok => HedgeSendOutcome::AwaitFills { token, rx, overflow,
+                requested_qty, proof, ambiguous: false },
+            TxSendStatus::Rejected => {
+                self.fills.unregister(client_order_index, token);
+                HedgeSendOutcome::Terminal { ev: ExecEvent::HedgeReject { cloid,
+                    reason: format!("Lighter reject code={} {}", result.code, result.message) },
+                    refresh_nonce_after_emit: true, proof: Some(proof) }
             }
-            r if r.status == TxSendStatus::NotSent => {
+            TxSendStatus::NotSent => {
                 self.nonce.rollback(1);
-                self.fills.unregister(client_order_index, fill_token);
-                HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeReject {
-                        cloid,
-                        reason: format!("{HEDGE_NOT_SENT_PREFIX} {}", r.message),
-                    },
-                    refresh_nonce_after_emit: false,
-                }
+                self.fills.unregister(client_order_index, token);
+                HedgeSendOutcome::Terminal { ev: ExecEvent::AttemptNotSent { cloid,
+                    reason: format!("{HEDGE_NOT_SENT_PREFIX} {}", result.message) },
+                    refresh_nonce_after_emit: false, proof: Some(proof) }
             }
-            r => {
-                self.fills.unregister(client_order_index, fill_token);
-                HedgeSendOutcome::Terminal {
-                    ev: ExecEvent::HedgeUnknown {
-                        cloid,
-                        reason: format!("Lighter tx outcome unknown: {}", r.message),
-                    },
-                    refresh_nonce_after_emit: true,
-                }
+            _ => {
+                self.nonce_uncertain.store(true, Ordering::Release);
+                // Keep route and native identity alive: response failure proves neither
+                // acceptance nor rejection. Cold resolution owns the uncertainty.
+                HedgeSendOutcome::AwaitFills { token, rx, overflow,
+                    requested_qty, proof, ambiguous: true }
             }
         }
     }
@@ -1117,13 +1011,13 @@ impl HlExchange {
         // stale cache value is last resort only if REST omitted the field entirely).
         let (account_value, withdrawable) = if use_cached_stats {
             (
-                portfolio.unwrap_or(Decimal::ZERO),
+                portfolio.ok_or_else(|| anyhow!("Lighter stats missing valid portfolio_value"))?,
                 available.unwrap_or(Decimal::ZERO),
             )
         } else {
             (
-                fallback_portfolio.or(portfolio).unwrap_or(Decimal::ZERO),
-                fallback_available.or(available).unwrap_or(Decimal::ZERO),
+                fallback_portfolio.ok_or_else(|| anyhow!("Lighter REST account missing valid portfolio_value"))?,
+                fallback_available.unwrap_or(Decimal::ZERO),
             )
         };
 
@@ -1199,6 +1093,7 @@ impl HlExchange {
             asset_positions: positions,
             withdrawable: withdrawable.normalize().to_string(),
             data_origin_ns: positions_origin_ns.min(stats_origin_ns),
+            margin_source_ns: if (use_cached_stats && available.is_some()) || (!use_cached_stats && fallback_available.is_some()) { stats_origin_ns } else { 0 },
         })
     }
 
@@ -1337,6 +1232,7 @@ pub struct HlClearinghouse {
     /// reconciler mins this into `AccountSnapshot::read_start_ns` so the orphan backstop's
     /// straddle guard sees the true data origin, not the snapshot assembly time.
     pub data_origin_ns: i64,
+    pub margin_source_ns: i64,
 }
 #[derive(Debug, Clone)]
 pub struct HlMarginSummary {
@@ -1361,225 +1257,225 @@ pub struct HlOpenOrder {
     pub sz: String,
 }
 
-pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>, ex: HlExchange) {
-    info!("lighter live hedge worker started (native signer + tx websocket)");
-    // Fill-wait continuations run here, OFF the command loop: a hedge that was accepted on
-    // the wire no longer blocks the next command for its fill_timeout, so a second maker
-    // fill's hedge hits the wire immediately instead of queueing ~2s behind the first.
-    // Everything nonce/socket-touching stays inside the loop (see send_hedge_tx).
+pub async fn run_hl_worker(mut rx: Receiver<HedgeCommand>, tx: Sender<ExecEvent>, ex: HlExchange, journal: Journal) {
+    info!("lighter hedge worker started");
     let mut waits = tokio::task::JoinSet::new();
-    let fill_timeout = ex.fill_timeout;
     while let Some(cmd) = rx.recv().await {
-        // Reap finished waiters without blocking so the set stays bounded.
         while waits.try_join_next().is_some() {}
         match cmd {
             HedgeCommand::Shutdown => {
-                // run() stops the strategy before sending Shutdown, so this queue is
-                // normally empty — but a hedge that still slipped in behind Shutdown is
-                // a real venue intent. Process it instead of dropping a fill unhedged.
-                while let Ok(late) = rx.try_recv() {
-                    if !matches!(late, HedgeCommand::Shutdown) {
-                        warn!("hedge worker shutdown: draining a queued hedge command");
-                        handle_hedge_cmd(&ex, &tx, &mut waits, fill_timeout, late).await;
-                    }
+                rx.close();
+                while let Some(cmd) = rx.recv().await {
+                    handle_hedge_cmd(&ex, &tx, &journal, &mut waits, cmd).await;
                 }
                 break;
             }
-            other => handle_hedge_cmd(&ex, &tx, &mut waits, fill_timeout, other).await,
+            cmd => handle_hedge_cmd(&ex, &tx, &journal, &mut waits, cmd).await,
         }
     }
-    drain_hl_waits(&mut waits, fill_timeout).await;
-    info!("lighter live hedge worker stopped");
+    let deadline = tokio::time::Instant::now() + RESOLUTION_BUDGET + Duration::from_secs(1);
+    while !waits.is_empty() {
+        if tokio::time::timeout_at(deadline, waits.join_next()).await.is_err() {
+            waits.abort_all();
+            while waits.join_next().await.is_some() {}
+            break;
+        }
+    }
+    info!("lighter hedge worker stopped");
 }
 
-async fn handle_hedge_cmd(
-    ex: &HlExchange,
-    tx: &Sender<ExecEvent>,
-    waits: &mut tokio::task::JoinSet<()>,
+async fn handle_hedge_cmd(ex: &HlExchange, tx: &Sender<ExecEvent>, journal: &Journal,
+    waits: &mut tokio::task::JoinSet<()>, cmd: HedgeCommand) {
+    let HedgeCommand::Hedge { mut intent, aggressive_px, .. } = cmd else { return };
+    let cloid = intent.cloid;
+    if intent.admission.is_claimed() {
+        warn!("duplicate claimed execution ticket ignored: {}", cloid.to_hex());
+        return;
+    }
+    if !ex.tx_ready() || waits.len() >= 64 {
+        intent.admission.cancel_queued();
+        if !ex.tx_ws.is_ready() { ex.tx_ws.request_reconnect(); }
+        if intent.admission.is_cancelled() {
+            let _ = tx.send(ExecEvent::AttemptNotSent { cloid,
+                reason: format!("{HEDGE_NOT_SENT_PREFIX} transport/nonce not ready or resolution capacity reached") }).await;
+        }
+        return;
+    }
+    if !intent.admission.try_claim(crate::hotpath::clock::mono_now_ns()) {
+        if intent.admission.is_cancelled() {
+            let _ = tx.send(ExecEvent::AttemptNotSent { cloid, reason: "expired or cancelled before send".into() }).await;
+        }
+        return;
+    }
+    match ex.send_hedge_tx(&intent, aggressive_px).await {
+        HedgeSendOutcome::Terminal { ev, refresh_nonce_after_emit, proof } => {
+            if let Some(proof) = proof { let _ = tx.send(ExecEvent::AttemptStarted { cloid, proof }).await; }
+            let _ = tx.send(ev).await;
+            if refresh_nonce_after_emit {
+                ex.nonce_uncertain.store(true, Ordering::Release);
+                if ex.nonce.hard_refresh(&ex.rest).await.is_ok() { ex.nonce_uncertain.store(false, Ordering::Release); }
+            }
+        }
+        HedgeSendOutcome::AwaitFills { token, rx, overflow, requested_qty, proof, ambiguous } => {
+            intent.qty = requested_qty;
+            intent.wire = Some(proof.clone());
+            let _ = tx.send(ExecEvent::AttemptStarted { cloid, proof }).await;
+            if ambiguous { let _ = tx.send(ExecEvent::HedgeUnknown { cloid, reason: "write/response outcome ambiguous; awaiting terminal evidence".into() }).await; }
+            let (ex, tx, journal) = (ex.clone(), tx.clone(), journal.clone());
+            waits.spawn(async move { resolve_attempt(ex, tx, journal, intent, token, rx, overflow, ambiguous).await; });
+        }
+    }
+}
+
+async fn publish_progress(tx: &Sender<ExecEvent>, intent: &HedgeIntent, totals: &FillTotals,
+    terminal_qty: Option<Decimal>, order_id: Option<i64>) {
+    let (observed_qty, quote, fee) = totals.values();
+    let qty = terminal_qty.unwrap_or(observed_qty);
+    let complete = qty == observed_qty;
+    let _ = tx.send(ExecEvent::ExecutionProgress { cloid: intent.cloid,
+        cumulative_qty: qty, cumulative_quote_usd: complete.then_some(quote),
+        cumulative_fee_usd: if complete { fee } else { None }, terminal: terminal_qty.is_some(),
+        venue_order_id: order_id.map(|x| x.to_string()),
+        event_time_ms: if complete { totals.trades.values().filter_map(|t| t.event_time_ms).max() } else { None } }).await;
+}
+
+struct ResolutionContext {
+    intent: HedgeIntent,
+    account: i64,
+    market: u32,
     fill_timeout: Duration,
-    cmd: HedgeCommand,
-) {
-    match cmd {
-        HedgeCommand::Hedge {
-            intent,
-            aggressive_px,
-            ..
-        } => {
-                let cloid = intent.cloid;
-                match ex
-                    .send_hedge_tx(
-                        &intent.market,
-                        intent.hedge_side,
-                        aggressive_px,
-                        intent.qty,
-                        cloid,
-                        false,
-                    )
-                    .await
-                {
-                    HedgeSendOutcome::Terminal {
-                        ev,
-                        refresh_nonce_after_emit,
-                    } => {
-                        // Event FIRST: the strategy's freeze/retry decision must not
-                        // queue behind a REST nonce refresh. The refresh still completes
-                        // before the next rx.recv(), preserving nonce serialization.
-                        let _ = tx.send(ev).await;
-                        if refresh_nonce_after_emit {
-                            let _ = ex.nonce.hard_refresh(&ex.rest).await;
-                        }
-                    }
-                    HedgeSendOutcome::AwaitFills {
-                        client_order_index,
-                        token,
-                        rx: fill_rx,
-                        requested_qty,
-                    } => {
-                        let fills = ex.fills.clone();
-                        let events = tx.clone();
-                        waits.spawn(async move {
-                            let _guard = FillRouteGuard {
-                                fills: fills.clone(),
-                                client_order_index,
-                                token,
-                            };
-                            let ev = match wait_fill(
-                                &fills,
-                                client_order_index,
-                                token,
-                                fill_rx,
-                                requested_qty,
-                                fill_timeout,
-                            )
-                            .await
-                            {
-                                Some(fill) => ExecEvent::HedgeFill {
-                                    cloid,
-                                    filled_qty: fill.qty,
-                                    px: fill.px,
-                                    fee_usd: fill.fee_usd,
-                                },
-                                None => ExecEvent::HedgeUnknown {
-                                    cloid,
-                                    reason: format!(
-                                        "Lighter accepted tx but no matching account_all fill within {fill_timeout:?}"
-                                    ),
-                                },
-                            };
-                            let _ = events.send(ev).await;
-                        });
-                    }
-                }
-            }
-            HedgeCommand::Flatten {
-                market,
-                side,
-                qty,
-                aggressive_px,
-                ..
-            } => {
-                // Flatten cloids are salted per dispatch: Lighter does NOT dedupe client
-                // order indices, so a deterministic id would collide with an equal-sized
-                // recovery hedge or an overlapping earlier flatten in the FillTracker.
-                let cloid = Cloid::flatten(
-                    &market,
-                    crate::livebot::fills::cum_scaled(qty),
-                    crate::hotpath::clock::mono_now_ns(),
-                );
-                // Reduce-only: a flatten must clamp at zero, never open the opposite
-                // direction off a stale snapshot (see exec/command.rs contract).
-                match ex
-                    .send_hedge_tx(&market, side, aggressive_px, qty, cloid, true)
-                    .await
-                {
-                    HedgeSendOutcome::Terminal {
-                        ev,
-                        refresh_nonce_after_emit,
-                    } => {
-                        let reason = match ev {
-                            ExecEvent::HedgeReject { reason, .. }
-                            | ExecEvent::HedgeUnknown { reason, .. } => reason,
-                            other => format!("unexpected flatten event {other:?}"),
-                        };
-                        let _ = tx
-                            .send(ExecEvent::HlFlattenReject {
-                                market,
-                                side,
-                                qty,
-                                reason,
-                            })
-                            .await;
-                        if refresh_nonce_after_emit {
-                            let _ = ex.nonce.hard_refresh(&ex.rest).await;
-                        }
-                    }
-                    HedgeSendOutcome::AwaitFills {
-                        client_order_index,
-                        token,
-                        rx: fill_rx,
-                        requested_qty,
-                    } => {
-                        let fills = ex.fills.clone();
-                        let events = tx.clone();
-                        waits.spawn(async move {
-                            let _guard = FillRouteGuard {
-                                fills: fills.clone(),
-                                client_order_index,
-                                token,
-                            };
-                            let ev = match wait_fill(
-                                &fills,
-                                client_order_index,
-                                token,
-                                fill_rx,
-                                requested_qty,
-                                fill_timeout,
-                            )
-                            .await
-                            {
-                                Some(fill) => ExecEvent::HlFlattenFill {
-                                    market,
-                                    side,
-                                    filled_qty: fill.qty,
-                                    px: fill.px,
-                                },
-                                None => ExecEvent::HlFlattenReject {
-                                    market,
-                                    side,
-                                    qty,
-                                    reason: format!(
-                                        "Lighter accepted flatten tx but no matching fill within {fill_timeout:?}"
-                                    ),
-                                },
-                            };
-                            let _ = events.send(ev).await;
-                        });
-                    }
-                }
-            }
-        HedgeCommand::Shutdown => {}
+    ambiguous: bool,
+}
+
+/// The send/nonce owner is separate from observation and cold history requests.
+async fn resolve_attempt(ex: HlExchange, tx: Sender<ExecEvent>, journal: Journal, intent: HedgeIntent,
+    token: u64, rx: Receiver<FillUpdate>, overflow: Arc<AtomicBool>, ambiguous: bool) {
+    let index = intent.cloid.to_lighter_client_order_index();
+    let _route = FillRouteGuard { fills: ex.fills.clone(), client_order_index: index, token };
+    let context = ResolutionContext { market: ex.wire(&intent.market).map(|w| w.market_index as u32).unwrap_or(u32::MAX),
+        account: ex.account_index, fill_timeout: ex.fill_timeout, intent: intent.clone(), ambiguous };
+    let lookup_exchange = ex.clone();
+    let resolved = resolve_updates(context, tx, journal, rx, overflow, move || {
+        let ex = lookup_exchange.clone();
+        let intent = intent.clone();
+        async move { ex.terminal_order_and_trades(&intent).await }
+    }).await;
+    if resolved && ambiguous && ex.nonce.hard_refresh(&ex.rest).await.is_ok() {
+        ex.nonce_uncertain.store(false, Ordering::Release);
     }
 }
 
-async fn drain_hl_waits(waits: &mut tokio::task::JoinSet<()>, fill_timeout: Duration) {
-    // Drain pending waits BOUNDED, then abort. Never abort first: the venue-side effect of
-    // an accepted IOC already happened — the drain is what preserves intent resolution
-    // (HedgeFill/HedgeUnknown) on a clean stop. run.rs awaits this worker, so the drain is
-    // genuinely part of the shutdown sequence; the cap keeps a wedged wait from hanging it.
-    let drain = async {
-        while waits.join_next().await.is_some() {}
-    };
-    if tokio::time::timeout(fill_timeout + Duration::from_millis(500), drain)
-        .await
-        .is_err()
-    {
-        warn!(
-            "hedge worker shutdown: aborting {} pending fill-wait(s) after drain timeout",
-            waits.len()
-        );
-        waits.abort_all();
+/// Production observation loop with a cold lookup seam for deterministic local tests.
+async fn resolve_updates<F, Fut>(context: ResolutionContext, tx: Sender<ExecEvent>, journal: Journal,
+    mut rx: Receiver<FillUpdate>, overflow: Arc<AtomicBool>, mut lookup: F) -> bool
+where F: FnMut() -> Fut, Fut: std::future::Future<Output = Result<Option<(RemoteOrder, Vec<TradePayload>)>>> {
+    let ResolutionContext { intent, account, market, fill_timeout, ambiguous } = context;
+    let index = intent.cloid.to_lighter_client_order_index();
+    let deadline = tokio::time::Instant::now() + RESOLUTION_BUDGET;
+    let first_poll = tokio::time::Instant::now() + if ambiguous { Duration::ZERO } else { fill_timeout };
+    let mut poll = tokio::time::interval_at(first_poll, Duration::from_secs(2));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut totals = FillTotals::default();
+    let mut terminal: Option<(Decimal, Option<i64>)> = None;
+    let mut unknown_emitted = ambiguous;
+    let mut passive = false;
+    loop {
+        if totals.values().0 == intent.qty { terminal = Some((intent.qty, terminal.and_then(|x| x.1))); }
+        if let Some((qty, oid)) = terminal {
+            if totals.values().0 == qty || passive {
+                publish_progress(&tx, &intent, &totals, Some(qty), oid).await;
+                return true;
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline), if !passive => {
+                if let Some((qty, oid)) = terminal {
+                    publish_progress(&tx, &intent, &totals, Some(qty), oid).await;
+                    return true;
+                }
+                let _ = tx.send(ExecEvent::HedgeUnknown { cloid: intent.cloid,
+                    reason: "60s active resolution exhausted; frozen reservation and passive late-event route retained".into() }).await;
+                passive = true;
+            }
+            update = rx.recv() => match update {
+                Some(FillUpdate::Trade(tr)) => {
+                    if let Some(evidence) = totals.observe(&tr, &intent, account, terminal.and_then(|x| x.1)) {
+                        journal.execution_trade(crate::hotpath::clock::mono_now_ns(), evidence);
+                        publish_progress(&tx, &intent, &totals, None, terminal.and_then(|x| x.1)).await;
+                    }
+                }
+                Some(FillUpdate::Order(order)) => {
+                    if let Some(qty) = terminal_order_qty(&order, index, account, Some(market)) {
+                        terminal = Some((qty, order.order_index));
+                    }
+                }
+                None => return false,
+            },
+            _ = poll.tick(), if !passive => {
+                if !unknown_emitted {
+                    let _ = tx.send(ExecEvent::HedgeUnknown { cloid: intent.cloid,
+                        reason: "fill observation timeout; cold terminal resolution pending".into() }).await;
+                    unknown_emitted = true;
+                }
+                if overflow.swap(false, Ordering::AcqRel) { warn!("fill route overflow; reconciling {} from venue history", intent.cloid.to_hex()); }
+                if let Ok(Ok(Some((order, trades)))) = tokio::time::timeout_at(deadline, lookup()).await {
+                    if let Some(qty) = terminal_order_qty(&order, index, account, Some(market)) {
+                        for tr in trades {
+                            if let Some(evidence) = totals.observe(&tr, &intent, account, order.order_index) {
+                                journal.execution_trade(crate::hotpath::clock::mono_now_ns(), evidence);
+                            }
+                        }
+                        publish_progress(&tx, &intent, &totals, Some(qty), order.order_index).await;
+                        return true;
+                    }
+                }
+            }
+        }
     }
 }
+
+fn terminal_order_qty(order: &RemoteOrder, index: i64, account: i64, market: Option<u32>) -> Option<Decimal> {
+    if order.client_order_index != Some(index) || !order.is_terminal()
+        || order.owner_account_index.is_some_and(|a| a != account)
+        || order.market_index.is_some_and(|m| Some(m) != market) { return None; }
+    order.filled_base_amount.as_deref()?.parse::<Decimal>().ok().filter(|q| *q >= Decimal::ZERO)
+}
+
+impl HlExchange {
+    async fn terminal_order_and_trades(&self, intent: &HedgeIntent) -> Result<Option<(RemoteOrder, Vec<TradePayload>)>> {
+        let market_id = self.wire(&intent.market)?.market_index as u32;
+        let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;
+        let index = intent.cloid.to_lighter_client_order_index();
+        let mut cursor: Option<String> = None;
+        for _ in 0..64 {
+            let page = self.rest.account_inactive_orders(self.account_index, market_id, &auth, cursor.as_deref()).await?;
+            let rows = page.get("orders").and_then(|x| x.as_array()).ok_or_else(|| anyhow!("inactive order response missing orders"))?;
+            for row in rows {
+                let Ok(order) = serde_json::from_value::<RemoteOrder>(row.clone()) else { continue };
+                if terminal_order_qty(&order, index, self.account_index, Some(market_id)).is_none() { continue; }
+                let mut trades = Vec::new();
+                if let Some(oid) = order.order_index {
+                    let mut trade_cursor: Option<String> = None;
+                    for _ in 0..64 {
+                        let Ok(page) = self.rest.trades_by_order(self.account_index, oid, &auth, trade_cursor.as_deref()).await else { break };
+                        if let Some(rows) = page.get("trades").and_then(|x| x.as_array()) {
+                            for row in rows { if let Ok(trade) = serde_json::from_value(row.clone()) { trades.push(trade); } }
+                        }
+                        let next = page.get("next_cursor").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+                        if next.is_none() || next == trade_cursor { break; }
+                        trade_cursor = next;
+                    }
+                }
+                return Ok(Some((order, trades)));
+            }
+            let next = page.get("next_cursor").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+            if next.is_none() || next == cursor { break; }
+            cursor = next;
+        }
+        Ok(None)
+    }
+}
+
 
 fn apply_account_all_positions(
     state: &AccountFeedState,
@@ -1765,12 +1661,6 @@ fn lighter_ws_url(base_url: &str) -> String {
     }
 }
 
-fn trade_fee_usd(tr: &TradePayload) -> Decimal {
-    let raw = value_dec(tr.taker_fee.as_ref()).or_else(|| value_dec(tr.maker_fee.as_ref()));
-    raw.map(|v| v / Decimal::from(1_000_000u64))
-        .unwrap_or(Decimal::ZERO)
-}
-
 fn lighter_leverage_from_account(
     raw: &serde_json::Value,
     market_id: u32,
@@ -1880,26 +1770,15 @@ mod tests {
     }
 
     #[test]
-    fn ioc_order_plan_conventions_match_lighter_signer() {
-        let limit_ioc = LighterOrderPlan {
-            market_index: 24,
-            client_order_index: 1,
-            base_amount: 1,
-            price: 12345,
-            order_expiry: 0,
-            is_ask: false,
-            order_type: ORDER_TYPE_LIMIT,
-            time_in_force: TIF_IMMEDIATE_OR_CANCEL,
-            reduce_only: false,
-        };
-        let market = LighterOrderPlan {
-            order_type: ORDER_TYPE_MARKET,
-            order_expiry: 0,
-            ..limit_ioc.clone()
-        };
-        assert_eq!(limit_ioc.order_expiry, 0);
-        assert!(market.price > 0);
-        assert_eq!(market.order_expiry, 0);
+    fn native_plan_builder_enforces_wire_codes_and_directional_rounding() {
+        let wire = LighterMarketWire { market_index: 24, symbol: "HYPE".into(), size_decimals: 3, price_decimals: 2 };
+        let buy = order_plan(&wire, Side::Buy, dec!(123.451), dec!(0.5019), 91, true, ORDER_TYPE_LIMIT).unwrap();
+        assert_eq!((buy.market_index, buy.client_order_index, buy.base_amount, buy.price), (24, 91, 501, 12346));
+        assert_eq!((buy.order_type, buy.time_in_force, buy.order_expiry), (0, 0, 0));
+        assert!(!buy.is_ask && buy.reduce_only);
+        let sell = order_plan(&wire, Side::Sell, dec!(123.459), dec!(0.5), 92, true, ORDER_TYPE_MARKET).unwrap();
+        assert_eq!((sell.order_type, sell.time_in_force, sell.order_expiry, sell.price), (1, 0, 0, 12345));
+        assert!(sell.is_ask && sell.reduce_only);
     }
 
     #[test]
@@ -1908,48 +1787,40 @@ mod tests {
         assert_eq!(signed_position_from_json(&v), dec!(-2.5));
     }
 
-    #[test]
-    fn trade_fee_usd_uses_lighter_callback_fee_when_present() {
-        assert_eq!(trade_fee_usd(&TradePayload::default()), Decimal::ZERO);
-        let tr = TradePayload {
-            taker_fee: Some(serde_json::json!(12345)),
-            ..TradePayload::default()
-        };
-        assert_eq!(trade_fee_usd(&tr), dec!(0.012345));
+    fn test_intent() -> HedgeIntent {
+        HedgeIntent::with_qty(Cloid::from_bytes_for_lighter([0;16]), "HYPE".into(), Side::Sell, dec!(0.5), dec!(100), 0)
     }
-
+    fn trade(id: i64, qty: &str) -> TradePayload {
+        TradePayload { trade_id: Some(id), ask_client_id: Some(1), ask_account_id: Some(9), ask_id: Some(100),
+            price: Some("100".into()), size: Some(qty.into()), is_maker_ask: Some(false),
+            taker_fee: Some(serde_json::json!(25)), ..TradePayload::default() }
+    }
     #[test]
-    fn lighter_fill_trade_dedupes_replayed_messages() {
-        let mut seen = HashSet::new();
-        let mut qty = Decimal::ZERO;
-        let mut notional = Decimal::ZERO;
-        let mut fee_usd = Decimal::ZERO;
-        let trade = TradePayload {
-            trade_id: Some(42),
-            bid_client_id: Some(77),
-            price: Some("10".into()),
-            size: Some("0.5".into()),
-            taker_fee: Some(serde_json::json!(1000000)),
-            ..TradePayload::default()
-        };
-
-        assert!(record_lighter_fill_trade(&trade, &mut seen, &mut qty, &mut notional, &mut fee_usd));
-        assert!(!record_lighter_fill_trade(&trade, &mut seen, &mut qty, &mut notional, &mut fee_usd));
-        assert_eq!(qty, dec!(0.5));
-        assert_eq!(notional, dec!(5.0));
-        assert_eq!(fee_usd, dec!(1));
-
-        let fallback = TradePayload {
-            bid_client_id: Some(77),
-            price: Some("10".into()),
-            size: Some("0.25".into()),
-            timestamp: Some(123),
-            ..TradePayload::default()
-        };
-        assert!(record_lighter_fill_trade(&fallback, &mut seen, &mut qty, &mut notional, &mut fee_usd));
-        assert!(!record_lighter_fill_trade(&fallback, &mut seen, &mut qty, &mut notional, &mut fee_usd));
-        assert_eq!(qty, dec!(0.75));
-        assert_eq!(notional, dec!(7.50));
+    fn fee_uses_own_role_notional_and_preserves_unknown() {
+        let intent = test_intent();
+        assert_eq!(own_trade_evidence(&trade(1,"0.5"), &intent, 9, None).unwrap().fee_usd, Some(dec!(0.00125)));
+        let mut row = trade(1,"0.5");
+        row.taker_fee = None;
+        row.maker_fee = Some(serde_json::json!(99999));
+        assert_eq!(own_trade_evidence(&row, &intent, 9, None).unwrap().fee_usd, Some(dec!(0)));
+        row.taker_fee = Some(serde_json::Value::Null);
+        assert_eq!(own_trade_evidence(&row, &intent, 9, None).unwrap().fee_usd, None);
+        row.taker_fee = Some(serde_json::json!(-25));
+        assert_eq!(own_trade_evidence(&row, &intent, 9, None).unwrap().fee_usd, Some(dec!(-0.00125)));
+        row.is_maker_ask = Some(true);
+        let contradictory = own_trade_evidence(&row, &intent, 9, None).unwrap();
+        assert_eq!(contradictory.qty, dec!(0.5));
+        assert_eq!(contradictory.fee_usd, None);
+    }
+    #[test]
+    fn split_trade_fees_are_invariant_and_replays_do_not_double_count() {
+        let intent = test_intent();
+        let mut totals = FillTotals::default();
+        for row in [trade(1,"0.2"), trade(2,"0.3"), trade(1,"0.2")] { totals.observe(&row, &intent, 9, None); }
+        assert_eq!(totals.values(), (dec!(0.5), dec!(50), Some(dec!(0.00125))));
+        let mut missing_id = trade(3,"0.5"); missing_id.trade_id = None;
+        assert!(!totals.observe(&missing_id, &intent, 9, None).unwrap().identity_complete);
+        assert_eq!(totals.values().0, dec!(0.5));
     }
 
     #[test]
@@ -1988,98 +1859,69 @@ mod tests {
     }
 
     #[test]
-    fn fill_tracker_routes_by_client_order_index() {
+    fn fill_routes_are_bounded_and_collision_cannot_evict_owner() {
         let tracker = FillTracker::default();
-        let (_token, mut rx) = tracker.register(77);
-        tracker.on_trade(TradePayload {
-            bid_client_id: Some(77),
-            price: Some("100".into()),
-            size: Some("0.1".into()),
-            ..TradePayload::default()
-        });
-        assert_eq!(rx.try_recv().unwrap().bid_client_id, Some(77));
+        let (token, mut rx, overflow) = tracker.register(1).unwrap();
+        assert!(tracker.register(1).is_err());
+        for _ in 0..=FILL_ROUTE_CAPACITY { tracker.on_trade(trade(1,"0.1")); }
+        assert!(overflow.load(Ordering::Acquire));
+        assert!(matches!(rx.try_recv().unwrap(), FillUpdate::Trade(_)));
+        tracker.unregister(1, token+1);
+        assert!(tracker.register(1).is_err());
+        tracker.unregister(1, token);
+        let (_next_token, mut next_rx, _) = tracker.register(1).unwrap();
+        tracker.unregister(1, token);
+        tracker.on_trade(trade(2,"0.1"));
+        assert!(matches!(next_rx.try_recv().unwrap(), FillUpdate::Trade(_)));
     }
 
-    fn fill_trade(client_id: i64, trade_id: i64, px: &str, sz: &str) -> TradePayload {
-        TradePayload {
-            bid_client_id: Some(client_id),
-            trade_id: Some(trade_id),
-            price: Some(px.into()),
-            size: Some(sz.into()),
-            ..TradePayload::default()
-        }
+    fn resolution_context() -> ResolutionContext {
+        ResolutionContext { intent: test_intent(), account: 9, market: 24, fill_timeout: Duration::from_millis(500), ambiguous: false }
     }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_fill_exits_immediately_on_full_fill() {
-        let fills = FillTracker::default();
-        let (token, rx) = fills.register(1);
-        fills.on_trade(fill_trade(1, 1, "10", "0.5"));
-        let started = tokio::time::Instant::now();
-        let fill = wait_fill(&fills, 1, token, rx, dec!(0.5), Duration::from_secs(2))
-            .await
-            .expect("fully filled");
-        assert_eq!(fill.qty, dec!(0.5));
-        assert_eq!(
-            tokio::time::Instant::now(),
-            started,
-            "fully-filled fast path must not wait out any grace/timeout"
-        );
+    fn terminal(qty: &str) -> RemoteOrder {
+        RemoteOrder { client_order_index: Some(1), order_index: Some(100), owner_account_index: Some(9), market_index: Some(24),
+            status: Some("canceled".into()), filled_base_amount: Some(qty.into()), ..RemoteOrder::default() }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wait_fill_holds_full_timeout_on_partial() {
-        let fills = FillTracker::default();
-        let (token, rx) = fills.register(2);
-        fills.on_trade(fill_trade(2, 1, "10", "0.2"));
-        let started = tokio::time::Instant::now();
-        let fill = wait_fill(&fills, 2, token, rx, dec!(0.5), Duration::from_millis(500))
-            .await
-            .expect("partial reported");
-        assert_eq!(fill.qty, dec!(0.2));
-        assert!(
-            tokio::time::Instant::now() - started >= Duration::from_millis(500),
-            "a partial must keep listening until the full fill timeout"
-        );
+    async fn full_fill_resolves_without_waiting_for_timeout() {
+        let (input, rx) = mpsc::channel(16); let (events, mut output) = mpsc::channel(16);
+        input.send(FillUpdate::Trade(trade(1,"0.5"))).await.unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(resolve_updates(resolution_context(), events, Journal::null(), rx, Arc::new(AtomicBool::new(false)),
+            || async { Ok(None) }).await);
+        assert_eq!(tokio::time::Instant::now(), start);
+        let all: Vec<_> = std::iter::from_fn(|| output.try_recv().ok()).collect();
+        assert!(all.iter().any(|ev| matches!(ev, ExecEvent::ExecutionProgress { cumulative_qty, terminal: true, .. } if *cumulative_qty==dec!(0.5))));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wait_fill_counts_slow_partials_up_to_timeout() {
-        // The second partial lands 400ms after the first — the old fixed 200ms grace window
-        // dropped it, latching a spurious PartiallyFilled freeze.
-        let fills = std::sync::Arc::new(FillTracker::default());
-        let (token, rx) = fills.register(3);
-        fills.on_trade(fill_trade(3, 1, "10", "0.2"));
-        let late = fills.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            late.on_trade(fill_trade(3, 2, "10", "0.3"));
-        });
-        let fill = wait_fill(&fills, 3, token, rx, dec!(0.5), Duration::from_secs(2))
-            .await
-            .expect("filled across slow partials");
-        assert_eq!(fill.qty, dec!(0.5), "late partial must be counted");
+    async fn partial_timeout_is_not_terminal_and_late_fill_remains_routed() {
+        let (input, rx) = mpsc::channel(16); let (events, mut output) = mpsc::channel(32);
+        input.send(FillUpdate::Trade(trade(1,"0.2"))).await.unwrap();
+        let resolver = tokio::spawn(resolve_updates(resolution_context(), events, Journal::null(), rx,
+            Arc::new(AtomicBool::new(false)), || async { Ok(None) }));
+        assert!(matches!(output.recv().await.unwrap(), ExecEvent::ExecutionProgress { cumulative_qty, terminal: false, .. } if cumulative_qty==dec!(0.2)));
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        assert!(!resolver.is_finished());
+        let interim: Vec<_> = std::iter::from_fn(|| output.try_recv().ok()).collect();
+        assert!(!interim.iter().any(|ev| matches!(ev, ExecEvent::ExecutionProgress { terminal: true, .. })));
+        assert!(interim.iter().any(|ev| matches!(ev, ExecEvent::HedgeUnknown { reason, .. } if reason.contains("60s"))));
+        input.send(FillUpdate::Trade(trade(2,"0.3"))).await.unwrap();
+        assert!(resolver.await.unwrap());
+        assert!(std::iter::from_fn(|| output.try_recv().ok()).any(|ev| matches!(ev, ExecEvent::ExecutionProgress { cumulative_qty, terminal: true, .. } if cumulative_qty==dec!(0.5))));
     }
 
-    #[test]
-    fn fill_tracker_token_scopes_unregister() {
-        let tracker = FillTracker::default();
-        let (stale_token, _stale_rx) = tracker.register(77);
-        // A collision replaces the older listener (error-logged); the newer route must
-        // survive a stale unregister from the older waiter.
-        let (_fresh_token, mut fresh_rx) = tracker.register(77);
-        tracker.unregister(77, stale_token);
-        tracker.on_trade(TradePayload {
-            bid_client_id: Some(77),
-            price: Some("100".into()),
-            size: Some("0.1".into()),
-            ..TradePayload::default()
-        });
-        assert_eq!(
-            fresh_rx.try_recv().unwrap().bid_client_id,
-            Some(77),
-            "stale unregister must not remove the newer registration"
-        );
+    #[tokio::test(start_paused = true)]
+    async fn cold_terminal_proof_preserves_quantity_when_trade_economics_missing() {
+        let (_input, rx) = mpsc::channel(16); let (events, mut output) = mpsc::channel(16);
+        assert!(resolve_updates(resolution_context(), events, Journal::null(), rx, Arc::new(AtomicBool::new(false)),
+            || async { Ok(Some((terminal("0.2"), Vec::new()))) }).await);
+        assert!(std::iter::from_fn(|| output.try_recv().ok()).any(|ev| matches!(ev,
+            ExecEvent::ExecutionProgress { cumulative_qty, cumulative_quote_usd: None, cumulative_fee_usd: None, terminal: true, .. } if cumulative_qty==dec!(0.2))));
+        let mut wrong_owner = terminal("0.2"); wrong_owner.owner_account_index = Some(8);
+        assert!(terminal_order_qty(&wrong_owner,1,9,Some(24)).is_none());
     }
 
     #[test]

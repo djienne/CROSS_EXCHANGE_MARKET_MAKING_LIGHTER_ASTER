@@ -109,7 +109,9 @@ impl OrderBook {
     /// Age in milliseconds of this book relative to `now` (by local receive time).
     #[inline]
     pub fn age_ms(&self, now: DateTime<Utc>) -> i64 {
-        (now - self.local_recv_ts).num_milliseconds()
+        let source_age = crate::hot_types::source_age_at_receive_ms(
+            self.exch_ts.timestamp_millis(), self.local_recv_ts.timestamp_millis());
+        (now - self.local_recv_ts).num_milliseconds().max(0).saturating_add(source_age)
     }
 
     /// True when a resting quote at `px` on `side` sits beyond the deepest captured

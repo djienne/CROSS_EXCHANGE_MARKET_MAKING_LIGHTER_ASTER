@@ -2,8 +2,8 @@
 name = "xemm_lighter_aster"
 version = "0.1.0"
 edition = "2021"
-# MSRV: uses Option::is_none_or (1.82) and {integer}::is_multiple_of (1.87).
-rust-version = "1.87"
+# Keep the supported compiler aligned with the container and release checks.
+rust-version = "1.92"
 default-run = "xemm_lighter_aster"
 description = "XEMM Aster<->Lighter maker/taker dry-run evaluator"
 
@@ -24,16 +24,16 @@ default = ["hotpath"]
 hotpath = [
     "dep:arc-swap",
     "dep:tokio-util",
-    "dep:async-trait",
     # Core pinning for ingest/strategy threads — tail-latency determinism for live trading.
     "dep:core_affinity",
-    # --- live-trading cryptographic signing (Aster EIP-191 plus legacy hedge helpers) ---
+    # --- live-trading cryptographic signing (Aster EIP-712) ---
     # Only the live `livebot` workers need these; the deterministic record/replay core
     # never signs, so they stay optional and `--no-default-features` pulls in none of them.
     "dep:k256",
     "dep:tiny-keccak",
-    "dep:rmp-serde",
     "dep:hex",
+    "dep:fs2",
+    "dep:memmap2",
 ]
 # Core pinning is now always enabled with `hotpath` (which includes `core_affinity`).
 # This alias is kept for backward compatibility with any `--features core-pin` invocations.
@@ -71,15 +71,15 @@ libloading = "0.8"
 # --- hotpath (optional, lock-free real-time substrate) ---
 arc-swap = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
-async-trait = { version = "0.1", optional = true }
 core_affinity = { version = "0.8", optional = true }
 # --- live signing (optional, pulled in by `hotpath`) ---
-# secp256k1 ECDSA with recoverable signatures (EIP-191 / EIP-712 'v'); keccak256;
+# secp256k1 ECDSA with recoverable signatures (EIP-712 'v'); keccak256;
 # msgpack for legacy hedge signing tests/helpers; hex for r/s serialization.
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 tiny-keccak = { version = "2", features = ["keccak"], optional = true }
-rmp-serde = { version = "1", optional = true }
 hex = { version = "0.4", optional = true }
+fs2 = { version = "0.4", optional = true }
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 # test-util enables tokio::test(start_paused) for deterministic timer tests on the

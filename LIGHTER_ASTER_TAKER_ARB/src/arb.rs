@@ -5,8 +5,8 @@
 //! The scan iteration (fetch books → f64 edge scan → gate checks) is the hot path:
 //! * **Book reads are lock-free** — Aster via `ArcSwapOption` load, Lighter via the
 //!   per-market cells resolved at venue construction (never the feed writer's mutex).
-//! * **All math on the scan path is f64** (`MarketMathF64`); Decimal appears only at the
-//!   submission/logging boundary for a qualifying opportunity.
+//! * **Sizing and edge prefilters use cached f64 math**; qualifying opportunities use
+//!   Decimal for exact gate thresholds, exchange quantities and accounting.
 //! * **No inline file I/O** — entry-gate samples, reduce-signal files, and execution logs
 //!   go through `spawn_blocking` (see `write_file_atomic_off_path`); account state arrives
 //!   via a `watch` channel from the background refresher.
@@ -17,10 +17,8 @@
 //! are unconfirmed.
 
 use std::collections::VecDeque;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +33,7 @@ use tracing::{debug, error, info, warn, Level};
 
 use crate::aster::creds::{AsterCreds, LighterCreds};
 use crate::aster::rest::{
-    immediate_fill_from_order_response, AsterImmediateFill, AsterRest,
+    immediate_fill_from_order_response, order_response_is_terminal, AsterRest,
     SubmitOutcome as AsterOutcome,
 };
 use crate::aster::sign::{AsterSigner, EvmAsterSigner};
@@ -43,13 +41,13 @@ use crate::aster::ws::AsterBookFeed;
 use crate::book::OrderBook;
 use crate::config::{Config, MarketCfg};
 use crate::connectors::{rest_book, rest_specs};
-use crate::decimal::bps_to_rate;
+use crate::decimal::{bps_to_rate, common_qty_step};
 use crate::entry_gate::{OpportunityGate, OpportunityGateInput};
 use crate::markets::MarketSpec;
-use crate::pnl::{format_ts, PnlTracker, TradeLedgerRow};
-use crate::types::{FillSummary, MarketId, Side};
+use crate::pnl::{format_ts, ActiveSession, ColdJournal, ColdLatest, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
+use crate::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side};
 use crate::venues::lighter::{
-    LighterFillConfirmation, LighterVenue, SubmitOutcome as LighterOutcome,
+    LighterFillConfirmation, LighterVenue, PendingFill, SubmitOutcome as LighterOutcome,
 };
 
 static EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -205,7 +203,7 @@ struct MarketMathF64 {
 
 impl MarketMathF64 {
     fn from_config_spec(cfg: &Config, spec: &MarketSpec) -> Result<Self> {
-        let common_step_dec = common_qty_step_dec(spec.step, spec.lighter_qty_step)?;
+        let common_step_dec = common_qty_step(spec.step, spec.lighter_qty_step)?;
         let common_qty_step = positive_decimal_to_f64(common_step_dec)
             .context("common quantity step is not representable as finite f64")?;
         let qty_decimal_places = common_step_dec.normalize().scale();
@@ -252,6 +250,9 @@ impl MarketMathF64 {
 
 #[derive(Debug, Clone, Copy)]
 struct AccountSnapshot {
+    execution_epoch: u64,
+    aster_open_orders: usize,
+    lighter_open_orders: usize,
     position: PositionSnapshot,
     lighter_ws_qty: Option<Decimal>,
     lighter_ws_rest_divergence_qty: Option<Decimal>,
@@ -316,48 +317,112 @@ struct ExecutionLease {
     expires_at: DateTime<Utc>,
 }
 
-/// The lease file is re-read at most this often. The scan loop polls every ~10ms but
-/// the orchestrator rewrites the lease at seconds cadence; validity (market/mode/
-/// expiry) is still re-checked against `now` on EVERY scan, so expiry stays exact and
-/// a revocation-by-rewrite is honored within one interval — negligible next to the
-/// post-trade cooldown, and fail-closed (a missing/invalid new lease disables
-/// execution at the next read).
 const LEASE_REREAD_INTERVAL: Duration = Duration::from_millis(250);
+const CONTROL_MAX_AGE: Duration = Duration::from_millis(500);
 
-/// Caches the parsed execution-lease file between throttled reads so lease mode does
-/// not pay a blocking `read_to_string` + JSON parse on every scan iteration.
-struct LeaseFileCache {
-    last_read_at: Option<tokio::time::Instant>,
+#[derive(Clone)]
+struct ControlSnapshot {
     lease: Option<ExecutionLease>,
+    observed_at: tokio::time::Instant,
+    validated_epoch: Option<u64>,
 }
 
-impl LeaseFileCache {
-    fn new() -> Self {
-        Self {
-            last_read_at: None,
-            lease: None,
-        }
-    }
+struct LeaseFileCache {
+    rx: watch::Receiver<ControlSnapshot>,
+    execution_epoch: Arc<AtomicU64>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
 
-    fn read_if_due(&mut self, path: &Path) {
-        let due = match self.last_read_at {
-            Some(at) => at.elapsed() >= LEASE_REREAD_INTERVAL,
-            None => true,
-        };
-        if !due {
-            return;
+fn begin_execution(epoch: &AtomicU64) -> u64 {
+    let previous = epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |value| (value % 2 == 0).then_some(value + 1)).unwrap_or_else(|value| value);
+    if previous % 2 == 0 { previous + 1 } else { previous }
+}
+
+fn finish_execution(epoch: &AtomicU64) -> u64 {
+    let previous = epoch.fetch_update(Ordering::AcqRel, Ordering::Acquire,
+        |value| (value % 2 == 1).then_some(value + 1)).unwrap_or_else(|value| value);
+    if previous % 2 == 1 { previous + 1 } else { previous }
+}
+
+fn publish_account(tx: &watch::Sender<AccountSnapshot>, snapshot: AccountSnapshot) {
+    tx.send_if_modified(|current| {
+        if snapshot.execution_epoch < current.execution_epoch
+            || (snapshot.execution_epoch == current.execution_epoch && snapshot.refreshed_at < current.refreshed_at) {
+            return false;
         }
-        self.last_read_at = Some(tokio::time::Instant::now());
-        self.lease = match std::fs::read_to_string(path) {
-            Ok(text) => match serde_json::from_str::<ExecutionLease>(&text) {
-                Ok(lease) => Some(lease),
-                Err(e) => {
-                    warn!("invalid execution lease {}: {e:#}", path.display());
-                    None
+        *current = snapshot;
+        true
+    });
+}
+
+fn spawn_control_refresher(
+    path: Option<PathBuf>, spec: MarketSpec, cfg: Config, aster: Arc<AsterRest>,
+    lighter: Arc<LighterVenue>, execution_epoch: Arc<AtomicU64>,
+    account_tx: watch::Sender<AccountSnapshot>, wake: Arc<Notify>, session: ActiveSession,
+) -> LeaseFileCache {
+    let (tx, rx) = watch::channel(ControlSnapshot {
+        lease: None, observed_at: tokio::time::Instant::now(), validated_epoch: None,
+    });
+    let mut result = LeaseFileCache { rx, execution_epoch: execution_epoch.clone(), task: None };
+    let Some(path) = path else { return result; };
+    result.task = Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(LEASE_REREAD_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut validated_lease: Option<String> = None;
+        loop {
+            tick.tick().await;
+            let observed_at = tokio::time::Instant::now();
+            let lease = tokio::fs::read_to_string(&path).await.ok()
+                .and_then(|text| serde_json::from_str::<ExecutionLease>(&text).ok())
+                .filter(|lease| lease.market == spec.market_id.0 && lease.mode == "reduce_only"
+                    && lease.expires_at > Utc::now()
+                    && lease.lease_id.as_deref().is_some_and(|id| !id.is_empty()));
+            let epoch = execution_epoch.load(Ordering::Acquire);
+            let mut state = ControlSnapshot { lease: lease.clone(), observed_at, validated_epoch: None };
+            if let Some(lease) = lease {
+                if epoch % 2 == 0 {
+                    let new_lease = validated_lease != lease.lease_id;
+                    if new_lease {
+                        let _ = tx.send(state.clone());
+                        wake.notify_one();
+                        let (nonce, snapshot) = tokio::join!(lighter.refresh_nonce(),
+                            refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch));
+                        if nonce.is_ok() {
+                            if let Ok(snapshot) = snapshot {
+                                let armed = if cfg.pnl.enabled {
+                                    if let Some(equity) = snapshot.margins.total_equity_usd() { session.arm_with_equity(equity).await }
+                                    else { Err(anyhow::anyhow!("marked equity unavailable for session arming")) }
+                                } else { session.arm().await };
+                                if armed.is_ok() {
+                                    publish_account(&account_tx, snapshot);
+                                    validated_lease = lease.lease_id.clone();
+                                }
+                            }
+                        }
+                    }
+                    let snapshot = *account_tx.borrow();
+                    if validated_lease == lease.lease_id
+                        && snapshot.execution_epoch == epoch
+                        && execution_epoch.load(Ordering::Acquire) == epoch
+                        && !snapshot.is_stale(Duration::from_millis(cfg.live.max_account_snapshot_age_ms as u64))
+                        && snapshot.aster_open_orders == 0 && snapshot.lighter_open_orders == 0
+                        && !session.unresolved() {
+                        state.validated_epoch = Some(epoch);
+                    }
                 }
-            },
-            Err(_) => None,
-        };
+            } else { validated_lease = None; }
+            if tx.send(state).is_err() { break; }
+            wake.notify_one();
+        }
+    }));
+    result
+}
+
+async fn wait_for_scan(wake: &Notify, interval_ms: u64) {
+    tokio::select! {
+        _ = wake.notified() => {}
+        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {}
     }
 }
 
@@ -370,29 +435,28 @@ struct ReduceSignalSample {
     gate_sample_count: usize,
 }
 
-#[derive(Debug)]
 struct ReduceSignalTracker {
-    path: Option<PathBuf>,
+    writer: Option<ColdLatest<ReduceSignalFile>>,
     min_samples: usize,
     window_ms: i64,
     samples: VecDeque<ReduceSignalSample>,
 }
 
 #[derive(Debug, Serialize)]
-struct ReduceSignalFile<'a> {
+struct ReduceSignalFile {
     timestamp: DateTime<Utc>,
-    market: &'a str,
+    market: String,
     status: &'static str,
     samples: usize,
     window_ms: i64,
     first_seen: DateTime<Utc>,
     last_seen: DateTime<Utc>,
-    best: ReduceSignalOpportunity<'a>,
+    best: ReduceSignalOpportunity,
 }
 
 #[derive(Debug, Serialize)]
-struct ReduceSignalOpportunity<'a> {
-    direction: &'a str,
+struct ReduceSignalOpportunity {
+    direction: String,
     qty: Decimal,
     gross_edge_bps: Decimal,
     expected_net_margin_bps: Decimal,
@@ -416,19 +480,19 @@ struct ReduceSignalOpportunity<'a> {
     buy_best_px: Decimal,
     sell_best_qty: Decimal,
     buy_best_qty: Decimal,
-    gate_decision: &'a str,
+    gate_decision: String,
     gate_threshold_bps: Option<Decimal>,
     gate_sample_count: usize,
 }
 
 impl ReduceSignalTracker {
-    fn new(options: &RunOptions) -> Self {
-        Self {
-            path: options.signal_file.clone(),
+    fn new(options: &RunOptions) -> Result<Self> {
+        Ok(Self {
+            writer: options.signal_file.clone().map(ColdLatest::new).transpose()?,
             min_samples: options.reduce_signal_min_samples.max(1),
             window_ms: options.reduce_signal_window_ms.max(1),
             samples: VecDeque::new(),
-        }
+        })
     }
 
     fn observe(
@@ -438,7 +502,7 @@ impl ReduceSignalTracker {
         gate: &crate::entry_gate::GateEvaluation,
         now: DateTime<Utc>,
     ) {
-        if self.path.is_none() || !gate.allow_execution {
+        if self.writer.is_none() || !gate.allow_execution {
             return;
         }
         self.prune(now);
@@ -467,9 +531,7 @@ impl ReduceSignalTracker {
     }
 
     fn write_confirmed(&self, spec: &MarketSpec, now: DateTime<Utc>) {
-        let Some(path) = &self.path else {
-            return;
-        };
+        let Some(writer) = &self.writer else { return; };
         let Some(first) = self.samples.front() else {
             return;
         };
@@ -485,14 +547,14 @@ impl ReduceSignalTracker {
         };
         let body = ReduceSignalFile {
             timestamp: now,
-            market: &spec.market_id.0,
+            market: spec.market_id.0.clone(),
             status: "confirmed",
             samples: self.samples.len(),
             window_ms: self.window_ms,
             first_seen: first.timestamp,
             last_seen: last.timestamp,
             best: ReduceSignalOpportunity {
-                direction: best.opportunity.direction.as_str(),
+                direction: best.opportunity.direction.as_str().to_string(),
                 qty: best.opportunity.qty,
                 gross_edge_bps: best.opportunity.gross_edge_bps,
                 expected_net_margin_bps: best.opportunity.expected_net_margin_bps,
@@ -516,77 +578,33 @@ impl ReduceSignalTracker {
                 buy_best_px: best.opportunity.buy_best_px,
                 sell_best_qty: best.opportunity.sell_best_qty,
                 buy_best_qty: best.opportunity.buy_best_qty,
-                gate_decision: best.gate_decision,
+                gate_decision: best.gate_decision.to_string(),
                 gate_threshold_bps: best.gate_threshold_bps,
                 gate_sample_count: best.gate_sample_count,
             },
         };
-        // Serialize in-memory (fast), then hand the actual filesystem work to a blocking
-        // task: this runs inside the scan loop, and an fsync/rename on a slow disk would
-        // otherwise stall the hot path for 0.5-10ms.
-        match serde_json::to_vec_pretty(&body) {
-            Ok(bytes) => write_file_atomic_off_path(path.clone(), bytes),
-            Err(e) => warn!("failed to serialize reduce signal {}: {e:#}", path.display()),
-        }
+        writer.publish(body);
     }
-}
 
-/// Atomically write `bytes` to `path` (tmp + rename) OFF the calling task when a tokio
-/// runtime is available. The scan loop must never block on filesystem latency; outside a
-/// runtime (tests/tools) the write happens inline.
-fn write_file_atomic_off_path(path: PathBuf, bytes: Vec<u8>) {
-    let write = move || {
-        if let Err(e) = write_bytes_atomic(&path, &bytes) {
-            warn!("failed to write {}: {e:#}", path.display());
-        }
-    };
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn_blocking(write);
-    } else {
-        write();
-    }
-}
+    fn healthy(&self) -> bool { self.writer.as_ref().is_none_or(ColdLatest::healthy) }
 
-fn write_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create parent dir {}", parent.display()))?;
+    async fn shutdown(&mut self) -> Result<()> {
+        if let Some(writer) = self.writer.as_mut() { writer.shutdown().await?; }
+        Ok(())
     }
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("reduce_signal.json");
-    let tmp = path.with_file_name(format!(".{file_name}.tmp"));
-    std::fs::write(&tmp, bytes).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
-    Ok(())
 }
 
 fn valid_execution_lease(
-    cache: &mut LeaseFileCache,
-    options: &RunOptions,
-    spec: &MarketSpec,
-    now: DateTime<Utc>,
+    cache: &mut LeaseFileCache, options: &RunOptions, spec: &MarketSpec, now: DateTime<Utc>,
 ) -> Option<ExecutionLease> {
-    if options.observe_only {
-        return None;
-    }
-    let Some(path) = &options.control_file else {
-        return None;
-    };
-    cache.read_if_due(path);
-    let lease = cache.lease.as_ref()?;
-    if lease.market != spec.market_id.0 || lease.mode != "reduce_only" || lease.expires_at <= now {
-        return None;
-    }
-    if let Some(lease_id) = lease.lease_id.as_deref() {
-        debug!(
-            "valid execution lease market={} lease_id={lease_id}",
-            spec.market_id
-        );
-    }
-    Some(lease.clone())
+    if options.observe_only || options.control_file.is_none() { return None; }
+    let state = cache.rx.borrow();
+    let epoch = cache.execution_epoch.load(Ordering::Acquire);
+    if epoch % 2 != 0 || state.observed_at.elapsed() > CONTROL_MAX_AGE
+        || state.validated_epoch != Some(epoch) { return None; }
+    state.lease.as_ref().filter(|lease| lease.market == spec.market_id.0
+        && lease.mode == "reduce_only" && lease.expires_at > now
+        && lease.lease_id.as_deref().is_some_and(|id| !id.is_empty())).cloned()
 }
 
 fn execution_lease_enabled(
@@ -603,32 +621,6 @@ fn execution_lease_enabled(
     }
     let lease = valid_execution_lease(cache, options, spec, now);
     (lease.is_some(), lease)
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy)]
-struct SizingDecision {
-    qty: Decimal,
-    desired_qty: Decimal,
-    min_qty: Decimal,
-    top_depth_qty: Decimal,
-    depth_guard_enabled: bool,
-    liquidity_multiple: Decimal,
-    depth_supported_qty: Decimal,
-    sell_depth_target_qty: Decimal,
-    buy_depth_target_qty: Decimal,
-    sell_depth_available_qty: Decimal,
-    buy_depth_available_qty: Decimal,
-    sell_depth_worst_px: Decimal,
-    buy_depth_worst_px: Decimal,
-    sell_depth_levels_used: usize,
-    buy_depth_levels_used: usize,
-    sell_best_px: Decimal,
-    buy_best_px: Decimal,
-    sell_best_qty: Decimal,
-    buy_best_qty: Decimal,
-    headroom_qty: Decimal,
-    margin_room_qty: Decimal,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -692,55 +684,6 @@ fn non_negative_decimal_to_f64(value: Decimal) -> Option<f64> {
     (out >= 0.0).then_some(out)
 }
 
-fn common_qty_step_dec(aster_step: Decimal, lighter_step: Decimal) -> Result<Decimal> {
-    let (a_units, a_scale) = decimal_step_units(aster_step)?;
-    let (l_units, l_scale) = decimal_step_units(lighter_step)?;
-    let scale = a_scale.max(l_scale);
-    let a = a_units
-        .checked_mul(pow10_u128(scale - a_scale)?)
-        .context("Aster quantity step scale overflow")?;
-    let l = l_units
-        .checked_mul(pow10_u128(scale - l_scale)?)
-        .context("Lighter quantity step scale overflow")?;
-    let common = lcm_u128(a, l).context("common quantity step overflow")?;
-    let common_i128 = i128::try_from(common).context("common quantity step too large")?;
-    Ok(Decimal::from_i128_with_scale(common_i128, scale).normalize())
-}
-
-fn decimal_step_units(step: Decimal) -> Result<(u128, u32)> {
-    if step <= Decimal::ZERO {
-        bail!("quantity step must be positive");
-    }
-    let normalized = step.normalize();
-    let mantissa = normalized.mantissa().abs();
-    if mantissa == 0 {
-        bail!("quantity step must be positive");
-    }
-    let units = u128::try_from(mantissa).context("quantity step mantissa overflow")?;
-    Ok((units, normalized.scale()))
-}
-
-fn pow10_u128(exp: u32) -> Result<u128> {
-    let mut out = 1u128;
-    for _ in 0..exp {
-        out = out.checked_mul(10).context("decimal scale overflow")?;
-    }
-    Ok(out)
-}
-
-fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        let r = a % b;
-        a = b;
-        b = r;
-    }
-    a
-}
-
-fn lcm_u128(a: u128, b: u128) -> Option<u128> {
-    let gcd = gcd_u128(a, b);
-    a.checked_div(gcd)?.checked_mul(b)
-}
 
 fn unit_snap_tol(units: f64) -> f64 {
     (units.abs() * f64::EPSILON * 64.0).max(1e-12)
@@ -783,8 +726,10 @@ fn qty_gt(a: f64, b: f64, math: &MarketMathF64) -> bool {
     a > b + qty_cmp_tol(math, a, b)
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TradeReport {
+    execution_id: String,
+    lighter_fee_evidence: Vec<FeeEvidence>,
     position: PositionSnapshot,
     lighter_ws_qty: Option<Decimal>,
     lighter_ws_rest_divergence_qty: Option<Decimal>,
@@ -797,7 +742,7 @@ struct TradeReport {
 }
 
 impl TradeReport {
-    fn available_margin_delta_usd(self) -> Decimal {
+    fn available_margin_delta_usd(&self) -> Decimal {
         (self.margin_after.aster_available_usd + self.margin_after.lighter_available_usd)
             - (self.margin_before.aster_available_usd + self.margin_before.lighter_available_usd)
     }
@@ -819,8 +764,9 @@ struct ActualEconomics {
     residual_notional_usd: Decimal,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RecoveryReport {
+    execution_id: String,
     action_taken: bool,
     position: PositionSnapshot,
     lighter_ws_qty: Option<Decimal>,
@@ -855,6 +801,8 @@ struct HedgeRetryPlan {
 
 #[derive(Debug, Clone)]
 struct HedgeRetryAttempt {
+    fee_evidence: Vec<FeeEvidence>,
+    identity: serde_json::Value,
     attempt: u64,
     venue: HedgeRetryVenue,
     side: Side,
@@ -938,11 +886,11 @@ enum ExecutionError {
     #[error("{details}")]
     Skipped { details: String },
     #[error("{details}")]
-    LegRejected { one_sided: bool, details: String },
-    #[error("{details}")]
     Unreconciled { details: String },
     #[error("{details}")]
     AccountingUnavailable { details: String },
+    #[error("{details}")]
+    OutcomeUnresolved { details: String },
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }
@@ -951,10 +899,7 @@ impl ExecutionError {
     fn needs_recovery(&self) -> bool {
         matches!(
             self,
-            ExecutionError::LegRejected {
-                one_sided: true,
-                ..
-            } | ExecutionError::Unreconciled { .. }
+            ExecutionError::Unreconciled { .. }
                 | ExecutionError::AccountingUnavailable { .. }
         )
     }
@@ -964,7 +909,8 @@ impl ExecutionError {
     }
 }
 
-pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> Result<()> {
+pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) -> Result<()> {
+    if options.control_file.is_some() { options.exposure_filter = ExposureFilter::Reduce; }
     if !cfg.live.enabled || !cfg.live.mode.eq_ignore_ascii_case("live") {
         bail!("refusing to run: set [live] enabled = true and mode = \"live\"");
     }
@@ -1061,6 +1007,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
     let acreds = AsterCreds::load(Path::new(&aster_env))?;
     let lcreds = LighterCreds::load(Path::new(&lighter_env))?;
+    let aster_account_id = acreds.user.clone();
     let aster_signer: Arc<dyn AsterSigner> =
         Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
     let aster = Arc::new(AsterRest::new(
@@ -1077,8 +1024,17 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         )
         .await?,
     );
+    let session = ActiveSession::new(crate::pnl::session_path(&cfg.pnl, &spec.market_id), serde_json::json!({
+        "schema_version": 2, "session_id": next_execution_id(), "process_id": std::process::id(), "started_at": Utc::now(), "status": "active",
+        "market": spec.market_id.to_string(), "aster_account": aster_account_id,
+        "lighter_account_index": lighter.account_index(), "lighter_market_index": spec.lighter_market_id,
+    }));
+    let execution_journal = ColdJournal::new(execution_log_path(&cfg, &spec.market_id), true)?;
+    let scan_wake = Arc::new(Notify::new());
     let aster_books =
         AsterBookFeed::spawn_from_rest_base(&cfg.venues.aster_base_url, &spec.aster_symbol);
+    aster_books.set_scan_notify(scan_wake.clone());
+    lighter.set_scan_notify(scan_wake.clone());
 
     aster_books.wait_ready(Duration::from_secs(20)).await?;
     info!("Aster websocket book ready: market={}", spec.market_id);
@@ -1098,9 +1054,15 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     .await?;
     let account_snapshot_max_age =
         Duration::from_millis(cfg.live.max_account_snapshot_age_ms as u64);
-    let mut account = refresh_account_snapshot(&spec.market_id, &aster, &lighter).await?;
+    let execution_epoch = Arc::new(AtomicU64::new(0));
+    let mut account = refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await?;
+    if options.control_file.is_none() && !options.observe_only {
+        if cfg.pnl.enabled {
+            session.arm_with_equity(account.margins.total_equity_usd()
+                .context("marked equity unavailable for session arming")?).await?;
+        } else { session.arm().await?; }
+    }
     let (account_tx, mut account_rx) = watch::channel(account);
-    let account_refresh_paused = Arc::new(AtomicBool::new(false));
     let account_refresh_now = Arc::new(Notify::new());
     let _account_refresh_task = spawn_account_snapshot_refresher(
         &cfg,
@@ -1108,7 +1070,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         aster.clone(),
         lighter.clone(),
         account_tx.clone(),
-        account_refresh_paused.clone(),
+        execution_epoch.clone(),
         account_refresh_now.clone(),
     );
 
@@ -1126,10 +1088,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut cooldown_until =
         tokio::time::Instant::now() + Duration::from_millis(cfg.arb.startup_warmup_ms);
     let mut trades_executed = 0u64;
-    let mut reduce_signal_tracker = ReduceSignalTracker::new(&options);
-    let mut nonce_refreshed_for_lease: Option<String> = None;
-    // In-flight lease nonce refresh (E: keep the REST round-trip off the scan iteration).
-    let mut nonce_refresh_task: Option<(String, tokio::task::JoinHandle<Result<()>>)> = None;
+    let mut reduce_signal_tracker = ReduceSignalTracker::new(&options)?;
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
     // Gated/standby decisions can repeat every 10ms scan while an edge stays visible;
@@ -1150,7 +1109,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     let mut last_full_eval = tokio::time::Instant::now();
     let mut last_flatten_denied_log_at: Option<tokio::time::Instant> = None;
     let mut last_fill_stats_log = tokio::time::Instant::now();
-    let mut lease_cache = LeaseFileCache::new();
+    let mut lease_cache = spawn_control_refresher(options.control_file.clone(), spec.clone(), cfg.clone(),
+        aster.clone(), lighter.clone(), execution_epoch.clone(), account_tx.clone(), scan_wake.clone(), session.clone());
+    let history_changed = entry_gate.changed();
     // Set when the cooldown select below woke on account_rx.changed(): changed()
     // consumes the watch seen-marker, so the freshness check later in the iteration
     // must OR this in or fresh-snapshot mismatch counting breaks. Persists across
@@ -1200,6 +1161,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
     // first polled and resolves at the next select.
     let ctrl_c = signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let run_result: Result<()> = async {
     loop {
         if let Some(deadline) = deadline {
             if tokio::time::Instant::now() >= deadline {
@@ -1216,6 +1178,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 break;
             }
             _ = tokio::time::sleep_until(cooldown_until) => {}
+            _ = scan_wake.notified() => {}
+            _ = history_changed.notified() => {}
             // A fresh account snapshot wakes the loop DURING cooldown so the mismatch
             // guard reacts within seconds instead of after a long trade cooldown; the
             // cooldown gate before the sizing path keeps entries shut on early wakes.
@@ -1225,7 +1189,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     // Unreachable while the refresher task holds the sender; bounded
                     // sleep so a closed channel cannot spin this loop hot.
                     Err(_) => {
-                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                        wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
                     }
                 }
             }
@@ -1241,7 +1205,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             Ok(v) => v,
             Err(e) => {
                 warn!("book fetch failed: {e:#}");
-                tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
                 continue;
             }
         };
@@ -1249,7 +1213,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         if !book_ok(&aster_book, now, cfg.arb.max_book_staleness_ms)
             || !book_ok(&lighter_book, now, cfg.arb.max_book_staleness_ms)
         {
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
 
@@ -1263,7 +1227,16 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             account_gen = account_gen.wrapping_add(1);
         }
         woke_for_account_update = false;
-        account = *account_rx.borrow_and_update();
+        let candidate_account = *account_rx.borrow_and_update();
+        if candidate_account.execution_epoch == execution_epoch.load(Ordering::Acquire)
+            && candidate_account.execution_epoch % 2 == 0 {
+            account = candidate_account;
+        }
+        if account.execution_epoch != execution_epoch.load(Ordering::Acquire) {
+            account_refresh_now.notify_one();
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
+            continue;
+        }
         if account.is_stale(account_snapshot_max_age) {
             let log_now = match last_stale_account_log_at {
                 Some(ts) => ts.elapsed() >= Duration::from_secs(5),
@@ -1277,7 +1250,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 );
                 last_stale_account_log_at = Some(tokio::time::Instant::now());
             }
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
         last_stale_account_log_at = None;
@@ -1292,7 +1265,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         ) {
             // Nothing an evaluation depends on has changed since the last full pass —
             // skip the sizing body this iteration (the staleness gates above already ran).
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
 
@@ -1363,10 +1336,10 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 error!(
                     "position mismatch persisted {mismatch_consecutive} checks (${mismatch_notional}); auto-flattening residual reduce-only"
                 );
-                account_refresh_paused.store(true, Ordering::Release);
+                begin_execution(&execution_epoch);
                 let recovery_result =
-                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, account.margins).await;
-                account_refresh_paused.store(false, Ordering::Release);
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, account.margins, &session, &execution_journal).await;
+                finish_execution(&execution_epoch);
                 match recovery_result {
                     Ok(recovery) => {
                         mismatch_consecutive = 0;
@@ -1378,14 +1351,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                             recovery.position.lighter_qty
                         );
                         if recovery.action_taken {
-                            if let Some(reason) =
-                                recovered_failures.record(recovery.estimated_loss_usdc, &cfg)
-                            {
-                                bail!("recovered-failure breaker triggered: {reason}");
-                            }
-                            record_recovery_loss(&mut pnl, &spec, &recovery)?;
+                            let hourly_breaker = recovered_failures.record(recovery.estimated_loss_usdc, &cfg);
+                            record_recovery_loss(&mut pnl, &spec, &recovery, &session, hourly_breaker).await?;
                         }
                         account = AccountSnapshot {
+                            execution_epoch: finish_execution(&execution_epoch),
+                            aster_open_orders: 0,
+                            lighter_open_orders: 0,
                             position: recovery.position,
                             lighter_ws_qty: recovery.lighter_ws_qty,
                             lighter_ws_rest_divergence_qty: recovery
@@ -1394,9 +1366,10 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                             margins: recovery.margin_after,
                             refreshed_at: tokio::time::Instant::now(),
                         };
-                        let _ = account_tx.send(account);
+                        publish_account(&account_tx, account);
                     }
                     Err(e) => {
+                        if session.unresolved() { bail!("mismatch recovery unresolved; no further order may be submitted: {e:#}"); }
                         error!("mismatch auto-flatten failed: {e:#}");
                         // Repeated failure to even inspect/flatten means the bot cannot
                         // guarantee its own safety: exit nonzero so the supervisor
@@ -1415,6 +1388,18 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             continue;
         }
         mismatch_consecutive = 0;
+        if cfg.pnl.enabled {
+            if let (Some(baseline),Some(current)) = (session.baseline_equity(),account.margins.total_equity_usd()) {
+                if let Some(loss) = session_marked_loss(baseline,current,cfg.pnl.max_loss_usdc) {
+                    execution_journal.try_append(ExecutionRecord::Row(serde_json::json!({"schema_version":2,"economic_status":"confirmed",
+                        "timestamp":Utc::now(),"session_id":session.id(),"market":spec.market_id.to_string(),
+                        "outcome":"session_marked_loss","pnl_metric":"session_marked_equity_loss",
+                        "baseline_equity_usd":baseline,"current_equity_usd":current,"loss_usd":loss,
+                        "max_loss_usdc":cfg.pnl.max_loss_usdc})))?;
+                    bail!("session marked-equity loss ${loss} reached ${}; new execution stopped",cfg.pnl.max_loss_usdc);
+                }
+            }
+        }
         let mark = aster_book
             .mid()
             .or_else(|| lighter_book.mid())
@@ -1450,7 +1435,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 "position f64 conversion failed; skipping scan iteration: aster={} lighter={}",
                 pos.aster_qty, pos.lighter_qty
             );
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         };
         let Some(margins_f) = MarginF64::from_snapshot(margins) else {
@@ -1458,69 +1443,14 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 "margin f64 conversion failed; skipping scan iteration: aster_available={} lighter_available={}",
                 margins.aster_available_usd, margins.lighter_available_usd
             );
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         };
         if tracing::enabled!(Level::DEBUG) {
             log_scan_state(&cfg, &spec, &aster_book, &lighter_book, pos, margins);
         }
-        let (execution_enabled, valid_lease) =
+        let (execution_enabled, _valid_lease) =
             execution_lease_enabled(&mut lease_cache, &options, &spec, now);
-        if options.control_file.is_some() && valid_lease.is_none() {
-            nonce_refreshed_for_lease = None;
-        }
-        if execution_enabled
-            && options.exposure_filter == ExposureFilter::Reduce
-            && options.control_file.is_some()
-        {
-            let lease_key = valid_lease
-                .as_ref()
-                .and_then(|lease| lease.lease_id.clone())
-                .unwrap_or_else(|| "unidentified".to_string());
-            if nonce_refreshed_for_lease.as_deref() != Some(lease_key.as_str()) {
-                // Run the refresh OFF the scan iteration (a REST round-trip would stall
-                // the loop). Execution under the new lease stays gated until the refresh
-                // completes — the `continue`s below skip this iteration — so there is no
-                // nonce-reuse risk, only a brief entry delay.
-                match nonce_refresh_task.take() {
-                    Some((pending_key, handle))
-                        if pending_key == lease_key && handle.is_finished() =>
-                    {
-                        match handle.await {
-                            Ok(Ok(())) => {
-                                nonce_refreshed_for_lease = Some(lease_key.clone());
-                                info!(
-                                    "refreshed Lighter nonce for reduce execution lease market={} lease_id={lease_key}",
-                                    spec.market_id
-                                );
-                            }
-                            Ok(Err(e)) => {
-                                return Err(e.context("lease nonce refresh failed"));
-                            }
-                            Err(e) => bail!("lease nonce refresh task panicked: {e}"),
-                        }
-                    }
-                    Some((pending_key, handle)) if pending_key == lease_key => {
-                        // Still in flight: keep waiting, do not execute under this lease.
-                        nonce_refresh_task = Some((pending_key, handle));
-                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
-                        continue;
-                    }
-                    stale => {
-                        if let Some((_, handle)) = stale {
-                            handle.abort(); // lease changed under a pending refresh
-                        }
-                        let lighter_for_refresh = lighter.clone();
-                        nonce_refresh_task = Some((
-                            lease_key.clone(),
-                            tokio::spawn(async move { lighter_for_refresh.refresh_nonce().await }),
-                        ));
-                        tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
-                        continue;
-                    }
-                }
-            }
-        }
         let Some(opp) = best_opportunity(
             &cfg,
             &spec,
@@ -1532,7 +1462,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             options.min_size,
             options.exposure_filter,
         ) else {
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         };
         if let Some(sanity) = book_sanity.entry_block() {
@@ -1561,7 +1491,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     );
                     last_book_sanity_block_log_at = Some(tokio::time::Instant::now());
                 }
-                tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+                wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
                 continue;
             }
         } else {
@@ -1655,7 +1585,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             }
         }
         if !gate.allow_execution {
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
         if exposure_effect_f64(
@@ -1691,7 +1621,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 );
                 last_standby_log_at = Some(tokio::time::Instant::now());
             }
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
         let reduce_only = options.exposure_filter == ExposureFilter::Reduce;
@@ -1712,38 +1642,27 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 pos.aster_qty,
                 pos.lighter_qty
             );
-            tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
             continue;
         }
-        if reduce_only && options.control_file.is_some() {
-            match tokio::join!(
-                aster.open_orders(&spec.market_id),
-                lighter.open_orders_count(&spec.market_id),
-            ) {
-                (Ok(open_a), Ok(open_l)) if open_a.is_empty() && open_l == 0 => {}
-                (Ok(open_a), Ok(open_l)) => {
-                    warn!(
-                        "reduce-only lease execution skipped because open orders remain: market={} aster_open_orders={} lighter_open_orders={}",
-                        spec.market_id,
-                        open_a.len(),
-                        open_l
-                    );
-                    tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
-                    continue;
-                }
-                (a_res, l_res) => {
-                    warn!(
-                        "reduce-only lease execution skipped because open-order check failed: market={} aster_result={:?} lighter_result={:?}",
-                        spec.market_id,
-                        a_res.as_ref().map(|orders| orders.len()),
-                        l_res
-                    );
-                    tokio::time::sleep(Duration::from_millis(cfg.arb.poll_interval_ms)).await;
-                    continue;
-                }
-            }
+        // No await between this final in-memory validation and starting the execution epoch.
+        let final_now = Utc::now();
+        let final_account = *account_rx.borrow();
+        let (final_aster, final_lighter) = fetch_books(&spec, &aster_books, &lighter)?;
+        if !execution_lease_enabled(&mut lease_cache, &options, &spec, final_now).0
+            || !lighter.tx_ready() || !entry_gate.healthy() || !execution_journal.healthy() || !reduce_signal_tracker.healthy() || session.unresolved()
+            || !Arc::ptr_eq(&final_aster, &aster_book) || !Arc::ptr_eq(&final_lighter, &lighter_book)
+            || !book_ok(&final_aster, final_now, cfg.arb.max_book_staleness_ms)
+            || !book_ok(&final_lighter, final_now, cfg.arb.max_book_staleness_ms)
+            || final_account.execution_epoch != account.execution_epoch
+            || final_account.refreshed_at != account.refreshed_at
+            || final_account.is_stale(account_snapshot_max_age)
+            || (cfg.pnl.enabled && (session.baseline_equity().is_none() || final_account.margins.total_equity_usd().is_none()))
+            || final_account.aster_open_orders != 0 || final_account.lighter_open_orders != 0 {
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
+            continue;
         }
-        account_refresh_paused.store(true, Ordering::Release);
+        begin_execution(&execution_epoch);
         let execution_result = execute_opportunity(
             &cfg,
             &spec,
@@ -1753,19 +1672,24 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
             pos,
             margins,
             reduce_only,
+            &execution_journal,
+            &session,
         )
         .await;
         match execution_result {
             Ok(report) => {
                 account = AccountSnapshot {
+                            execution_epoch: finish_execution(&execution_epoch),
+                            aster_open_orders: 0,
+                            lighter_open_orders: 0,
                     position: report.position,
                     lighter_ws_qty: report.lighter_ws_qty,
                     lighter_ws_rest_divergence_qty: report.lighter_ws_rest_divergence_qty,
                     margins: report.margin_after,
                     refreshed_at: tokio::time::Instant::now(),
                 };
-                let _ = account_tx.send(account);
-                account_refresh_paused.store(false, Ordering::Release);
+                publish_account(&account_tx, account);
+                finish_execution(&execution_epoch);
                 trades_executed += 1;
                 info!(
                     "trade report count={} expected_net=${} actual_gross=${} actual_fees=${} actual_net=${} actual_net_bps={} fill_qty_mismatch={} aster_fill_qty={} aster_vwap={} aster_notional=${} aster_fee=${} lighter_fill_qty={} lighter_vwap={} lighter_notional=${} lighter_fee=${} available_margin_delta=${} available_before=${} available_after=${} aster_available_before=${} aster_available_after=${} lighter_available_before=${} lighter_available_after=${} final_aster_pos={} final_lighter_pos={} final_net_pos={}",
@@ -1795,44 +1719,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     report.position.lighter_qty,
                     report.position.net_qty()
                 );
-                if report.hedge_retry_action_taken {
-                    warn!(
-                        "hedge retry counted as recovered risk event count_limit={} loss_limit=${}",
-                        cfg.arb.max_recovered_failures_per_hour,
-                        cfg.arb.max_recovered_loss_usdc_per_hour
-                    );
-                    if let Some(reason) = recovered_failures.record(Decimal::ZERO, &cfg) {
-                        bail!("recovered-failure breaker triggered after hedge retry: {reason}");
-                    }
-                }
-                if let Some(pnl) = pnl.as_mut() {
-                    let row = pnl_trade_row(&spec, &opp, &report);
-                    let update = pnl.record_trade(row)?;
-                    let snapshot = pnl.snapshot();
-                    info!(
-                        "pnl update market={} since={} trades={} cumulative_pnl=${} max_loss=${} breaker_tripped={}",
-                        spec.market_id,
-                        format_ts(snapshot.since),
-                        update.trade_count,
-                        update.cumulative_pnl_usdc,
-                        snapshot.max_loss_usdc,
-                        update.breaker.is_some()
-                    );
-                    if let Some(breaker) = update.breaker {
-                        error!(
-                            "circuit breaker triggered: market={} since={} cumulative_pnl=${} max_loss=${} last_trade_net=${}",
-                            breaker.market,
-                            format_ts(breaker.pnl_since),
-                            breaker.cumulative_pnl_usdc,
-                            breaker.max_loss_usdc,
-                            breaker.last_trade_actual_net_usd
-                        );
-                        bail!(
-                            "circuit breaker triggered: cumulative PnL ${} <= -${}; manual reset required",
-                            breaker.cumulative_pnl_usdc,
-                            breaker.max_loss_usdc
-                        );
-                    }
+                let hourly_breaker = if report.hedge_retry_action_taken {
+                    recovered_failures.record(Decimal::ZERO, &cfg)
+                } else { None };
+                let row = pnl_trade_row(&spec, &opp, &report);
+                if let Some(update) = commit_accounting(&mut pnl, row, &session, hourly_breaker).await? {
+                    info!("pnl update market={} trades={} cumulative_pnl=${}",
+                        spec.market_id, update.trade_count, update.cumulative_pnl_usdc);
                 }
                 if options.max_trades.is_some_and(|max| trades_executed >= max) {
                     info!("max_trades reached; stopping");
@@ -1846,6 +1739,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                 cooldown_until = tokio::time::Instant::now() + Duration::from_millis(cooldown_ms);
             }
             Err(e) => {
+                if matches!(e, ExecutionError::OutcomeUnresolved { .. } | ExecutionError::Other(_)) {
+                    bail!("execution stopped with session barrier retained: {e:#}");
+                }
                 if e.is_skip() {
                     warn!("arb execution skipped: {e:#}");
                     let cooldown_ms = if options.exposure_filter == ExposureFilter::Reduce {
@@ -1855,7 +1751,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     };
                     cooldown_until =
                         tokio::time::Instant::now() + Duration::from_millis(cooldown_ms);
-                    account_refresh_paused.store(false, Ordering::Release);
+                    finish_execution(&execution_epoch);
                     continue;
                 }
                 let needs_recovery = e.needs_recovery();
@@ -1872,12 +1768,12 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     };
                     cooldown_until =
                         tokio::time::Instant::now() + Duration::from_millis(cooldown_ms);
-                    account_refresh_paused.store(false, Ordering::Release);
+                    finish_execution(&execution_epoch);
                     continue;
                 }
-                account_refresh_paused.store(true, Ordering::Release);
+                begin_execution(&execution_epoch);
                 let recovery_result =
-                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins).await;
+                    recover_if_needed(&cfg, &spec, &aster, &lighter, &http, margins, &session, &execution_journal).await;
                 let recovery = recovery_result?;
                 info!(
                     "rescue check complete action_taken={} estimated_loss=${} final_aster_pos={} final_lighter_pos={} lighter_ws={:?} aster_open_orders={} lighter_open_orders={} available_after=${}",
@@ -1891,6 +1787,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     recovery.margin_after.aster_available_usd + recovery.margin_after.lighter_available_usd
                 );
                 account = AccountSnapshot {
+                            execution_epoch: finish_execution(&execution_epoch),
+                            aster_open_orders: 0,
+                            lighter_open_orders: 0,
                     position: recovery.position,
                     lighter_ws_qty: recovery.lighter_ws_qty,
                     lighter_ws_rest_divergence_qty: recovery
@@ -1899,32 +1798,17 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
                     margins: recovery.margin_after,
                     refreshed_at: tokio::time::Instant::now(),
                 };
-                let _ = account_tx.send(account);
-                account_refresh_paused.store(false, Ordering::Release);
-                if recovery.action_taken {
-                    if let Some(reason) =
-                        recovered_failures.record(recovery.estimated_loss_usdc, &cfg)
-                    {
-                        bail!("recovered-failure breaker triggered: {reason}");
-                    }
-                    record_recovery_loss(&mut pnl, &spec, &recovery)?;
-                } else if matches!(e, ExecutionError::AccountingUnavailable { .. }) {
-                    // Both legs were accepted and recovery found positions balanced: the
-                    // trade almost certainly COMPLETED but its economics could not be
-                    // read before the deadline. Book the margin-delta estimate rather
-                    // than leaving the loss breaker blind to it. Deliberately NOT
-                    // synthesized from immediate-fill data (config-estimated fees and a
-                    // possibly-partial Lighter leg would write wrong SIGNED PnL); the
-                    // delta can overstate a loss slightly and never books phantom gains,
-                    // so the breaker fails conservative. The execution journal row keeps
-                    // the raw data for manual correction. Not counted as a rescue event
-                    // in recovered_failures — nothing was rescued.
-                    record_recovery_loss(&mut pnl, &spec, &recovery)?;
-                }
-                match refresh_account_snapshot(&spec.market_id, &aster, &lighter).await {
+                publish_account(&account_tx, account);
+                finish_execution(&execution_epoch);
+                let hourly_breaker = if recovery.action_taken {
+                    recovered_failures.record(recovery.estimated_loss_usdc, &cfg)
+                } else { None };
+                // Every failed execution is accounted before its session barrier is released.
+                record_recovery_loss(&mut pnl, &spec, &recovery, &session, hourly_breaker).await?;
+                match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
                     Ok(snapshot) => {
                         account = snapshot;
-                        let _ = account_tx.send(account);
+                        publish_account(&account_tx, account);
                     }
                     Err(refresh_err) => {
                         warn!("account snapshot refresh failed after recovery: {refresh_err:#}")
@@ -1940,6 +1824,29 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, options: RunOptions) -> R
         }
     }
     Ok(())
+    }.await;
+    if let Some(task) = lease_cache.task.take() { task.abort(); }
+    _account_refresh_task.abort();
+    let (history_drained, signals_drained, executions_drained, pnl_drained) = tokio::join!(
+        entry_gate.shutdown(), reduce_signal_tracker.shutdown(), execution_journal.shutdown(),
+        async { if let Some(pnl) = pnl.as_ref() { pnl.shutdown().await } else { Ok(()) } },
+    );
+    let drained = history_drained.and(signals_drained).and(executions_drained).and(pnl_drained);
+    let shutdown = if drained.is_ok() && !session.unresolved() {
+        finish_execution(&execution_epoch);
+        match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
+            Ok(snapshot) if snapshot.aster_open_orders == 0 && snapshot.lighter_open_orders == 0 => {
+                let (a_book, l_book) = fetch_books(&spec, &aster_books, &lighter)?;
+                if net_mismatch_notional(snapshot.position, &a_book, &l_book)
+                    .is_some_and(|amount| amount <= cfg.risk.max_position_mismatch_usd) {
+                    session.clear_verified().await
+                } else { Err(anyhow::anyhow!("shutdown position mismatch; session remains armed")) }
+            }
+            _ => Err(anyhow::anyhow!("shutdown account/orders unverified; session remains armed")),
+        }
+    } else if session.unresolved() { Err(anyhow::anyhow!("unresolved execution; session remains armed")) }
+    else { drained };
+    run_result.and(shutdown)
 }
 
 fn fetch_books(
@@ -1976,26 +1883,10 @@ fn scan_inputs_unchanged(
     }
 }
 
-async fn fetch_books_rest_lighter(
-    cfg: &Config,
-    spec: &MarketSpec,
-    http: &reqwest::Client,
-    lighter: &LighterVenue,
-) -> Result<(OrderBook, OrderBook)> {
-    let aster =
-        rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20)
-            .await?;
-    let lighter_book = lighter.order_book(&spec.market_id)?;
-    Ok((aster, lighter_book))
-}
 
 fn book_ok(book: &OrderBook, now: chrono::DateTime<Utc>, max_age_ms: i64) -> bool {
-    let age_ms = book.age_ms(now);
-    book.best_bid().is_some()
-        && book.best_ask().is_some()
-        && !book.is_crossed()
-        && age_ms >= 0
-        && age_ms <= max_age_ms
+    book.best_bid().is_some() && book.best_ask().is_some() && !book.is_crossed()
+        && book.is_fresh(now, max_age_ms)
 }
 
 fn best_opportunity(
@@ -2019,8 +1910,22 @@ fn best_opportunity(
         Direction::SellAsterBuyLighter,
         Direction::SellLighterBuyAster,
     ] {
+        let (sell_book, buy_book) = match direction {
+            Direction::SellAsterBuyLighter => (aster, lighter),
+            Direction::SellLighterBuyAster => (lighter, aster),
+        };
+        let (Some((top_sell, _)), Some((top_buy, _)), Some(reference)) =
+            (sell_book.best_bid_f64(), buy_book.best_ask_f64(), aster.mid_f64()) else { continue; };
+        if reference <= 0.0 || (top_sell - top_buy) / reference * 10_000.0
+            < required_f - EDGE_PREFILTER_EPS_BPS { continue; }
+        let reduce_cap = if exposure_filter == ExposureFilter::Reduce {
+            let reduces_aster = match direction.aster_side() { Side::Buy => pos.aster_qty < 0.0, Side::Sell => pos.aster_qty > 0.0 };
+            let reduces_lighter = match direction.lighter_side() { Side::Buy => pos.lighter_qty < 0.0, Side::Sell => pos.lighter_qty > 0.0 };
+            if !reduces_aster || !reduces_lighter { continue; }
+            Some(pos.aster_qty.abs().min(pos.lighter_qty.abs()))
+        } else { None };
         let Some((sizing, sell_px, buy_px, ref_px)) =
-            depth_priced_sizing(cfg, spec, math, direction, aster, lighter, pos, margins, min_size)
+            depth_priced_sizing(cfg, spec, math, direction, aster, lighter, pos, margins, min_size, reduce_cap)
         else {
             continue;
         };
@@ -2063,28 +1968,6 @@ fn opportunity_allowed_by_exposure_filter(
     }
 }
 
-fn exposure_effect(pos: PositionSnapshot, direction: Direction, qty: Decimal) -> ExposureEffect {
-    if qty <= Decimal::ZERO {
-        return ExposureEffect::Unknown;
-    }
-    let a_sign = if matches!(direction.aster_side(), Side::Buy) {
-        Decimal::ONE
-    } else {
-        -Decimal::ONE
-    };
-    let l_sign = -a_sign;
-    let before = pos.aster_qty.abs().max(pos.lighter_qty.abs());
-    let after_a = pos.aster_qty + a_sign * qty;
-    let after_l = pos.lighter_qty + l_sign * qty;
-    let after = after_a.abs().max(after_l.abs());
-    if after < before {
-        ExposureEffect::Reduce
-    } else if after > before {
-        ExposureEffect::Increase
-    } else {
-        ExposureEffect::Flat
-    }
-}
 
 fn exposure_effect_f64(
     aster_qty: f64,
@@ -2199,27 +2082,9 @@ fn build_opportunity_f64(
     }
 }
 
-fn depth_priced_opportunity(
-    cfg: &Config,
-    spec: &MarketSpec,
-    math: &MarketMathF64,
-    direction: Direction,
-    aster: &OrderBook,
-    lighter: &OrderBook,
-    pos: PositionF64,
-    margins: MarginF64,
-    min_size: bool,
-) -> Option<Opportunity> {
-    let (sizing, sell_px, buy_px, ref_px_f) = depth_priced_sizing(
-        cfg, spec, math, direction, aster, lighter, pos, margins, min_size,
-    )?;
-    Some(build_opportunity_f64(
-        cfg, math, direction, sizing, sell_px, buy_px, ref_px_f,
-    ))
-}
 
-/// The all-f64 sizing/pricing stage of [`depth_priced_opportunity`], split out so the
-/// scan loop can apply the edge pre-filter before paying for the Decimal build.
+/// Depth sizing stays in f64; only candidates clearing its conservative edge floor
+/// are converted to Decimal for submission and accounting.
 fn depth_priced_sizing(
     cfg: &Config,
     spec: &MarketSpec,
@@ -2230,6 +2095,7 @@ fn depth_priced_sizing(
     pos: PositionF64,
     margins: MarginF64,
     min_size: bool,
+    reduce_cap: Option<f64>,
 ) -> Option<(SizingDecisionF64, f64, f64, f64)> {
     let ref_px_f = aster.mid_f64().or_else(|| lighter.mid_f64())?;
     if ref_px_f <= 0.0 {
@@ -2289,7 +2155,7 @@ fn depth_priced_sizing(
     let sell_available = sell_book.cumulative_qty_f64(Side::Sell, max_levels)?;
     let buy_available = buy_book.cumulative_qty_f64(Side::Buy, max_levels)?;
     let depth_supported_qty = sell_available.min(buy_available) / liquidity_multiple;
-    let max_qty = depth_supported_qty.min(headroom).min(margin_room);
+    let max_qty = depth_supported_qty.min(headroom).min(margin_room).min(reduce_cap.unwrap_or(f64::MAX));
     if max_qty <= 0.0 {
         return None;
     }
@@ -2494,93 +2360,10 @@ fn ceil_to_common_step_f64(qty: f64, math: &MarketMathF64) -> f64 {
     round_qty_to_scale_f64(units * math.common_qty_step, math)
 }
 
-#[cfg(test)]
-fn min_trade_qty(
-    spec: &MarketSpec,
-    aster_px: Decimal,
-    lighter_px: Decimal,
-) -> Option<Decimal> {
-    if aster_px <= Decimal::ZERO || lighter_px <= Decimal::ZERO {
-        return None;
-    }
-    Some(
-        spec.aster_min_qty
-            .max(spec.aster_min_notional / aster_px)
-            .max(spec.lighter_min_notional / lighter_px),
-    )
-}
-
-#[cfg(test)]
-fn max_qty_by_headroom(
-    max_abs_qty: Decimal,
-    pos: PositionSnapshot,
-    a_sign: Decimal,
-    l_sign: Decimal,
-) -> Decimal {
-    fn leg(max_abs_qty: Decimal, current: Decimal, sign: Decimal) -> Decimal {
-        let same_direction = current == Decimal::ZERO
-            || (current > Decimal::ZERO && sign > Decimal::ZERO)
-            || (current < Decimal::ZERO && sign < Decimal::ZERO);
-        if same_direction {
-            (max_abs_qty - current.abs()).max(Decimal::ZERO)
-        } else {
-            current.abs() + max_abs_qty
-        }
-    }
-    leg(max_abs_qty, pos.aster_qty, a_sign).min(leg(max_abs_qty, pos.lighter_qty, l_sign))
-}
-
-#[cfg(test)]
-fn max_qty_by_available_margin(
-    cfg: &Config,
-    ref_px: Decimal,
-    pos: PositionSnapshot,
-    margins: MarginSnapshot,
-    a_sign: Decimal,
-    l_sign: Decimal,
-) -> Decimal {
-    fn leg(
-        ref_px: Decimal,
-        current: Decimal,
-        sign: Decimal,
-        available: Decimal,
-        buffer: Decimal,
-    ) -> Decimal {
-        let increases_abs = current == Decimal::ZERO
-            || (current > Decimal::ZERO && sign > Decimal::ZERO)
-            || (current < Decimal::ZERO && sign < Decimal::ZERO);
-        let usable = available - buffer;
-        let margin_qty = if usable <= Decimal::ZERO || ref_px <= Decimal::ZERO {
-            Decimal::ZERO
-        } else {
-            usable / ref_px
-        };
-        if !increases_abs {
-            // Mirrors the f64 hot path above: reduces are margin-free only up to
-            // |current|; the crossing remainder consumes margin like an increase.
-            return current.abs() + margin_qty;
-        }
-        margin_qty
-    }
-    leg(
-        ref_px,
-        pos.aster_qty,
-        a_sign,
-        margins.aster_available_usd,
-        cfg.risk.margin_buffer_usd,
-    )
-    .min(leg(
-        ref_px,
-        pos.lighter_qty,
-        l_sign,
-        margins.lighter_available_usd,
-        cfg.risk.margin_buffer_usd,
-    ))
-}
 
 fn next_execution_id() -> String {
     let seq = EXECUTION_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{seq}", Utc::now().timestamp_millis())
+    format!("{}-{}-{seq}", Utc::now().timestamp_nanos_opt().unwrap_or(0), std::process::id())
 }
 
 fn execution_log_path(cfg: &Config, market: &MarketId) -> PathBuf {
@@ -2598,684 +2381,349 @@ fn execution_log_path(cfg: &Config, market: &MarketId) -> PathBuf {
     PathBuf::from(&cfg.pnl.persist_dir).join(format!("executions_{component}.jsonl"))
 }
 
-fn append_execution_log(cfg: &Config, spec: &MarketSpec, row: serde_json::Value) {
-    let path = execution_log_path(cfg, &spec.market_id);
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = append_execution_log_inner(&path, &row) {
-            warn!(
-                "failed to append execution diagnostics {}: {e:#}",
-                path.display()
-            );
-        }
-    });
+#[derive(Serialize)]
+struct ExecutionStart {
+    schema_version: u32,
+    economic_status: &'static str,
+    timestamp: DateTime<Utc>,
+    execution_id: String,
+    session_id: String,
+    market: String,
+    outcome: &'static str,
+    direction: &'static str,
+    qty: Decimal,
 }
 
-fn append_execution_log_inner(path: &Path, row: &serde_json::Value) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create execution diagnostics dir {}", parent.display()))?;
+#[derive(Serialize)]
+#[serde(untagged)]
+enum ExecutionRecord {
+    Start(ExecutionStart),
+    Row(serde_json::Value),
+}
+
+type ExecutionJournal = ColdJournal<ExecutionRecord>;
+
+async fn append_execution_record(journal: &ExecutionJournal, row: serde_json::Value) -> Result<()> {
+    journal.append_confirmed(ExecutionRecord::Row(row)).await
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct LegEvidence {
+    pub(crate) fee_evidence: Vec<FeeEvidence>,
+    pub(crate) terminal: bool,
+    pub(crate) qty: Option<Decimal>,
+    pub(crate) fill: Option<FillSummary>,
+    pub(crate) order_id: Option<i64>,
+    pub(crate) error: Option<String>,
+}
+
+impl LegEvidence {
+    fn not_submitted() -> Self {
+        Self { fee_evidence:Vec::new(), terminal: true, qty: Some(Decimal::ZERO), fill: Some(FillSummary::zero()),
+            order_id: None, error: None }
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open execution diagnostics {}", path.display()))?;
-    serde_json::to_writer(&mut file, row)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    Ok(())
+    fn unresolved(error: String) -> Self {
+        Self { fee_evidence:Vec::new(), terminal: false, qty: None, fill: None, order_id: None, error: Some(error) }
+    }
 }
 
-fn insert_json<T: Serialize>(
-    row: &mut serde_json::Map<String, serde_json::Value>,
-    key: &str,
-    value: T,
-) {
-    let value = serde_json::to_value(value).unwrap_or(serde_json::Value::Null);
-    row.insert(key.to_string(), value);
+pub(crate) fn aster_order_identity(outcome: &AsterOutcome, side: Side, qty: Decimal) -> serde_json::Value {
+    let mut identity = match outcome {
+        AsterOutcome::Accepted { client_order_id, venue_order_id, .. } => serde_json::json!({
+            "venue": "aster", "submitted": true, "client_order_id": client_order_id, "order_id": venue_order_id }),
+        AsterOutcome::Unknown { client_order_id, .. } => serde_json::json!({
+            "venue": "aster", "submitted": true, "client_order_id": client_order_id }),
+        AsterOutcome::Rejected { .. } => serde_json::json!({ "venue": "aster", "submitted": false }),
+    };
+    identity["side"] = serde_json::json!(side.as_str());
+    identity["qty"] = serde_json::json!(qty);
+    identity
+}
+
+pub(crate) fn lighter_order_identity(outcome: &LighterOutcome, side: Side, qty: Decimal) -> serde_json::Value {
+    let mut identity = match outcome {
+        LighterOutcome::Accepted { client_order_index, tx_hash, nonce, .. }
+        | LighterOutcome::Unknown { client_order_index, tx_hash, nonce, .. } => serde_json::json!({
+            "venue": "lighter", "submitted": true, "client_order_index": client_order_index,
+            "tx_hash": tx_hash, "nonce": nonce }),
+        _ => serde_json::json!({ "venue": "lighter", "submitted": false }),
+    };
+    identity["side"] = serde_json::json!(side.as_str());
+    identity["qty"] = serde_json::json!(qty);
+    identity
+}
+
+pub(crate) async fn resolve_aster_evidence(
+    spec: &MarketSpec, aster: &AsterRest, outcome: &AsterOutcome, timeout: Duration,
+) -> LegEvidence {
+    let (client, initial) = match outcome {
+        AsterOutcome::Accepted { client_order_id, raw, .. } => (client_order_id, Some(raw.clone())),
+        AsterOutcome::Unknown { client_order_id, .. } => (client_order_id, None),
+        AsterOutcome::Rejected { .. } => return LegEvidence::not_submitted(),
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut known_terminal = None;
+    let resolved = tokio::time::timeout_at(deadline, async {
+        let mut body = initial;
+        loop {
+            if let Some(raw) = body.take() {
+                if order_response_is_terminal(&raw)? {
+                    let order: serde_json::Value = serde_json::from_str(&raw)?;
+                    if let Some(returned) = order.get("clientOrderId").and_then(serde_json::Value::as_str) {
+                        anyhow::ensure!(returned == client, "Aster terminal order identity mismatch");
+                    }
+                    let immediate = immediate_fill_from_order_response(&raw)?;
+                    let order_id = order.get("orderId").and_then(serde_json::Value::as_i64)
+                        .context("Aster terminal order lacks order id")?;
+                    known_terminal = Some(LegEvidence { fee_evidence:Vec::new(), terminal: true, qty: Some(immediate.qty),
+                        fill: if immediate.qty == Decimal::ZERO { Some(FillSummary::zero()) }
+                            else { FillSummary::from_qty_notional(immediate.qty, immediate.notional, Decimal::ZERO)
+                                .map(|fill| fill.with_fee_provenance(FeeProvenance::Unknown)) },
+                        order_id: Some(order_id), error: Some("fill accounting deadline".to_string()) });
+                    let fill = if immediate.qty == Decimal::ZERO { Some(FillSummary::zero()) }
+                        else {
+                            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                            match aster.wait_order_fill_summary(&spec.market_id, order_id, immediate.qty, remaining).await {
+                                Ok(fill) => Some(fill),
+                                Err(_) => FillSummary::from_qty_notional(immediate.qty, immediate.notional, Decimal::ZERO)
+                                    .map(|fill| fill.with_fee_provenance(FeeProvenance::Unknown)),
+                            }
+                        };
+                    return Ok::<_, anyhow::Error>(LegEvidence { fee_evidence:Vec::new(), terminal: true, qty: Some(immediate.qty),
+                        fill, order_id: Some(order_id), error: None });
+                }
+            }
+            match aster.query_order(&spec.market_id, client).await {
+                Ok(order) => {
+                    anyhow::ensure!(order.get("clientOrderId").and_then(serde_json::Value::as_str) == Some(client.as_str()),
+                        "Aster queried order identity unavailable/mismatched");
+                    body = Some(serde_json::to_string(&order)?);
+                }
+                Err(error) => debug!("Aster order not yet resolved client={client}: {error:#}"),
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }).await;
+    match resolved {
+        Ok(Ok(evidence)) => evidence,
+        Ok(Err(error)) => LegEvidence::unresolved(format!("{error:#}")),
+        Err(_) => known_terminal.unwrap_or_else(|| LegEvidence::unresolved(format!("Aster order {client} unresolved at deadline"))),
+    }
+}
+
+pub(crate) async fn resolve_lighter_evidence(
+    spec: &MarketSpec, lighter: &LighterVenue, outcome: &LighterOutcome,
+    mut pending: Option<PendingFill>, side: Side, qty: Decimal, timeout: Duration,
+) -> LegEvidence {
+    let client = match outcome {
+        LighterOutcome::Accepted { client_order_index, .. }
+        | LighterOutcome::Unknown { client_order_index, .. } => *client_order_index,
+        _ => return LegEvidence::not_submitted(),
+    };
+    let start = tokio::time::Instant::now();
+    let mut confirmation = if let Some(pending) = pending.as_mut() {
+        Some(pending.observe_confirmed(timeout.min(Duration::from_secs(3))).await)
+    } else { None };
+    let confirmed_terminal = |value: &LighterFillConfirmation| {
+        value.terminal_order.as_ref().is_some_and(|order| order.is_terminal())
+            || (value.filled_qty == qty && value.fill.is_some())
+    };
+    let needs_history = confirmation.as_ref().is_none_or(|value| !confirmed_terminal(value)
+        || value.fill.as_ref().is_none_or(|fill| fill.fee_provenance != FeeProvenance::Venue));
+    if needs_history {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let history = lighter.resolve_order_terminal(&spec.market_id, client, side, qty, remaining);
+        tokio::pin!(history);
+        if let Some(pending) = pending.as_mut() {
+            let stream = pending.observe_confirmed(remaining);
+            tokio::pin!(stream);
+            tokio::select! {
+                value = &mut stream => {
+                    let strong = confirmed_terminal(&value) && value.fill.as_ref()
+                        .is_some_and(|fill| fill.fee_provenance == FeeProvenance::Venue);
+                    confirmation = Some(value);
+                    if !strong { if let Ok(value) = history.await { confirmation = Some(value); } }
+                }
+                result = &mut history => match result {
+                    Ok(value) => confirmation = Some(value),
+                    Err(_) => confirmation = Some(stream.await),
+                }
+            }
+        } else if let Ok(value) = history.await { confirmation = Some(value); }
+    }
+    match confirmation {
+        Some(value) if confirmed_terminal(&value) => LegEvidence { fee_evidence:value.fee_evidence, terminal: true,
+            qty: Some(value.filled_qty), fill: value.fill,
+            order_id: value.terminal_order.and_then(|order| order.order_index), error: None },
+        _ => LegEvidence::unresolved(format!("Lighter order {client} has no terminal evidence")),
+    }
+}
+
+async fn wait_position_evidence(
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    expected: PositionSnapshot, reference: Decimal,
+) -> Result<PositionSnapshot> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    tokio::time::timeout_at(deadline, async {
+        loop {
+            if let Ok(position) = reconcile_positions(&spec.market_id, aster, lighter).await {
+                if (position.aster_qty - expected.aster_qty).abs() * reference <= cfg.risk.max_position_mismatch_usd
+                    && (position.lighter_qty - expected.lighter_qty).abs() * reference <= cfg.risk.max_position_mismatch_usd {
+                    return Ok(position);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms.max(250))).await;
+        }
+    }).await.context("positions did not reflect terminal fill evidence")?
 }
 
 async fn execute_opportunity(
-    cfg: &Config,
-    spec: &MarketSpec,
-    aster: &AsterRest,
-    lighter: &LighterVenue,
-    opp: &Opportunity,
-    pre_position: PositionSnapshot,
-    margin_before: MarginSnapshot,
-    reduce_only: bool,
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    opp: &Opportunity, pre_position: PositionSnapshot, margin_before: MarginSnapshot,
+    reduce_only: bool, journal: &ExecutionJournal, session: &ActiveSession,
 ) -> std::result::Result<TradeReport, ExecutionError> {
     let execution_id = next_execution_id();
     let started_at = Utc::now();
-    let aster_bound = aster_price_bound(opp, cfg.arb.max_aster_slippage_bps);
-    let lighter_bound = lighter_price_bound(opp, cfg.arb.max_lighter_slippage_bps);
     let aster_side = opp.direction.aster_side();
     let lighter_side = opp.direction.lighter_side();
-    info!(
-        "arb execution start execution_id={} market={} direction={} qty={} reduce_only={} gross={}bps expected_net=${} aster_bound={} lighter_bound={} aster_slippage_bps={} lighter_slippage_bps={} pre_aster_pos={} pre_lighter_pos={}",
-        execution_id,
-        spec.market_id,
-        opp.direction.as_str(),
-        opp.qty,
-        reduce_only,
-        opp.gross_edge_bps,
-        opp.expected_net_usd,
-        aster_bound,
-        lighter_bound,
-        cfg.arb.max_aster_slippage_bps,
-        cfg.arb.max_lighter_slippage_bps,
-        pre_position.aster_qty,
-        pre_position.lighter_qty
+    let aster_bound = aster_price_bound(opp, cfg.arb.max_aster_slippage_bps);
+    let lighter_bound = lighter_price_bound(opp, cfg.arb.max_lighter_slippage_bps);
+    // The durable session was armed cold. This bounded queue operation never waits for disk.
+    journal.try_append(ExecutionRecord::Start(ExecutionStart { schema_version:2,economic_status:"incomplete",
+        timestamp:started_at,execution_id:execution_id.clone(),session_id:session.id().to_string(),
+        market:spec.market_id.to_string(),outcome:"submitting",direction:opp.direction.as_str(),qty:opp.qty }))?;
+    let (a_res, (l_res, pending)) = tokio::join!(
+        aster.submit_ioc_order(&spec.market_id, aster_side, opp.qty, aster_bound, reduce_only),
+        lighter.submit_market_order_deferred_fill(&spec.market_id, lighter_side, opp.qty, lighter_bound, reduce_only),
     );
-    if tracing::enabled!(Level::DEBUG) {
-        debug!(
-            "submitting arb legs execution_id={} direction={} qty={} aster_side={} lighter_side={} reduce_only={} aster_price_bound={} lighter_price_bound={} available_before=${} aster_available_before=${} lighter_available_before=${}",
-            execution_id,
-            opp.direction.as_str(),
-            opp.qty,
-            aster_side,
-            lighter_side,
-            reduce_only,
-            aster_bound,
-            lighter_bound,
-            margin_before.aster_available_usd + margin_before.lighter_available_usd,
-            margin_before.aster_available_usd,
-            margin_before.lighter_available_usd
-        );
+    let mut orders = vec![aster_order_identity(&a_res, aster_side, opp.qty), lighter_order_identity(&l_res, lighter_side, opp.qty)];
+    session.record_unresolved(serde_json::json!({ "schema_version": 2, "economic_status": "incomplete",
+        "timestamp": Utc::now(), "execution_id": execution_id, "session_id": session.id(),
+        "market": spec.market_id.to_string(), "outcome": "resolving", "orders": orders,
+        "orders_complete": true, "pre_positions": {"aster_qty": pre_position.aster_qty, "lighter_qty": pre_position.lighter_qty} })).await?;
+    let (a, l) = tokio::join!(
+        resolve_aster_evidence(spec, aster, &a_res, Duration::from_secs(10)),
+        resolve_lighter_evidence(spec, lighter, &l_res, pending, lighter_side, opp.qty, Duration::from_secs(10)),
+    );
+    let mut row = serde_json::json!({
+        "schema_version": 2, "economic_status": "incomplete", "timestamp": Utc::now(),
+        "started_at": started_at, "execution_id": execution_id, "session_id": session.id(), "market": spec.market_id.to_string(),
+        "execution_mode": "concurrent_confirm_rescue", "direction": opp.direction.as_str(),
+        "qty": opp.qty, "reduce_only": reduce_only, "orders": orders, "orders_complete": true,
+        "aster_submit": format!("{a_res:?}"), "lighter_submit": format!("{l_res:?}"),
+        "aster_confirmation": a, "lighter_confirmation": l,
+        "gross_edge_bps": opp.gross_edge_bps, "expected_net_usd": opp.expected_net_usd,
+        "aster_bound": aster_bound, "lighter_bound": lighter_bound,
+        "pre_positions": {"aster_qty": pre_position.aster_qty, "lighter_qty": pre_position.lighter_qty},
+        "depth_guard": { "enabled": opp.depth_guard_enabled, "liquidity_multiple": opp.liquidity_multiple,
+            "sell_depth_target_qty": opp.sell_depth_target_qty, "buy_depth_target_qty": opp.buy_depth_target_qty,
+            "sell_depth_worst_px": opp.sell_depth_worst_px, "buy_depth_worst_px": opp.buy_depth_worst_px }
+    });
+    if !a.terminal || !l.terminal {
+        row["outcome"] = serde_json::json!("unresolved");
+        session.record_unresolved(row.clone()).await?;
+        append_execution_record(journal,row).await?;
+        return Err(ExecutionError::OutcomeUnresolved { details: "submission terminal evidence unavailable; session remains armed".to_string() });
     }
-    let a = aster.submit_ioc_order(
-        &spec.market_id,
-        aster_side,
-        opp.qty,
-        aster_bound,
-        reduce_only,
-    );
-    let l = lighter.submit_market_order_deferred_fill(
-        &spec.market_id,
-        lighter_side,
-        opp.qty,
-        lighter_bound,
-        reduce_only,
-    );
-    let (a_res, (l_res, lighter_pending_fill)) = tokio::join!(a, l);
-    info!(
-        "arb leg submission results execution_id={execution_id} Aster={a_res:?} Lighter={l_res:?}"
-    );
-
-    let aster_accepted = matches!(&a_res, AsterOutcome::Accepted { .. });
-    let lighter_accepted = matches!(&l_res, LighterOutcome::Accepted { .. });
-    match (&a_res, &l_res) {
-        (
-            AsterOutcome::Accepted { venue_order_id, .. },
-            LighterOutcome::Accepted {
-                client_order_index, ..
-            },
-        ) => {
-            info!(
-                "arb legs accepted execution_id={} {} qty={} aster_oid={:?} lighter_client_order_index={}",
-                execution_id,
-                opp.direction.as_str(),
-                opp.qty,
-                venue_order_id,
-                client_order_index
-            );
+    let mut aster_fill = a.fill;
+    let mut lighter_fill = l.fill;
+    let mut lighter_fee_evidence = l.fee_evidence.clone();
+    let a_sign = if aster_side == Side::Buy { Decimal::ONE } else { -Decimal::ONE };
+    let expected = PositionSnapshot {
+        aster_qty: pre_position.aster_qty + a_sign * a.qty.unwrap_or(Decimal::ZERO),
+        lighter_qty: pre_position.lighter_qty - a_sign * l.qty.unwrap_or(Decimal::ZERO),
+    };
+    let mut position = match wait_position_evidence(cfg, spec, aster, lighter, expected, opp.ref_px).await {
+        Ok(position) => position,
+        Err(error) => {
+            row["outcome"] = serde_json::json!("unreconciled");
+            row["error"] = serde_json::json!(format!("{error:#}"));
+            append_execution_record(journal,row).await?;
+            return Err(ExecutionError::Unreconciled { details: format!("{error:#}") });
         }
-        _ => {
-            let (pos_after, aster_open, lighter_open) = tokio::join!(
-                reconcile_positions(&spec.market_id, aster, lighter),
-                aster.open_orders(&spec.market_id),
-                lighter.rest_open_orders_count(&spec.market_id),
-            );
-            let lighter_ws_qty = lighter.ws_position_qty(&spec.market_id).ok();
-            let pos_after_ok = pos_after.ok();
-            append_execution_log(
-                cfg,
-                spec,
-                serde_json::json!({
-                    "timestamp": Utc::now(),
-                    "started_at": started_at,
-                    "execution_id": execution_id,
-                    "market": spec.market_id.to_string(),
-                    "execution_mode": "concurrent_confirm_rescue",
-                    "outcome": "submit_rejected",
-                    "direction": opp.direction.as_str(),
-                    "qty": opp.qty,
-                    "reduce_only": reduce_only,
-                    "gross_edge_bps": opp.gross_edge_bps,
-                    "expected_net_usd": opp.expected_net_usd,
-                    "depth_guard": {
-                        "enabled": opp.depth_guard_enabled,
-                        "liquidity_multiple": opp.liquidity_multiple,
-                        "depth_supported_qty": opp.depth_supported_qty,
-                        "sell_depth_target_qty": opp.sell_depth_target_qty,
-                        "buy_depth_target_qty": opp.buy_depth_target_qty,
-                        "sell_depth_available_qty": opp.sell_depth_available_qty,
-                        "buy_depth_available_qty": opp.buy_depth_available_qty,
-                        "sell_depth_worst_px": opp.sell_depth_worst_px,
-                        "buy_depth_worst_px": opp.buy_depth_worst_px,
-                        "sell_depth_levels_used": opp.sell_depth_levels_used,
-                        "buy_depth_levels_used": opp.buy_depth_levels_used,
-                        "sell_best_px": opp.sell_best_px,
-                        "buy_best_px": opp.buy_best_px,
-                        "sell_best_qty": opp.sell_best_qty,
-                        "buy_best_qty": opp.buy_best_qty,
-                    },
-                    "aster_bound": aster_bound,
-                    "lighter_bound": lighter_bound,
-                    "aster_submit": format!("{a_res:?}"),
-                    "lighter_submit": format!("{l_res:?}"),
-                    "one_sided_accept": aster_accepted ^ lighter_accepted,
-                    "aster_position_after": pos_after_ok.map(|p| p.aster_qty),
-                    "lighter_position_rest_after": pos_after_ok.map(|p| p.lighter_qty),
-                    "lighter_position_ws_after": lighter_ws_qty,
-                    "aster_open_orders_after": aster_open.as_ref().ok().map(|orders| orders.len()),
-                    "lighter_open_orders_rest_after": lighter_open.as_ref().ok().copied(),
-                    "error": format!("one or both legs not accepted: Aster={a_res:?} Lighter={l_res:?}"),
-                }),
-            );
-            let aster_unknown = matches!(&a_res, AsterOutcome::Unknown { .. });
-            let lighter_unknown = matches!(&l_res, LighterOutcome::Unknown { .. });
-            if !aster_accepted && !lighter_accepted {
-                if aster_unknown || lighter_unknown {
-                    // An Unknown outcome (HTTP timeout, ws response_timeout /
-                    // disconnected_after_send) means the order may actually be LIVE and
-                    // FILLED at the venue. That is not a clean skip: classify as
-                    // Unreconciled so needs_recovery() runs the post-trade reconcile +
-                    // rescue path, which verifies real positions and flattens any
-                    // residual leg instead of cooling down on top of a naked position.
-                    return Err(ExecutionError::Unreconciled {
-                        details: format!(
-                            "no leg accepted but outcome(s) unknown (order may exist at venue): Aster={a_res:?} Lighter={l_res:?}"
-                        ),
-                    });
-                }
-                return Err(ExecutionError::Skipped {
-                    details: format!(
-                        "neither leg accepted: Aster={a_res:?} Lighter={l_res:?}"
-                    ),
-                });
+    };
+    let mut hedge_retry_action_taken = false;
+    let mut aster_order_id = a.order_id.unwrap_or(0);
+    let mut lighter_client_order_index = match &l_res {
+        LighterOutcome::Accepted { client_order_index, .. } | LighterOutcome::Unknown { client_order_index, .. } => *client_order_index,
+        _ => 0,
+    };
+    if position.net_qty().abs() * opp.ref_px > cfg.risk.max_position_mismatch_usd {
+        let retry = try_missing_hedge_retry(cfg, spec, aster, lighter, opp, pre_position, position, reduce_only).await;
+        hedge_retry_action_taken = retry.attempted;
+        for attempt in &retry.attempts {
+            orders.push(attempt.identity.clone());
+            if attempt.fill_status.as_deref() == Some("unresolved") {
+                row["outcome"] = serde_json::json!("unresolved_hedge_retry");
+                row["orders_complete"] = serde_json::json!(!orders.iter().any(|order|
+                    order.get("identity_unavailable").and_then(serde_json::Value::as_bool) == Some(true)));
+                row["orders"] = serde_json::json!(orders);
+                row["hedge_retry"] = hedge_retry_report_json(Some(&retry));
+                session.record_unresolved(row.clone()).await?;
+                append_execution_record(journal,row).await?;
+                return Err(ExecutionError::OutcomeUnresolved { details: "hedge retry remains unresolved".to_string() });
             }
-            return Err(ExecutionError::LegRejected {
-                one_sided: aster_accepted ^ lighter_accepted,
-                details: format!(
-                    "one or both legs not accepted: Aster={a_res:?} Lighter={l_res:?}"
-                ),
-            });
-        }
-    }
-
-    let (aster_order_id, aster_immediate_fill, aster_immediate_error) = match &a_res {
-        AsterOutcome::Accepted {
-            venue_order_id: Some(order_id),
-            raw,
-        } => match immediate_fill_from_order_response(raw) {
-            Ok(fill) => (*order_id, fill, None),
-            Err(e) => (
-                *order_id,
-                AsterImmediateFill {
-                    qty: Decimal::ZERO,
-                    vwap: Decimal::ZERO,
-                    notional: Decimal::ZERO,
-                },
-                Some(format!("{e:#}")),
-            ),
-        },
-        other => {
-            return Err(ExecutionError::AccountingUnavailable {
-                details: format!("Aster accepted response missing orderId: {other:?}"),
-            });
-        }
-    };
-    let aster_initial_zero_fill = aster_immediate_fill.qty <= Decimal::ZERO;
-    let lighter_client_order_index = match &l_res {
-        LighterOutcome::Accepted {
-            client_order_index, ..
-        } => *client_order_index,
-        other => {
-            return Err(ExecutionError::AccountingUnavailable {
-                details: format!("Lighter accepted response missing client id: {other:?}"),
-            });
-        }
-    };
-    let Some(lighter_pending_fill) = lighter_pending_fill else {
-        append_execution_log(
-            cfg,
-            spec,
-            serde_json::json!({
-                "timestamp": Utc::now(),
-                "started_at": started_at,
-                "execution_id": execution_id,
-                "market": spec.market_id.to_string(),
-                "execution_mode": "concurrent_confirm_rescue",
-                "outcome": "accounting_unavailable",
-                "direction": opp.direction.as_str(),
-                "qty": opp.qty,
-                "reduce_only": reduce_only,
-                "aster_submit": format!("{a_res:?}"),
-                "lighter_submit": format!("{l_res:?}"),
-                "aster_order_id": aster_order_id,
-                "lighter_client_order_index": lighter_client_order_index,
-                "error": format!("Lighter accepted response missing deferred fill waiter: {l_res:?}"),
-            }),
-        );
-        return Err(ExecutionError::AccountingUnavailable {
-            details: format!("Lighter accepted response missing deferred fill waiter: {l_res:?}"),
-        });
-    };
-
-    let reconcile_fut = wait_post_trade_reconciled(cfg, spec, aster, lighter, opp);
-    let aster_fill_fut = aster.wait_order_fill_summary(
-        &spec.market_id,
-        aster_order_id,
-        opp.qty,
-        Duration::from_secs(10),
-    );
-    let lighter_fill_fut = lighter_pending_fill.wait_confirmed(Duration::from_secs(10));
-    let (mut reconciled, aster_fill, lighter_confirmation) =
-        tokio::join!(reconcile_fut, aster_fill_fut, lighter_fill_fut);
-
-    let mut aster_fill_ok = None;
-    let mut aster_fill_error = None;
-    let mut aster_fill_note = None;
-    match aster_fill {
-        Ok(fill) => {
-            aster_fill_ok = Some(fill);
-        }
-        Err(e) if aster_immediate_fill.qty > Decimal::ZERO
-            && aster_immediate_fill.notional > Decimal::ZERO =>
-        {
-            let note = format!(
-                "Aster userTrades unavailable for orderId={aster_order_id}; using immediate IOC response fill qty={} vwap={} notional=${}: {e:#}",
-                aster_immediate_fill.qty,
-                aster_immediate_fill.vwap,
-                aster_immediate_fill.notional
-            );
-            warn!("{note}");
-            aster_fill_note = Some(note);
-            aster_fill_ok = Some(immediate_fill_summary(
-                aster_immediate_fill,
-                cfg.arb.aster_taker_fee_bps,
-            ));
-        }
-        Err(e) if aster_initial_zero_fill => {
-            let note = format!(
-                "Aster IOC orderId={} reported zero initial fill and no userTrades before timeout; treating Aster leg as zero fill: {e:#}",
-                aster_order_id
-            );
-            warn!(
-                "Aster IOC orderId={} reported zero initial fill and no userTrades before timeout; treating Aster leg as zero fill: {e:#}",
-                aster_order_id
-            );
-            aster_fill_note = Some(note);
-            aster_fill_ok = Some(zero_fill_summary());
-        }
-        Err(e) => {
-            aster_fill_error = Some(format!(
-                "Aster fill accounting unavailable for orderId={aster_order_id}: {e:#}"
-            ));
-        }
-    }
-    let mut lighter_fill_ok = lighter_confirmation.fill;
-    let mut hedge_retry_report = None;
-    if reconciled.is_err() {
-        let retry_start_position = reconcile_positions(&spec.market_id, aster, lighter).await.ok();
-        if let Some(retry_start_position) = retry_start_position {
-            let retry = try_missing_hedge_retry(
-                cfg,
-                spec,
-                aster,
-                lighter,
-                opp,
-                pre_position,
-                retry_start_position,
-                reduce_only,
-            )
-            .await;
-            if retry.succeeded {
-                if let (Some(position), Some(net_notional)) =
-                    (retry.final_position, retry.net_notional)
-                {
-                    reconciled = Ok((position, net_notional));
+            match attempt.venue {
+                HedgeRetryVenue::Aster => {
+                    aster_fill = add_fill_summary(aster_fill, attempt.fill);
+                    if aster_order_id == 0 { aster_order_id = attempt.identity.get("order_id").and_then(serde_json::Value::as_i64).unwrap_or(0); }
                 }
-                for attempt in &retry.attempts {
-                    match attempt.venue {
-                        HedgeRetryVenue::Aster => {
-                            aster_fill_ok = add_fill_summary(aster_fill_ok, attempt.fill);
-                        }
-                        HedgeRetryVenue::Lighter => {
-                            lighter_fill_ok = add_fill_summary(lighter_fill_ok, attempt.fill);
-                        }
-                    }
+                HedgeRetryVenue::Lighter => {
+                    lighter_fill = add_fill_summary(lighter_fill, attempt.fill);
+                    lighter_fee_evidence.extend(attempt.fee_evidence.iter().cloned());
+                    if lighter_client_order_index == 0 { lighter_client_order_index = attempt.identity.get("client_order_index").and_then(serde_json::Value::as_i64).unwrap_or(0); }
                 }
             }
-            hedge_retry_report = Some(retry);
+        }
+        row["hedge_retry"] = hedge_retry_report_json(Some(&retry));
+        if retry.succeeded {
+            position = retry.final_position.expect("successful retry has final position");
         } else {
-            hedge_retry_report = Some(HedgeRetryReport::empty(
-                cfg.arb.hedge_retry_slippage_bps,
-                Some("could not reconcile positions before hedge retry".to_string()),
-            ));
+            row["outcome"] = serde_json::json!("unreconciled");
+            row["orders"] = serde_json::json!(orders);
+            append_execution_record(journal,row).await?;
+            return Err(ExecutionError::Unreconciled { details: retry.error.unwrap_or_else(|| "missing hedge could not be completed".to_string()) });
         }
     }
-    let lighter_fill_error = lighter_fill_ok.is_none().then(|| {
-        format!(
-            "Lighter fill accounting unavailable for client_order_index={lighter_client_order_index} status={}",
-            lighter_confirmation.status.as_str()
-        )
-    });
-    let (reconciled_position, net_notional, reconcile_error) = match &reconciled {
-        Ok((pos, net_notional)) => (Some(*pos), Some(*net_notional), None),
-        Err(e) => (None, None, Some(format!("{e:#}"))),
+    let (a_open, l_open, margin_after) = tokio::join!(aster.open_orders(&spec.market_id),
+        lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
+    let economics = match (aster_fill, lighter_fill) {
+        (Some(a), Some(l)) => actual_economics(cfg, opp, a, l),
+        _ => Err(ExecutionError::AccountingUnavailable { details: "terminal fill economics incomplete".to_string() }),
     };
+    row["orders"] = serde_json::json!(orders);
+    row["aster_fill"] = serde_json::json!(aster_fill);
+    row["lighter_fill"] = serde_json::json!(lighter_fill);
+    row["lighter_fee_evidence"] = serde_json::json!(lighter_fee_evidence);
+    row["aster_order_id"] = serde_json::json!(aster_order_id);
+    row["lighter_client_order_index"] = serde_json::json!(lighter_client_order_index);
+    row["final_positions"] = serde_json::json!({"aster_qty": position.aster_qty,
+        "lighter_rest_qty": position.lighter_qty, "net_qty": position.net_qty()});
+    let clean_orders = a_open.as_ref().is_ok_and(|orders| orders.is_empty()) && l_open.as_ref().is_ok_and(|count| *count == 0);
+    row["outcome"] = serde_json::json!(if economics.is_ok() && clean_orders && margin_after.is_ok() { "success" } else { "accounting_unavailable" });
+    if let Ok(economics) = &economics {
+        row["economic_status"] = serde_json::json!("confirmed");
+        row["actual_economics"] = serde_json::json!({"gross_usd": economics.gross_usd,
+            "fees_usd": economics.fees_usd, "net_usd": economics.net_usd, "net_bps": economics.net_bps,
+            "fill_qty_mismatch": economics.fill_qty_mismatch, "residual_qty": economics.residual_qty,
+            "residual_notional_usd": economics.residual_notional_usd});
+    }
+    append_execution_record(journal,row).await?;
+    if !clean_orders { return Err(ExecutionError::AccountingUnavailable { details: "open-order evidence unavailable or nonempty".to_string() }); }
+    let margin_after = margin_after.map_err(|error| ExecutionError::AccountingUnavailable { details: format!("{error:#}") })?;
+    let economics = economics?;
+    if a.qty == Some(Decimal::ZERO) && l.qty == Some(Decimal::ZERO) && !hedge_retry_action_taken {
+        session.resolve_execution().await?;
+        return Err(ExecutionError::Skipped { details: "both legs confirmed terminal without fills".to_string() });
+    }
     let lighter_ws_qty = lighter.ws_position_qty(&spec.market_id).ok();
-    let lighter_ws_rest_divergence_qty =
-        reconciled_position.and_then(|pos| lighter_ws_qty.map(|ws| (ws - pos.lighter_qty).abs()));
-    let (aster_open, lighter_open, margin_after_result) = tokio::join!(
-        aster.open_orders(&spec.market_id),
-        lighter.rest_open_orders_count(&spec.market_id),
-        reconcile_margins(aster, lighter),
-    );
-    let (margin_after, margin_after_error) = match margin_after_result {
-        Ok(margin) => (Some(margin), None),
-        Err(e) => (
-            None,
-            Some(format!(
-                "margin reconciliation unavailable after trade: {e:#}"
-            )),
-        ),
-    };
-    let mut economics_ok = None;
-    let mut economics_error = None;
-    if reconcile_error.is_none() {
-        if let (Some(aster_fill), Some(lighter_fill)) = (aster_fill_ok, lighter_fill_ok) {
-            match actual_economics(cfg, opp, aster_fill, lighter_fill) {
-                Ok(economics) => economics_ok = Some(economics),
-                Err(e) => economics_error = Some(format!("{e:#}")),
-            }
-        }
-    }
-    let margin_before_json = serde_json::json!({
-        "aster_available_usd": margin_before.aster_available_usd,
-        "lighter_available_usd": margin_before.lighter_available_usd,
-        "total_available_usd": margin_before.aster_available_usd + margin_before.lighter_available_usd,
-    });
-    let margin_after_json = margin_after.map(|m| {
-        serde_json::json!({
-            "aster_available_usd": m.aster_available_usd,
-            "lighter_available_usd": m.lighter_available_usd,
-            "total_available_usd": m.aster_available_usd + m.lighter_available_usd,
-        })
-    });
-    let actual_economics_json = economics_ok.map(|e| {
-        serde_json::json!({
-            "gross_usd": e.gross_usd,
-            "fees_usd": e.fees_usd,
-            "net_usd": e.net_usd,
-            "net_bps": e.net_bps,
-            "fill_qty_mismatch": e.fill_qty_mismatch,
-            "residual_qty": e.residual_qty,
-            "residual_notional_usd": e.residual_notional_usd,
-        })
-    });
-    let final_positions_json = reconciled_position.map(|p| {
-        serde_json::json!({
-            "aster_qty": p.aster_qty,
-            "lighter_rest_qty": p.lighter_qty,
-            "lighter_ws_qty": lighter_ws_qty,
-            "lighter_ws_rest_divergence_qty": lighter_ws_rest_divergence_qty,
-            "net_qty": p.net_qty(),
-            "net_notional_usd": net_notional,
-        })
-    });
-    let open_orders_after_json = serde_json::json!({
-        "aster": aster_open.as_ref().ok().map(|orders| orders.len()),
-        "lighter_rest": lighter_open.as_ref().ok().copied(),
-        "aster_error": aster_open.as_ref().err().map(|e| format!("{e:#}")),
-        "lighter_error": lighter_open.as_ref().err().map(|e| format!("{e:#}")),
-    });
-    let open_orders_error = match (&aster_open, &lighter_open) {
-        (Ok(a_orders), Ok(l_orders)) if a_orders.is_empty() && *l_orders == 0 => None,
-        (Ok(a_orders), Ok(l_orders)) => Some(format!(
-            "open orders remain after execution: aster={} lighter={}",
-            a_orders.len(),
-            l_orders
-        )),
-        (a_res, l_res) => Some(format!(
-            "open-order check unavailable after execution: aster={:?} lighter={:?}",
-            a_res.as_ref().map(|orders| orders.len()),
-            l_res
-        )),
-    };
-    let aster_immediate_fill_json = serde_json::json!({
-        "qty": aster_immediate_fill.qty,
-        "vwap": aster_immediate_fill.vwap,
-        "notional": aster_immediate_fill.notional,
-        "error": aster_immediate_error,
-    });
-    let final_error = reconcile_error
-        .clone()
-        .or_else(|| aster_fill_error.clone())
-        .or_else(|| lighter_fill_error.clone())
-        .or_else(|| economics_error.clone())
-        .or_else(|| open_orders_error.clone())
-        .or_else(|| margin_after_error.clone());
-    let outcome = if final_error.is_some() {
-        "failed"
-    } else {
-        "success"
-    };
-    let mut execution_row = serde_json::Map::new();
-    insert_json(&mut execution_row, "timestamp", Utc::now());
-    insert_json(&mut execution_row, "started_at", started_at);
-    insert_json(&mut execution_row, "execution_id", execution_id.clone());
-    insert_json(&mut execution_row, "market", spec.market_id.to_string());
-    insert_json(
-        &mut execution_row,
-        "execution_mode",
-        "concurrent_confirm_rescue",
-    );
-    insert_json(&mut execution_row, "outcome", outcome);
-    insert_json(
-        &mut execution_row,
-        "confirmation_policy",
-        "both_legs_confirmed_or_reduce_only_rescue",
-    );
-    insert_json(&mut execution_row, "direction", opp.direction.as_str());
-    insert_json(&mut execution_row, "qty", opp.qty);
-    insert_json(&mut execution_row, "reduce_only", reduce_only);
-    insert_json(&mut execution_row, "gross_edge_bps", opp.gross_edge_bps);
-    insert_json(
-        &mut execution_row,
-        "expected_net_margin_bps",
-        opp.expected_net_margin_bps,
-    );
-    insert_json(&mut execution_row, "expected_net_usd", opp.expected_net_usd);
-    insert_json(&mut execution_row, "required_margin_usd", opp.required_margin_usd);
-    insert_json(&mut execution_row, "sell_px", opp.sell_px);
-    insert_json(&mut execution_row, "buy_px", opp.buy_px);
-    insert_json(&mut execution_row, "ref_px", opp.ref_px);
-    insert_json(&mut execution_row, "top_depth_qty", opp.top_depth_qty);
-    insert_json(
-        &mut execution_row,
-        "depth_guard",
-        serde_json::json!({
-            "enabled": opp.depth_guard_enabled,
-            "liquidity_multiple": opp.liquidity_multiple,
-            "depth_supported_qty": opp.depth_supported_qty,
-            "sell_depth_target_qty": opp.sell_depth_target_qty,
-            "buy_depth_target_qty": opp.buy_depth_target_qty,
-            "sell_depth_available_qty": opp.sell_depth_available_qty,
-            "buy_depth_available_qty": opp.buy_depth_available_qty,
-            "sell_depth_worst_px": opp.sell_depth_worst_px,
-            "buy_depth_worst_px": opp.buy_depth_worst_px,
-            "sell_depth_levels_used": opp.sell_depth_levels_used,
-            "buy_depth_levels_used": opp.buy_depth_levels_used,
-            "sell_best_px": opp.sell_best_px,
-            "buy_best_px": opp.buy_best_px,
-            "sell_best_qty": opp.sell_best_qty,
-            "buy_best_qty": opp.buy_best_qty,
-        }),
-    );
-    insert_json(&mut execution_row, "aster_side", aster_side.as_str());
-    insert_json(&mut execution_row, "lighter_side", lighter_side.as_str());
-    insert_json(&mut execution_row, "aster_bound", aster_bound);
-    insert_json(&mut execution_row, "lighter_bound", lighter_bound);
-    insert_json(
-        &mut execution_row,
-        "slippage_bps",
-        serde_json::json!({
-            "aster_entry": cfg.arb.max_aster_slippage_bps,
-            "lighter_entry": cfg.arb.max_lighter_slippage_bps,
-            "hedge_retry": cfg.arb.hedge_retry_slippage_bps,
-            "emergency": cfg.arb.emergency_slippage_bps,
-        }),
-    );
-    insert_json(
-        &mut execution_row,
-        "pre_positions",
-        serde_json::json!({
-            "aster_qty": pre_position.aster_qty,
-            "lighter_qty": pre_position.lighter_qty,
-            "net_qty": pre_position.net_qty(),
-        }),
-    );
-    insert_json(&mut execution_row, "margin_before", margin_before_json);
-    insert_json(&mut execution_row, "margin_after", margin_after_json);
-    insert_json(&mut execution_row, "aster_submit", format!("{a_res:?}"));
-    insert_json(&mut execution_row, "lighter_submit", format!("{l_res:?}"));
-    insert_json(&mut execution_row, "aster_order_id", aster_order_id);
-    insert_json(
-        &mut execution_row,
-        "aster_immediate_fill",
-        aster_immediate_fill_json,
-    );
-    insert_json(
-        &mut execution_row,
-        "lighter_client_order_index",
-        lighter_client_order_index,
-    );
-    insert_json(&mut execution_row, "aster_fill", aster_fill_ok);
-    insert_json(&mut execution_row, "lighter_fill", lighter_fill_ok);
-    insert_json(
-        &mut execution_row,
-        "lighter_fill_confirmation",
-        serde_json::json!({
-            "status": lighter_confirmation.status.as_str(),
-            "filled_qty": lighter_confirmation.filled_qty,
-            "matched_trades_seen": lighter_confirmation.matched_trades_seen,
-            "terminal_order": lighter_confirmation.terminal_order.as_ref().map(|order| format!("{order:?}")),
-        }),
-    );
-    insert_json(
-        &mut execution_row,
-        "hedge_retry",
-        hedge_retry_report_json(hedge_retry_report.as_ref()),
-    );
-    insert_json(
-        &mut execution_row,
-        "aster_fill_error",
-        aster_fill_error.clone(),
-    );
-    insert_json(&mut execution_row, "aster_fill_note", aster_fill_note);
-    insert_json(
-        &mut execution_row,
-        "lighter_fill_error",
-        lighter_fill_error.clone(),
-    );
-    insert_json(&mut execution_row, "reconcile_error", reconcile_error);
-    insert_json(
-        &mut execution_row,
-        "economics_error",
-        economics_error.clone(),
-    );
-    insert_json(
-        &mut execution_row,
-        "open_orders_error",
-        open_orders_error.clone(),
-    );
-    insert_json(&mut execution_row, "margin_after_error", margin_after_error);
-    insert_json(&mut execution_row, "actual_economics", actual_economics_json);
-    insert_json(&mut execution_row, "final_positions", final_positions_json);
-    insert_json(&mut execution_row, "open_orders_after", open_orders_after_json);
-    insert_json(&mut execution_row, "error", final_error.clone());
-    append_execution_log(
-        cfg,
-        spec,
-        serde_json::Value::Object(execution_row),
-    );
-
-    let (pos, net_notional) = reconciled?;
-    let _aster_fill = aster_fill_ok.ok_or_else(|| ExecutionError::AccountingUnavailable {
-        details: aster_fill_error.unwrap_or_else(|| {
-            format!("Aster fill accounting unavailable for orderId={aster_order_id}")
-        }),
-    })?;
-    let _lighter_fill = lighter_fill_ok.ok_or_else(|| ExecutionError::AccountingUnavailable {
-        details: lighter_fill_error.unwrap_or_else(|| {
-            format!(
-                "Lighter fill accounting unavailable for client_order_index={lighter_client_order_index}"
-            )
-        }),
-    })?;
-    let economics = economics_ok.ok_or_else(|| ExecutionError::AccountingUnavailable {
-        details: economics_error
-            .unwrap_or_else(|| "actual economics unavailable after fill accounting".to_string()),
-    })?;
-    if let Some(open_orders_error) = open_orders_error {
-        return Err(ExecutionError::AccountingUnavailable {
-            details: open_orders_error,
-        });
-    }
-    let margin_after = margin_after.ok_or_else(|| ExecutionError::AccountingUnavailable {
-        details: "margin reconciliation unavailable after trade".to_string(),
-    })?;
-    info!(
-        "post-trade reconciled execution_id={execution_id}: aster={} lighter_rest={} lighter_ws={:?} net={} (${net_notional}) available_after=${} available_margin_delta=${} actual_gross=${} actual_fees=${} actual_net=${} actual_net_bps={} aster_vwap={} lighter_vwap={}",
-        pos.aster_qty,
-        pos.lighter_qty,
-        lighter_ws_qty,
-        pos.net_qty(),
-        margin_after.aster_available_usd + margin_after.lighter_available_usd,
-        (margin_after.aster_available_usd + margin_after.lighter_available_usd)
-            - (margin_before.aster_available_usd + margin_before.lighter_available_usd),
-        economics.gross_usd,
-        economics.fees_usd,
-        economics.net_usd,
-        economics.net_bps,
-        economics.aster_fill.vwap,
-        economics.lighter_fill.vwap
-    );
-    Ok(TradeReport {
-        position: pos,
-        lighter_ws_qty,
-        lighter_ws_rest_divergence_qty,
-        margin_before,
-        margin_after,
-        economics,
-        aster_order_id,
-        lighter_client_order_index,
-        hedge_retry_action_taken: hedge_retry_report
-            .as_ref()
-            .is_some_and(|report| report.attempted),
-    })
+    Ok(TradeReport { execution_id, lighter_fee_evidence, position, lighter_ws_qty,
+        lighter_ws_rest_divergence_qty: lighter_ws_qty.map(|ws| (ws - position.lighter_qty).abs()),
+        margin_before, margin_after, economics, aster_order_id, lighter_client_order_index, hedge_retry_action_taken })
 }
 
-fn zero_fill_summary() -> FillSummary {
-    FillSummary {
-        qty: Decimal::ZERO,
-        vwap: Decimal::ZERO,
-        notional: Decimal::ZERO,
-        fee_usd: Decimal::ZERO,
-    }
-}
+fn zero_fill_summary() -> FillSummary { FillSummary::zero() }
 
-fn immediate_fill_summary(fill: AsterImmediateFill, fee_bps: Decimal) -> FillSummary {
-    FillSummary {
-        qty: fill.qty,
-        vwap: fill.vwap,
-        notional: fill.notional,
-        fee_usd: fill.notional * bps_to_rate(fee_bps),
-    }
-}
 
 /// Ledger row for a recovery/auto-flatten that took action: books the estimated realized
 /// loss into cumulative PnL so the loss breaker cannot develop blind spots (previously
@@ -3283,7 +2731,12 @@ fn immediate_fill_summary(fill: AsterImmediateFill, fee_bps: Decimal) -> FillSum
 fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedgerRow {
     let loss = recovery.estimated_loss_usdc;
     let timestamp = Utc::now();
+    let event_id = recovery.execution_id.clone();
     TradeLedgerRow {
+        schema_version: 2,
+        economic_status: EconomicStatus::Estimated,
+        execution_id: Some(event_id.clone()),
+        source_event_id: Some(format!("recovery-{event_id}")),
         timestamp,
         market: spec.market_id.0.clone(),
         direction: "RECOVERY".to_string(),
@@ -3294,12 +2747,13 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
         actual_net_usd: -loss,
         actual_net_bps: Decimal::ZERO,
         fill_qty_mismatch: Decimal::ZERO,
-        aster_fill: zero_fill_summary(),
-        lighter_fill: zero_fill_summary(),
+        aster_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
+        lighter_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
+        lighter_fee_evidence: Vec::new(),
         // The orchestrator dedups rows on `taker:<aster_order_id>:<lighter_client_order_index>`;
         // a constant 0 collapsed every recovery after the first into one key, hiding
         // repeat losses from downstream accounting. The row timestamp keys each recovery.
-        aster_order_id: timestamp.timestamp_millis(),
+        aster_order_id: -timestamp.timestamp_micros(),
         lighter_client_order_index: 0,
         final_aster_position: recovery.position.aster_qty,
         final_lighter_position: recovery.position.lighter_qty,
@@ -3318,34 +2772,39 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
 
 /// Record a recovery-loss ledger row (if the PnL tracker is enabled) and enforce the
 /// cumulative-loss breaker, mirroring the normal trade path.
-fn record_recovery_loss(
-    pnl: &mut Option<PnlTracker>,
-    spec: &MarketSpec,
-    recovery: &RecoveryReport,
-) -> Result<()> {
-    if recovery.estimated_loss_usdc <= Decimal::ZERO {
-        return Ok(());
+/// The only completed-execution accounting exit: acknowledge the row before enforcing
+/// either breaker, and retain the session marker if persistence fails.
+async fn commit_accounting(
+    pnl: &mut Option<PnlTracker>, row: TradeLedgerRow, session: &ActiveSession,
+    hourly_breaker: Option<String>,
+) -> Result<Option<PnlUpdate>> {
+    let update = if let Some(pnl) = pnl.as_mut() { Some(pnl.record_trade(row).await?) } else { None };
+    session.resolve_execution().await?;
+    if let Some(breaker) = update.as_ref().and_then(|update| update.breaker.as_ref()) {
+        bail!("circuit breaker triggered: cumulative PnL ${} <= -${}; manual reset required",
+            breaker.cumulative_pnl_usdc, breaker.max_loss_usdc);
     }
-    let Some(pnl) = pnl.as_mut() else {
-        return Ok(());
-    };
-    let update = pnl.record_trade(recovery_loss_row(spec, recovery))?;
-    warn!(
-        "recovery loss booked to pnl ledger: market={} loss=${} cumulative_pnl=${}",
-        spec.market_id, recovery.estimated_loss_usdc, update.cumulative_pnl_usdc
-    );
-    if let Some(breaker) = update.breaker {
-        bail!(
-            "circuit breaker triggered by recovery loss: cumulative PnL ${} <= -${}; manual reset required",
-            breaker.cumulative_pnl_usdc,
-            breaker.max_loss_usdc
-        );
+    if let Some(reason) = hourly_breaker { bail!("recovered-failure breaker triggered: {reason}"); }
+    Ok(update)
+}
+
+async fn record_recovery_loss(
+    pnl: &mut Option<PnlTracker>, spec: &MarketSpec, recovery: &RecoveryReport,
+    session: &ActiveSession, hourly_breaker: Option<String>,
+) -> Result<()> {
+    if let Some(update) = commit_accounting(pnl, recovery_loss_row(spec, recovery), session, hourly_breaker).await? {
+        warn!("recovery estimate recorded: market={} loss=${} cumulative_guard_pnl=${}",
+            spec.market_id, recovery.estimated_loss_usdc, update.cumulative_pnl_usdc);
     }
     Ok(())
 }
 
 fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> TradeLedgerRow {
     TradeLedgerRow {
+        schema_version: 2,
+        economic_status: EconomicStatus::Confirmed,
+        execution_id: Some(report.execution_id.clone()),
+        source_event_id: Some(report.execution_id.clone()),
         timestamp: Utc::now(),
         market: spec.market_id.0.clone(),
         direction: opp.direction.as_str().to_string(),
@@ -3362,6 +2821,7 @@ fn pnl_trade_row(spec: &MarketSpec, opp: &Opportunity, report: &TradeReport) -> 
         fill_qty_mismatch: report.economics.fill_qty_mismatch,
         aster_fill: report.economics.aster_fill,
         lighter_fill: report.economics.lighter_fill,
+        lighter_fee_evidence: report.lighter_fee_evidence.clone(),
         aster_order_id: report.aster_order_id,
         lighter_client_order_index: report.lighter_client_order_index,
         final_aster_position: report.position.aster_qty,
@@ -3384,6 +2844,11 @@ fn actual_economics(
     aster_fill: FillSummary,
     lighter_fill: FillSummary,
 ) -> std::result::Result<ActualEconomics, ExecutionError> {
+    if aster_fill.fee_provenance != FeeProvenance::Venue || lighter_fill.fee_provenance != FeeProvenance::Venue {
+        return Err(ExecutionError::AccountingUnavailable {
+            details: "one or both execution fees are unknown or estimated".to_string(),
+        });
+    }
     let fill_qty_mismatch = (aster_fill.qty - lighter_fill.qty).abs();
     if fill_qty_mismatch * opp.ref_px > cfg.risk.max_position_mismatch_usd {
         return Err(ExecutionError::AccountingUnavailable {
@@ -3400,7 +2865,8 @@ fn actual_economics(
         Direction::SellAsterBuyLighter => (aster_fill, lighter_fill),
         Direction::SellLighterBuyAster => (lighter_fill, aster_fill),
     };
-    // PnL is realized only over the MATCHED quantity at the two VWAPs. With unequal legs
+    // Matched spread capture uses the matched quantity at the two VWAPs; it is not
+    // realized account PnL while cross-venue inventory remains open. With unequal legs
     // (tolerated up to max_position_mismatch_usd) the naive `sell.notional − buy.notional`
     // books the unhedged residual as pure profit/loss — masking the loss breaker with
     // fiction and later mirrored by the residual close. The residual is reported as open
@@ -3443,10 +2909,13 @@ fn add_fill_summary(base: Option<FillSummary>, extra: Option<FillSummary>) -> Op
                     vwap: notional / qty,
                     notional,
                     fee_usd: a.fee_usd + b.fee_usd,
+                    fee_provenance: if a.fee_provenance == FeeProvenance::Venue && b.fee_provenance == FeeProvenance::Venue {
+                        FeeProvenance::Venue
+                    } else { FeeProvenance::Unknown },
                 })
             }
         }
-        (Some(fill), None) | (None, Some(fill)) => Some(fill),
+        (Some(_), None) | (None, Some(_)) => None,
         (None, None) => None,
     }
 }
@@ -3531,107 +3000,40 @@ fn hedge_retry_plan(
 }
 
 async fn submit_aster_hedge_retry(
-    cfg: &Config,
-    spec: &MarketSpec,
-    aster: &AsterRest,
-    plan: HedgeRetryPlan,
-    reduce_only: bool,
-    timeout: Duration,
-) -> (String, Option<FillSummary>, Option<String>, Option<String>) {
-    let submit = aster
-        .submit_ioc_order(
-            &spec.market_id,
-            plan.side,
-            plan.qty,
-            plan.price_bound,
-            reduce_only,
-        )
-        .await;
-    let submit_result = format!("{submit:?}");
-    match submit {
-        AsterOutcome::Accepted {
-            venue_order_id: Some(order_id),
-            raw,
-        } => {
-            let immediate = immediate_fill_from_order_response(&raw).ok();
-            match aster
-                .wait_order_fill_summary(&spec.market_id, order_id, plan.qty, timeout)
-                .await
-            {
-                Ok(fill) => (
-                    submit_result,
-                    Some(fill),
-                    Some("filled".to_string()),
-                    None,
-                ),
-                Err(e) => {
-                    if let Some(immediate) = immediate {
-                        if immediate.qty > Decimal::ZERO && immediate.notional > Decimal::ZERO {
-                            return (
-                                submit_result,
-                                Some(immediate_fill_summary(
-                                    immediate,
-                                    cfg.arb.aster_taker_fee_bps,
-                                )),
-                                Some("immediate_fill_fallback".to_string()),
-                                None,
-                            );
-                        }
-                    }
-                    (
-                        submit_result,
-                        None,
-                        Some("accounting_unavailable".to_string()),
-                        Some(format!("{e:#}")),
-                    )
-                }
-            }
-        }
-        other => (
-            submit_result,
-            None,
-            Some("not_accepted".to_string()),
-            Some(format!("Aster hedge retry not accepted: {other:?}")),
-        ),
-    }
+    _cfg: &Config, spec: &MarketSpec, aster: &AsterRest, plan: HedgeRetryPlan,
+    reduce_only: bool, timeout: Duration,
+) -> (String, Option<FillSummary>, Option<String>, Option<String>, serde_json::Value, Vec<FeeEvidence>) {
+    let start = tokio::time::Instant::now();
+    let outcome = match tokio::time::timeout(timeout,
+        aster.submit_ioc_order(&spec.market_id, plan.side, plan.qty, plan.price_bound, reduce_only)).await {
+        Ok(outcome) => outcome,
+        Err(_) => return ("Aster hedge retry submit deadline".to_string(), None, Some("unresolved".to_string()),
+            Some("submission identity unavailable at deadline".to_string()), serde_json::json!({
+                "venue":"aster","submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
+    };
+    let identity = aster_order_identity(&outcome, plan.side, plan.qty);
+    let evidence = resolve_aster_evidence(spec, aster, &outcome, timeout.saturating_sub(start.elapsed())).await;
+    (format!("{outcome:?}"), evidence.fill,
+        Some(if evidence.terminal { "terminal" } else { "unresolved" }.to_string()), evidence.error, identity, evidence.fee_evidence)
 }
 
 async fn submit_lighter_hedge_retry(
-    spec: &MarketSpec,
-    lighter: &LighterVenue,
-    plan: HedgeRetryPlan,
-    reduce_only: bool,
-    timeout: Duration,
-) -> (String, Option<FillSummary>, Option<String>, Option<String>) {
-    let (submit, pending_fill) = lighter
-        .submit_market_order_deferred_fill(
-            &spec.market_id,
-            plan.side,
-            plan.qty,
-            plan.price_bound,
-            reduce_only,
-        )
-        .await;
-    let submit_result = format!("{submit:?}");
-    match (submit, pending_fill) {
-        (LighterOutcome::Accepted { .. }, Some(pending_fill)) => {
-            let confirmation: LighterFillConfirmation = pending_fill.wait_confirmed(timeout).await;
-            let status = confirmation.status.as_str().to_string();
-            let error = confirmation.fill.is_none().then(|| {
-                format!(
-                    "Lighter hedge retry fill unavailable status={} filled_qty={} matched_trades_seen={}",
-                    status, confirmation.filled_qty, confirmation.matched_trades_seen
-                )
-            });
-            (submit_result, confirmation.fill, Some(status), error)
-        }
-        (other, _) => (
-            submit_result,
-            None,
-            Some("not_accepted".to_string()),
-            Some(format!("Lighter hedge retry not accepted: {other:?}")),
-        ),
-    }
+    spec: &MarketSpec, lighter: &LighterVenue, plan: HedgeRetryPlan,
+    reduce_only: bool, timeout: Duration,
+) -> (String, Option<FillSummary>, Option<String>, Option<String>, serde_json::Value, Vec<FeeEvidence>) {
+    let start = tokio::time::Instant::now();
+    let (outcome, pending) = match tokio::time::timeout(timeout, lighter.submit_market_order_deferred_fill(
+        &spec.market_id, plan.side, plan.qty, plan.price_bound, reduce_only)).await {
+        Ok(result) => result,
+        Err(_) => return ("Lighter hedge retry submit deadline".to_string(), None, Some("unresolved".to_string()),
+            Some("submission identity unavailable at deadline".to_string()), serde_json::json!({
+                "venue":"lighter","submitted":true,"identity_unavailable":true,"side":plan.side.as_str(),"qty":plan.qty}),Vec::new()),
+    };
+    let identity = lighter_order_identity(&outcome, plan.side, plan.qty);
+    let evidence = resolve_lighter_evidence(spec, lighter, &outcome, pending, plan.side, plan.qty,
+        timeout.saturating_sub(start.elapsed())).await;
+    (format!("{outcome:?}"), evidence.fill,
+        Some(if evidence.terminal { "terminal" } else { "unresolved" }.to_string()), evidence.error, identity, evidence.fee_evidence)
 }
 
 async fn try_missing_hedge_retry(
@@ -3645,6 +3047,7 @@ async fn try_missing_hedge_retry(
     reduce_only: bool,
 ) -> HedgeRetryReport {
     let timeout = Duration::from_millis(cfg.arb.hedge_retry_timeout_ms);
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut report = HedgeRetryReport::empty(cfg.arb.hedge_retry_slippage_bps, None);
     for attempt_no in 1..=cfg.arb.max_hedge_retry_attempts {
         let Some(plan) = hedge_retry_plan(cfg, spec, opp, pre_position, current_position) else {
@@ -3668,7 +3071,7 @@ async fn try_missing_hedge_retry(
             reduce_only,
             cfg.arb.hedge_retry_slippage_bps
         );
-        let (submit_result, fill, fill_status, submit_error) = match plan.venue {
+        let (submit_result, fill, fill_status, submit_error, identity, fee_evidence) = match plan.venue {
             HedgeRetryVenue::Aster => {
                 submit_aster_hedge_retry(cfg, spec, aster, plan, reduce_only, timeout).await
             }
@@ -3676,7 +3079,10 @@ async fn try_missing_hedge_retry(
                 submit_lighter_hedge_retry(spec, lighter, plan, reduce_only, timeout).await
             }
         };
+        let unresolved = fill_status.as_deref() == Some("unresolved");
         report.attempts.push(HedgeRetryAttempt {
+            fee_evidence,
+            identity,
             attempt: attempt_no,
             venue: plan.venue,
             side: plan.side,
@@ -3688,11 +3094,20 @@ async fn try_missing_hedge_retry(
             fill_status,
             error: submit_error.clone(),
         });
-        let (reconciled, open_a, open_l) = tokio::join!(
-            wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp, timeout),
+        if unresolved {
+            report.error = Some("retry order terminal evidence unavailable".to_string());
+            return report;
+        }
+        let verified = tokio::time::timeout_at(deadline, async { tokio::join!(
+            wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp,
+                deadline.saturating_duration_since(tokio::time::Instant::now())),
             aster.open_orders(&spec.market_id),
             lighter.rest_open_orders_count(&spec.market_id),
-        );
+        ) }).await;
+        let (reconciled, open_a, open_l) = match verified {
+            Ok(result) => result,
+            Err(_) => { report.error = Some("hedge retry verification deadline".to_string()); return report; }
+        };
         match (reconciled, open_a, open_l) {
             (Ok((position, net_notional)), Ok(aster_orders), Ok(lighter_orders))
                 if aster_orders.is_empty() && lighter_orders == 0 =>
@@ -3725,7 +3140,8 @@ async fn try_missing_hedge_retry(
                 ));
             }
             (reconciled, open_a, open_l) => {
-                if let Ok(position) = reconcile_positions(&spec.market_id, aster, lighter).await {
+                if let Ok(Ok(position)) = tokio::time::timeout_at(deadline,
+                    reconcile_positions(&spec.market_id, aster, lighter)).await {
                     current_position = position;
                     report.final_position = Some(position);
                 }
@@ -3750,6 +3166,8 @@ fn hedge_retry_report_json(report: Option<&HedgeRetryReport>) -> serde_json::Val
         .iter()
         .map(|attempt| {
             serde_json::json!({
+                "identity": attempt.identity,
+                "fee_evidence": attempt.fee_evidence,
                 "attempt": attempt.attempt,
                 "venue": attempt.venue.as_str(),
                 "side": attempt.side.as_str(),
@@ -3780,15 +3198,6 @@ fn hedge_retry_report_json(report: Option<&HedgeRetryReport>) -> serde_json::Val
     })
 }
 
-async fn wait_post_trade_reconciled(
-    cfg: &Config,
-    spec: &MarketSpec,
-    aster: &AsterRest,
-    lighter: &LighterVenue,
-    opp: &Opportunity,
-) -> std::result::Result<(PositionSnapshot, Decimal), ExecutionError> {
-    wait_post_trade_reconciled_for(cfg, spec, aster, lighter, opp, Duration::from_secs(10)).await
-}
 
 async fn wait_post_trade_reconciled_for(
     cfg: &Config,
@@ -3836,159 +3245,108 @@ async fn wait_post_trade_reconciled_for(
 }
 
 async fn recover_if_needed(
-    cfg: &Config,
-    spec: &MarketSpec,
-    aster: &AsterRest,
-    lighter: &LighterVenue,
-    http: &reqwest::Client,
-    margin_before: MarginSnapshot,
+    cfg: &Config, spec: &MarketSpec, aster: &AsterRest, lighter: &LighterVenue,
+    http: &reqwest::Client, margin_before: MarginSnapshot, session: &ActiveSession,
+    journal: &ExecutionJournal,
 ) -> Result<RecoveryReport> {
-    tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms)).await;
-    let pos = reconcile_positions(&spec.market_id, aster, lighter).await?;
-    let (aster_book, lighter_book) = fetch_books_rest_lighter(cfg, spec, http, lighter).await?;
-    let mark = aster_book
-        .mid()
-        .or_else(|| lighter_book.mid())
-        .unwrap_or(Decimal::ZERO);
-    if mark <= Decimal::ZERO {
-        bail!("residual recovery mark unavailable");
-    }
-    let net = pos.net_qty();
-    let net_notional = net.abs() * mark;
-    let (open_a, open_l, margin_after) = tokio::join!(
-        aster.open_orders(&spec.market_id),
-        lighter.rest_open_orders_count(&spec.market_id),
-        reconcile_margins(aster, lighter),
-    );
-    if net_notional <= cfg.risk.max_position_mismatch_usd {
-        let open_a = open_a?;
-        let open_l = open_l?;
-        let margin_after = margin_after?;
-        if !open_a.is_empty() || open_l > 0 {
-            bail!(
-                "rescue check found open orders despite balanced positions: aster={} lighter={}",
-                open_a.len(),
-                open_l
-            );
-        }
-        let estimated_loss_usdc = estimated_recovery_loss(margin_before, margin_after);
-        return Ok(RecoveryReport {
-            action_taken: false,
-            position: pos,
-            lighter_ws_qty: lighter.ws_position_qty(&spec.market_id).ok(),
-            margin_after,
-            estimated_loss_usdc,
-            aster_open_orders: open_a.len(),
-            lighter_open_orders: open_l,
-        });
-    }
-    warn!(
-        "residual recovery: aster={} lighter={} net={} ${}",
-        pos.aster_qty, pos.lighter_qty, net, net_notional
-    );
-    // Close bounds are computed from EACH venue's own mid (falling back to the shared
-    // mark): a dislocation between venues beyond emergency_slippage_bps used to make the
-    // second leg's bound non-executable on its own book after the first already closed.
-    // Notional thresholds and verification keep the shared (aster-preferred) mark.
-    let aster_mark = aster_book.mid().unwrap_or(mark);
-    let lighter_mark = lighter_book.mid().unwrap_or(mark);
+    let execution_id = next_execution_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut orders = Vec::new();
     let mut action_taken = false;
-    if pos.aster_qty.abs() * mark > cfg.risk.max_position_mismatch_usd {
-        let side = if pos.aster_qty > Decimal::ZERO {
-            Side::Sell
-        } else {
-            Side::Buy
-        };
-        let bound = emergency_close_bound(aster_mark, side, cfg.arb.emergency_slippage_bps);
-        let res = aster
-            .submit_ioc_order(&spec.market_id, side, pos.aster_qty.abs(), bound, true)
-            .await;
-        warn!("Aster reduce-only recovery result: {res:?}");
-        action_taken = true;
-    }
-    if pos.lighter_qty.abs() * mark > cfg.risk.max_position_mismatch_usd {
-        // The promoted-observer auto-flatten path reaches here BEFORE the lease
-        // nonce-refresh block ever ran, so the local nonce can be stale from another
-        // writer's turn. Refresh first; on failure warn and PROCEED with the close —
-        // the submit path self-heals via hard_refresh on a nonce reject, and a naked
-        // leg must never stay open because a refresh round-trip failed. Redundant
-        // refreshes on the post-execution rescue path are serialized by the venue
-        // write lock and harmless.
-        if let Err(e) = lighter.refresh_nonce().await {
-            warn!("Lighter nonce refresh before recovery close failed; proceeding: {e:#}");
-        }
-        let side = if pos.lighter_qty > Decimal::ZERO {
-            Side::Sell
-        } else {
-            Side::Buy
-        };
-        let bound = emergency_close_bound(lighter_mark, side, cfg.arb.emergency_slippage_bps);
-        let res = lighter
-            .submit_market_order(&spec.market_id, side, pos.lighter_qty.abs(), bound, true)
-            .await;
-        warn!("Lighter reduce-only recovery result: {res:?}");
-        action_taken = true;
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        tokio::time::sleep(Duration::from_millis(
-            cfg.risk.min_reconcile_interval_ms.max(250),
-        ))
-        .await;
-        let (final_pos, open_a, open_l, margin_after) = tokio::join!(
-            reconcile_positions(&spec.market_id, aster, lighter),
-            aster.open_orders(&spec.market_id),
-            lighter.rest_open_orders_count(&spec.market_id),
-            reconcile_margins(aster, lighter),
-        );
-        let final_pos = final_pos?;
-        let open_a = open_a?;
-        let open_l = open_l?;
-        let margin_after = margin_after?;
-        let final_net_notional = final_pos.net_qty().abs() * mark;
-        let final_aster_notional = final_pos.aster_qty.abs() * mark;
-        let final_lighter_notional = final_pos.lighter_qty.abs() * mark;
-        let lighter_ws_qty = lighter.ws_position_qty(&spec.market_id).ok();
-        warn!(
-            "residual recovery verification: aster={} lighter_rest={} lighter_ws={:?} net={} ${} aster_abs=${} lighter_abs=${} aster_open_orders={} lighter_open_orders={}",
-            final_pos.aster_qty,
-            final_pos.lighter_qty,
-            lighter_ws_qty,
-            final_pos.net_qty(),
-            final_net_notional,
-            final_aster_notional,
-            final_lighter_notional,
-            open_a.len(),
-            open_l
-        );
-        if final_aster_notional <= cfg.risk.max_position_mismatch_usd
-            && final_lighter_notional <= cfg.risk.max_position_mismatch_usd
-            && open_a.is_empty()
-            && open_l == 0
-        {
-            let estimated_loss_usdc = estimated_recovery_loss(margin_before, margin_after);
-            return Ok(RecoveryReport {
-                action_taken,
-                position: final_pos,
-                lighter_ws_qty,
-                margin_after,
-                estimated_loss_usdc,
-                aster_open_orders: open_a.len(),
-                lighter_open_orders: open_l,
-            });
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "residual recovery failed to verify flat: aster={} lighter={} net={} ${} aster_abs=${} lighter_abs=${} aster_open_orders={} lighter_open_orders={}",
-                final_pos.aster_qty,
-                final_pos.lighter_qty,
-                final_pos.net_qty(),
-                final_net_notional,
-                final_aster_notional,
-                final_lighter_notional,
-                open_a.len(),
-                open_l
+    let mut in_flight = false;
+    let mut baseline = None;
+    let result = tokio::time::timeout_at(deadline, async {
+        for attempt in 0..=3 {
+            let (position, a_book, l_book) = tokio::join!(
+                reconcile_positions(&spec.market_id, aster, lighter),
+                rest_book::fetch_aster_book(http, &cfg.venues.aster_base_url, &spec.aster_symbol, 20),
+                rest_book::fetch_lighter_book(http, &cfg.venues.lighter_base_url, spec.lighter_market_id, 20),
             );
+            let position = position?;
+            if baseline.is_none() { baseline = Some(position); }
+            let (a_book, l_book) = (a_book?, l_book?);
+            let mark = a_book.mid().context("recovery Aster mark unavailable")?;
+            let l_mark = l_book.mid().context("recovery Lighter mark unavailable")?;
+            anyhow::ensure!(mark > Decimal::ZERO && l_mark > Decimal::ZERO
+                && !a_book.is_crossed() && !l_book.is_crossed(), "invalid recovery books");
+            let balanced = position.net_qty().abs() * mark <= cfg.risk.max_position_mismatch_usd;
+            let flat = position.aster_qty.abs() * mark <= cfg.risk.max_position_mismatch_usd
+                && position.lighter_qty.abs() * l_mark <= cfg.risk.max_position_mismatch_usd;
+            if balanced && (!action_taken || flat) {
+                let (a_open, l_open, margins) = tokio::join!(aster.open_orders(&spec.market_id),
+                    lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
+                anyhow::ensure!(a_open?.is_empty() && l_open? == 0, "recovery has unverified/live open orders");
+                let margins = margins?;
+                return Ok::<_, anyhow::Error>(RecoveryReport { execution_id: execution_id.clone(), action_taken,
+                    position, lighter_ws_qty: lighter.ws_position_qty(&spec.market_id).ok(),
+                    margin_after: margins, estimated_loss_usdc: estimated_recovery_loss(margin_before, margins),
+                    aster_open_orders: 0, lighter_open_orders: 0 });
+            }
+            anyhow::ensure!(attempt < 3, "recovery still nonflat after three close attempts");
+            let a_qty = floor_to_step(position.aster_qty.abs(), spec.step);
+            let l_qty = floor_to_step(position.lighter_qty.abs(), spec.lighter_qty_step);
+            let a_side = if position.aster_qty > Decimal::ZERO { Side::Sell } else { Side::Buy };
+            let l_side = if position.lighter_qty > Decimal::ZERO { Side::Sell } else { Side::Buy };
+            in_flight = true;
+            let (a_result, l_result) = tokio::join!(
+                async { if a_qty > Decimal::ZERO {
+                    Some(aster.submit_ioc_order(&spec.market_id, a_side, a_qty,
+                        emergency_close_bound(mark, a_side, cfg.arb.emergency_slippage_bps), true).await)
+                } else { None } },
+                async { if l_qty > Decimal::ZERO {
+                    Some(lighter.submit_market_order_deferred_fill(&spec.market_id, l_side, l_qty,
+                        emergency_close_bound(l_mark, l_side, cfg.arb.emergency_slippage_bps), true).await)
+                } else { None } },
+            );
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).min(Duration::from_secs(5));
+            if let Some(outcome) = &a_result { orders.push(aster_order_identity(outcome, a_side, a_qty)); }
+            if let Some((outcome, _)) = &l_result { orders.push(lighter_order_identity(outcome, l_side, l_qty)); }
+            in_flight = false;
+            session.record_unresolved(serde_json::json!({"schema_version":2,"economic_status":"incomplete",
+                "execution_id":execution_id,"session_id":session.id(),"market":spec.market_id.to_string(),
+                "outcome":"recovery_resolving","orders":orders,"orders_complete":true,
+                "pre_positions":baseline.map(|position|serde_json::json!({"aster_qty":position.aster_qty,"lighter_qty":position.lighter_qty}))})).await?;
+            action_taken |= a_result.is_some() || l_result.is_some();
+            let (a_evidence, l_evidence) = tokio::join!(
+                async { match &a_result {
+                    Some(outcome) => resolve_aster_evidence(spec, aster, outcome, remaining).await,
+                    None => LegEvidence::not_submitted(),
+                } },
+                async { match l_result {
+                    Some((outcome, pending)) => resolve_lighter_evidence(spec, lighter, &outcome, pending, l_side, l_qty, remaining).await,
+                    None => LegEvidence::not_submitted(),
+                } },
+            );
+            if !a_evidence.terminal || !l_evidence.terminal {
+                bail!("recovery close terminal evidence unavailable; no further close may be submitted");
+            }
+            tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms.max(250))).await;
+        }
+        unreachable!()
+    }).await;
+    match result {
+        Ok(Ok(report)) => {
+            append_execution_record(journal,serde_json::json!({ "schema_version": 2, "economic_status": "estimated",
+                "timestamp": Utc::now(), "execution_id": execution_id, "session_id": session.id(),
+                "market": spec.market_id.to_string(), "outcome": "recovery_complete", "orders": orders,
+                "action_taken": action_taken, "estimated_loss_usdc": report.estimated_loss_usdc,
+                "final_positions": {"aster_qty": report.position.aster_qty, "lighter_rest_qty": report.position.lighter_qty} })).await?;
+            Ok(report)
+        }
+        result => {
+            let detail = match result {
+                Ok(Err(error)) => format!("{error:#}"),
+                Err(_) => "recovery exceeded thirty seconds".to_string(),
+                _ => unreachable!(),
+            };
+            let evidence = serde_json::json!({ "schema_version": 2, "economic_status": "incomplete",
+                "timestamp": Utc::now(), "execution_id": execution_id, "session_id": session.id(),
+                "market": spec.market_id.to_string(), "outcome": "recovery_unresolved", "orders": orders,
+                "orders_complete": !in_flight, "pre_positions": baseline.map(|position| serde_json::json!({
+                    "aster_qty":position.aster_qty,"lighter_qty":position.lighter_qty})), "error": detail });
+            session.record_unresolved(evidence.clone()).await?;
+            append_execution_record(journal,evidence).await?;
+            bail!("{detail}")
         }
     }
 }
@@ -3998,6 +3356,11 @@ async fn recover_if_needed(
 /// zero (or a gain) while a loss was realized. Falls back to the available-margin delta
 /// when either snapshot lacks equity. Floored at zero — this feeds loss breakers and must
 /// never book phantom gains.
+fn session_marked_loss(baseline: Decimal, current: Decimal, limit: Decimal) -> Option<Decimal> {
+    let loss = baseline-current;
+    (loss >= limit).then_some(loss)
+}
+
 fn estimated_recovery_loss(before: MarginSnapshot, after: MarginSnapshot) -> Decimal {
     let delta = match (before.total_equity_usd(), after.total_equity_usd()) {
         (Some(before_eq), Some(after_eq)) => before_eq - after_eq,
@@ -4037,12 +3400,20 @@ async fn refresh_account_snapshot(
     market: &MarketId,
     aster: &AsterRest,
     lighter: &LighterVenue,
+    execution_epoch: &AtomicU64,
 ) -> Result<AccountSnapshot> {
-    let (aster_pos, aster_balance, lighter_account) = tokio::join!(
+    let epoch = execution_epoch.load(Ordering::Acquire);
+    anyhow::ensure!(epoch % 2 == 0, "execution active; account refresh deferred");
+    let observed_at = tokio::time::Instant::now();
+    let (aster_pos, aster_balance, lighter_account, aster_orders, lighter_orders) = tokio::join!(
         aster.position_qty(market),
         aster.balance_snapshot(),
-        lighter.account_snapshot(market)
+        lighter.account_snapshot(market),
+        aster.open_orders(market),
+        lighter.rest_open_orders_count(market)
     );
+    anyhow::ensure!(execution_epoch.load(Ordering::Acquire) == epoch,
+        "execution changed while account query was in flight");
     let lighter_account = lighter_account?;
     let aster_balance = aster_balance?;
     let position = PositionSnapshot {
@@ -4058,11 +3429,14 @@ async fn refresh_account_snapshot(
         lighter_equity_usd: lighter_account.equity_usdc(),
     };
     Ok(AccountSnapshot {
+        execution_epoch: epoch,
+        aster_open_orders: aster_orders?.len(),
+        lighter_open_orders: lighter_orders?,
         position,
         lighter_ws_qty,
         lighter_ws_rest_divergence_qty,
         margins,
-        refreshed_at: tokio::time::Instant::now(),
+        refreshed_at: observed_at,
     })
 }
 
@@ -4072,7 +3446,7 @@ fn spawn_account_snapshot_refresher(
     aster: Arc<AsterRest>,
     lighter: Arc<LighterVenue>,
     tx: watch::Sender<AccountSnapshot>,
-    paused: Arc<AtomicBool>,
+    execution_epoch: Arc<AtomicU64>,
     refresh_now: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     let refresh_ms = (cfg.live.max_account_snapshot_age_ms as u64 / 2).max(10_000);
@@ -4089,17 +3463,17 @@ fn spawn_account_snapshot_refresher(
                 _ = tick.tick() => {}
                 _ = refresh_now.notified() => {}
             }
-            if paused.load(Ordering::Acquire) {
+            if execution_epoch.load(Ordering::Acquire) % 2 != 0 {
                 continue;
             }
-            match refresh_account_snapshot(&market, &aster, &lighter).await {
+            match refresh_account_snapshot(&market, &aster, &lighter, &execution_epoch).await {
                 Ok(snapshot) => {
                     // Re-check the pause flag before publishing: a refresh already in
                     // flight when the executor set paused=true would otherwise
                     // overwrite the fresh post-trade snapshot with pre-trade positions
                     // stamped refreshed_at=now, defeating the staleness gate for up to
                     // a full refresh interval.
-                    if paused.load(Ordering::Acquire) {
+                    if execution_epoch.load(Ordering::Acquire) % 2 != 0 {
                         continue;
                     }
                     debug!(
@@ -4111,9 +3485,8 @@ fn spawn_account_snapshot_refresher(
                         snapshot.margins.aster_available_usd,
                         snapshot.margins.lighter_available_usd
                     );
-                    if tx.send(snapshot).is_err() {
-                        break;
-                    }
+                    if tx.is_closed() { break; }
+                    publish_account(&tx, snapshot);
                 }
                 Err(e) => {
                     let sleep_ms = if is_rate_limit_error(&e) {
@@ -4304,48 +3677,12 @@ fn lighter_price_bound(opp: &Opportunity, slippage_bps: Decimal) -> Decimal {
     }
 }
 
-#[cfg(test)]
-fn floor_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
-    floor_to_step(floor_to_step(qty, aster_step), lighter_step)
-}
-
-#[cfg(test)]
-fn ceil_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    let mut out = qty;
-    for _ in 0..8 {
-        let next = ceil_to_step(ceil_to_step(out, aster_step), lighter_step);
-        if next == out && is_step_multiple(out, aster_step) && is_step_multiple(out, lighter_step) {
-            return out;
-        }
-        out = next;
-    }
-    out
-}
 
 fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
     if qty <= Decimal::ZERO || step <= Decimal::ZERO {
         return Decimal::ZERO;
     }
     (qty / step).floor() * step
-}
-
-#[cfg(test)]
-fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).ceil() * step
-}
-
-#[cfg(test)]
-fn is_step_multiple(qty: Decimal, step: Decimal) -> bool {
-    if qty < Decimal::ZERO || step <= Decimal::ZERO {
-        return false;
-    }
-    (qty / step).fract() == Decimal::ZERO
 }
 
 #[cfg(test)]
@@ -4502,12 +3839,14 @@ mod tests {
             vwap: dec!(63.80),
             notional: dec!(12.76),
             fee_usd: dec!(0.005),
+            fee_provenance: FeeProvenance::Venue,
         };
         let lighter_fill = FillSummary {
             qty: dec!(0.16),
             vwap: dec!(63.72),
             notional: dec!(10.1952),
             fee_usd: dec!(0),
+            fee_provenance: FeeProvenance::Venue,
         };
         let e = actual_economics(&cfg, &opp, aster_fill, lighter_fill).expect("within tolerance");
         assert_eq!(e.gross_usd, dec!(0.0128));
@@ -4522,16 +3861,8 @@ mod tests {
             aster_qty: dec!(1),
             lighter_qty: dec!(-1),
         };
-        let q = max_qty_by_headroom(dec!(2), pos, dec!(-1), dec!(1));
-        assert_eq!(q, dec!(3));
-    }
-
-    #[test]
-    fn common_step_floors_qty() {
-        assert_eq!(
-            floor_to_common_step(dec!(1.2345), dec!(0.01), dec!(0.001)),
-            dec!(1.23)
-        );
+        let q = max_qty_by_headroom_f64(2.0, pos.aster_qty.to_f64().unwrap(), pos.lighter_qty.to_f64().unwrap(), -1.0, 1.0);
+        assert_eq!(q, 3.0);
     }
 
     #[test]
@@ -4575,10 +3906,7 @@ mod tests {
         )
         .expect("reduce opportunity should be selected");
         assert_eq!(opp.direction, Direction::SellLighterBuyAster);
-        assert_eq!(
-            exposure_effect(pos, opp.direction, opp.qty),
-            ExposureEffect::Reduce
-        );
+        assert_eq!(opp.qty, dec!(0.13));
     }
 
     #[test]
@@ -4605,10 +3933,7 @@ mod tests {
         )
         .expect("increasing opportunity exists");
         assert_eq!(any.direction, Direction::SellAsterBuyLighter);
-        assert_eq!(
-            exposure_effect(pos, any.direction, any.qty),
-            ExposureEffect::Increase
-        );
+        assert_eq!(any.qty, dec!(0.12));
         assert!(best_opportunity(
             &cfg,
             &spec,
@@ -4711,156 +4036,64 @@ mod tests {
     }
 
     #[test]
-    fn edge_prefilter_never_skips_what_exact_filter_accepts() {
-        // The f64 pre-filter may only skip candidates the exact Decimal filter also
-        // rejects; anything within the epsilon band must fall through to the exact
-        // comparison. Sweep a dense neighborhood of several thresholds.
-        for required in [dec!(6), dec!(0.5), dec!(4.5), dec!(10.000000000001)] {
-            let required_f = decimal_to_f64(required).unwrap();
-            for k in -10_000i64..=10_000 {
-                let edge_f = required_f + k as f64 * 1e-13;
-                if edge_f < required_f - EDGE_PREFILTER_EPS_BPS {
-                    assert!(
-                        f64_to_dec(edge_f) < required,
-                        "pre-filter skipped a candidate the exact filter accepts: edge_f={edge_f} required={required}"
-                    );
-                }
-            }
-            // The threshold itself and its immediate neighborhood sit inside the band:
-            // they must NOT be pre-skipped (the exact filter decides them, as today).
-            for k in [-5_000i64, -1, 0, 1, 5_000] {
-                let edge_f = required_f + k as f64 * 1e-13;
-                assert!(edge_f >= required_f - EDGE_PREFILTER_EPS_BPS);
-            }
-            // NaN never triggers the skip; it falls through and f64_to_dec(NaN) == 0
-            // is rejected by the exact filter — identical to the pre-change behavior.
-            assert!(!(f64::NAN < required_f - EDGE_PREFILTER_EPS_BPS));
+    fn production_edge_filter_accepts_and_rejects_both_sides_of_fee_floor() {
+        let cfg = test_cfg();
+        let spec = test_spec();
+        let math = test_math(&cfg, &spec);
+        let (mut accepted, mut rejected) = (0,0);
+        for tick in -20..=20 {
+            let sell = dec!(100.0601) + Decimal::from(tick) * dec!(0.00001);
+            let expected = (sell-dec!(100))/(sell+dec!(0.1))*dec!(10000) >= dec!(6);
+            let result = best_opportunity(&cfg,&spec,&math,
+                &book(sell,sell+dec!(0.2)), &book(dec!(98),dec!(100)),
+                PositionF64 {aster_qty:0.0,lighter_qty:0.0},margins_f64(margins()),false,ExposureFilter::Any);
+            assert_eq!(result.is_some(),expected,"sell={sell}");
+            if expected { accepted+=1; } else { rejected+=1; }
         }
+        assert!(accepted>0 && rejected>0);
     }
 
     #[test]
-    fn flatten_execution_rights_gate_denies_observer_and_standby() {
-        // The mismatch auto-flatten reuses execution_lease_enabled as its rights gate:
-        // pin the four deployment shapes. (The orchestrator's 24/7 observer runs with
-        // --control-file and NO lease — it must never be allowed to flatten.)
+    fn cached_execution_rights_require_fresh_validated_epoch_and_unexpired_lease() {
         let spec = test_spec();
-        let now = DateTime::parse_from_rfc3339("2026-07-09T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-
-        // Normal active taker: no control file, not observe-only -> allowed.
-        let mut cache = LeaseFileCache::new();
-        let options = RunOptions::default();
-        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(allowed, "normal taker must keep its auto-flatten safety net");
-
-        // --observe-only: never allowed, even without a control file.
-        let mut cache = LeaseFileCache::new();
-        let options = RunOptions {
-            observe_only: true,
-            ..RunOptions::default()
-        };
-        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(!allowed, "observe-only must never hold execution rights");
-
-        // Standby observer: control file set, lease file absent -> not allowed.
-        let dir = std::env::temp_dir().join(format!(
-            "lighter_aster_taker_arb_gate_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("lease.json");
-        let mut cache = LeaseFileCache::new();
-        let options = RunOptions {
-            control_file: Some(path.clone()),
-            ..RunOptions::default()
-        };
-        let (allowed, _) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(!allowed, "standby without a lease must not hold execution rights");
-
-        // Reduce taker with a valid lease -> allowed.
-        let expires = now + chrono::Duration::seconds(60);
-        std::fs::write(
-            &path,
-            format!(
-                r#"{{"market":"HYPE","mode":"reduce_only","lease_id":"g","expires_at":"{}"}}"#,
-                expires.to_rfc3339()
-            ),
-        )
-        .unwrap();
-        let mut cache = LeaseFileCache::new();
-        let (allowed, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(allowed, "a valid reduce lease grants execution rights");
-        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("g"));
-
-        let _ = std::fs::remove_dir_all(dir);
+        let now = Utc::now();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let state = ControlSnapshot { lease: Some(ExecutionLease { market: "HYPE".to_string(),
+            mode: "reduce_only".to_string(), lease_id: Some("lease-1".to_string()),
+            expires_at: now + chrono::Duration::seconds(60) }),
+            observed_at: tokio::time::Instant::now(), validated_epoch: Some(0) };
+        let (tx, rx) = watch::channel(state.clone());
+        let mut cache = LeaseFileCache { rx, execution_epoch: epoch.clone(), task: None };
+        let mut options = RunOptions { control_file: Some(PathBuf::from("lease.json")), ..RunOptions::default() };
+        assert!(execution_lease_enabled(&mut cache, &options, &spec, now).0);
+        options.observe_only = true;
+        assert!(!execution_lease_enabled(&mut cache, &options, &spec, now).0);
+        options.observe_only = false;
+        assert!(!execution_lease_enabled(&mut cache, &options, &spec, now + chrono::Duration::seconds(60)).0);
+        begin_execution(&epoch);
+        finish_execution(&epoch);
+        assert!(!execution_lease_enabled(&mut cache, &options, &spec, now).0);
+        let mut fresh = state.clone();
+        fresh.validated_epoch = Some(2);
+        tx.send(fresh.clone()).unwrap();
+        assert!(execution_lease_enabled(&mut cache, &options, &spec, now).0);
+        fresh.observed_at = tokio::time::Instant::now() - CONTROL_MAX_AGE - Duration::from_millis(1);
+        tx.send(fresh).unwrap();
+        assert!(!execution_lease_enabled(&mut cache, &options, &spec, now).0);
     }
 
     #[test]
-    fn lease_cache_throttles_reads_and_enforces_expiry() {
-        let dir = std::env::temp_dir().join(format!(
-            "lighter_aster_taker_arb_lease_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("lease.json");
-        let now = DateTime::parse_from_rfc3339("2026-06-24T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let expires = now + chrono::Duration::seconds(60);
-        let write_lease = |id: &str| {
-            std::fs::write(
-                &path,
-                format!(
-                    r#"{{"market":"HYPE","mode":"reduce_only","lease_id":"{id}","expires_at":"{}"}}"#,
-                    expires.to_rfc3339()
-                ),
-            )
-            .unwrap()
-        };
-        write_lease("a");
-        let options = RunOptions {
-            control_file: Some(path.clone()),
-            ..RunOptions::default()
-        };
-        let spec = test_spec();
-        let mut cache = LeaseFileCache::new();
-
-        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(enabled);
-        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("a"));
-
-        // A rewrite within the reread interval is not seen yet (the read is throttled)...
-        write_lease("b");
-        let (_, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("a"));
-
-        // ...but expiry is enforced against the CACHED lease on every call, no re-read.
-        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, expires);
-        assert!(!enabled);
-        assert!(lease.is_none());
-
-        // Once the interval passes (backdate the last read) the rewrite is picked up.
-        cache.last_read_at = Some(tokio::time::Instant::now() - LEASE_REREAD_INTERVAL);
-        let (_, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert_eq!(lease.unwrap().lease_id.as_deref(), Some("b"));
-
-        // A deleted file fails closed at the next re-read.
-        std::fs::remove_file(&path).unwrap();
-        cache.last_read_at = Some(tokio::time::Instant::now() - LEASE_REREAD_INTERVAL);
-        let (enabled, lease) = execution_lease_enabled(&mut cache, &options, &spec, now);
-        assert!(!enabled);
-        assert!(lease.is_none());
-
-        let _ = std::fs::remove_dir_all(dir);
+    fn stale_pretrade_account_cannot_replace_completed_execution() {
+        let snapshot = |epoch, qty| AccountSnapshot { execution_epoch: epoch, aster_open_orders: 0,
+            lighter_open_orders: 0, position: PositionSnapshot { aster_qty: qty, lighter_qty: -qty },
+            lighter_ws_qty: None, lighter_ws_rest_divergence_qty: None, margins: margins(),
+            refreshed_at: tokio::time::Instant::now() };
+        let (tx, rx) = watch::channel(snapshot(0, dec!(0)));
+        publish_account(&tx, snapshot(2, dec!(1)));
+        // The old request completes later, so a timestamp-only guard would accept it.
+        publish_account(&tx, snapshot(0, dec!(0)));
+        assert_eq!(rx.borrow().execution_epoch, 2);
+        assert_eq!(rx.borrow().position.aster_qty, dec!(1));
     }
 
     #[test]
@@ -4975,510 +4208,64 @@ mod tests {
         assert_eq!(tracker.event_count(), 2);
     }
 
-    fn assert_opp_eq_f64_vs_decimal(
-        f64_opp: &Opportunity,
-        dec_opp: &Opportunity,
-        ctx: &str,
-    ) {
-        let qty_diff = (f64_opp.qty - dec_opp.qty).abs();
-        assert!(
-            qty_diff <= dec!(0.0000001),
-            "{ctx}: qty drift exceeded: f64={} dec={} diff={}",
-            f64_opp.qty,
-            dec_opp.qty,
-            qty_diff
-        );
-        let edge_diff = (f64_opp.gross_edge_bps - dec_opp.gross_edge_bps).abs();
-        assert!(
-            edge_diff < dec!(0.001),
-            "{ctx}: gross_edge_bps drift exceeded: f64={} dec={} diff={}",
-            f64_opp.gross_edge_bps,
-            dec_opp.gross_edge_bps,
-            edge_diff
-        );
-        let net_diff = (f64_opp.expected_net_usd - dec_opp.expected_net_usd).abs();
-        assert!(
-            net_diff < dec!(0.0000001),
-            "{ctx}: expected_net_usd drift exceeded: f64={} dec={} diff={}",
-            f64_opp.expected_net_usd,
-            dec_opp.expected_net_usd,
-            net_diff
-        );
-    }
-
-    fn build_opportunity_decimal(
-        cfg: &Config,
-        direction: Direction,
-        sizing: SizingDecision,
-        sell_px: Decimal,
-        buy_px: Decimal,
-        ref_px: Decimal,
-    ) -> Opportunity {
-        let gross_edge_bps = (sell_px - buy_px) / ref_px * Decimal::from(10_000);
-        let aster_px = if matches!(direction.aster_side(), Side::Sell) {
-            sell_px
-        } else {
-            buy_px
-        };
-        let lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
-            sell_px
-        } else {
-            buy_px
-        };
-        let gross_usd = sizing.qty * (sell_px - buy_px);
-        let fee_usd = sizing.qty
-            * (aster_px * bps_to_rate(cfg.arb.aster_taker_fee_bps)
-                + lighter_px * bps_to_rate(cfg.arb.lighter_taker_fee_bps));
-        let required_margin_usd = sizing.qty * ref_px * bps_to_rate(cfg.arb.margin_bps);
-        Opportunity {
-            direction,
-            qty: sizing.qty,
-            qty_f64: sizing.qty.to_f64().unwrap(),
-            gross_edge_bps,
-            expected_net_margin_bps: gross_edge_bps - cfg.arb.required_gross_edge_bps(),
-            sell_px,
-            buy_px,
-            ref_px,
-            top_depth_qty: sizing.top_depth_qty,
-            depth_guard_enabled: sizing.depth_guard_enabled,
-            liquidity_multiple: sizing.liquidity_multiple,
-            depth_supported_qty: sizing.depth_supported_qty,
-            sell_depth_target_qty: sizing.sell_depth_target_qty,
-            buy_depth_target_qty: sizing.buy_depth_target_qty,
-            sell_depth_available_qty: sizing.sell_depth_available_qty,
-            buy_depth_available_qty: sizing.buy_depth_available_qty,
-            sell_depth_worst_px: sizing.sell_depth_worst_px,
-            buy_depth_worst_px: sizing.buy_depth_worst_px,
-            sell_depth_levels_used: sizing.sell_depth_levels_used,
-            buy_depth_levels_used: sizing.buy_depth_levels_used,
-            sell_best_px: sizing.sell_best_px,
-            buy_best_px: sizing.buy_best_px,
-            sell_best_qty: sizing.sell_best_qty,
-            buy_best_qty: sizing.buy_best_qty,
-            desired_qty: sizing.desired_qty,
-            min_qty: sizing.min_qty,
-            headroom_qty: sizing.headroom_qty,
-            margin_room_qty: sizing.margin_room_qty,
-            expected_gross_usd: gross_usd,
-            expected_fee_usd: fee_usd,
-            expected_net_usd: gross_usd - fee_usd,
-            required_margin_usd,
-        }
-    }
-
-    fn decimal_depth_priced_opportunity(
-        cfg: &Config,
-        spec: &MarketSpec,
-        direction: Direction,
-        aster: &OrderBook,
-        lighter: &OrderBook,
-        pos: PositionSnapshot,
-        margins: MarginSnapshot,
-        min_size: bool,
-    ) -> Option<Opportunity> {
-        let ref_px = aster.mid().or_else(|| lighter.mid())?;
-        if ref_px <= Decimal::ZERO {
-            return None;
-        }
-        let (sell_book, buy_book) = match direction {
-            Direction::SellAsterBuyLighter => (aster, lighter),
-            Direction::SellLighterBuyAster => (lighter, aster),
-        };
-        let sell_top = sell_book.side_levels(Side::Sell).first().copied()?;
-        let buy_top = buy_book.side_levels(Side::Buy).first().copied()?;
-        let top_depth_qty = sell_top.qty.min(buy_top.qty);
-        let desired = cfg.arb.desired_notional / ref_px;
-        let est_aster_px = if matches!(direction.aster_side(), Side::Sell) {
-            sell_top.px
-        } else {
-            buy_top.px
-        };
-        let est_lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
-            sell_top.px
-        } else {
-            buy_top.px
-        };
-        let est_min_qty = min_trade_qty(spec, est_aster_px, est_lighter_px)?;
-        let a_delta_sign = if matches!(direction.aster_side(), Side::Buy) {
-            Decimal::ONE
-        } else {
-            -Decimal::ONE
-        };
-        let l_delta_sign = -a_delta_sign;
-        let headroom = max_qty_by_headroom(
-            cfg.risk.max_abs_position_notional_usd / ref_px,
-            pos,
-            a_delta_sign,
-            l_delta_sign,
-        );
-        let margin_room =
-            max_qty_by_available_margin(cfg, ref_px, pos, margins, a_delta_sign, l_delta_sign);
-        let depth_guard_enabled = cfg.arb.depth_guard.enabled;
-        let liquidity_multiple = if depth_guard_enabled {
-            cfg.arb.depth_guard.liquidity_multiple
-        } else {
-            Decimal::ONE
-        };
-        let max_levels = if depth_guard_enabled {
-            cfg.arb.depth_guard.max_levels
-        } else {
-            1
-        };
-        let sell_available = sell_book.cumulative_qty(Side::Sell, max_levels);
-        let buy_available = buy_book.cumulative_qty(Side::Buy, max_levels);
-        let depth_supported_qty = sell_available.min(buy_available) / liquidity_multiple;
-        let max_qty = depth_supported_qty.min(headroom).min(margin_room);
-        if max_qty <= Decimal::ZERO {
-            return None;
-        }
-        let initial_qty = if min_size {
-            let q = ceil_to_common_step(est_min_qty, spec.step, spec.lighter_qty_step);
-            if q <= max_qty { q } else { return None; }
-        } else {
-            let q = floor_to_common_step(desired.min(max_qty), spec.step, spec.lighter_qty_step);
-            if q >= est_min_qty { q } else { return None; }
-        };
-        let (sizing, sell_px, buy_px) = decimal_depth_price_sized_qty(
-            spec, direction, sell_book, buy_book, initial_qty, desired,
-            top_depth_qty, headroom, margin_room, depth_guard_enabled,
-            liquidity_multiple, max_levels, depth_supported_qty, min_size,
-        )?;
-        Some(build_opportunity_decimal(cfg, direction, sizing, sell_px, buy_px, ref_px))
-    }
-
-    fn decimal_depth_price_sized_qty(
-        spec: &MarketSpec,
-        direction: Direction,
-        sell_book: &OrderBook,
-        buy_book: &OrderBook,
-        initial_qty: Decimal,
-        desired_qty: Decimal,
-        top_depth_qty: Decimal,
-        headroom_qty: Decimal,
-        margin_room_qty: Decimal,
-        depth_guard_enabled: bool,
-        liquidity_multiple: Decimal,
-        max_levels: usize,
-        depth_supported_qty: Decimal,
-        min_size: bool,
-    ) -> Option<(SizingDecision, Decimal, Decimal)> {
-        let mut qty = initial_qty;
-        for _ in 0..3 {
-            if qty <= Decimal::ZERO || qty > depth_supported_qty {
-                return None;
-            }
-            let depth_target = qty * liquidity_multiple;
-            let sell_quote = sell_book.depth_vwap(Side::Sell, depth_target, max_levels)?;
-            let buy_quote = buy_book.depth_vwap(Side::Buy, depth_target, max_levels)?;
-            let sell_px = sell_quote.vwap_px;
-            let buy_px = buy_quote.vwap_px;
-            let aster_px = if matches!(direction.aster_side(), Side::Sell) {
-                sell_px
-            } else {
-                buy_px
-            };
-            let lighter_px = if matches!(direction.lighter_side(), Side::Sell) {
-                sell_px
-            } else {
-                buy_px
-            };
-            let min_qty = min_trade_qty(spec, aster_px, lighter_px)?;
-            if min_size {
-                let min_step_qty = ceil_to_common_step(min_qty, spec.step, spec.lighter_qty_step);
-                if min_step_qty > qty {
-                    if min_step_qty > depth_supported_qty
-                        || min_step_qty > headroom_qty
-                        || min_step_qty > margin_room_qty
-                    {
-                        return None;
-                    }
-                    qty = min_step_qty;
-                    continue;
-                }
-            } else if qty < min_qty {
-                return None;
-            }
-            return Some((
-                SizingDecision {
-                    qty,
-                    desired_qty,
-                    min_qty,
-                    top_depth_qty,
-                    depth_guard_enabled,
-                    liquidity_multiple,
-                    depth_supported_qty,
-                    sell_depth_target_qty: sell_quote.target_qty,
-                    buy_depth_target_qty: buy_quote.target_qty,
-                    sell_depth_available_qty: sell_quote.available_qty,
-                    buy_depth_available_qty: buy_quote.available_qty,
-                    sell_depth_worst_px: sell_quote.worst_px,
-                    buy_depth_worst_px: buy_quote.worst_px,
-                    sell_depth_levels_used: sell_quote.levels_used,
-                    buy_depth_levels_used: buy_quote.levels_used,
-                    sell_best_px: sell_quote.best_px,
-                    buy_best_px: buy_quote.best_px,
-                    sell_best_qty: sell_quote.best_qty,
-                    buy_best_qty: buy_quote.best_qty,
-                    headroom_qty,
-                    margin_room_qty,
-                },
-                sell_px,
-                buy_px,
-            ));
-        }
-        None
-    }
-
     #[test]
-    fn f64_matches_decimal_top_of_book_opportunity() {
-        let cfg = test_cfg();
-        let spec = test_spec();
-        let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: Decimal::ZERO,
-            lighter_qty: Decimal::ZERO,
-        };
-        let margins = margins();
-        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
-            let (a_bid, a_ask, l_bid, l_ask) = match direction {
-                Direction::SellAsterBuyLighter => (dec!(101), dec!(103), dec!(98), dec!(100)),
-                Direction::SellLighterBuyAster => (dec!(100), dec!(101.5), dec!(101), dec!(103)),
-            };
-            let aster = book(a_bid, a_ask);
-            let lighter = book(l_bid, l_ask);
-            let f64_opp = depth_priced_opportunity(
-                &cfg,
-                &spec,
-                &math,
-                direction,
-                &aster,
-                &lighter,
-                pos_f64(pos),
-                margins_f64(margins),
-                false,
-            )
-            .expect("f64 opportunity should exist");
-            let dec_opp = decimal_depth_priced_opportunity(
-                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
-            )
-            .expect("decimal opportunity should exist");
-            assert_opp_eq_f64_vs_decimal(&f64_opp, &dec_opp, direction.as_str());
-        }
-    }
-
-    #[test]
-    fn f64_matches_decimal_multi_level_depth_opportunity() {
+    fn depth_sizing_matches_hand_calculated_two_level_cashflows() {
         let mut cfg = test_cfg();
-        cfg.arb.depth_guard.enabled = true;
+        cfg.arb.desired_notional = dec!(104);
         cfg.arb.depth_guard.liquidity_multiple = dec!(2);
-        cfg.arb.depth_guard.max_levels = 5;
-        cfg.arb.desired_notional = dec!(1000);
         let spec = test_spec();
         let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: Decimal::ZERO,
-            lighter_qty: Decimal::ZERO,
-        };
-        let margins = margins();
-        let aster = depth_book(
-            [
-                (dec!(100.00), dec!(5)),
-                (dec!(99.50), dec!(10)),
-                (dec!(99.00), dec!(20)),
-                (dec!(98.50), dec!(30)),
-            ],
-            [
-                (dec!(100.50), dec!(5)),
-                (dec!(101.00), dec!(10)),
-                (dec!(101.50), dec!(20)),
-                (dec!(102.00), dec!(30)),
-            ],
-        );
-        let lighter = depth_book(
-            [
-                (dec!(99.00), dec!(4)),
-                (dec!(98.50), dec!(8)),
-                (dec!(98.00), dec!(16)),
-                (dec!(97.50), dec!(32)),
-            ],
-            [
-                (dec!(99.50), dec!(4)),
-                (dec!(100.00), dec!(8)),
-                (dec!(100.50), dec!(16)),
-                (dec!(101.00), dec!(32)),
-            ],
-        );
-        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
-            let f64_opp = depth_priced_opportunity(
-                &cfg,
-                &spec,
-                &math,
-                direction,
-                &aster,
-                &lighter,
-                pos_f64(pos),
-                margins_f64(margins),
-                false,
-            )
-            .expect("f64 opportunity should exist");
-            let dec_opp = decimal_depth_priced_opportunity(
-                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
-            )
-            .expect("decimal opportunity should exist");
-            assert_opp_eq_f64_vs_decimal(&f64_opp, &dec_opp, direction.as_str());
-        }
+        let aster = depth_book([(dec!(103),dec!(0.5)),(dec!(102),dec!(5))],[(dec!(105),dec!(5))]);
+        let lighter = depth_book([(dec!(99),dec!(5))],[(dec!(100),dec!(0.5)),(dec!(101),dec!(5))]);
+        let opp = best_opportunity(&cfg, &spec, &math, &aster, &lighter,
+            PositionF64 { aster_qty:0.0,lighter_qty:0.0 }, margins_f64(margins()), false, ExposureFilter::Any).unwrap();
+        assert_eq!(opp.qty, dec!(1));
+        assert_eq!(opp.sell_depth_levels_used, 2);
+        assert_eq!(opp.buy_depth_levels_used, 2);
+        assert_eq!(opp.sell_px, dec!(102.25)); // (0.5*103 + 1.5*102) / 2
+        assert_eq!(opp.buy_px, dec!(100.75)); // (0.5*100 + 1.5*101) / 2
+        assert!((opp.expected_net_usd - dec!(1.4591)).abs() < dec!(0.00000001));
     }
 
     #[test]
-    fn f64_matches_decimal_with_non_zero_position() {
+    fn minimum_size_uses_the_real_common_lattice() {
         let cfg = test_cfg();
-        let spec = test_spec();
+        let mut spec = test_spec();
+        spec.step = dec!(0.02);
+        spec.lighter_qty_step = dec!(0.03);
         let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: dec!(2.5),
-            lighter_qty: dec!(-2.5),
-        };
-        let margins = margins();
-        for direction in [Direction::SellAsterBuyLighter, Direction::SellLighterBuyAster] {
-            let aster = book(dec!(100), dec!(101));
-            let lighter = book(dec!(99), dec!(100));
-            let f64_opp = depth_priced_opportunity(
-                &cfg,
-                &spec,
-                &math,
-                direction,
-                &aster,
-                &lighter,
-                pos_f64(pos),
-                margins_f64(margins),
-                false,
-            );
-            let dec_opp = decimal_depth_priced_opportunity(
-                &cfg, &spec, direction, &aster, &lighter, pos, margins, false,
-            );
-            match (f64_opp, dec_opp) {
-                (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, direction.as_str()),
-                (None, None) => {}
-                (f64_opp, dec_opp) => panic!(
-                    "{}: f64 and decimal disagree on existence: f64={:?} dec={:?}",
-                    direction.as_str(),
-                    f64_opp.map(|o| o.qty),
-                    dec_opp.map(|o| o.qty)
-                ),
-            }
-        }
+        let opp = best_opportunity(&cfg, &spec, &math,
+            &book(dec!(20),dec!(20.1)), &book(dec!(19.8),dec!(19.9)),
+            PositionF64 { aster_qty:0.0,lighter_qty:0.0 }, margins_f64(margins()), true, ExposureFilter::Any).unwrap();
+        assert_eq!(opp.qty, dec!(0.54));
+        assert_eq!(opp.qty % spec.step, Decimal::ZERO);
+        assert_eq!(opp.qty % spec.lighter_qty_step, Decimal::ZERO);
+        assert!(dec!(0.48) * dec!(19.9) < spec.lighter_min_notional);
     }
 
     #[test]
-    fn f64_matches_decimal_min_size_near_min_notional() {
-        let cfg = test_cfg();
-        let spec = test_spec();
-        let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: Decimal::ZERO,
-            lighter_qty: Decimal::ZERO,
-        };
-        let margins = margins();
-        let px = dec!(20.0);
-        let aster = book(px - dec!(0.05), px + dec!(0.05));
-        let lighter = book(px - dec!(0.10), px - dec!(0.05));
-        let f64_opp = depth_priced_opportunity(
-            &cfg,
-            &spec,
-            &math,
-            Direction::SellLighterBuyAster,
-            &aster,
-            &lighter,
-            pos_f64(pos),
-            margins_f64(margins),
-            true,
-        );
-        let dec_opp = decimal_depth_priced_opportunity(
-            &cfg, &spec, Direction::SellLighterBuyAster, &aster, &lighter, pos, margins, true,
-        );
-        match (f64_opp, dec_opp) {
-            (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, "min_size"),
-            (None, None) => {}
-            (f64_opp, dec_opp) => panic!(
-                "min_size: f64 and decimal disagree on existence: f64={:?} dec={:?}",
-                f64_opp.map(|o| o.qty),
-                dec_opp.map(|o| o.qty)
-            ),
-        }
-    }
-
-    #[test]
-    fn f64_matches_decimal_thin_top_of_book_with_depth() {
+    fn reduce_execution_caps_quantity_at_both_existing_positions() {
         let mut cfg = test_cfg();
-        cfg.arb.depth_guard.enabled = true;
-        cfg.arb.depth_guard.liquidity_multiple = dec!(10);
-        cfg.arb.depth_guard.max_levels = 3;
+        cfg.arb.desired_notional = dec!(100);
         let spec = test_spec();
         let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: Decimal::ZERO,
-            lighter_qty: Decimal::ZERO,
-        };
-        let margins = margins();
-        let aster = depth_book(
-            [(dec!(101), dec!(0.20)), (dec!(100.90), dec!(10))],
-            [(dec!(103), dec!(10))],
-        );
-        let lighter = depth_book(
-            [(dec!(98), dec!(10))],
-            [(dec!(100), dec!(0.20)), (dec!(100.10), dec!(10))],
-        );
-        let f64_opp = depth_priced_opportunity(
-            &cfg,
-            &spec,
-            &math,
-            Direction::SellAsterBuyLighter,
-            &aster,
-            &lighter,
-            pos_f64(pos),
-            margins_f64(margins),
-            false,
-        );
-        let dec_opp = decimal_depth_priced_opportunity(
-            &cfg, &spec, Direction::SellAsterBuyLighter, &aster, &lighter, pos, margins, false,
-        );
-        match (f64_opp, dec_opp) {
-            (Some(f), Some(d)) => assert_opp_eq_f64_vs_decimal(&f, &d, "thin_top"),
-            (None, None) => {}
-            (f64_opp, dec_opp) => panic!(
-                "thin_top: f64 and decimal disagree on existence: f64={:?} dec={:?}",
-                f64_opp.map(|o| o.qty),
-                dec_opp.map(|o| o.qty)
-            ),
-        }
+        let opp = best_opportunity(&cfg, &spec, &math,
+            &book(dec!(99),dec!(100)), &book(dec!(101),dec!(102)),
+            PositionF64 { aster_qty:-0.2,lighter_qty:0.2 }, margins_f64(margins()), false, ExposureFilter::Reduce).unwrap();
+        assert_eq!(opp.qty, dec!(0.2));
+        assert_eq!(opp.direction, Direction::SellLighterBuyAster);
     }
 
     #[test]
-    fn exposure_effect_f64_matches_decimal() {
-        let cfg = test_cfg();
-        let spec = test_spec();
-        let math = test_math(&cfg, &spec);
-        let cases = [
-            (dec!(1), dec!(-1), dec!(0.2), Direction::SellAsterBuyLighter),
-            (dec!(-1), dec!(1), dec!(0.2), Direction::SellLighterBuyAster),
-            (dec!(0), dec!(0), dec!(0.5), Direction::SellAsterBuyLighter),
-            (dec!(2), dec!(-2), dec!(3), Direction::SellAsterBuyLighter),
-            (dec!(-2), dec!(2), dec!(3), Direction::SellLighterBuyAster),
-        ];
-        for (a, l, q, dir) in cases {
-            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
-            let dec_result = exposure_effect(pos, dir, q);
-            let f64_result = exposure_effect_f64(
-                a.to_f64().unwrap(),
-                l.to_f64().unwrap(),
-                dir,
-                q.to_f64().unwrap(),
-                &math,
-            );
-            assert_eq!(dec_result, f64_result,
-                "exposure_effect mismatch for pos=({},{}) qty={} dir={}: dec={:?} f64={:?}",
-                a, l, q, dir.as_str(), dec_result, f64_result);
-        }
+    fn exposure_effect_matches_known_position_changes() {
+        let math = test_math(&test_cfg(), &test_spec());
+        for (a,l,qty,expected) in [
+            (1.0,-1.0,0.2,ExposureEffect::Reduce),
+            (0.0,0.0,0.5,ExposureEffect::Increase),
+            (2.0,-2.0,3.0,ExposureEffect::Reduce),
+            (1.0,-1.0,2.0,ExposureEffect::Flat),
+            (1.0,-1.0,0.0,ExposureEffect::Unknown),
+        ] { assert_eq!(exposure_effect_f64(a,l,Direction::SellAsterBuyLighter,qty,&math), expected); }
     }
 
     #[test]
@@ -5499,23 +4286,11 @@ mod tests {
     }
 
     #[test]
-    fn net_mismatch_notional_f64_matches_decimal() {
-        let cases = [
-            (dec!(1), dec!(-1), dec!(100), dec!(101)),
-            (dec!(0.5), dec!(-0.3), dec!(50), dec!(51)),
-            (dec!(0), dec!(0), dec!(100), dec!(101)),
-        ];
-        for (a, l, bid, ask) in cases {
-            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
-            let aster = book(bid, ask);
-            let lighter = book(bid, ask);
-            let mark = aster.mid().or_else(|| lighter.mid()).unwrap();
-            let dec_result = pos.net_qty().abs() * mark;
-            let f64_result = net_mismatch_notional(pos, &aster, &lighter).unwrap();
-            let diff = (dec_result - f64_result).abs();
-            assert!(diff < dec!(0.0000001),
-                "net_mismatch drift for pos=({},{}) bid={} ask={}: dec={} f64={} diff={}",
-                a, l, bid, ask, dec_result, f64_result, diff);
+    fn net_mismatch_values_only_unhedged_quantity() {
+        for (a,l,expected) in [(dec!(1),dec!(-1),dec!(0)),(dec!(0.5),dec!(-0.3),dec!(10.1))] {
+            let result = net_mismatch_notional(PositionSnapshot { aster_qty:a,lighter_qty:l },
+                &book(dec!(50),dec!(51)), &book(dec!(50),dec!(51))).unwrap();
+            assert!((result - expected).abs() < dec!(0.0000001));
         }
     }
 
@@ -5557,9 +4332,10 @@ mod tests {
     }
 
     #[test]
-    fn recovery_loss_row_gets_unique_dedup_id_from_timestamp() {
+    fn recovery_rows_preserve_distinct_source_execution_ids() {
         let spec = test_spec();
         let recovery = RecoveryReport {
+            execution_id: "test-recovery-1".to_string(),
             action_taken: true,
             position: PositionSnapshot {
                 aster_qty: Decimal::ZERO,
@@ -5574,8 +4350,11 @@ mod tests {
         let row = recovery_loss_row(&spec, &recovery);
         // Deterministic given the row's own timestamp, and nonzero — so the
         // orchestrator dedup key `taker:<unix_ms>:0` is unique per recovery.
-        assert_eq!(row.aster_order_id, row.timestamp.timestamp_millis());
-        assert_ne!(row.aster_order_id, 0);
+        let mut other = recovery.clone();
+        other.execution_id = "test-recovery-2".to_string();
+        let second = recovery_loss_row(&spec,&other);
+        assert_ne!(row.source_event_id,second.source_event_id);
+        assert_eq!(row.economic_status,EconomicStatus::Estimated);
         assert_eq!(row.lighter_client_order_index, 0);
         assert_eq!(row.actual_net_usd, dec!(-1.25));
     }
@@ -5599,7 +4378,7 @@ mod tests {
         // room = |current| (margin-free reduce) + usable margin priced at ref_px for
         // the crossing remainder — never the old unconditional f64::MAX.
         let room = max_qty_by_available_margin_f64(10.0, 5.0, -5.0, -1.0, 1.0, 150.0, 150.0, 50.0);
-        assert_eq!(room, 5.0 + (150.0 - 50.0) / 10.0);
+        assert_eq!(room, 15.0);
     }
 
     #[test]
@@ -5614,41 +4393,68 @@ mod tests {
     }
 
     #[test]
-    fn margin_room_f64_matches_decimal_on_crossing_cases() {
-        let mut cfg = test_cfg();
-        cfg.risk.margin_buffer_usd = dec!(50);
-        let margins = MarginSnapshot {
-            aster_available_usd: dec!(150),
-            lighter_available_usd: dec!(120),
-            aster_equity_usd: None,
-            lighter_equity_usd: None,
-        };
-        let cases = [
-            // (aster_qty, lighter_qty, a_sign, l_sign)
-            (dec!(5), dec!(-5), dec!(-1), dec!(1)),   // both legs reduce/cross
-            (dec!(5), dec!(-5), dec!(1), dec!(-1)),   // both legs increase
-            (dec!(0.3), dec!(-5), dec!(-1), dec!(1)), // asymmetric crossing
-            (dec!(0), dec!(0), dec!(1), dec!(-1)),    // flat
-        ];
-        for (a, l, a_sign, l_sign) in cases {
-            let pos = PositionSnapshot { aster_qty: a, lighter_qty: l };
-            let dec_room =
-                max_qty_by_available_margin(&cfg, dec!(10), pos, margins, a_sign, l_sign);
-            let f64_room = max_qty_by_available_margin_f64(
-                10.0,
-                decimal_to_f64(a).unwrap(),
-                decimal_to_f64(l).unwrap(),
-                decimal_to_f64(a_sign).unwrap(),
-                decimal_to_f64(l_sign).unwrap(),
-                150.0,
-                120.0,
-                50.0,
-            );
-            let diff = (decimal_to_f64(dec_room).unwrap() - f64_room).abs();
-            assert!(
-                diff < 1e-9,
-                "margin room drift for pos=({a},{l}) signs=({a_sign},{l_sign}): dec={dec_room} f64={f64_room}"
-            );
+    fn margin_room_respects_the_limiting_venue_and_crossing_inventory() {
+        for (a,l,a_sign,l_sign,expected) in [
+            (5.0,-5.0,-1.0,1.0,12.0), (5.0,-5.0,1.0,-1.0,7.0),
+            (0.3,-5.0,-1.0,1.0,10.3), (0.0,0.0,1.0,-1.0,7.0),
+        ] {
+            assert!((max_qty_by_available_margin_f64(10.0,a,l,a_sign,l_sign,150.0,120.0,50.0)-expected).abs()<1e-10);
         }
     }
+
+    #[tokio::test]
+    async fn hourly_breaker_returns_only_after_recovery_row_is_durable() {
+        let dir = std::env::temp_dir().join(format!("taker_commit_{}", next_execution_id()));
+        let spec = test_spec();
+        let config = PnlCfg { persist_dir:dir.to_string_lossy().into_owned(), max_loss_usdc:dec!(10), ..Default::default() };
+        let mut pnl = Some(PnlTracker::new(&config,&spec.market_id,Utc::now()).unwrap());
+        let session = ActiveSession::new(crate::pnl::session_path(&config,&spec.market_id),
+            serde_json::json!({"session_id":"commit-test"}));
+        session.arm().await.unwrap();
+        session.record_unresolved(serde_json::json!({"execution_id":"recovery-test"})).await.unwrap();
+        let recovery = RecoveryReport { execution_id:"recovery-test".to_string(), action_taken:true,
+            position:PositionSnapshot {aster_qty:dec!(0),lighter_qty:dec!(0)},lighter_ws_qty:None,
+            margin_after:margins(),estimated_loss_usdc:dec!(0.26),aster_open_orders:0,lighter_open_orders:0 };
+        let error = record_recovery_loss(&mut pnl,&spec,&recovery,&session,Some("hourly loss".to_string())).await.unwrap_err();
+        assert!(error.to_string().contains("hourly loss"));
+        let path = pnl.as_ref().unwrap().snapshot().ledger_path;
+        let row: TradeLedgerRow = serde_json::from_str(std::fs::read_to_string(path).unwrap().trim()).unwrap();
+        assert_eq!(row.actual_net_usd,dec!(-0.26));
+        assert_eq!(row.source_event_id.as_deref(),Some("recovery-recovery-test"));
+        assert!(!session.unresolved());
+        pnl.as_ref().unwrap().shutdown().await.unwrap();
+        session.clear_verified().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn accounting_worker_failure_keeps_the_unresolved_session_barrier() {
+        let dir = std::env::temp_dir().join(format!("taker_commit_failure_{}", next_execution_id()));
+        let spec = test_spec();
+        let config = PnlCfg {persist_dir:dir.to_string_lossy().into_owned(),..Default::default()};
+        let mut pnl = Some(PnlTracker::new(&config,&spec.market_id,Utc::now()).unwrap());
+        pnl.as_ref().unwrap().shutdown().await.unwrap();
+        let session = ActiveSession::new(crate::pnl::session_path(&config,&spec.market_id),
+            serde_json::json!({"session_id":"failed-commit-test"}));
+        session.arm().await.unwrap();
+        session.record_unresolved(serde_json::json!({"execution_id":"failed"})).await.unwrap();
+        let recovery = RecoveryReport {execution_id:"failed".to_string(),action_taken:true,
+            position:PositionSnapshot {aster_qty:dec!(0),lighter_qty:dec!(0)},lighter_ws_qty:None,
+            margin_after:margins(),estimated_loss_usdc:dec!(0.26),aster_open_orders:0,lighter_open_orders:0};
+        assert!(record_recovery_loss(&mut pnl,&spec,&recovery,&session,None).await.is_err());
+        assert!(session.unresolved());
+        assert!(session.clear_verified().await.is_err());
+        drop(session);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn session_marked_guard_cancels_equal_opposite_venue_moves_and_trips_at_boundary() {
+        let initial = margin_snapshot(dec!(50),dec!(50),Some(dec!(100)),Some(dec!(100)));
+        let balanced_move = margin_snapshot(dec!(40),dec!(60),Some(dec!(90)),Some(dec!(110)));
+        assert_eq!(session_marked_loss(initial.total_equity_usd().unwrap(),balanced_move.total_equity_usd().unwrap(),dec!(10)),None);
+        assert_eq!(session_marked_loss(dec!(200),dec!(190.01),dec!(10)),None);
+        assert_eq!(session_marked_loss(dec!(200),dec!(190),dec!(10)),Some(dec!(10)));
+    }
+
 }

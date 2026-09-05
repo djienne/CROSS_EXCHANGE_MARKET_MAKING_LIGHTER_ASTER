@@ -21,7 +21,7 @@ pub enum CooldownScope {
 }
 
 /// Tracks the post-trade cooldown deadlines in monotonic-clock nanos. Owned by the risk
-/// reactor; the hot path reads the mirrored deadline from [`super::account::HotRisk`].
+/// reactor; the strategy reads its own deadlines directly.
 #[derive(Debug, Clone)]
 pub struct CooldownState {
     scope: CooldownScope,
@@ -64,15 +64,7 @@ impl CooldownState {
         }
     }
 
-    /// The deadline to mirror into the global hot atomic. Under `PerMarket` this is the
-    /// LATEST per-market deadline (a conservative single-value mirror; precise per-market
-    /// enforcement still goes through [`active`]).
-    pub fn hot_mirror_until_ns(&self) -> i64 {
-        match self.scope {
-            CooldownScope::Global => self.global_until_ns,
-            CooldownScope::PerMarket => self.per_market.values().copied().max().unwrap_or(0),
-        }
-    }
+
 }
 
 /// Why new maker quoting is currently frozen (plan §6 start-condition / §8 invariants).
@@ -210,8 +202,8 @@ mod tests {
         c.trigger(1_000, 60_000_000_000, &"BTC".into());
         assert!(c.active(1_000, &"BTC".into()));
         assert!(!c.active(1_000, &"ETH".into())); // ETH not triggered
-        // mirror is the latest deadline
-        assert_eq!(c.hot_mirror_until_ns(), 1_000 + 60_000_000_000);
+        assert!(c.active(60_000_000_999, &"BTC".into()));
+        assert!(!c.active(60_000_001_000, &"BTC".into()));
     }
 
     #[test]
@@ -220,7 +212,8 @@ mod tests {
         c.trigger(0, 60_000_000_000, &"BTC".into());
         // a later, shorter trigger must not pull the deadline in
         c.trigger(1_000, 10_000_000_000, &"BTC".into());
-        assert_eq!(c.hot_mirror_until_ns(), 60_000_000_000);
+        assert!(c.active(59_999_999_999, &"BTC".into()));
+        assert!(!c.active(60_000_000_000, &"BTC".into()));
     }
 
     #[test]

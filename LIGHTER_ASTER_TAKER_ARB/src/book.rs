@@ -37,24 +37,6 @@ pub struct DepthQuoteF64 {
     pub levels_used: usize,
 }
 
-impl DepthQuoteF64 {
-    pub fn to_decimal_quote(self) -> DepthQuote {
-        DepthQuote {
-            side: self.side,
-            target_qty: f64_to_decimal(self.target_qty),
-            available_qty: f64_to_decimal(self.available_qty),
-            vwap_px: f64_to_decimal(self.vwap_px),
-            worst_px: f64_to_decimal(self.worst_px),
-            best_px: f64_to_decimal(self.best_px),
-            best_qty: f64_to_decimal(self.best_qty),
-            levels_used: self.levels_used,
-        }
-    }
-}
-
-fn f64_to_decimal(v: f64) -> Decimal {
-    Decimal::from_f64_retain(v).unwrap_or(Decimal::ZERO)
-}
 
 fn decimal_to_f64(value: Decimal) -> Option<f64> {
     let out = value.to_f64()?;
@@ -74,6 +56,7 @@ pub struct OrderBook {
     pub bids: ArrayVec<Level, MAX_BOOK_LEVELS>,
     pub asks: ArrayVec<Level, MAX_BOOK_LEVELS>,
     pub exch_ts: DateTime<Utc>,
+    pub engine_ts: Option<DateTime<Utc>>,
     pub local_recv_ts: DateTime<Utc>,
 }
 
@@ -88,6 +71,7 @@ impl OrderBook {
             bids: build_side(bids, true),
             asks: build_side(asks, false),
             exch_ts,
+            engine_ts: None,
             local_recv_ts,
         }
     }
@@ -113,6 +97,22 @@ impl OrderBook {
 
     pub fn age_ms(&self, now: DateTime<Utc>) -> i64 {
         (now - self.local_recv_ts).num_milliseconds()
+    }
+
+    pub fn source_age_ms(&self, now: DateTime<Utc>) -> Option<i64> {
+        if self.exch_ts == DateTime::<Utc>::UNIX_EPOCH { return None; }
+        let age = (now - self.exch_ts).num_milliseconds();
+        (age >= -1000).then_some(age.max(0))
+    }
+
+    pub fn engine_age_ms(&self, now: DateTime<Utc>) -> Option<i64> {
+        self.engine_ts.map(|timestamp| (now - timestamp).num_milliseconds().max(0))
+    }
+
+    pub fn is_fresh(&self, now: DateTime<Utc>, max_age_ms: i64) -> bool {
+        let local_age = self.age_ms(now);
+        local_age >= 0 && local_age <= max_age_ms
+            && self.source_age_ms(now).is_some_and(|age| age <= max_age_ms)
     }
 
     pub fn side_levels(&self, side: Side) -> &[Level] {
@@ -320,4 +320,20 @@ mod tests {
         let quote = book.depth_vwap_f64(Side::Buy, 1.0, 20).unwrap();
         assert_eq!(quote.levels_used, 10);
     }
+    #[test]
+    fn emitter_freshness_is_independent_of_quiet_engine_and_receive_time() {
+        let now = Utc::now();
+        let mut book = OrderBook::from_levels([(dec!(10),dec!(1))],[(dec!(11),dec!(1))], now, now);
+        book.engine_ts = Some(now - chrono::Duration::hours(1));
+        assert!(book.is_fresh(now, 2000));
+        book.exch_ts = now - chrono::Duration::milliseconds(2001);
+        assert!(!book.is_fresh(now, 2000));
+        book.exch_ts = now + chrono::Duration::milliseconds(1000);
+        assert!(book.is_fresh(now, 2000));
+        book.exch_ts = now + chrono::Duration::milliseconds(1001);
+        assert!(!book.is_fresh(now, 2000));
+        book.exch_ts = DateTime::<Utc>::UNIX_EPOCH;
+        assert!(!book.is_fresh(now, 2000));
+    }
+
 }

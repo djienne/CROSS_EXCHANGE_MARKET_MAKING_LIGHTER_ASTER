@@ -8,7 +8,7 @@
 use rust_decimal::Decimal;
 
 use crate::config::PartialPolicy;
-use crate::decimal::{ceil_to_step, floor_to_step};
+use crate::decimal::floor_to_step;
 use crate::inventory::{hl_min_hedge_qty, HedgeabilityRules};
 use crate::markets::MarketSpec;
 
@@ -98,26 +98,6 @@ pub fn is_eligible(class: PairClass, policy: PartialPolicy) -> bool {
     }
 }
 
-/// Minimum live quote quantity (plan §7.5): large enough that the order clears Aster's
-/// min-qty AND min-notional, the HL min hedge, and a configured safety notional — floored
-/// to whole steps but never below one step. Returns the quantity the strategy should size
-/// up to.
-pub fn min_quote_qty(spec: &MarketSpec, ref_px: Decimal, safety_notional: Decimal) -> Decimal {
-    if ref_px <= Decimal::ZERO || spec.step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    let rules = HedgeabilityRules {
-        hyperliquid_min_notional: spec.hl_min_notional,
-        hyperliquid_qty_step: spec.hl_qty_step,
-    };
-    let by_aster_notional = ceil_to_step(spec.aster_min_notional / ref_px, spec.step);
-    let by_safety = ceil_to_step(safety_notional / ref_px, spec.step);
-    spec.aster_min_qty
-        .max(by_aster_notional)
-        .max(hl_min_hedge_qty(&rules, ref_px))
-        .max(by_safety)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,13 +160,4 @@ mod tests {
         assert_eq!(classify(&spec(dec!(0.1), dec!(10), dec!(0.001)), dec!(0), dec!(100)).class, PairClass::D);
     }
 
-    #[test]
-    fn min_quote_qty_respects_all_floors() {
-        // ref 100: aster_min_notional $5 => 0.05; HL min $10 => 0.1; safety $25 => 0.25.
-        // step 0.001 => the binding floor is the $25 safety => 0.25.
-        let s = spec(dec!(0.001), dec!(10), dec!(0.001));
-        assert_eq!(min_quote_qty(&s, dec!(100), dec!(25)), dec!(0.25));
-        // With no safety notional, HL min (0.1) binds.
-        assert_eq!(min_quote_qty(&s, dec!(100), dec!(0)), dec!(0.1));
-    }
 }

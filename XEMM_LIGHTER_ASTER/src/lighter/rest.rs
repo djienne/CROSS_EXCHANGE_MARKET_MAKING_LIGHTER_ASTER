@@ -1,7 +1,7 @@
 //! Lighter REST client (reqwest). Endpoints + param encodings verified against the SDK:
 //!   GET  /api/v1/orderBooks
 //!   GET  /api/v1/nextNonce            ?account_index&api_key_index
-//!   GET  /api/v1/accountActiveOrders  ?account_index&market_id&auth
+//!   GET  /api/v1/accountActiveOrders  ?account_index&market_id (authorization header)
 //!   GET  /api/v1/orderBookOrders      ?market_id&limit
 //!   POST /api/v1/sendTx               form: tx_type, tx_info
 //!   POST /api/v1/sendTxBatch          form: tx_types(json), tx_infos(json)
@@ -44,6 +44,48 @@ impl RestClient {
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+
+
+    async fn authenticated_history(
+        &self, path: &str, auth: &str, mut params: Vec<(&str, String)>, cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        params.push(("limit", "100".into()));
+        if let Some(cursor) = cursor { params.push(("cursor", cursor.to_string())); }
+        let value: serde_json::Value = self.http.get(self.url(path))
+            .header("authorization", auth).query(&params).send().await?
+            .error_for_status()?.json().await?;
+        if !value.get("code").and_then(|c| c.as_i64()).is_some_and(|c| c == 0 || c == 200) {
+            bail!("Lighter history returned an error envelope: {value}");
+        }
+        Ok(value)
+    }
+
+    pub async fn account_inactive_orders(
+        &self, account_index: i64, market_id: u32, auth: &str, cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.authenticated_history("/api/v1/accountInactiveOrders", auth, vec![
+            ("account_index", account_index.to_string()), ("market_id", market_id.to_string()),
+        ], cursor).await
+    }
+
+    pub async fn trades_by_order(
+        &self, account_index: i64, order_index: i64, auth: &str, cursor: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        self.authenticated_history("/api/v1/trades", auth, vec![
+            ("account_index", account_index.to_string()), ("order_index", order_index.to_string()),
+            ("sort_by", "trade_id".into()), ("sort_dir", "desc".into()),
+        ], cursor).await
+    }
+
+    pub async fn tx_by_hash(&self, tx_hash: &str) -> Result<serde_json::Value> {
+        let value: serde_json::Value = self.http.get(self.url("/api/v1/tx"))
+            .query(&[("by", "hash"), ("value", tx_hash)]).send().await?
+            .error_for_status()?.json().await?;
+        if value.get("code").and_then(|c| c.as_i64()).is_some_and(|c| c != 0 && c != 200) {
+            bail!("Lighter transaction query returned an error envelope: {value}");
+        }
+        Ok(value)
     }
 
     pub async fn order_books(&self) -> Result<Vec<OrderBookDetail>> {
@@ -94,10 +136,10 @@ impl RestClient {
         let resp: AccountActiveOrdersResponse = self
             .http
             .get(self.url("/api/v1/accountActiveOrders"))
+            .header("authorization", auth)
             .query(&[
                 ("account_index", account_index.to_string()),
                 ("market_id", market_id.to_string()),
-                ("auth", auth.to_string()),
             ])
             .send()
             .await?
@@ -105,6 +147,7 @@ impl RestClient {
             .json()
             .await
             .context("parse accountActiveOrders")?;
+        if resp.code != 0 && resp.code != 200 { bail!("Lighter active-orders error code {}", resp.code); }
         Ok(resp.orders)
     }
 
@@ -154,37 +197,30 @@ impl RestClient {
     /// Signed position (base units) for a market via REST — authoritative and independent of
     /// the account WS (so position is never stale even if that WS dies).
     pub async fn account_position(&self, account_index: i64, market_id: u32) -> Result<Decimal> {
-        let v = self.account_raw(account_index).await?;
-        if let Some(acc) = v
-            .get("accounts")
-            .and_then(|a| a.as_array())
-            .and_then(|a| a.first())
-        {
-            if let Some(poss) = acc.get("positions").and_then(|p| p.as_array()) {
-                for p in poss {
-                    if p.get("market_id").and_then(|m| m.as_u64()) == Some(market_id as u64) {
-                        let sign = p.get("sign").and_then(|x| x.as_i64()).unwrap_or(1);
-                        return Ok(signed_position_decimal(p.get("position"), sign));
-                    }
-                }
+        let value = self.account_raw(account_index).await?;
+        let account = value.get("accounts").and_then(|v| v.as_array()).and_then(|v| v.first())
+            .context("Lighter account response is missing its account row")?;
+        let positions = account.get("positions").and_then(|v| v.as_array())
+            .context("Lighter account response is missing positions")?;
+        for position in positions {
+            if position.get("market_id").and_then(|v| v.as_u64()) == Some(market_id as u64) {
+                return signed_position_decimal(position.get("position"), position.get("sign").and_then(|v| v.as_i64()));
             }
         }
         Ok(Decimal::ZERO)
     }
 
     pub async fn account_raw(&self, account_index: i64) -> Result<serde_json::Value> {
-        self.http
-            .get(self.url("/api/v1/account"))
-            .query(&[
-                ("by", "index".to_string()),
-                ("value", account_index.to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("parse account")
+        let value: serde_json::Value = self.http.get(self.url("/api/v1/account"))
+            .query(&[("by", "index".to_string()), ("value", account_index.to_string())])
+            .send().await?.error_for_status()?.json().await.context("parse account")?;
+        if !value.get("code").and_then(|code| code.as_i64()).is_some_and(|code| code == 0 || code == 200) {
+            bail!("Lighter account query returned an error or missing response code");
+        }
+        if !value.get("accounts").and_then(|rows| rows.as_array()).is_some_and(|rows| !rows.is_empty()) {
+            bail!("Lighter account query has no account row");
+        }
+        Ok(value)
     }
 
     /// GET /api/v1/getMakerOnlyApiKeys (maker-only restriction detection).
@@ -209,7 +245,7 @@ impl RestClient {
         let text = resp.text().await.unwrap_or_default();
         match serde_json::from_str::<TxResponse>(&text) {
             Ok(tx) => Ok(tx),
-            Err(_) if status.is_success() => Ok(TxResponse::default()),
+            Err(_) if status.is_success() => bail!("Lighter transaction response has no valid outcome: {text}"),
             Err(e) => bail!("tx response {} not JSON: {} ({})", status, text, e),
         }
     }
@@ -223,10 +259,15 @@ fn value_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
     }
 }
 
-fn signed_position_decimal(position: Option<&serde_json::Value>, sign: i64) -> Decimal {
-    let mag = value_decimal(position).unwrap_or(Decimal::ZERO).abs();
-    let signed = if sign < 0 { -mag } else { mag };
-    signed.normalize()
+fn signed_position_decimal(position: Option<&serde_json::Value>, sign: Option<i64>) -> Result<Decimal> {
+    let quantity = value_decimal(position).context("invalid Lighter position quantity")?;
+    if quantity < Decimal::ZERO { bail!("negative Lighter unsigned position magnitude"); }
+    if quantity.is_zero() { return Ok(Decimal::ZERO); }
+    match sign {
+        Some(1) => Ok(quantity),
+        Some(-1) => Ok(-quantity),
+        _ => bail!("invalid or missing Lighter position sign"),
+    }
 }
 
 #[cfg(test)]
@@ -234,21 +275,58 @@ mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    #[test]
-    fn signed_position_decimal_parses_string_without_float_tail() {
-        let value = serde_json::json!("0.850000");
-        assert_eq!(signed_position_decimal(Some(&value), 1), dec!(0.85));
-        assert_eq!(signed_position_decimal(Some(&value), -1), dec!(-0.85));
+
+    #[tokio::test]
+    async fn authenticated_order_reads_use_headers_and_reject_error_envelopes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = RestClient::new(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for body in [
+                r#"{"code":200,"orders":[]}"#,
+                r#"{"code":200,"orders":[],"next_cursor":"next"}"#,
+                r#"{"code":200,"trades":[]}"#,
+                r#"{"code":20001,"orders":[]}"#,
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let mut chunk = [0u8; 1024];
+                    let count = stream.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                requests.push(String::from_utf8(bytes).unwrap());
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        assert!(client.account_active_orders(7, 24, "test-auth").await.unwrap().is_empty());
+        assert_eq!(client.account_inactive_orders(7, 24, "test-auth", Some("page/2")).await.unwrap()["next_cursor"], "next");
+        assert!(client.trades_by_order(7, 99, "test-auth", None).await.unwrap()["trades"].as_array().unwrap().is_empty());
+        assert!(client.account_active_orders(7, 24, "test-auth").await.is_err());
+        let requests = server.await.unwrap();
+        for request in &requests {
+            assert!(request.to_ascii_lowercase().contains("authorization: test-auth"));
+            assert!(!request.lines().next().unwrap().contains("auth="));
+        }
+        assert!(requests[1].contains("cursor=page%2F2"));
+        assert!(requests[2].contains("order_index=99") && requests[2].contains("limit=100"));
     }
 
     #[test]
-    fn signed_position_decimal_parses_json_number_without_float_tail() {
-        let value = serde_json::json!(0.85);
-        assert_eq!(signed_position_decimal(Some(&value), 1).to_string(), "0.85");
-    }
-
-    #[test]
-    fn signed_position_decimal_missing_is_zero() {
-        assert_eq!(signed_position_decimal(None, 1), Decimal::ZERO);
+    fn position_magnitude_and_sign_are_validated_without_inventing_flat() {
+        for value in [serde_json::json!("0.85"), serde_json::json!(0.85)] {
+            assert_eq!(signed_position_decimal(Some(&value), Some(1)).unwrap(), dec!(0.85));
+            assert_eq!(signed_position_decimal(Some(&value), Some(-1)).unwrap(), dec!(-0.85));
+            assert!(signed_position_decimal(Some(&value), None).is_err());
+            assert!(signed_position_decimal(Some(&value), Some(0)).is_err());
+        }
+        assert!(signed_position_decimal(None, Some(1)).is_err());
+        assert!(signed_position_decimal(Some(&serde_json::json!("garbage")), Some(1)).is_err());
+        assert!(signed_position_decimal(Some(&serde_json::json!("-0.85")), Some(1)).is_err());
+        assert_eq!(signed_position_decimal(Some(&serde_json::json!("0")), None).unwrap(), Decimal::ZERO);
     }
 }

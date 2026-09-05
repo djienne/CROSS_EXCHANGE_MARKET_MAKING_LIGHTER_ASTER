@@ -24,22 +24,37 @@ impl PaperExec {
     /// strategy (it owns the slot state), so they emit nothing here.
     pub fn on_exec_command(&self, cmd: ExecCommand) -> Vec<ExecEvent> {
         match cmd {
-            ExecCommand::Place { client_id, .. } => {
+            ExecCommand::Barrier { completion } => {
+                completion.complete(crate::hotpath::clock::mono_now_ns());
+                Vec::new()
+            }
+            ExecCommand::Place { client_id, permit, .. } => {
+                if !permit.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    return if permit.is_cancelled() { vec![ExecEvent::PlaceReject { client_id, reason: "not sent: stale or revoked quote".into() }] } else { Vec::new() };
+                }
                 let venue_order_id = format!("paper-{client_id}");
                 vec![ExecEvent::PlaceAck { client_id, venue_order_id }]
             }
             ExecCommand::Cancel { client_id, .. } => {
                 vec![ExecEvent::CancelAck { client_id }]
             }
-            ExecCommand::Replace { old_client_id, new_client_id, .. } => {
+            ExecCommand::Replace { old_client_id, new_client_id, permit, .. } => {
+                if !permit.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    return if permit.is_cancelled() { vec![ExecEvent::CancelAck { client_id: old_client_id }, ExecEvent::PlaceReject { client_id: new_client_id, reason: "not sent: stale or revoked quote".into() }] } else { Vec::new() };
+                }
                 let venue_order_id = format!("paper-{new_client_id}");
                 vec![
                     ExecEvent::CancelAck { client_id: old_client_id },
                     ExecEvent::PlaceAck { client_id: new_client_id, venue_order_id },
                 ]
             }
-            ExecCommand::FlattenAster { market, side, qty, .. } => {
-                vec![ExecEvent::AsterFlattenAck { market, side, qty }]
+            ExecCommand::FlattenAster { intent, .. } => {
+                if !intent.admission.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    return if intent.admission.is_cancelled() { vec![ExecEvent::AttemptNotSent { cloid: intent.cloid, reason: "expired or cancelled before send".into() }] } else { Vec::new() };
+                }
+                vec![ExecEvent::ExecutionProgress { cloid: intent.cloid, cumulative_qty: intent.qty,
+                    cumulative_quote_usd: Some(intent.qty * intent.aster_fill_px), cumulative_fee_usd: Some(Decimal::ZERO),
+                    terminal: true, venue_order_id: None, event_time_ms: Some(chrono::Utc::now().timestamp_millis()) }]
             }
             // Bulk safety cancels + the dead-man heartbeat have no per-order paper ack.
             ExecCommand::CancelMarket { .. }
@@ -55,14 +70,16 @@ impl PaperExec {
         match cmd {
             HedgeCommand::Hedge { intent, aggressive_px, .. } => {
                 let cloid = intent.cloid;
+                if !intent.admission.try_claim(crate::hotpath::clock::mono_now_ns()) {
+                    return if intent.admission.is_cancelled() { vec![ExecEvent::AttemptNotSent { cloid, reason: "expired or cancelled before send".into() }] } else { Vec::new() };
+                }
                 let hl_oid = format!("paper-hedge-{}", cloid.to_hex());
                 vec![
                     ExecEvent::HedgeAck { cloid, hl_oid },
-                    ExecEvent::HedgeFill { cloid, filled_qty: intent.qty, px: aggressive_px, fee_usd: Decimal::ZERO },
+                    ExecEvent::ExecutionProgress { cloid, cumulative_qty: intent.qty,
+                        cumulative_quote_usd: Some(intent.qty * aggressive_px), cumulative_fee_usd: Some(Decimal::ZERO),
+                        terminal: true, venue_order_id: None, event_time_ms: Some(chrono::Utc::now().timestamp_millis()) },
                 ]
-            }
-            HedgeCommand::Flatten { market, side, qty, aggressive_px, .. } => {
-                vec![ExecEvent::HlFlattenFill { market, side, filled_qty: qty, px: aggressive_px }]
             }
             HedgeCommand::Shutdown => Vec::new(),
         }
@@ -91,6 +108,7 @@ mod tests {
     fn place_acks_instantly() {
         let p = PaperExec::new();
         let evs = p.on_exec_command(ExecCommand::Place {
+            permit: super::super::command::MakerPermit::for_test(),
             market: "BTC".into(),
             side: Side::Buy,
             price_ticks: 1000,
@@ -111,6 +129,7 @@ mod tests {
     fn replace_acks_cancel_then_place() {
         let p = PaperExec::new();
         let evs = p.on_exec_command(ExecCommand::Replace {
+            permit: super::super::command::MakerPermit::for_test(),
             market: "BTC".into(),
             side: Side::Buy,
             old_client_id: "old".into(),
@@ -144,6 +163,8 @@ mod tests {
             cum_filled_qty: dec!(0.5),
             event_time_ms: 1,
             reduce_only: false,
+            commission: None,
+            commission_asset: None,
         };
         let intent = HedgeIntent::from_fill(&fill, 0);
         let cloid = intent.cloid;
@@ -155,12 +176,13 @@ mod tests {
         });
         assert!(matches!(&evs[0], ExecEvent::HedgeAck { cloid: c, .. } if *c == cloid));
         match &evs[1] {
-            ExecEvent::HedgeFill { cloid: c, filled_qty, px, .. } => {
+            ExecEvent::ExecutionProgress { cloid: c, cumulative_qty, cumulative_quote_usd, terminal, .. } => {
                 assert_eq!(*c, cloid);
-                assert_eq!(*filled_qty, dec!(0.5));
-                assert_eq!(*px, dec!(99.9));
+                assert_eq!(*cumulative_qty, dec!(0.5));
+                assert_eq!(*cumulative_quote_usd, Some(dec!(49.95)));
+                assert!(*terminal);
             }
-            _ => panic!("expected HedgeFill"),
+            _ => panic!("expected terminal execution progress"),
         }
     }
 

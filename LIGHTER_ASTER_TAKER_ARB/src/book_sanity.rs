@@ -1,10 +1,10 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use arc_swap::ArcSwap;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -48,34 +48,30 @@ impl BookSanitySnapshot {
 
 #[derive(Clone)]
 pub struct BookSanityHandle {
-    inner: Arc<Mutex<BookSanitySnapshot>>,
+    inner: Arc<ArcSwap<BookSanitySnapshot>>,
 }
 
 impl BookSanityHandle {
     fn new(enabled: bool) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(BookSanitySnapshot::configured(enabled))),
+            inner: Arc::new(ArcSwap::from_pointee(BookSanitySnapshot::configured(enabled))),
         }
     }
 
-    pub fn snapshot(&self) -> BookSanitySnapshot {
-        self.inner
-            .lock()
-            .expect("book sanity state poisoned")
-            .clone()
-    }
+    pub fn snapshot(&self) -> BookSanitySnapshot { self.inner.load().as_ref().clone() }
 
     pub fn entry_block(&self) -> Option<BookSanitySnapshot> {
-        let snapshot = self.snapshot();
-        (snapshot.enabled && snapshot.blocked).then_some(snapshot)
+        let snapshot = self.inner.load();
+        (snapshot.enabled && snapshot.blocked).then(|| snapshot.as_ref().clone())
     }
 
     fn update_error(&self, now: DateTime<Utc>, reason: String) -> BookSanitySnapshot {
-        let mut snapshot = self.inner.lock().expect("book sanity state poisoned");
+        let mut snapshot = self.snapshot();
         snapshot.last_checked_at = Some(now);
         snapshot.last_reason = Some(Arc::from(reason));
         snapshot.last_action = "check_error".to_string();
-        snapshot.clone()
+        self.inner.store(Arc::new(snapshot.clone()));
+        snapshot
     }
 
     fn update_failure(
@@ -84,7 +80,7 @@ impl BookSanityHandle {
         now: DateTime<Utc>,
         reason: String,
     ) -> BookSanitySnapshot {
-        let mut snapshot = self.inner.lock().expect("book sanity state poisoned");
+        let mut snapshot = self.snapshot();
         let was_blocked = snapshot.blocked;
         snapshot.last_checked_at = Some(now);
         snapshot.last_reason = Some(Arc::from(reason));
@@ -102,11 +98,12 @@ impl BookSanityHandle {
         } else {
             snapshot.last_action = "failure_observed".to_string();
         }
-        snapshot.clone()
+        self.inner.store(Arc::new(snapshot.clone()));
+        snapshot
     }
 
     fn update_success(&self, cfg: &BookSanityCfg, now: DateTime<Utc>) -> BookSanitySnapshot {
-        let mut snapshot = self.inner.lock().expect("book sanity state poisoned");
+        let mut snapshot = self.snapshot();
         snapshot.last_checked_at = Some(now);
         snapshot.last_reason = None;
         snapshot.failure_streak = 0;
@@ -123,7 +120,8 @@ impl BookSanityHandle {
         } else {
             snapshot.last_action = "ok".to_string();
         }
-        snapshot.clone()
+        self.inner.store(Arc::new(snapshot.clone()));
+        snapshot
     }
 }
 
@@ -471,38 +469,11 @@ fn safe_market(market: &MarketId) -> String {
 }
 
 fn append_event(path: &Path, event: &SanityEvent) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create book sanity dir {}", parent.display()))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open book sanity log {}", path.display()))?;
-    serde_json::to_writer(&mut file, event).context("serialize book sanity event")?;
-    file.write_all(b"\n")?;
-    file.flush()?;
-    Ok(())
+    crate::pnl::append_json_line(path,event,false)
 }
 
 fn persist_snapshot(path: &Path, snapshot: &BookSanitySnapshot) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create book sanity state dir {}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    {
-        let mut file = File::create(&tmp)
-            .with_context(|| format!("create book sanity state {}", tmp.display()))?;
-        serde_json::to_writer_pretty(&mut file, snapshot)
-            .context("serialize book sanity state")?;
-        file.write_all(b"\n")?;
-        file.flush()?;
-    }
-    fs::rename(&tmp, path)
-        .with_context(|| format!("replace book sanity state {}", path.display()))?;
-    Ok(())
+    crate::pnl::write_json_atomic(path,snapshot,false)
 }
 
 #[cfg(test)]

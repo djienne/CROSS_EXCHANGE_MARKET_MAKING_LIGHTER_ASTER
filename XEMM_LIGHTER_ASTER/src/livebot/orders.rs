@@ -76,6 +76,7 @@ impl CancelAfterAckReason {
 /// One side's current order in one market.
 #[derive(Debug, Clone)]
 pub struct MakerSlot {
+    queued_admission: Option<std::sync::Arc<super::fills::Admission>>,
     pub side: Side,
     pub state: OrderLifecycle,
     pub client_id: Option<String>,
@@ -108,6 +109,7 @@ pub struct MakerSlot {
 impl MakerSlot {
     fn new(side: Side) -> Self {
         MakerSlot {
+            queued_admission: None,
             side,
             state: OrderLifecycle::Idle,
             client_id: None,
@@ -141,6 +143,7 @@ impl MakerSlot {
 }
 
 fn clear_slot(slot: &mut MakerSlot) {
+    if let Some(ticket) = slot.queued_admission.take() { ticket.cancel_queued(); }
     slot.state = OrderLifecycle::Idle;
     slot.client_id = None;
     slot.venue_order_id = None;
@@ -168,6 +171,7 @@ pub struct OrderManager {
     /// Monotonic counter for flatten (reduce-only close) client ids — session-prefixed so
     /// their fills pass `is_own_client_id` attribution (see `handle_maker_fill`).
     flatten_epoch: u64,
+    recent_makers: VecDeque<super::account::MakerQuery>,
 }
 
 struct MarketSlots {
@@ -189,7 +193,7 @@ impl OrderManager {
                 replace_times_ns: VecDeque::new(),
             })
             .collect();
-        OrderManager { session, slots, flatten_epoch: 0 }
+        OrderManager { session, slots, flatten_epoch: 0, recent_makers: VecDeque::with_capacity(64) }
     }
 
     /// Fresh session-prefixed client id for a FLATTEN order (reduce-only close). These ids
@@ -200,6 +204,22 @@ impl OrderManager {
         let id = super::ids::aster_flatten_client_id(&self.session, market, self.flatten_epoch);
         self.flatten_epoch += 1;
         id
+    }
+
+    pub fn next_attempt_id(&mut self, market: &MarketId) -> super::ids::Cloid {
+        let id = super::ids::Cloid::hedge(self.session.as_str(), &market.0, self.flatten_epoch as i64);
+        self.flatten_epoch = self.flatten_epoch.checked_add(1).expect("execution sequence exhausted");
+        id
+    }
+
+    pub fn recent_makers(&self) -> Vec<super::account::MakerQuery> { self.recent_makers.iter().cloned().collect() }
+    pub fn expected_lots(&self, client_id: &str) -> Option<i64> {
+        self.recent_makers.iter().find(|q| q.client_id == client_id).map(|q| q.qty_lots)
+    }
+
+    fn remember_maker(&mut self, market: &MarketId, side: Side, client_id: &str, qty_lots: i64) {
+        if self.recent_makers.len() >= 64 { self.recent_makers.pop_front(); }
+        self.recent_makers.push_back(super::account::MakerQuery { market: market.clone(), side, client_id: client_id.to_owned(), qty_lots });
     }
 
     fn market_mut(&mut self, market: &MarketId) -> Option<&mut MarketSlots> {
@@ -225,6 +245,22 @@ impl OrderManager {
         })
     }
 
+    pub fn bind_admission(&mut self, market: &MarketId, side: Side, ticket: std::sync::Arc<super::fills::Admission>) {
+        if let Some(m) = self.market_mut(market) {
+            let slot = match side { Side::Buy => &mut m.bid, Side::Sell => &mut m.ask };
+            if let Some(old) = slot.queued_admission.replace(ticket) { old.cancel_queued(); }
+        }
+    }
+
+    pub fn revoke_queued(&self, market: &MarketId, side: Side) {
+        if let Some(ticket) = self.slot(market, side).and_then(|s| s.queued_admission.as_ref()) { ticket.cancel_queued(); }
+    }
+
+    pub fn potential_lots(&self, market: &MarketId, side: Side) -> i64 {
+        self.slot(market, side).filter(|s| s.is_live()).map(|s|
+            s.remaining_lots().saturating_add(s.pending_replace_qty_lots.max(0))).unwrap_or(0)
+    }
+
     /// Allocate the next client id for a new order on (market, side), bumping the epoch.
     pub fn next_client_id(&mut self, market: &MarketId, side: Side) -> Option<String> {
         let session = self.session.clone();
@@ -240,6 +276,7 @@ impl OrderManager {
 
     /// Record that a place was sent for (market, side) with `client_id`.
     pub fn on_place_sent(&mut self, market: &MarketId, side: Side, client_id: String, price_ticks: i64, qty_lots: i64, now_ns: i64) {
+        self.remember_maker(market, side, &client_id, qty_lots);
         self.record_replace(market, now_ns);
         if let Some(m) = self.market_mut(market) {
             let slot = match side {
@@ -273,6 +310,7 @@ impl OrderManager {
         new_qty_lots: i64,
         now_ns: i64,
     ) {
+        self.remember_maker(market, side, &new_client_id, new_qty_lots);
         self.record_replace(market, now_ns);
         if let Some(m) = self.market_mut(market) {
             let slot = match side {

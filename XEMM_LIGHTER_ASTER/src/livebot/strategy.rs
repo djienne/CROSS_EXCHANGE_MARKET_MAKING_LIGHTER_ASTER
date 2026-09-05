@@ -20,7 +20,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 
-use crate::book::{Level, OrderBook};
+use crate::book::OrderBook;
 use crate::config::Config;
 use crate::edge::EdgeConfig;
 use crate::hot_types::HotBook;
@@ -36,12 +36,11 @@ use crate::requoter::ReplaceReason;
 use crate::types::{MarketId, RejectReason, Side};
 
 use super::account::{AccountState, Venue};
-use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand};
-use super::exec::paper::cap_aggressive_px;
+use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, MakerPermit};
 use super::exec::ExecMode;
-use super::fills::{AsterFill, FillDedup, HedgeIntent};
-use super::ids::SessionId;
-use super::journal::Journal;
+use super::fills::{AsterFill, FillDedup, HedgeIntent, HedgeState, IntentPurpose};
+use super::ids::{SessionId, Cloid};
+use super::journal::{Journal, JournalDetail, QuoteRecord, DiagnosticRecord};
 use super::orders::{CancelAfterAckReason, CancelTarget, OrderLifecycle, OrderManager};
 use super::risk::{evaluate_maker_gate, position_mismatch, CooldownScope, CooldownState, MakerGateInputs};
 use super::precheck::{hot_precheck_side, HotPrecheck};
@@ -63,7 +62,6 @@ const BREAKER_TRIP_STREAK: u32 = 3;
 /// reads balanced but the reported snapshot shows a net imbalance, stop treating the disagreement
 /// as a transient venue read (the cross-check's defer would otherwise repeat forever, leaving the
 /// exposure unhedged with the maker gate closed) and let the persistence gate confirm + recover.
-const ORPHAN_CROSSCHECK_MAX_DEFERS: u32 = 5;
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,14 +122,6 @@ enum HlQuoteSource {
     L2,
 }
 
-impl HlQuoteSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            HlQuoteSource::Bbo => "bbo",
-            HlQuoteSource::L2 => "l2",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AsterQuoteSource {
@@ -186,7 +176,6 @@ struct SelectedHlHotBook {
 struct HlBboDepthSnapshot {
     top_qty: Option<Decimal>,
     required_qty: Decimal,
-    multiple: Decimal,
     sufficient: bool,
 }
 
@@ -194,7 +183,6 @@ struct HlBboDepthSnapshot {
 struct HlBboHotDepthSnapshot {
     top_lots: Option<i64>,
     required_lots: i64,
-    multiple: Decimal,
     sufficient: bool,
 }
 
@@ -205,17 +193,6 @@ struct SelectedAsterTouch {
     age_ms: i64,
 }
 
-#[derive(Debug, Clone)]
-struct AsterFillTouchContext {
-    source: AsterQuoteSource,
-    book: Arc<OrderBook>,
-    age_ms: i64,
-    touch: Level,
-    signed_distance_bps: Decimal,
-    distance_bps: Decimal,
-    quote_invalid_at_fill: bool,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AsterTouchGuardStatus {
     Off,
@@ -223,15 +200,6 @@ enum AsterTouchGuardStatus {
     Expired,
 }
 
-impl AsterTouchGuardStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            AsterTouchGuardStatus::Off => "off",
-            AsterTouchGuardStatus::Active => "ON",
-            AsterTouchGuardStatus::Expired => "expired",
-        }
-    }
-}
 
 fn quote_cfg_for_touch_guard(
     quote: &QuoteEngineConfig,
@@ -250,7 +218,7 @@ fn quote_cfg_for_touch_guard(
 }
 
 fn fresh_hot_book(book: &HotBook, now_ns: i64, max_stale_ns: i64) -> bool {
-    now_ns.saturating_sub(book.recv_ns) <= max_stale_ns && !book.is_crossed()
+    book.age_ms(now_ns) <= max_stale_ns / 1_000_000 && !book.is_crossed()
 }
 
 #[inline]
@@ -296,7 +264,7 @@ fn hl_bbo_depth_snapshot(
     let required_qty = hedge_qty * multiple;
     let top_qty = hl_bbo_top_qty(book, hedge_side);
     let sufficient = top_qty.is_some_and(|qty| qty >= required_qty);
-    HlBboDepthSnapshot { top_qty, required_qty, multiple, sufficient }
+    HlBboDepthSnapshot { top_qty, required_qty, sufficient }
 }
 
 fn hl_bbo_hot_depth_snapshot(
@@ -310,7 +278,7 @@ fn hl_bbo_hot_depth_snapshot(
     let required_lots = scale.hl_qty_to_lots_ceil(hedge_qty * multiple);
     let top_lots = hl_bbo_top_lots(book, hedge_side);
     let sufficient = required_lots > 0 && top_lots.is_some_and(|qty| qty >= required_lots);
-    HlBboHotDepthSnapshot { top_lots, required_lots, multiple, sufficient }
+    HlBboHotDepthSnapshot { top_lots, required_lots, sufficient }
 }
 
 #[inline]
@@ -522,126 +490,6 @@ fn crossing_hedge_px(book: &OrderBook, hedge_side: Side, slip_bps: Decimal) -> O
     }
 }
 
-#[inline]
-fn level_px(level: Option<Level>) -> Option<String> {
-    level.map(|l| l.px.to_string())
-}
-
-#[inline]
-fn level_qty(level: Option<Level>) -> Option<String> {
-    level.map(|l| l.qty.to_string())
-}
-
-#[inline]
-fn decimal_qty(qty: Option<Decimal>) -> Option<String> {
-    qty.map(|q| q.to_string())
-}
-
-fn aster_fill_touch_context(
-    selected: SelectedAsterTouch,
-    side: Side,
-    fill_px: Decimal,
-    min_touch_distance_bps: Decimal,
-) -> Option<AsterFillTouchContext> {
-    if fill_px <= Decimal::ZERO {
-        return None;
-    }
-    let touch = match side {
-        Side::Buy => selected.book.best_bid(),
-        Side::Sell => selected.book.best_ask(),
-    }?;
-    let signed_gap = match side {
-        Side::Buy => touch.px - fill_px,
-        Side::Sell => fill_px - touch.px,
-    };
-    let signed_distance_bps = signed_gap / fill_px * Decimal::from(10_000);
-    let distance_bps = signed_distance_bps.max(Decimal::ZERO);
-    let quote_invalid_at_fill =
-        signed_gap <= Decimal::ZERO || distance_bps < min_touch_distance_bps;
-    Some(AsterFillTouchContext {
-        source: selected.source,
-        book: selected.book,
-        age_ms: selected.age_ms,
-        touch,
-        signed_distance_bps,
-        distance_bps,
-        quote_invalid_at_fill,
-    })
-}
-
-fn hl_hedge_context_json(
-    selected: &SelectedHlBook,
-    aggressive_px: Decimal,
-    slippage_bps: Decimal,
-) -> serde_json::Value {
-    let bid = selected.book.best_bid();
-    let ask = selected.book.best_ask();
-    let bbo_depth = selected.bbo_depth.as_ref();
-    serde_json::json!({
-        "source": selected.source.as_str(),
-        "source_path": selected.path.as_str(selected.source),
-        "age_ms": selected.age_ms,
-        "exch_ts_ms": selected.book.exch_ts.timestamp_millis(),
-        "bid_px": level_px(bid),
-        "bid_qty": level_qty(bid),
-        "ask_px": level_px(ask),
-        "ask_qty": level_qty(ask),
-        "bbo_top_qty": decimal_qty(bbo_depth.and_then(|d| d.top_qty)),
-        "bbo_required_qty": bbo_depth.map(|d| d.required_qty.to_string()),
-        "bbo_depth_multiple": bbo_depth.map(|d| d.multiple.to_string()),
-        "bbo_depth_sufficient": bbo_depth.map(|d| d.sufficient),
-        "aggressive_px": aggressive_px.to_string(),
-        "slippage_bps": slippage_bps.to_string(),
-    })
-}
-
-fn aster_fill_touch_context_json(ctx: Option<&AsterFillTouchContext>) -> serde_json::Value {
-    match ctx {
-        Some(ctx) => {
-            let bid = ctx.book.best_bid();
-            let ask = ctx.book.best_ask();
-            serde_json::json!({
-                "source": ctx.source.as_str(),
-                "age_ms": ctx.age_ms,
-                "exch_ts_ms": ctx.book.exch_ts.timestamp_millis(),
-                "bid_px": level_px(bid),
-                "bid_qty": level_qty(bid),
-                "ask_px": level_px(ask),
-                "ask_qty": level_qty(ask),
-                "touch_px": ctx.touch.px.to_string(),
-                "touch_qty": ctx.touch.qty.to_string(),
-                "signed_touch_distance_bps": ctx.signed_distance_bps.to_string(),
-                "touch_distance_bps": ctx.distance_bps.to_string(),
-                "quote_invalid_at_fill": ctx.quote_invalid_at_fill,
-            })
-        }
-        None => serde_json::json!({
-            "source": serde_json::Value::Null,
-            "available": false,
-            "quote_invalid_at_fill": true,
-        }),
-    }
-}
-
-/// Effective Aster position-notional cap for ONE market under the live margin guard.
-///
-/// `cap_base_usd` is the conservative real-collateral measure (the min of wallet balance and
-/// mark-to-market equity, so unrealized losses on the Aster leg tighten it). The live cap is
-/// `(cap_base - buffer).max(0) * leverage`, minus the notional already consumed by OTHER markets'
-/// Aster positions (collateral is account-wide, but the cap is enforced per market). The static
-/// config cap still wins when it is the smaller of the two. Never returns a negative cap.
-fn effective_aster_cap_notional(
-    static_cap: Decimal,
-    cap_base_usd: Decimal,
-    buffer_usd: Decimal,
-    leverage: Decimal,
-    other_markets_notional: Decimal,
-) -> Decimal {
-    let usable = (cap_base_usd - buffer_usd).max(Decimal::ZERO) * leverage;
-    let for_this_market = (usable - other_markets_notional).max(Decimal::ZERO);
-    static_cap.min(for_this_market)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_side(
     edge: &EdgeConfig,
@@ -794,6 +642,8 @@ fn evaluate_side_with_hl_sources(
 struct MarketCtx {
     spec: Arc<MarketSpec>,
     scale: MarketScale,
+    aster_cell: Arc<crate::hotpath::VenueBook>,
+    hedge_cell: Arc<crate::hotpath::VenueBook>,
     /// false ⇒ not eligible for live trading under the partial policy (never quoted).
     eligible: bool,
 }
@@ -802,6 +652,7 @@ struct MarketCtx {
 struct GenSlot {
     last_aster_gen: u64,
     last_hl_gen: u64,
+    decisions: [&'static str; 2],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -809,6 +660,13 @@ struct SweepState {
     requested_ns: i64,
     last_attempt_ns: i64,
     reason: &'static str,
+}
+
+#[derive(Clone)]
+struct MakerCoverage {
+    logical_id: Cloid,
+    qty: Decimal,
+    quote: Option<Decimal>,
 }
 
 /// All the wiring the strategy loop owns (single-thread; no locks).
@@ -831,6 +689,15 @@ pub struct Strategy {
     /// HL the moment the net clears the HL minimum (the primary fast-hedge path — never a
     /// per-partial taker flatten). A residual that genuinely lingers is flattened in `on_tick`.
     pending: HashMap<MarketId, PendingInventory>,
+    logical_ids: HashMap<MarketId, Cloid>,
+    maker_coverage: HashMap<String, MakerCoverage>,
+    uncertain_makers: std::collections::HashSet<String>,
+    correction_needed: std::collections::HashSet<MarketId>,
+    correction_attempts: HashMap<MarketId, u32>,
+    hedge_readiness: Option<super::exec::hyperliquid::HedgeReadiness>,
+    maker_epoch: Arc<std::sync::atomic::AtomicU64>,
+    draining: bool,
+    drain_control: Option<Arc<super::exec::command::DrainControl>>,
     exec_tx: Sender<ExecCommand>,
     /// Optional priority lane to the Aster exec worker (acked cancels + flattens jump
     /// queued places/replaces — see `exec::command::is_priority_cmd`). `None` (tests
@@ -856,18 +723,6 @@ pub struct Strategy {
     aster_rate_limited_until_ns: i64,
     /// Count of Aster REST rate-limit notifications observed in this strategy process.
     aster_429_count: u64,
-    /// Per-market throttle for the orphan/pending flatten + recovery: `(dispatch_ns, snapshot
-    /// source_ts_ns at dispatch, hedge_side)`. A recovery re-fires only when BOTH the wall-clock
-    /// cooldown has elapsed AND a STRICTLY NEWER snapshot has arrived (so the prior action has had
-    /// a chance to land in ground truth) — edge-triggered on fresh state, not just wall-clock.
-    /// The side is used by the anti-flip guard: if recovery would reverse direction within 3×
-    /// cooldown, it is suppressed (prevents round-trip thrashing on transient snapshot glitches).
-    last_recovery: HashMap<MarketId, (i64, i64, Option<Side>)>,
-    /// Per-market monotonic salt for recovery cloids. Lighter does NOT dedupe client order
-    /// indices, so every recovery dispatch must get a fresh cloid (attempt 0 = the base
-    /// `Cloid::recovery` id, then `-a{n}` salts) — reusing one against a possibly-live
-    /// earlier order would cross-attribute its fills in the FillTracker.
-    recovery_attempt_seq: HashMap<MarketId, u32>,
     /// Persistence gate for the orphan backstop: `(signed_orphan_net, snapshot source_ts_ns)` of
     /// the FIRST snapshot a net delta was seen. The backstop only ACTS when the SAME orphan (same
     /// sign, comparable size) is still present in a STRICTLY NEWER snapshot — so a transient
@@ -875,16 +730,6 @@ pub struct Strategy {
     /// yet) is filtered out instead of triggering a redundant recovery hedge. This keeps recovery
     /// EXCEPTIONAL (real persistent orphans only), so fast fills are hedged by the primary path.
     orphan_seen: HashMap<MarketId, (Decimal, i64)>,
-    /// Escalation counter for the snapshot-predicted cross-check: `(distinct-snapshot defer
-    /// count, last counted snapshot source_ts_ns)`. The cross-check defers when predicted reads
-    /// balanced but the snapshot shows a net imbalance (likely a transient venue read) — but if
-    /// that disagreement persists across [`ORPHAN_CROSSCHECK_MAX_DEFERS`] DISTINCT snapshots it
-    /// is not transient (e.g. predicted drifted on a missed fill), and deferring forever would
-    /// leave real exposure unhedged with the maker gate closed. Past the threshold the reported
-    /// snapshot is treated as truth and the persistence gate (which still requires confirmation
-    /// in a strictly newer snapshot) takes over. Cleared when the market reads delta-neutral or
-    /// the cross-check condition stops holding.
-    orphan_crosscheck_defers: HashMap<MarketId, (u32, i64)>,
     /// Monotonic ns of the most recent hot action (maker fill processed / primary hedge dispatched)
     /// per market. The orphan backstop ignores any snapshot whose READS BEGAN before this — such a
     /// snapshot cannot yet reflect the action, so acting on it could double-hedge (the fast-network
@@ -972,6 +817,8 @@ impl Strategy {
                     MarketCtx {
                         spec: Arc::new(s.clone()),
                         scale: MarketScale::from_spec(s),
+                        aster_cell: registry.cell(&s.market_id, VenueTag::Aster).expect("market registry has Aster cell"),
+                        hedge_cell: registry.cell(&s.market_id, VenueTag::Hyperliquid).expect("market registry has hedge cell"),
                         eligible: *eligibility.get(&s.market_id).unwrap_or(&false),
                     },
                 )
@@ -987,7 +834,6 @@ impl Strategy {
         let num_markets = registry.num_markets();
         let precheck_cfg = super::precheck::HotPrecheckConfig {
             max_book_stale_ns: cfg.simulation.max_book_staleness_ms * 1_000_000,
-            requote_threshold_ticks: cfg.live.quote.price_change_ticks_to_requote as i64,
         };
         Strategy {
             cfg,
@@ -1003,6 +849,15 @@ impl Strategy {
             aster_pos: HashMap::new(),
             hl_pos: HashMap::new(),
             pending: HashMap::new(),
+            logical_ids: HashMap::new(),
+            maker_coverage: HashMap::new(),
+            uncertain_makers: std::collections::HashSet::new(),
+            correction_needed: std::collections::HashSet::new(),
+            correction_attempts: HashMap::new(),
+            hedge_readiness: None,
+            maker_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            draining: false,
+            drain_control: None,
             exec_tx,
             exec_prio_tx: None,
             hedge_tx,
@@ -1015,10 +870,7 @@ impl Strategy {
             aster_cmd_times_ns: VecDeque::new(),
             aster_rate_limited_until_ns: 0,
             aster_429_count: 0,
-            last_recovery: HashMap::new(),
-            recovery_attempt_seq: HashMap::new(),
             orphan_seen: HashMap::new(),
-            orphan_crosscheck_defers: HashMap::new(),
             last_hot_action_ns: HashMap::new(),
             heal_confirm: None,
             aster_stream: None,
@@ -1034,10 +886,28 @@ impl Strategy {
             margin_suppressed: HashMap::new(),
             aster_touch_guard_blocked: HashMap::new(),
             dirty: None,
-            gen_slots: (0..num_markets).map(|_| GenSlot { last_aster_gen: 0, last_hl_gen: 0 }).collect(),
+            gen_slots: (0..num_markets).map(|_| GenSlot { last_aster_gen: 0, last_hl_gen: 0, decisions: ["NOT_EVALUATED"; 2] }).collect(),
             precheck_cfg,
             mark_cache: HashMap::new(),
         }
+    }
+
+    pub fn set_drain_control(&mut self, control: Arc<super::exec::command::DrainControl>) { self.drain_control = Some(control); }
+
+    pub fn set_hedge_readiness(&mut self, readiness: super::exec::hyperliquid::HedgeReadiness) {
+        self.hedge_readiness = Some(readiness);
+    }
+
+    fn logical_id(&mut self, market: &MarketId) -> Cloid {
+        if let Some(id) = self.logical_ids.get(market) { return *id; }
+        let id = self.orders.next_attempt_id(market);
+        self.logical_ids.insert(market.clone(), id);
+        id
+    }
+
+    fn publish_execution_queries(&self) {
+        self.account.publish_pending_exec(self.hedges.values()
+            .filter(|h| h.venue == Venue::Aster && h.unresolved()).cloned().collect());
     }
 
     /// Wire the shared dirty-market bitset (set by the registry builder in `run.rs`).
@@ -1053,6 +923,7 @@ impl Strategy {
         trip_file_path: std::path::PathBuf,
         shutdown: tokio_util::sync::CancellationToken,
     ) {
+        self.journal.configure_trip_path(trip_file_path.clone());
         self.trip_file_path = Some(trip_file_path);
         self.shutdown = shutdown;
     }
@@ -1070,7 +941,6 @@ impl Strategy {
 
     pub fn mark_clean_start(&mut self) {
         self.clean_start = true;
-        self.account.hot.set_trading_allowed(true);
     }
 
     /// Adopt the venue-REPORTED positions from the startup snapshot as the predicted positions.
@@ -1252,12 +1122,14 @@ impl Strategy {
 
     /// Latch a freeze. Maker quoting stops until the cold reconciler proves the account/order state
     /// is clean across snapshots and self-heals it.
+    fn revoke_makers(&self) { self.maker_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel); }
+
     fn freeze(&mut self, now_ns: i64, cause: &'static str) {
+        self.revoke_makers();
         if !self.frozen {
             self.frozen = true;
-            self.account.hot.set_trading_allowed(false);
             warn!("maker quoting FROZEN: {cause}");
-            self.journal.record(now_ns, "freeze", None, serde_json::json!({ "cause": cause }));
+            self.journal.reason(now_ns, "freeze", None, cause);
         }
     }
 
@@ -1294,7 +1166,7 @@ impl Strategy {
         match cmd {
             ExecCommand::Replace { .. } => 2, // worker performs cancel + place
             ExecCommand::CancelAllBot => self.markets.len().max(1) as u32,
-            ExecCommand::Shutdown => 0,
+            ExecCommand::Shutdown | ExecCommand::Barrier { .. } => 0,
             _ => 1,
         }
     }
@@ -1375,19 +1247,7 @@ impl Strategy {
                 self.exec_tx.capacity()
             );
         }
-        self.journal.record(
-            now_ns,
-            "aster_cmd_blocked",
-            None,
-            serde_json::json!({
-                "cause": cause,
-                "priority": format!("{priority:?}"),
-                "cmd_rate": self.aster_cmds_in_window(now_ns),
-                "cmd_cap": self.cfg.live.aster.effective_max_rest_requests_per_minute(),
-                "backoff_ms": remaining.max(0),
-                "exec_capacity": self.exec_tx.capacity(),
-            }),
-        );
+        self.journal.reason(now_ns, "aster_cmd_blocked", None, cause);
     }
 
     fn on_aster_rate_limited(&mut self, now_ns: i64, reason: String, backoff_ms: i64) {
@@ -1406,15 +1266,11 @@ impl Strategy {
             last_attempt_ns: now_ns,
             reason: "aster_rate_limited",
         });
-        self.journal.record(
-            now_ns,
-            "aster_rate_limited",
-            None,
-            serde_json::json!({"reason": reason, "backoff_ms": backoff_ms, "count": self.aster_429_count}),
-        );
+        self.journal.reason(now_ns, "aster_rate_limited", None, "venue rate limit");
     }
 
     fn cancel_target(&mut self, market: &MarketId, side: Side, now_ns: i64) -> CancelTarget {
+        self.orders.revoke_queued(market, side);
         if self.exec_mode.sends_real_orders() && self.sweep_pending.is_some() {
             return CancelTarget::Suppressed;
         }
@@ -1422,8 +1278,15 @@ impl Strategy {
             .cancel_target(market, side, now_ns, self.cfg.live.aster.cancel_retry_backoff_ms)
     }
 
+    fn cell(&self, market: &MarketId, venue: VenueTag) -> Option<&crate::hotpath::VenueBook> {
+        self.ctx.get(market).map(|ctx| match venue {
+            VenueTag::Aster => ctx.aster_cell.as_ref(),
+            VenueTag::Hyperliquid => ctx.hedge_cell.as_ref(),
+        })
+    }
+
     fn book(&self, market: &MarketId, venue: VenueTag) -> Option<Arc<OrderBook>> {
-        self.registry.cell(market, venue).and_then(|c| c.load())
+        self.cell(market, venue).and_then(|c| c.load())
     }
 
     /// Fresh executable HL quote source for immediate hedging: prefer BBO, then L2.
@@ -1432,7 +1295,8 @@ impl Strategy {
     /// cannot make stale data look fresh. The returned Arc keeps the chosen book alive
     /// across subsequent &mut self work in the fill handler.
     fn fresh_hl_quote_book(&self, market: &MarketId, now_ns: i64) -> Option<SelectedHlBook> {
-        let cell = self.registry.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
 
         // Read age before the ArcSwap pointer so a concurrent publish cannot pair an
@@ -1462,7 +1326,8 @@ impl Strategy {
         hedge_side: Side,
         hedge_qty: Decimal,
     ) -> Option<SelectedHlBook> {
-        let cell = self.registry.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
 
@@ -1507,7 +1372,8 @@ impl Strategy {
         hedge_side: Side,
         hedge_qty: Decimal,
     ) -> Option<SelectedHlHotBook> {
-        let cell = self.registry.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        if cell.stream_down() || cell.is_divergent() { return None; }
         let ctx = self.ctx.get(market)?;
         let max_stale_ns = self.cfg.simulation.max_book_staleness_ms * 1_000_000;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
@@ -1516,14 +1382,14 @@ impl Strategy {
         let l2 = cell.load_hot();
         let l2_ok = l2
             .as_deref()
-            .is_some_and(|b| now_ns.saturating_sub(b.recv_ns) <= max_stale_ns && executable_hot_book(b));
+            .is_some_and(|b| b.age_ms(now_ns) <= max_stale_ns / 1_000_000 && executable_hot_book(b));
 
         let bbo_age_ms = cell.bbo_age_ms(now_ns);
         let bbo = cell.load_bbo_hot();
         let mut bbo_depth = None;
         if bbo
             .as_deref()
-            .is_some_and(|b| now_ns.saturating_sub(b.recv_ns) <= max_stale_ns && executable_hot_book(b))
+            .is_some_and(|b| b.age_ms(now_ns) <= max_stale_ns / 1_000_000 && executable_hot_book(b))
             && bbo.as_deref().is_some_and(|b| hot_bbo_not_older_than_l2(b, l2.as_deref()))
         {
             let book = bbo.as_ref().expect("checked above");
@@ -1557,7 +1423,8 @@ impl Strategy {
         hedge_qty: Decimal,
         selected: &SelectedHlHotBook,
     ) -> Option<SelectedHlBook> {
-        let cell = self.registry.cell(market, VenueTag::Hyperliquid)?;
+        let cell = self.cell(market, VenueTag::Hyperliquid)?;
+        if cell.stream_down() || cell.is_divergent() { return None; }
         let ctx = self.ctx.get(market)?;
         let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
@@ -1602,7 +1469,6 @@ impl Strategy {
                     bbo_depth: selected.bbo_depth.as_ref().map(|d| HlBboDepthSnapshot {
                         top_qty: d.top_lots.map(|lots| ctx.scale.hl_lots_to_qty(lots)),
                         required_qty: ctx.scale.hl_lots_to_qty(d.required_lots),
-                        multiple: d.multiple,
                         sufficient: d.sufficient,
                     }),
                 })
@@ -1628,7 +1494,8 @@ impl Strategy {
     /// Fresh executable Aster touch source for fill-time diagnostics: prefer BBO when it is
     /// fresh and not exchange-older than the installed L2 book, otherwise use fresh L2.
     fn fresh_aster_touch_book(&self, market: &MarketId, now_ns: i64) -> Option<SelectedAsterTouch> {
-        let cell = self.registry.cell(market, VenueTag::Aster)?;
+        let cell = self.cell(market, VenueTag::Aster)?;
+        if cell.stream_down() || cell.is_divergent() { return None; }
         let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
 
         let l2_age_ms = cell.book_age_ms(now_ns);
@@ -1659,6 +1526,7 @@ impl Strategy {
     }
 
     fn request_safety_sweep(&mut self, now_ns: i64, reason: &'static str) {
+        self.revoke_makers();
         let should_send = self
             .sweep_pending
             .is_none_or(|s| now_ns.saturating_sub(s.last_attempt_ns) >= (self.cfg.live.aster.safety_sweep_retry_ms as i64).saturating_mul(1_000_000));
@@ -1670,7 +1538,7 @@ impl Strategy {
         match self.try_send_aster_cmd(ExecCommand::CancelAllBot, AsterCommandPriority::Safety, now_ns) {
             ExecDispatch::Sent => {
                 warn!("safety sweep requested: {reason}");
-                self.journal.record(now_ns, "safety_sweep", None, serde_json::json!({"reason": reason}));
+                self.journal.reason(now_ns, "safety_sweep", None, reason);
                 self.sweep_pending = Some(SweepState { requested_ns, last_attempt_ns: now_ns, reason });
             }
             ExecDispatch::BudgetBlocked => {
@@ -1695,13 +1563,13 @@ impl Strategy {
         // Trust only a snapshot whose reads began after the original sweep request. While a sweep
         // is pending, maker quoting is gated, so a fresh snapshot with no bot-owned Aster orders is
         // enough to clear local slots; retry timestamps are delivery backoff, not a new proof bar.
-        if snap.read_start_ns > sweep.requested_ns && !self.has_open_aster_bot_orders_in(&snap) {
+        if snap.read_start_ns > sweep.requested_ns && self.uncertain_makers.is_empty() && !self.has_open_aster_bot_orders_in(&snap) {
             for (m, side) in self.orders.live_slots() {
                 self.orders.on_closed(&m, side);
             }
             self.sweep_pending = None;
             warn!("safety sweep confirmed clean by account snapshot");
-            self.journal.record(now_ns, "safety_sweep_clean", None, serde_json::json!({"reason": sweep.reason}));
+            self.journal.reason(now_ns, "safety_sweep_clean", None, sweep.reason);
             return;
         }
 
@@ -1721,7 +1589,6 @@ impl Strategy {
     fn market_feeds_fresh(&self, market: &MarketId, now_ns: i64) -> bool {
         let max_stale = self.cfg.simulation.max_book_staleness_ms;
         let aster_fresh = self
-            .registry
             .cell(market, VenueTag::Aster)
             // Aster depth is still the queue/depth source, but a fresh bookTicker/BBO is
             // sufficient for live quote-touch safety on quiet event-driven depth feeds.
@@ -1729,7 +1596,6 @@ impl Strategy {
             // read young, but it is blind; close the gate immediately, not at age expiry.
             .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         let hl_fresh = self
-            .registry
             .cell(market, VenueTag::Hyperliquid)
             .is_some_and(|c| c.quote_age_ms(now_ns) <= max_stale && !c.is_divergent() && !c.stream_down());
         aster_fresh && hl_fresh
@@ -1738,45 +1604,62 @@ impl Strategy {
     fn position_context(&self, market: &MarketId, now_ns: i64) -> PositionContext {
         let a = self.aster_pos.get(market).copied().unwrap_or_default();
         let h = self.hl_pos.get(market).copied().unwrap_or_default();
-        let mut aster_cap_notional = self.cfg.capital.aster_cap_notional();
-        // Live margin guard: shrink the Aster cap to the REAL available collateral (minus a buffer)
-        // so the position-increasing side stops quoting before the exchange rejects with -2019. Only
-        // when live, enabled, and the snapshot is fresh — otherwise keep the static cap (a stale
-        // snapshot already closes the maker gate via `account_fresh`, so no order is placed off it).
-        // Load the snapshot ONCE and judge freshness from that same Arc to avoid a load/age race.
-        let mg = &self.cfg.live.margin_guard;
-        if self.exec_mode.sends_real_orders() && mg.enabled {
+        let mut a_cap = self.cfg.capital.aster_cap_notional();
+        let mut h_cap = self.cfg.capital.hyperliquid_cap_notional();
+        if self.exec_mode.sends_real_orders() && self.cfg.live.margin_guard.enabled {
             let snap = self.account.load();
-            let fresh = snap.source_ts_ns != 0
-                && now_ns.saturating_sub(snap.source_ts_ns) / 1_000_000 <= self.cfg.live.max_account_snapshot_age_ms;
-            if fresh {
-                // Conservative collateral: min(wallet balance, mark-to-market equity).
-                let cap_base = snap.aster_available_usd.min(snap.aster_equity_usd);
-                // Notional already consumed by OTHER markets' Aster legs (account-wide collateral).
-                let other: Decimal = snap
-                    .aster_positions
-                    .iter()
-                    .filter(|p| &p.market != market)
-                    .map(|p| p.signed_qty.abs() * p.entry_px)
-                    .sum();
-                aster_cap_notional = effective_aster_cap_notional(
-                    aster_cap_notional,
-                    cap_base,
-                    mg.aster_safety_buffer_usd,
-                    self.cfg.capital.leverage,
-                    other,
-                );
+            let mark = self.book(market, VenueTag::Hyperliquid).and_then(|b| b.mid()).unwrap_or(Decimal::ZERO);
+            let fresh = |origin: i64| origin > 0 && now_ns.saturating_sub(origin) / 1_000_000 <= self.cfg.live.max_account_snapshot_age_ms;
+            let margin_cap = |venue, free: Decimal, buffer: Decimal, origin: i64| {
+                if !fresh(origin) || mark <= Decimal::ZERO { return Decimal::ZERO; }
+                snap.reported_position(venue, market).abs() * mark + (free - buffer).max(Decimal::ZERO)
+            };
+            a_cap = a_cap.min(margin_cap(Venue::Aster, snap.aster_available_usd,
+                self.cfg.live.margin_guard.aster_safety_buffer_usd, snap.aster_margin_source_ns));
+            h_cap = h_cap.min(margin_cap(Venue::Hyperliquid, snap.hl_withdrawable_usd,
+                self.cfg.live.margin_guard.lighter_safety_buffer_usd, snap.hl_margin_source_ns));
+        }
+        PositionContext { aster_pos_qty: a.qty, hl_pos_qty: h.qty, aster_cap_notional: a_cap,
+            hl_cap_notional: h_cap, enforce: self.cfg.capital.enforce_position_cap,
+            reduce_position_only: self.exec_mode.sends_real_orders() && self.cfg.live.quote.reduce_position_only }
+    }
+
+    /// Reserve the full interval of still-possible positions, including resting
+    /// makers' future hedges. Free margin already excludes reported-position margin.
+    fn margin_allows(&self, market: &MarketId, maker_side: Side, qty: Decimal, price: Decimal, now_ns: i64) -> bool {
+        if !self.exec_mode.sends_real_orders() || !self.cfg.live.margin_guard.enabled { return true; }
+        let Some(ctx) = self.ctx.get(market) else { return false };
+        let snap = self.account.load();
+        let a = self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default();
+        let h = self.hl_pos.get(market).map(|p| p.qty).unwrap_or_default();
+        let mark = self.book(market, VenueTag::Hyperliquid).and_then(|b| b.mid()).unwrap_or(price)
+            .max(price) * (Decimal::ONE + self.cfg.live.hyperliquid.normal_slippage_bps / Decimal::from(10_000));
+        for (venue, predicted, free, buffer, origin) in [
+            (Venue::Aster, a, snap.aster_available_usd, self.cfg.live.margin_guard.aster_safety_buffer_usd, snap.aster_margin_source_ns),
+            (Venue::Hyperliquid, h, snap.hl_withdrawable_usd, self.cfg.live.margin_guard.lighter_safety_buffer_usd, snap.hl_margin_source_ns),
+        ] {
+            if origin <= 0 || now_ns.saturating_sub(origin) / 1_000_000 > self.cfg.live.max_account_snapshot_age_ms { return false; }
+            let mut buys = Decimal::ZERO;
+            let mut sells = Decimal::ZERO;
+            for side in [Side::Buy, Side::Sell] {
+                let mut possible = ctx.scale.lots_to_qty(self.orders.potential_lots(market, side));
+                if side == maker_side { possible += qty; }
+                let leg_side = if venue == Venue::Aster { side } else { side.opposite() };
+                if leg_side == Side::Buy { buys += possible; } else { sells += possible; }
             }
+            for intent in self.hedges.values().filter(|i| &i.market == market && i.venue == venue && i.unresolved()) {
+                if intent.hedge_side == Side::Buy { buys += intent.remaining_qty(); } else { sells += intent.remaining_qty(); }
+            }
+            if venue == Venue::Hyperliquid {
+                let pending = self.pending.get(market).map(|p| p.signed_qty).unwrap_or_default();
+                if pending < Decimal::ZERO { buys += -pending; } else { sells += pending; }
+            }
+            let reported = snap.reported_position(venue, market);
+            let worst = (predicted + buys).abs().max((predicted - sells).abs());
+            let required = (worst - reported.abs()).max(Decimal::ZERO) * mark;
+            if required > (free - buffer).max(Decimal::ZERO) { return false; }
         }
-        PositionContext {
-            aster_pos_qty: a.qty,
-            hl_pos_qty: h.qty,
-            aster_cap_notional,
-            hl_cap_notional: self.cfg.capital.hyperliquid_cap_notional(),
-            enforce: self.cfg.capital.enforce_position_cap,
-            reduce_position_only: self.exec_mode.sends_real_orders()
-                && self.cfg.live.quote.reduce_position_only,
-        }
+        true
     }
 
     /// The reason new maker quoting is currently closed for `market`, or `None` if it may quote.
@@ -1789,6 +1672,12 @@ impl Strategy {
     /// [`note_quote_gate`](Self::note_quote_gate).
     fn maker_gate_reason(&self, market: &MarketId, now_ns: i64) -> Option<&'static str> {
         let live = self.exec_mode.sends_real_orders();
+        if self.draining { return Some("QUIESCING"); }
+        if !self.uncertain_makers.is_empty() { return Some("MAKER_EXECUTION_UNCERTAIN"); }
+        if !self.journal.healthy() { return Some("JOURNAL_UNHEALTHY"); }
+        if self.correction_needed.contains(market) { return Some("RESIDUAL_CORRECTION"); }
+        if live && self.hedge_readiness.as_ref().is_some_and(|r| !r.is_ready()) { return Some("HEDGE_TRANSPORT_NOT_READY"); }
+        if live && (self.exec_tx.is_closed() || self.hedge_tx.is_closed()) { return Some("EXECUTION_WORKER_UNAVAILABLE"); }
         if live && self.sweep_pending.is_some() {
             return Some("SAFETY_SWEEP_PENDING");
         }
@@ -1849,6 +1738,8 @@ impl Strategy {
         let grace_ns = self.cooldown_ns.saturating_mul(2).max(5_000_000_000);
         match reason {
             Some(r) => {
+                self.orders.revoke_queued(market, Side::Buy);
+                self.orders.revoke_queued(market, Side::Sell);
                 match self.quote_suppressed.get(market).copied() {
                     // New closure, or the reason changed: (re)start the timer; not yet logged.
                     Some((_, prev_r, _)) if prev_r != r => {
@@ -1863,7 +1754,7 @@ impl Strategy {
                     Some((since_ns, _, false)) => {
                         if now_ns.saturating_sub(since_ns) >= grace_ns {
                             warn!("maker quoting SUPPRESSED on {market}: {r} (gate closed, placing no new quotes)");
-                            self.journal.record(now_ns, "quote_suppressed", Some(market.0.clone()), serde_json::json!({"reason": r}));
+                            self.journal.reason(now_ns, "quote_suppressed", Some(market.0.clone()), r);
                             self.quote_suppressed.insert(market.clone(), (since_ns, r, true));
                         }
                     }
@@ -1886,7 +1777,7 @@ impl Strategy {
                     if logged {
                         let secs = now_ns.saturating_sub(since_ns) as f64 / 1e9;
                         info!("maker quoting RESUMED on {market} after {secs:.1}s suppressed ({prev_r})");
-                        self.journal.record(now_ns, "quote_resumed", Some(market.0.clone()), serde_json::json!({"prev_reason": prev_r, "suppressed_secs": secs}));
+                        self.journal.reason(now_ns, "quote_resumed", Some(market.0.clone()), prev_r);
                     }
                 }
                 true
@@ -1963,89 +1854,23 @@ impl Strategy {
     /// no-quote. (Added to root-cause the stuck-after-fill no-quote without a blind redeploy.)
     pub fn log_quote_diag(&self, now_ns: i64) {
         for market in &self.markets {
-            let gate = self.maker_gate_reason(market, now_ns).unwrap_or("OPEN");
-            let (Some(a_cell), Some(h_cell)) = (
-                self.registry.cell(market, VenueTag::Aster),
-                self.registry.cell(market, VenueTag::Hyperliquid),
-            ) else {
-                info!("qdiag {market}: gate={gate} (book cell missing)");
-                continue;
-            };
-            let ab = a_cell.load();
-            let a_bbo = a_cell.load_bbo();
-            let hl_l2 = h_cell.load();
-            let hl_bbo = h_cell.load_bbo();
-            let Some(aster_book) = ab.as_deref() else {
-                info!("qdiag {market}: gate={gate} (no published Aster book yet)");
-                continue;
-            };
-            let aster_bbo_book = a_bbo.as_deref();
-            let hl_l2_book = hl_l2.as_deref();
-            let hl_bbo_book = hl_bbo.as_deref();
-            if hl_l2_book.is_none() && hl_bbo_book.is_none() {
-                info!("qdiag {market}: gate={gate} (no published HL L2/BBO yet)");
-                continue;
-            }
-            let Some(ctx) = self.ctx.get(market) else { continue };
-            let spec = &ctx.spec;
-            let pos = self.position_context(market, now_ns);
-            let max_stale = self.cfg.simulation.max_book_staleness_ms;
-            let now = Utc::now();
-            let mut decided = String::new();
-            for side in [Side::Buy, Side::Sell] {
-                let current = self.current_order_for_decision(market, side, &ctx.scale);
-                let resting = current.is_some();
-                let touch_status = self.aster_touch_guard_status_for_empty(market, side, current, now_ns);
-                let touch_blocked = touch_status == AsterTouchGuardStatus::Active;
-                let quote_cfg = quote_cfg_for_touch_guard(&self.cfg.quote, touch_blocked, current);
-                let r = compute_desired_quote_select_books(
-                    &self.cfg.edge,
-                    &quote_cfg,
-                    aster_book,
-                    aster_bbo_book,
-                    hl_l2_book,
-                    hl_bbo_book,
-                    side,
-                    spec,
-                    max_stale,
-                    now,
-                    &pos,
-                );
-                let d = match r {
-                    Ok((q, _, hsrc, asrc)) => format!("{side:?}=OK(px={} qty={} depth={}x target={} hlvwap={} hlworst={} hllvls={} asrc={} aeff={}@{} alvls={} hlsrc={})", q.price, q.qty, q.depth_liquidity_multiple, q.depth_target_qty, q.expected_hl_vwap, q.expected_hl_worst_px, q.expected_hl_depth_levels_used, asrc.as_str(), q.effective_aster_touch_source.as_str(), q.effective_aster_touch_px, q.aster_depth_levels_used, hsrc.as_str()),
-                    Err(e) => format!("{side:?}=REJECT({})", e.as_str()),
-                };
-                decided.push_str(&d);
-                decided.push_str(&format!(
-                    " rest={resting} touch_block={} ",
-                    touch_status.as_str()
-                ));
-            }
-            let pa = self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default();
-            let ph = self.hl_pos.get(market).map(|p| p.qty).unwrap_or_default();
-            // rate=N/cap: the replace-rate limiter usage. If this is at cap while sides show OK but
-            // rest=false, the rate limiter is the reason quoting stopped (see OrderManager::replace_rate_ok).
-            let rate = self.orders.replaces_in_window(market, now_ns);
-            let cap = self.cfg.live.quote.effective_max_replaces_per_minute_per_symbol();
-            let cmd_rate = self.aster_cmds_in_window(now_ns);
-            let cmd_cap = self.cfg.live.aster.effective_max_rest_requests_per_minute();
-            let cmd_reserve = self.cfg.live.aster.effective_optional_rest_reserve_per_minute();
-            let exec_cap = self.exec_tx.capacity();
-            let backoff_ms = self.aster_backoff_remaining_ms(now_ns).max(0);
-            let rate_limited = self.aster_429_count;
-            let aster_l2_age = a_cell.book_age_ms(now_ns);
-            let aster_bbo_age = a_cell.bbo_age_ms(now_ns);
-            let hl_l2_age = h_cell.book_age_ms(now_ns);
-            let hl_bbo_age = h_cell.bbo_age_ms(now_ns);
-            let a_bbo = aster_bbo_book
-                .and_then(|b| Some((b.best_bid()?, b.best_ask()?)))
-                .map(|(bid, ask)| format!("{}x{} / {}x{}", bid.qty, bid.px, ask.qty, ask.px))
-                .unwrap_or_else(|| "none".to_string());
-            let bbo = hl_bbo_book
-                .and_then(|b| Some((b.best_bid()?, b.best_ask()?)))
-                .map(|(bid, ask)| format!("{}x{} / {}x{}", bid.qty, bid.px, ask.qty, ask.px))
-                .unwrap_or_else(|| "none".to_string());
-            info!("qdiag {market}: gate={gate} replace_rate={rate}/{cap} aster_cmd_rate={cmd_rate}/{cmd_cap} reserve={cmd_reserve} exec_cap={exec_cap} aster_429={rate_limited} backoff_ms={backoff_ms} pos_a={pa} pos_h={ph} acap={} hedges={} aster_l2_age_ms={aster_l2_age} aster_bbo_age_ms={aster_bbo_age} aster_bbo={a_bbo} hl_l2_age_ms={hl_l2_age} hl_bbo_age_ms={hl_bbo_age} hl_bbo={bbo} | {decided}", pos.aster_cap_notional, self.hedges.len());
+            let decisions = self.registry.market_idx(market).map(|idx| self.gen_slots[idx.0 as usize].decisions).unwrap_or(["NOT_EVALUATED"; 2]);
+            let aster_age_ms = self.cell(market, VenueTag::Aster).map(|c| c.quote_age_ms(now_ns)).unwrap_or(i64::MAX);
+            let lighter_age_ms = self.cell(market, VenueTag::Hyperliquid).map(|c| c.quote_age_ms(now_ns)).unwrap_or(i64::MAX);
+            self.journal.typed(now_ns, "quote_diagnostic", Some(market.0.clone()), JournalDetail::Diagnostic(DiagnosticRecord {
+                gate: self.maker_gate_reason(market, now_ns).unwrap_or("OPEN"),
+                aster_qty: self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default(),
+                lighter_qty: self.hl_pos.get(market).map(|p| p.qty).unwrap_or_default(),
+                pending_qty: self.pending.get(market).map(|p| p.signed_qty).unwrap_or_default(),
+                outstanding_attempts: self.hedges.values().filter(|h| &h.market == market).count(),
+                aster_age_ms, lighter_age_ms, bid_decision: decisions[0], ask_decision: decisions[1],
+            }), "confirmed");
+        }
+    }
+
+    fn note_decision(&mut self, market: &MarketId, side: Side, reason: &'static str) {
+        if let Some(idx) = self.registry.market_idx(market) {
+            self.gen_slots[idx.0 as usize].decisions[if side == Side::Buy { 0 } else { 1 }] = reason;
         }
     }
 
@@ -2061,9 +1886,9 @@ impl Strategy {
         let scale = ctx.scale.clone();
         if !force {
             if let Some(idx) = self.registry.market_idx(market) {
+                let a_gen = self.cell(market, VenueTag::Aster).map_or(0, |c| c.quote_generation());
+                let h_gen = self.cell(market, VenueTag::Hyperliquid).map_or(0, |c| c.quote_generation());
                 let slot = &mut self.gen_slots[idx.0 as usize];
-                let a_gen = self.registry.cell(market, VenueTag::Aster).map_or(0, |c| c.quote_generation());
-                let h_gen = self.registry.cell(market, VenueTag::Hyperliquid).map_or(0, |c| c.quote_generation());
                 if a_gen == slot.last_aster_gen && h_gen == slot.last_hl_gen {
                     return;
                 }
@@ -2074,8 +1899,8 @@ impl Strategy {
         let mut fast_cancelled = [false; 2]; // [Buy, Sell]
         if self.cfg.live.quote.use_hot_integer_math && !force {
             if let (Some(a_cell), Some(h_cell)) = (
-                self.registry.cell(market, VenueTag::Aster),
-                self.registry.cell(market, VenueTag::Hyperliquid),
+                self.cell(market, VenueTag::Aster),
+                self.cell(market, VenueTag::Hyperliquid),
             ) {
                 let a_arc = a_cell.load_hot();
                 let a_bbo_arc = a_cell.load_bbo_hot();
@@ -2128,8 +1953,8 @@ impl Strategy {
             }
         }
         let (Some(a_cell), Some(h_cell)) = (
-            self.registry.cell(market, VenueTag::Aster),
-            self.registry.cell(market, VenueTag::Hyperliquid),
+            self.cell(market, VenueTag::Aster),
+            self.cell(market, VenueTag::Hyperliquid),
         ) else {
             return;
         };
@@ -2145,6 +1970,7 @@ impl Strategy {
         // Read freshness before the ArcSwap pointers so a concurrent publish cannot
         // pair an older book Arc with a newer stamp. At worst we skip one fresh update
         // until the next wake/tick; we never quote from a falsely-fresh stale Arc.
+        let book_versions = (a_cell.content_version(), h_cell.content_version());
         let a_bbo_age_ms = a_cell.bbo_age_ms(now_ns);
         let hl_l2_age_ms = h_cell.book_age_ms(now_ns);
         let hl_bbo_age_ms = h_cell.bbo_age_ms(now_ns);
@@ -2206,13 +2032,40 @@ impl Strategy {
                 current,
                 replace_unprof,
             );
+            self.note_decision(market, side, reject.map(|r| r.as_str()).unwrap_or(match &decision {
+                SideDecision::Hold => "HOLD", SideDecision::Place(_) => "PLACE", SideDecision::Replace { .. } => "REPLACE",
+                SideDecision::Cancel { reason } => reason.as_str(),
+            }));
             self.latch_empty_touch_reject_if_needed(market, side, &decision, reject, current, now_ns);
-            self.apply_decision(market, side, decision, &scale, now_ns).await;
+            self.apply_decision_with_books(market, side, decision, &scale, now_ns, Some(book_versions)).await;
         }
         crate::metrics::SINGLE_REPRICE.record((crate::hotpath::clock::mono_now_ns() - t0) as u64);
     }
 
+    fn maker_permit(&self, market: &MarketId, now_ns: i64, versions: Option<(u64, u64)>) -> MakerPermit {
+        #[cfg(test)]
+        if versions.is_none() { return MakerPermit::for_test(); }
+        let (a_version, h_version) = versions.expect("production quotes carry book versions");
+        let ctx = &self.ctx[market];
+        let max_ms = self.cfg.simulation.max_book_staleness_ms;
+        let mut remaining_ms = max_ms;
+        for age in [ctx.aster_cell.book_age_ms(now_ns), ctx.aster_cell.bbo_age_ms(now_ns),
+            ctx.hedge_cell.book_age_ms(now_ns), ctx.hedge_cell.bbo_age_ms(now_ns)] {
+            if age <= max_ms { remaining_ms = remaining_ms.min(max_ms.saturating_sub(age)); }
+        }
+        if self.exec_mode.sends_real_orders() {
+            remaining_ms = remaining_ms.min(self.cfg.live.max_account_snapshot_age_ms.saturating_sub(self.account.age_ms(now_ns)));
+        }
+        MakerPermit::new([(ctx.aster_cell.clone(), a_version), (ctx.hedge_cell.clone(), h_version)],
+            self.maker_epoch.clone(), now_ns.saturating_add(remaining_ms.max(0).saturating_mul(1_000_000)), self.hedge_readiness.clone())
+    }
+
+    #[cfg(test)]
     async fn apply_decision(&mut self, market: &MarketId, side: Side, decision: SideDecision, scale: &MarketScale, now_ns: i64) {
+        self.apply_decision_with_books(market, side, decision, scale, now_ns, None).await;
+    }
+
+    async fn apply_decision_with_books(&mut self, market: &MarketId, side: Side, decision: SideDecision, scale: &MarketScale, now_ns: i64, versions: Option<(u64, u64)>) {
         match decision {
             SideDecision::Hold => {}
             SideDecision::Cancel { reason } => {
@@ -2229,7 +2082,7 @@ impl Strategy {
                         if reason == ReplaceReason::QuoteTooCloseToTouch {
                             self.latch_aster_touch_guard(market, side, now_ns);
                         }
-                        self.journal.record(now_ns, "cancel", Some(market.0.clone()), serde_json::json!({"side": side.as_str(), "reason": reason.as_str()}));
+                        self.journal.typed(now_ns, "cancel", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: None, qty: None, reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
                     }
                     ExecDispatch::BudgetBlocked => {
                         self.note_aster_budget_block(now_ns, "targeted_cancel_budget_blocked", AsterCommandPriority::RiskReducing);
@@ -2242,6 +2095,7 @@ impl Strategy {
                 }
             }
             SideDecision::Place(desired) => {
+                if !self.margin_allows(market, side, desired.qty, desired.price, now_ns) { self.note_decision(market, side, "MARGIN_INSUFFICIENT"); return; }
                 if let Some(&suppress_ns) = self.margin_suppressed.get(&(market.clone(), side)) {
                     if now_ns.saturating_sub(suppress_ns) < 10_000_000_000 {
                         return;
@@ -2265,12 +2119,15 @@ impl Strategy {
                     return;
                 }
                 if let Some(cid) = self.orders.next_client_id(market, side) {
-                    let cmd = ExecCommand::Place { market: market.clone(), side, price_ticks, qty_lots, client_id: cid.clone() };
+                    let permit = self.maker_permit(market, now_ns, versions);
+                    let admission = permit.admission.clone();
+                    let cmd = ExecCommand::Place { permit, market: market.clone(), side, price_ticks, qty_lots, client_id: cid.clone() };
                     match self.try_send_aster_cmd(cmd, AsterCommandPriority::Optional, now_ns) {
                         ExecDispatch::Sent => {
                             self.orders.on_place_sent(market, side, cid, price_ticks, qty_lots, now_ns);
+                            self.orders.bind_admission(market, side, admission);
                             self.clear_aster_touch_guard(market, side, now_ns);
-                            self.journal.record(now_ns, "place", Some(market.0.clone()), serde_json::json!({"side": side.as_str(), "price": desired.price.to_string(), "qty": desired.qty.to_string()}));
+                            self.journal.typed(now_ns, "place", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: None, client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
                         }
                         ExecDispatch::BudgetBlocked => {
                             debug!("Aster command budget/backoff: optional place deferred for {market} {side:?}");
@@ -2286,6 +2143,11 @@ impl Strategy {
                 }
             }
             SideDecision::Replace { desired, reason } => {
+                if !self.margin_allows(market, side, desired.qty, desired.price, now_ns) {
+                    self.note_decision(market, side, "MARGIN_INSUFFICIENT");
+                    self.cancel_both_sides(market, now_ns);
+                    return;
+                }
                 if let Some(&suppress_ns) = self.margin_suppressed.get(&(market.clone(), side)) {
                     if now_ns.saturating_sub(suppress_ns) < 10_000_000_000 {
                         return;
@@ -2310,15 +2172,7 @@ impl Strategy {
                     match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                         ExecDispatch::Sent => {
                             self.orders.on_cancel_sent(market, side, now_ns);
-                            self.journal.record(
-                                now_ns,
-                                "cancel",
-                                Some(market.0.clone()),
-                                serde_json::json!({
-                                    "side": side.as_str(),
-                                    "reason": "NO_LONGER_PROFITABLE_CANCEL_ONLY",
-                                }),
-                            );
+                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "NO_LONGER_PROFITABLE_CANCEL_ONLY");
                         }
                         ExecDispatch::BudgetBlocked => {
                             self.note_aster_budget_block(now_ns, "no_longer_profitable_cancel_only", AsterCommandPriority::RiskReducing);
@@ -2389,7 +2243,7 @@ impl Strategy {
                     match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                         ExecDispatch::Sent => {
                             self.orders.on_cancel_sent(market, side, now_ns);
-                            self.journal.record(now_ns, "cancel", Some(market.0.clone()), serde_json::json!({"side": side.as_str(), "reason": "BACKPRESSURE_CANCEL_ONLY"}));
+                            self.journal.reason(now_ns, "cancel", Some(market.0.clone()), "BACKPRESSURE_CANCEL_ONLY");
                         }
                         ExecDispatch::BudgetBlocked => {
                             self.note_aster_budget_block(now_ns, "urgent_cancel_only_budget_blocked", AsterCommandPriority::RiskReducing);
@@ -2403,7 +2257,10 @@ impl Strategy {
                     return;
                 }
                 if let Some(new_cid) = self.orders.next_client_id(market, side) {
+                    let permit = self.maker_permit(market, now_ns, versions);
+                    let admission = permit.admission.clone();
                     let cmd = ExecCommand::Replace {
+                        permit,
                         market: market.clone(),
                         side,
                         old_client_id: old_cid,
@@ -2420,8 +2277,9 @@ impl Strategy {
                             // replacement to PendingPlace. This preserves fill/cancel attribution during
                             // the cancel-then-place race window.
                             self.orders.on_replace_sent(market, side, new_cid, price_ticks, qty_lots, now_ns);
+                            self.orders.bind_admission(market, side, admission);
                             self.clear_aster_touch_guard(market, side, now_ns);
-                            self.journal.record(now_ns, "replace", Some(market.0.clone()), serde_json::json!({"side": side.as_str(), "reason": reason.as_str(), "price": desired.price.to_string()}));
+                            self.journal.typed(now_ns, "replace", Some(market.0.clone()), JournalDetail::Quote(QuoteRecord { side, price: Some(desired.price), qty: Some(desired.qty), reason: Some(reason.as_str()), client_id: self.orders.slot(market, side).and_then(|s| s.client_id.clone()) }), "confirmed");
                         }
                         ExecDispatch::BudgetBlocked if non_urgent => {
                             debug!("Aster command budget/backoff: optional replace deferred for {market} {side:?} ({})", reason.as_str());
@@ -2447,176 +2305,139 @@ impl Strategy {
     /// Exactly-once hedging (invariant 4): a deduped repeat is ignored. Triggers the
     /// post-trade cooldown and cancels the residual on that side (§4.1, §8.4).
     pub async fn handle_maker_fill(&mut self, fill: AsterFill, now_ns: i64) {
-        // ATTRIBUTION (live only): only a fill from THIS session's bot order may hedge. A foreign /
-        // manual / prior-run order on the same symbol must NEVER trigger an HL hedge. (Paper fills are
-        // synthesized from our own slots, so the check is skipped there.)
-        if self.exec_mode.sends_real_orders() && !self.orders.is_own_client_id(&fill.client_id) {
-            warn!("ignoring non-bot Aster fill on {} (client_id {:?}) — not this session's order", fill.market, fill.client_id);
-            return;
+        if self.exec_mode.sends_real_orders() && !self.orders.is_own_client_id(&fill.client_id) { return; }
+        if !self.dedup.observe(&fill) { return; }
+        self.revoke_makers();
+        if self.uncertain_makers.contains(&fill.client_id) {
+            if let (Some(ctx), Some(lots)) = (self.ctx.get(&fill.market), self.orders.expected_lots(&fill.client_id)) {
+                if ctx.scale.qty_to_lots(fill.cum_filled_qty) >= lots { self.uncertain_makers.remove(&fill.client_id); }
+            }
         }
-        if !self.dedup.observe(&fill) {
-            debug!("duplicate fill ignored (already hedged): order={} trade={}", fill.order_id, fill.trade_id);
-            return;
-        }
-        // 1. Update predicted Aster position (signed by side), and close the local maker
-        // slot immediately when the venue reports the order is fully filled. Otherwise
-        // cancel_both_sides() would send a cancel for an already-FILLED order; Aster can
-        // answer FILLED/EXPIRED, which this strategy correctly treats as ambiguous and
-        // freezes. A normal full fill should hedge + cancel the opposite side, not self-freeze.
-        let signed = SignedPosition::signed(fill.aster_side, fill.last_fill_qty);
-        self.aster_pos.entry(fill.market.clone()).or_default().apply_fill(signed, fill.last_fill_px);
-        if let Some(ctx) = self.ctx.get(&fill.market) {
-            let cum_filled_lots = ctx.scale.qty_to_lots(fill.cum_filled_qty);
-            self.orders.on_maker_fill_progress(&fill.market, fill.aster_side, &fill.client_id, cum_filled_lots);
-        }
-        self.margin_suppressed.remove(&(fill.market.clone(), Side::Buy));
-        self.margin_suppressed.remove(&(fill.market.clone(), Side::Sell));
-        // Stamp the last hot action for this market: a reconcile snapshot whose reads BEGAN before
-        // now cannot yet reflect this fill (or the hedge we are about to fire), so the orphan
-        // backstop must ignore it (T2.2 straddle guard). Stamped for reduce-only fills too — they
-        // also move the Aster position the backstop reads.
-        self.last_hot_action_ns.insert(fill.market.clone(), now_ns);
-        // 2. Start cooldown (any execution event, §6).
-        self.cooldown.trigger(now_ns, self.cooldown_ns, &fill.market);
-        self.account.hot.set_cooldown_until_ns(self.cooldown.hot_mirror_until_ns());
-        // A REDUCE-ONLY fill is one of OUR OWN flatten/recovery closes: it already reduced the
-        // position in step 1, and it must NOT trigger a new hedge — doing so would loop
-        // (hedge → its fill → flatten → its reduce-only fill → hedge → …). Stop here.
+        let tracked = self.hedges.values().find(|h| h.client_id.as_deref() == Some(&fill.client_id))
+            .map(|h| (h.cloid, h.logical_id, h.filled_qty, h.filled_quote_usd, h.fee_usd, h.qty));
+        let logical_id = tracked.map(|h| h.1)
+            .or_else(|| self.maker_coverage.get(&fill.client_id).map(|c| c.logical_id))
+            .unwrap_or_else(|| self.logical_id(&fill.market));
         if fill.reduce_only {
-            debug!("reduce-only fill (flatten/recovery close) on {}: position updated, no hedge", fill.market);
-            return;
-        }
-        // PRIMARY HEDGE PATH (the money-making path; orphan correction is NOT this). Fold the fill
-        // into pending inventory and hedge on HL the MOMENT the accumulated net clears the HL minimum.
-        // A full ~$12 clip hedges immediately; small partials accumulate into ONE hedgeable chunk —
-        // never a per-partial taker flatten. Opposite fills net down (booking realized PnL). A residual
-        // that genuinely lingers is flattened later in `on_tick` (exceptional). All cheap Decimal math.
-        let (hl_min_notional, hl_qty_step) = match self.ctx.get(&fill.market) {
-            Some(c) => (c.spec.hl_min_notional, c.spec.hl_qty_step),
-            None => {
-                // Unknown market (should not happen — we have ctx for every spec): still pull both
-                // resting sides for post-fill safety, then stop.
-                self.cancel_both_sides(&fill.market, now_ns);
-                return;
-            }
-        };
-        let hl_mark_book = self.fresh_hl_quote_book(&fill.market, now_ns);
-        let mark = hl_mark_book
-            .as_ref()
-            .and_then(|b| b.book.mid())
-            .unwrap_or(fill.last_fill_px);
-        if mark <= Decimal::ZERO {
-            warn!("invalid non-positive HL mark {} for {} fill; freezing (backstop recovers the leg)", mark, fill.market);
-            self.cancel_both_sides(&fill.market, now_ns);
-            self.freeze(now_ns, "invalid_hl_mark_at_fill");
-            return;
-        }
-        let fee_rate = self.cfg.edge.aster_maker_fee_bps / Decimal::from(10_000);
-        let normal_slip = self.cfg.live.hyperliquid.normal_slippage_bps;
-        let rules = HedgeabilityRules { hyperliquid_min_notional: hl_min_notional, hyperliquid_qty_step: hl_qty_step };
-
-        let prev = self.pending.remove(&fill.market);
-        let outcome = inventory::handle_fill_parts(fill.aster_side, fill.last_fill_qty, fill.last_fill_px, Utc::now(), prev, &rules, mark, fee_rate);
-
-        if let Some(hedge) = outcome.hedge {
-            // The accumulated net is hedgeable. Deterministic cloid from the triggering fill identity;
-            // the third component is the fill's CUMULATIVE filled qty (strictly increasing per
-            // order_id) — NOT the net hedge qty, which can repeat across flushes and collide
-            // (overwriting an in-flight hedge + a reused-cloid HL reject → an unhedged leg).
-            let cloid = super::ids::Cloid::hedge(&fill.order_id, &fill.trade_id, super::fills::cum_scaled(fill.cum_filled_qty));
-            let cloid_hex = cloid.to_hex();
-            // Price the IOC to CROSS the current executable HL touch (NOT mid, NOT the Aster fill
-            // price). The temporary book guard drops at the end of this statement, before any &mut self.
-            let hl_hedge_book = self.fresh_hl_hedge_book_hot_first(&fill.market, now_ns, hedge.hedge_side, hedge.qty);
-            let aggressive_px = hl_hedge_book
-                .as_ref()
-                .and_then(|ob| crossing_hedge_px(ob.book.as_ref(), hedge.hedge_side, normal_slip));
-            let mut intent = HedgeIntent::with_qty(cloid, fill.market.clone(), hedge.hedge_side, hedge.qty, hedge.avg_aster_px, now_ns);
-            let Some(aggressive_px) = aggressive_px else {
-                // No fresh HL touch to cross — do NOT hedge off a stale fallback price (that is the
-                // reject we observed live). Keep an explicit UNKNOWN hedge obligation so the maker
-                // gate closes for the right reason and the orphan-recovery backstop has a durable
-                // record of the exact unhedged quantity instead of relying only on later snapshots.
-                warn!("no HL book touch for {} {:?} hedge; freezing (backstop recovers the leg)", fill.market, hedge.hedge_side);
-                intent.mark_unknown();
-                self.hedges.insert(cloid_hex.clone(), intent);
-                self.cancel_both_sides(&fill.market, now_ns);
-                self.journal.record(now_ns, "hedge_unknown", Some(fill.market.0.clone()), serde_json::json!({"reason": "no_hl_touch_at_fill", "qty": hedge.qty.to_string(), "side": hedge.hedge_side.as_str(), "cloid": cloid_hex}));
-                self.freeze(now_ns, "no_hl_touch_at_fill");
-                return;
-            };
-            intent.mark_submitted(now_ns);
-            // Insert BEFORE the send (invariant): a HedgeAck/Fill can't be processed until this fn
-            // returns (single task), so the map always knows the cloid first.
-            self.hedges.insert(cloid_hex.clone(), intent.clone());
-            // >>> FIRE THE HEDGE NOW — before cancels/journaling. This is the latency-critical wire
-            //     send; the bookkeeping below must never sit ahead of it on the hot path. <<<
-            let dispatch_err = self
-                .hedge_tx
-                .try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: normal_slip, emergency: false })
-                .err();
-            let hedge_dispatch_ok = dispatch_err.is_none();
-            // Cancel BOTH resting sides immediately after the hedge (post-fill cooldown ⇒ neither
-            // should rest); kept right after the send so the resting-order window stays tiny.
-            self.cancel_both_sides(&fill.market, now_ns);
-            // Journal (cold audit trail) AFTER the hedge is on the wire.
-            if let Some(hl_context) = &hl_hedge_book {
-                let aster_touch = self
-                    .fresh_aster_touch_book(&fill.market, now_ns)
-                    .and_then(|selected| {
-                        aster_fill_touch_context(
-                            selected,
-                            fill.aster_side,
-                            fill.last_fill_px,
-                            self.cfg.quote.min_aster_touch_distance_bps,
-                        )
-                    });
-                self.journal.record(
-                    now_ns,
-                    "fill_hedge_context",
-                    Some(fill.market.0.clone()),
-                    serde_json::json!({
-                        "order_id": fill.order_id.clone(),
-                        "trade_id": fill.trade_id.clone(),
-                        "client_id": fill.client_id.clone(),
-                        "cloid": cloid_hex.clone(),
-                        "aster_side": fill.aster_side.as_str(),
-                        "hedge_side": hedge.hedge_side.as_str(),
-                        "qty": hedge.qty.to_string(),
-                        "aster_fill_px": hedge.avg_aster_px.to_string(),
-                        "last_fill_px": fill.last_fill_px.to_string(),
-                        "hedge_dispatch_ok": hedge_dispatch_ok,
-                        "hl": hl_hedge_context_json(hl_context, aggressive_px, normal_slip),
-                        "aster": aster_fill_touch_context_json(aster_touch.as_ref()),
-                    }),
-                );
-            }
-            if let Some(rec) = &outcome.netted {
-                self.journal.record(now_ns, "net", Some(fill.market.0.clone()), serde_json::json!({"closed_qty": rec.closed_qty.to_string(), "realized_pnl": rec.realized_pnl.to_string()}));
-            }
-            self.journal.record(now_ns, "fill", Some(fill.market.0.clone()), serde_json::json!({"side": hedge.hedge_side.as_str(), "qty": hedge.qty.to_string(), "avg_aster_px": hedge.avg_aster_px.to_string(), "cloid": cloid_hex}));
-            // A dropped dispatch (queue full / worker wedged) must NOT be swallowed — mark the intent
-            // dangerous + freeze so the backstop recovers it (rather than the slow timeout). This is
-            // the ONLY place a primary dispatch can fail; it is exceptional.
-            if let Some(e) = dispatch_err {
-                warn!("hedge dispatch failed for {cloid_hex} ({e}); marking orphan + freezing (backstop will recover)");
-                if let Some(h) = self.hedges.get_mut(&cloid_hex) {
-                    h.mark_unknown();
+            if let Some((cloid, _, old_qty, old_quote, old_fee, requested)) = tracked {
+                if fill.cum_filled_qty > old_qty {
+                    let exact_increment = fill.cum_filled_qty - old_qty == fill.last_fill_qty;
+                    let quote = if exact_increment { old_quote.map(|q| q + fill.last_fill_qty * fill.last_fill_px) } else { None };
+                    let fee = if exact_increment { old_fee.zip(fill.usd_fee()).map(|(a, b)| a + b) } else { None };
+                    self.handle_exec_event(ExecEvent::ExecutionProgress { cloid,
+                        cumulative_qty: fill.cum_filled_qty, cumulative_quote_usd: quote,
+                        cumulative_fee_usd: fee, terminal: fill.cum_filled_qty == requested,
+                        venue_order_id: Some(fill.order_id.clone()), event_time_ms: (fill.event_time_ms > 0).then_some(fill.event_time_ms) }, now_ns);
                 }
-                self.freeze(now_ns, "hedge_dispatch_failed");
+            } else if !self.maker_coverage.get(&fill.client_id).is_some_and(|c| c.qty >= fill.cum_filled_qty) {
+                self.freeze_and_sweep(now_ns, "untracked_reduce_only_fill");
             }
-            // pending was flushed (outcome.pending is None).
-        } else {
-            // No hedge this fill: still cancel both resting sides + journal any netting; keep the
-            // sub-min residual accumulating if present (the common, cheap case — never a taker flatten).
+            self.journal.maker_fill(now_ns, logical_id.to_hex(), &fill);
+            return;
+        }
+        let previous = self.maker_coverage.get(&fill.client_id).cloned();
+        let old_qty = previous.as_ref().map(|c| c.qty).unwrap_or(Decimal::ZERO);
+        let delta = (fill.cum_filled_qty - old_qty).max(Decimal::ZERO);
+        if delta > Decimal::ZERO {
+            let exact_increment = delta == fill.last_fill_qty;
+            let quote = if exact_increment {
+                previous.as_ref().map(|c| c.quote).unwrap_or(Some(Decimal::ZERO))
+                    .map(|q| q + fill.last_fill_qty * fill.last_fill_px)
+            } else { None };
+            self.maker_coverage.insert(fill.client_id.clone(), MakerCoverage { logical_id, qty: fill.cum_filled_qty, quote });
+            let mut delta_fill = fill.clone();
+            delta_fill.last_fill_qty = delta;
+            self.process_maker_delta(&delta_fill, logical_id, now_ns).await;
+            if !exact_increment {
+                self.journal.maker_progress(now_ns, logical_id, &fill.market, fill.aster_side,
+                    &fill.client_id, &fill.order_id, fill.cum_filled_qty, quote, false, (fill.event_time_ms > 0).then_some(fill.event_time_ms));
+            }
+        }
+        // Native per-trade economics are preserved even if REST covered the quantity first.
+        self.journal.maker_fill(now_ns, logical_id.to_hex(), &fill);
+    }
+
+    pub async fn handle_maker_order_progress(&mut self, market: MarketId, side: Side, client_id: String,
+        order_id: String, qty: Decimal, quote: Option<Decimal>, terminal: bool, event_time_ms: i64, now_ns: i64) {
+        if !self.orders.is_own_client_id(&client_id) || qty < Decimal::ZERO { return; }
+        if terminal { self.uncertain_makers.remove(&client_id); }
+        if qty == Decimal::ZERO && !self.maker_coverage.contains_key(&client_id) { return; }
+        let logical_id = self.maker_coverage.get(&client_id).map(|c| c.logical_id).unwrap_or_else(|| self.logical_id(&market));
+        let previous = self.maker_coverage.get(&client_id).cloned();
+        let old_qty = previous.as_ref().map(|c| c.qty).unwrap_or(Decimal::ZERO);
+        if qty < old_qty { return; }
+        let delta = qty - old_qty;
+        let delta_quote = quote.zip(previous.as_ref().map(|c| c.quote).unwrap_or(Some(Decimal::ZERO))).map(|(q, old)| q-old);
+        self.maker_coverage.insert(client_id.clone(), MakerCoverage { logical_id, qty, quote });
+        if delta > Decimal::ZERO {
+            let px = delta_quote.filter(|q| *q > Decimal::ZERO).map(|q| q / delta)
+                .or_else(|| self.book(&market, VenueTag::Aster).and_then(|b| b.mid())).unwrap_or(Decimal::ZERO);
+            if px <= Decimal::ZERO { self.freeze_and_sweep(now_ns, "unpriced_maker_backfill"); return; }
+            let fill = AsterFill { market: market.clone(), aster_side: side, order_id: order_id.clone(),
+                trade_id: String::new(), client_id: client_id.clone(), last_fill_qty: delta, last_fill_px: px,
+                cum_filled_qty: qty, event_time_ms, reduce_only: false, commission: None, commission_asset: None };
+            self.process_maker_delta(&fill, logical_id, now_ns).await;
+        }
+        self.journal.maker_progress(now_ns, logical_id, &market, side, &client_id, &order_id, qty, quote, terminal, (event_time_ms > 0).then_some(event_time_ms));
+    }
+
+    async fn process_maker_delta(&mut self, fill: &AsterFill, logical_id: Cloid, now_ns: i64) {
+        self.aster_pos.entry(fill.market.clone()).or_default()
+            .apply_fill(SignedPosition::signed(fill.aster_side, fill.last_fill_qty), fill.last_fill_px);
+        if let Some(ctx) = self.ctx.get(&fill.market) {
+            self.orders.on_maker_fill_progress(&fill.market, fill.aster_side, &fill.client_id, ctx.scale.qty_to_lots(fill.cum_filled_qty));
+        }
+        self.last_hot_action_ns.insert(fill.market.clone(), now_ns);
+        self.cooldown.trigger(now_ns, self.cooldown_ns, &fill.market);
+        let Some(ctx) = self.ctx.get(&fill.market) else { self.freeze_and_sweep(now_ns, "unknown_fill_market"); return };
+        let rules = HedgeabilityRules { hyperliquid_min_notional: ctx.spec.hl_min_notional, hyperliquid_qty_step: ctx.spec.hl_qty_step };
+        let step = ctx.spec.hl_qty_step;
+        let mark = self.fresh_hl_quote_book(&fill.market, now_ns).and_then(|b| b.book.mid()).unwrap_or(fill.last_fill_px);
+        let previous = self.pending.remove(&fill.market);
+        let first_fill_ts = previous.as_ref().map(|p| p.first_fill_ts).unwrap_or_else(Utc::now);
+        let outcome = inventory::handle_fill_parts(fill.aster_side, fill.last_fill_qty, fill.last_fill_px,
+            Utc::now(), previous, &rules, mark, self.cfg.edge.aster_maker_fee_bps / Decimal::from(10_000));
+        if let Some(pending) = outcome.pending { self.pending.insert(fill.market.clone(), pending); }
+        if let Some(hedge) = outcome.hedge {
+            let qty = crate::decimal::floor_to_step(hedge.qty, step);
+            let remainder = hedge.qty - qty;
+            if remainder > Decimal::ZERO {
+                self.pending.insert(fill.market.clone(), PendingInventory {
+                    signed_qty: SignedPosition::signed(hedge.hedge_side.opposite(), remainder),
+                    avg_aster_px: hedge.avg_aster_px, first_fill_ts, last_fill_ts: Utc::now(),
+                });
+            }
+            let cloid = self.orders.next_attempt_id(&fill.market);
+            let mut intent = HedgeIntent::with_qty(cloid, fill.market.clone(), hedge.hedge_side, qty, hedge.avg_aster_px, now_ns);
+            intent.logical_id = logical_id;
+            intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
+            let slip = self.cfg.live.hyperliquid.normal_slippage_bps;
+            let source = self.fresh_hl_hedge_book_hot_first(&fill.market, now_ns, hedge.hedge_side, qty);
+            intent.book_source = source.as_ref().map(|b| b.path.as_str(b.source));
+            intent.book_age_ms = source.as_ref().map(|b| b.age_ms);
+            let price = source.and_then(|b| crossing_hedge_px(&b.book, hedge.hedge_side, slip));
+            if let Some(aggressive_px) = price.filter(|_| qty > Decimal::ZERO) {
+                intent.mark_submitted(now_ns);
+                self.hedges.insert(cloid.to_hex(), intent.clone());
+                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: slip, emergency: false }).is_err() {
+                    if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
+                        h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
+                    }
+                    self.correction_needed.insert(fill.market.clone());
+                    self.freeze(now_ns, "hedge_dispatch_failed");
+                }
+            } else {
+                intent.admission.cancel_queued(); intent.mark_rejected(); intent.terminal_ns = Some(now_ns);
+                self.hedges.insert(cloid.to_hex(), intent);
+                self.correction_needed.insert(fill.market.clone());
+                self.freeze(now_ns, "hedge_source_unavailable");
+            }
             self.cancel_both_sides(&fill.market, now_ns);
-            if let Some(rec) = &outcome.netted {
-                self.journal.record(now_ns, "net", Some(fill.market.0.clone()), serde_json::json!({"closed_qty": rec.closed_qty.to_string(), "realized_pnl": rec.realized_pnl.to_string()}));
-            }
-            if let Some(inv) = outcome.pending {
-                self.pending.insert(fill.market.clone(), inv);
-            }
-            // (no hedge & no pending) ⇒ the fill netted exactly flat: nothing else to do.
+            if let Some(h) = self.hedges.get(&cloid.to_hex()) { self.journal.progress(now_ns, h); }
+        } else { self.cancel_both_sides(&fill.market, now_ns); }
+        if let Some(net) = outcome.netted {
+            self.journal.typed(now_ns, "net", Some(fill.market.0.clone()), JournalDetail::Net {
+                closed_qty: net.closed_qty, realized_pnl: net.realized_pnl }, "estimated");
         }
     }
 
@@ -2693,6 +2514,8 @@ impl Strategy {
                 cum_filled_qty: prior_cum_qty + fill_qty,
                 event_time_ms: 0,
                 reduce_only: false,
+            commission: None,
+            commission_asset: None,
             };
             self.handle_maker_fill(fill, now_ns).await;
             return; // one fill per print is enough for the paper model
@@ -2701,6 +2524,13 @@ impl Strategy {
 
     /// Fold a worker/venue event back into the order + hedge state.
     pub fn handle_exec_event(&mut self, ev: ExecEvent, now_ns: i64) {
+        if matches!(&ev, ExecEvent::MakerOrderProgress { .. } | ExecEvent::ExecutionProgress { .. }
+            | ExecEvent::HedgeFill { .. } | ExecEvent::AsterFlattenAck { .. }) { self.revoke_makers(); }
+        let order_evidence = match &ev {
+            ExecEvent::PlaceAck { client_id, venue_order_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: Some(venue_order_id.clone()), state: "accepted" }),
+            ExecEvent::CancelAck { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "cancelled" }),
+            _ => None,
+        };
         match ev {
             ExecEvent::PlaceAck { client_id, venue_order_id } => {
                 if let Some((market, side, cancel_venue_order_id, cancel_reason)) =
@@ -2724,16 +2554,7 @@ impl Strategy {
                         match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                             ExecDispatch::Sent => {
                                 self.orders.on_cancel_sent(&market, side, now_ns);
-                                self.journal.record(
-                                    now_ns,
-                                    "cancel_after_ack",
-                                    Some(market.0),
-                                    serde_json::json!({
-                                        "side": side.as_str(),
-                                        "client_id": client_id,
-                                        "reason": cancel_reason.as_str(),
-                                    }),
-                                );
+                                self.journal.reason(now_ns, "cancel_after_ack", Some(market.0.clone()), cancel_reason.as_str());
                             }
                             ExecDispatch::BudgetBlocked => {
                                 self.note_aster_budget_block(now_ns, "cancel_after_ack", AsterCommandPriority::RiskReducing);
@@ -2765,6 +2586,7 @@ impl Strategy {
                 }
             }
             ExecEvent::PlaceUnknown { client_id, reason } => {
+                self.uncertain_makers.insert(client_id.clone());
                 // The order may be resting. Do NOT close the local slot. Freeze and
                 // sweep/reconcile so account/openOrders becomes the source of truth.
                 warn!("place outcome UNKNOWN (client {client_id}): {reason}; sweeping all bot orders + freezing");
@@ -2775,6 +2597,7 @@ impl Strategy {
                 self.cancel_ack_by_client_id(&client_id);
             }
             ExecEvent::CancelReject { client_id, reason } => {
+                self.uncertain_makers.insert(client_id.clone());
                 // The cancel FAILED, so the order may still be resting. Freeze and request a
                 // cancel-all, but do NOT forget local slots until a newer account snapshot proves
                 // no bot-owned Aster orders remain.
@@ -2782,179 +2605,120 @@ impl Strategy {
                 self.freeze(now_ns, "cancel_rejected");
                 self.request_safety_sweep(now_ns, "cancel_rejected");
             }
-            ExecEvent::MakerFill(_fill) => {
+            ExecEvent::MakerFill(_) | ExecEvent::MakerOrderProgress { .. } => {
                 // Routed through handle_maker_fill by the driver; nothing here.
             }
             ExecEvent::AsterRateLimited { reason, backoff_ms } => {
                 self.on_aster_rate_limited(now_ns, reason, backoff_ms);
             }
             ExecEvent::HedgeAck { cloid, hl_oid } => {
+                if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) { h.mark_acked(hl_oid); }
+            }
+            ExecEvent::AttemptStarted { cloid, proof } => {
                 if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
-                    h.mark_acked(hl_oid);
+                    self.last_hot_action_ns.entry(h.market.clone()).and_modify(|v| *v = (*v).max(proof.sent_ns)).or_insert(proof.sent_ns);
+                    h.wire = Some(proof);
+                    self.journal.progress(now_ns, h);
                 }
             }
-            ExecEvent::HedgeFill { cloid, filled_qty, px, fee_usd } => {
-                let cloid_hex = cloid.to_hex();
-                // The venue qty step for this hedge's market. A complete hedge can be reported across
-                // MULTIPLE HedgeFill events, or leave a sub-step rounding remainder, so "filled to
-                // within one qty step" MUST count as fully Filled. Otherwise the intent latches
-                // `PartiallyFilled` (a dangerous/orphan state) and silently closes the maker gate
-                // forever even though the leg is fully hedged on-venue — the stuck-quoting bug.
-                let step = self
-                    .hedges
-                    .get(&cloid_hex)
-                    .and_then(|h| self.ctx.get(&h.market))
-                    .map(|c| c.spec.hl_qty_step)
-                    .unwrap_or(Decimal::ZERO);
-                let mut journal_event = None;
-                if let Some(h) = self.hedges.get_mut(&cloid_hex) {
-                    h.apply_fill(filled_qty);
-                    let signed = SignedPosition::signed(h.hedge_side, filled_qty);
-                    self.hl_pos.entry(h.market.clone()).or_default().apply_fill(signed, px);
-                    journal_event = Some((
-                        h.market.0.clone(),
-                        h.hedge_side.as_str().to_string(),
-                    ));
-                    if h.state == super::fills::HedgeState::Filled || h.remaining_qty() <= step {
-                        h.mark_reconciled();
-                    }
-                }
-                if let Some((market, side)) = journal_event {
-                    self.journal.record(
-                        now_ns,
-                        "hedge_fill",
-                        Some(market),
-                        serde_json::json!({
-                            "cloid": cloid_hex,
-                            "side": side,
-                            "qty": filled_qty.to_string(),
-                            "px": px.to_string(),
-                            "fee_usd": fee_usd.to_string(),
-                        }),
-                    );
-                }
-            }
-            ExecEvent::HedgeUnknown { cloid, reason } => {
-                let cloid_hex = cloid.to_hex();
-                warn!("hedge outcome UNKNOWN (cloid {cloid_hex}): {reason}; freezing until reconcile");
-                let market = self.hedges.get_mut(&cloid_hex).map(|h| {
-                    h.mark_unknown();
-                    h.market.0.clone()
-                });
-                if let Some(market) = market {
-                    self.journal.record(
-                        now_ns,
-                        "hedge_unknown",
-                        Some(market),
-                        serde_json::json!({"cloid": cloid_hex, "reason": reason}),
-                    );
-                }
-                self.freeze(now_ns, "hedge_unknown");
+            ExecEvent::AttemptNotSent { cloid, reason } => {
+                self.handle_definitive_reject(cloid, reason, true, now_ns);
             }
             ExecEvent::HedgeReject { cloid, reason } => {
-                let cloid_hex = cloid.to_hex();
-                warn!("hedge rejected (cloid {cloid_hex}): {reason}");
-                // Safe to auto-retry ONLY when NOTHING can have landed on HL (a fresh-touch
-                // emergency resend, ~1 RTT vs the slow ~4–6 s recovery, no double-hedge risk):
-                // the venue-confirmed IOC no-fill ("could not immediately match") and the
-                // NotSent fast-fail (frame never left the socket, nonce rolled back). NOT
-                // "unexpectedly resting" (an order IS on the book → retrying would double up —
-                // freeze instead) and NOT an ambiguous transport error (might have landed →
-                // freeze + let the reconciler resolve).
-                let definitive_no_fill =
-                    super::exec::hyperliquid::hedge_reject_is_definitive_no_fill(&reason);
-                let info = self
-                    .hedges
-                    .get(&cloid_hex)
-                    .map(|h| (h.market.clone(), h.hedge_side, h.remaining_qty(), h.attempts));
-                if let Some((market, hedge_side, qty, attempts)) = info {
-                    if definitive_no_fill && attempts < 2 && qty > Decimal::ZERO {
-                        let emerg_slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
-                        let fresh_book = self.fresh_hl_hedge_book_hot_first(&market, now_ns, hedge_side, qty);
-                        let fresh_px = fresh_book
-                            .as_ref()
-                            .and_then(|ob| crossing_hedge_px(ob.book.as_ref(), hedge_side, emerg_slip));
-                        if let Some(px) = fresh_px {
-                            // Reuse the SAME deterministic cloid + intent (idempotent: the original
-                            // never landed). mark_submitted bumps attempts; clone before the send so
-                            // the &mut borrow is released.
-                            let intent = self.hedges.get_mut(&cloid_hex).map(|h| {
-                                h.mark_submitted(now_ns);
-                                h.clone()
-                            });
-                            if let Some(intent) = intent {
-                                let cmd = HedgeCommand::Hedge { intent, aggressive_px: px, slippage_bps: emerg_slip, emergency: true };
-                                if self.hedge_tx.try_send(cmd).is_ok() {
-                                    if let Some(ctx) = &fresh_book {
-                                        self.journal.record(
-                                            now_ns,
-                                            "hedge_retry_context",
-                                            Some(market.0.clone()),
-                                            serde_json::json!({
-                                                "cloid": cloid_hex.clone(),
-                                                "reason": reason.clone(),
-                                                "attempt": attempts + 1,
-                                                "side": hedge_side.as_str(),
-                                                "qty": qty.to_string(),
-                                                "hl": hl_hedge_context_json(ctx, px, emerg_slip),
-                                            }),
-                                        );
-                                    }
-                                    warn!("hedge {cloid_hex} retry #{} off fresh touch @ {px} (emergency {emerg_slip} bps)", attempts + 1);
-                                    return;
-                                }
-                                if let Some(h) = self.hedges.get_mut(&cloid_hex) {
-                                    h.mark_unknown();
-                                }
-                            }
-                        }
-                    }
+                let retry = super::exec::hyperliquid::hedge_reject_is_definitive_no_fill(&reason);
+                self.handle_definitive_reject(cloid, reason, retry, now_ns);
+            }
+            ExecEvent::HedgeFill { cloid, filled_qty, px, fee_usd } => {
+                // Historical test/paper event: normalize immediately to cumulative evidence.
+                if let Some(h) = self.hedges.get(&cloid.to_hex()) {
+                    let qty = h.filled_qty + filled_qty;
+                    let quote = h.filled_quote_usd.map(|q| q + filled_qty * px);
+                    let fee = h.fee_usd.map(|f| f + fee_usd);
+                    self.apply_execution_progress(cloid, qty, quote, fee, qty == h.qty, None, None, now_ns);
                 }
-                // No retry (ambiguous / exhausted / no touch): mark rejected + freeze. Orphan-leg danger.
-                if let Some(h) = self.hedges.get_mut(&cloid_hex) {
-                    h.mark_rejected();
+            }
+            ExecEvent::ExecutionProgress { cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms } => {
+                self.apply_execution_progress(cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms, now_ns);
+            }
+            ExecEvent::ExecutionTrade(trade) => self.journal.execution_trade(now_ns, trade),
+            ExecEvent::HedgeUnknown { cloid, reason } => {
+                if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
+                    if !h.terminal { h.mark_unknown(); }
+                    self.journal.progress(now_ns, h);
                 }
-                self.freeze(now_ns, "hedge_rejected");
+                warn!("execution remains unresolved {}: {reason}", cloid.to_hex());
+                self.freeze_and_sweep(now_ns, "execution_unknown");
             }
-            ExecEvent::AsterFlattenAck { market, side, qty } => {
-                self.journal.record(
-                    now_ns,
-                    "aster_flatten_ack",
-                    Some(market.0),
-                    serde_json::json!({"side": side.as_str(), "qty": qty.to_string()}),
-                );
+            ExecEvent::AsterFlattenAck { cloid, .. } => {
+                if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) { h.state = HedgeState::Acked; }
             }
-            ExecEvent::AsterFlattenReject { market, side, qty, reason } => {
-                error!("aster flatten rejected on {market}: {side:?} {qty}: {reason}");
-                self.freeze(now_ns, "aster_flatten_rejected");
-                self.journal.record(
-                    now_ns,
-                    "aster_flatten_reject",
-                    Some(market.0),
-                    serde_json::json!({"side": side.as_str(), "qty": qty.to_string(), "reason": reason}),
-                );
-            }
-            ExecEvent::HlFlattenFill { market, side, filled_qty, px } => {
-                let signed = SignedPosition::signed(side, filled_qty);
-                self.hl_pos.entry(market.clone()).or_default().apply_fill(signed, px);
-                self.journal.record(
-                    now_ns,
-                    "hl_flatten_fill",
-                    Some(market.0),
-                    serde_json::json!({"side": side.as_str(), "qty": filled_qty.to_string(), "px": px.to_string()}),
-                );
-            }
-            ExecEvent::HlFlattenReject { market, side, qty, reason } => {
-                error!("hl flatten rejected on {market}: {side:?} {qty}: {reason}");
-                self.freeze(now_ns, "hl_flatten_rejected");
-                self.journal.record(
-                    now_ns,
-                    "hl_flatten_reject",
-                    Some(market.0),
-                    serde_json::json!({"side": side.as_str(), "qty": qty.to_string(), "reason": reason}),
-                );
+            ExecEvent::AsterFlattenReject { cloid, reason, terminal, .. } => {
+                if terminal { self.handle_definitive_reject(cloid, reason, false, now_ns); }
+                else {
+                    if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) { h.mark_unknown(); }
+                    self.freeze_and_sweep(now_ns, "aster_correction_unknown");
+                }
             }
         }
+        if let Some(detail) = order_evidence { self.journal.typed(now_ns, "order_update", None, detail, "confirmed"); }
+        self.publish_execution_queries();
+    }
+
+    fn apply_execution_progress(&mut self, cloid: Cloid, qty: Decimal, quote: Option<Decimal>, fee: Option<Decimal>,
+        terminal: bool, order_id: Option<String>, event_time_ms: Option<i64>, now_ns: i64) {
+        let Some(h) = self.hedges.get_mut(&cloid.to_hex()) else { return };
+        let (delta, delta_quote) = h.apply_progress(qty, quote, fee, terminal, now_ns);
+        if delta > Decimal::ZERO || h.event_time_ms.is_none() { h.event_time_ms = event_time_ms; }
+        if let Some(oid) = order_id { h.hl_oid = Some(oid); }
+        if delta > Decimal::ZERO {
+            let px = delta_quote.filter(|q| *q > Decimal::ZERO).map(|q| q / delta).unwrap_or(h.aster_fill_px);
+            let positions = if h.venue == Venue::Aster { &mut self.aster_pos } else { &mut self.hl_pos };
+            positions.entry(h.market.clone()).or_default().apply_fill(SignedPosition::signed(h.hedge_side, delta), px);
+            self.last_hot_action_ns.insert(h.market.clone(), now_ns);
+        }
+        if h.venue == Venue::Aster {
+            if let Some(client_id) = &h.client_id {
+                self.maker_coverage.insert(client_id.clone(), MakerCoverage {
+                    logical_id: h.logical_id, qty: h.filled_qty, quote: h.filled_quote_usd,
+                });
+            }
+        }
+        if terminal && h.remaining_qty() > Decimal::ZERO { self.correction_needed.insert(h.market.clone()); }
+        if !self.exec_mode.sends_real_orders() && terminal && h.remaining_qty() == Decimal::ZERO { h.mark_reconciled(); }
+        self.journal.progress(now_ns, h);
+    }
+
+    fn handle_definitive_reject(&mut self, cloid: Cloid, reason: String, retryable: bool, now_ns: i64) {
+        let Some(h) = self.hedges.get_mut(&cloid.to_hex()) else { return };
+        if h.filled_qty > Decimal::ZERO {
+            h.mark_unknown(); h.terminal = false;
+            self.freeze_and_sweep(now_ns, "contradictory_execution_reject");
+            return;
+        }
+        h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
+        self.journal.progress(now_ns, h);
+        let old = h.clone();
+        if retryable && old.purpose == IntentPurpose::Hedge && old.attempts < 2 {
+            let slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
+            let px = self.fresh_hl_hedge_book_hot_first(&old.market, now_ns, old.hedge_side, old.remaining_qty())
+                .and_then(|b| crossing_hedge_px(&b.book, old.hedge_side, slip));
+            if let Some(aggressive_px) = px {
+                let next = self.orders.next_attempt_id(&old.market);
+                let mut intent = HedgeIntent::with_qty(next, old.market.clone(), old.hedge_side, old.remaining_qty(), old.aster_fill_px, now_ns);
+                intent.logical_id = old.logical_id;
+                intent.attempts = old.attempts;
+                intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
+                intent.mark_submitted(now_ns);
+                self.hedges.insert(next.to_hex(), intent.clone());
+                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: slip, emergency: true }).is_ok() { return; }
+                if let Some(h) = self.hedges.get_mut(&next.to_hex()) {
+                    h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
+                }
+            }
+        }
+        warn!("execution rejected {}: {reason}", cloid.to_hex());
+        self.correction_needed.insert(old.market);
+        self.freeze_and_sweep(now_ns, "execution_rejected");
     }
 
     /// Ack a placed order by client id. Returns `(market, side, venue_order_id)` when this ack
@@ -3078,472 +2842,214 @@ impl Strategy {
             );
             return;
         }
-        // TRIP — latch, journal, persist, and halt (graceful drain leaves the position open).
         self.breaker_tripped = true;
-        // In-memory flag FIRST (before the fallible latch write below): run.rs turns it into a
-        // guaranteed nonzero exit at shutdown even if write_trip fails on an unwritable path.
-        if let Some(flag) = &self.trip_flag {
-            flag.store(true, std::sync::atomic::Ordering::Release);
-        }
-        let market = self.markets.first().map(|m| m.0.clone()).unwrap_or_default();
-        error!(
-            "CIRCUIT BREAKER TRIPPED on {market}: equity {equity} USD is {loss} USD below baseline \
-             {baseline} USD (limit {limit} USD). Cancelling orders, LEAVING positions open, halting."
-        );
-        self.journal.record(
-            now_ns,
-            "circuit_trip",
-            Some(market.clone()),
-            serde_json::json!({
-                "baseline_usd": baseline.to_string(),
-                "equity_usd": equity.to_string(),
-                "loss_usd": loss.to_string(),
-                "limit_usd": limit.to_string(),
-                // Components + freshness, so the next forensic run reads straight off the row.
-                "aster_equity_usd": snap.aster_equity_usd.to_string(),
-                "hl_equity_usd": snap.hl_equity_usd.to_string(),
-                "hl_unrealized_usd": snap.hl_unrealized_usd.to_string(),
-                "snapshot_age_ms": self.account.age_ms(now_ns),
-                "read_start_age_ms": now_ns.saturating_sub(snap.read_start_ns) / 1_000_000,
-                "breach_streak": self.breaker_breach_streak,
-                "generation": snap.generation,
-            }),
-        );
-        if let Some(path) = self.trip_file_path.clone() {
-            let rec = super::breaker::TripRecord {
-                ts_utc: Utc::now().to_rfc3339(),
-                market,
-                baseline_usd: baseline,
-                equity_usd: equity,
-                loss_usd: loss,
-                limit_usd: limit,
-                reason: "cumulative loss exceeded max_cumulative_loss_usdc".to_string(),
-            };
-            if let Err(e) = super::breaker::write_trip(&path, &rec) {
-                error!("failed to write circuit-breaker trip latch to {}: {e:#}", path.display());
-            }
-        }
-        if self.cfg.live.shutdown_cancel_all {
-            self.request_safety_sweep(now_ns, "circuit_breaker");
-        }
+        if let Some(flag) = &self.trip_flag { flag.store(true, std::sync::atomic::Ordering::Release); }
+        // Safety dispatch precedes every persistence action. The writer owns JSON,
+        // write/flush/sync and rename; a stalled filesystem cannot delay cancellation.
         self.freeze(now_ns, "circuit_breaker");
-        // Reuse the existing graceful shutdown: run.rs observes this token, retries CancelAllBot
-        // with a bounded awaited send, and exits. Positions are LEFT OPEN.
+        if self.cfg.live.shutdown_cancel_all { self.request_safety_sweep(now_ns, "circuit_breaker"); }
         self.shutdown.cancel();
+        self.journal.trip(super::breaker::TripSnapshot {
+            ts_ms: Utc::now().timestamp_millis(),
+            market: self.markets.first().map(|m| m.0.clone()).unwrap_or_default(),
+            baseline_usd: baseline, equity_usd: equity, loss_usd: loss, limit_usd: limit,
+        });
     }
 
     /// Periodic maintenance: time out overdue hedges, run the orphan-recovery backstop, and
     /// refresh the dead-man countdown.
     pub async fn on_tick(&mut self, now_ns: i64) {
-        // Safety FIRST: the cumulative-loss circuit breaker. If it trips it halts the process; do it
-        // before any maintenance so a tripped run does nothing else this tick.
-        self.check_circuit_breaker(now_ns);
+        if !self.draining { self.check_circuit_breaker(now_ns); }
+        if self.breaker_tripped && !self.draining { return; }
         self.drive_safety_sweep(now_ns);
-        let timeout_ns = self.cfg.live.max_unhedged_age_ms.max(0) * 1_000_000;
-        let mut newly_dangerous = false;
+        let timeout_ns = self.cfg.live.max_unhedged_age_ms.max(0).saturating_mul(1_000_000);
+        let mut overdue = false;
         for h in self.hedges.values_mut() {
-            let was = h.state.is_dangerous();
+            let previous = h.state;
             h.check_timeout(now_ns, timeout_ns);
-            if !was && h.state.is_dangerous() {
-                newly_dangerous = true;
+            if h.state != previous && h.state.is_dangerous() {
+                overdue = true;
+                if h.terminal { self.correction_needed.insert(h.market.clone()); }
+                self.journal.progress(now_ns, h);
             }
         }
-        if newly_dangerous {
-            self.freeze(now_ns, "hedge_timeout");
-        }
-        // Flatten any sub-min PENDING residual that has genuinely lingered (aged out) or grown too
-        // large — the exceptional case where accumulation never reached a hedgeable chunk. The
-        // normal case never reaches here (a pending residual is flushed to a hedge by the next
-        // fill). Reduce-only on Aster keeps it delta-neutral.
+        if overdue { self.freeze_and_sweep(now_ns, "execution_deadline"); }
         if self.exec_mode.sends_real_orders() {
-            let max_notional = self.cfg.live.partials.max_pending_notional_usd;
-            let max_age_ms = self.cfg.live.partials.max_pending_age_ms;
-            let now_utc = Utc::now();
-            let stuck: Vec<(MarketId, Side, Decimal)> = self
-                .pending
-                .iter()
-                .filter_map(|(m, inv)| {
-                    let mark = self
-                        .book(m, VenueTag::Hyperliquid)
-                        .and_then(|b| b.mid())
-                        .unwrap_or(inv.avg_aster_px);
-                    inventory::check_pending_limits(inv, max_notional, max_age_ms, mark, now_utc).map(|_| {
-                        let side = if inv.signed_qty > Decimal::ZERO { Side::Sell } else { Side::Buy };
-                        (m.clone(), side, inv.signed_qty.abs())
-                    })
-                })
-                .collect();
-            let snap_src = self.account.load().source_ts_ns;
-            for (m, side, qty) in stuck {
-                self.pending.remove(&m);
-                // Share the recovery throttle so recover_orphans (same tick / next ticks) does NOT
-                // re-flatten this residual before the FlattenAster lands in a newer snapshot.
-                self.last_recovery.insert(m.clone(), (now_ns, snap_src, None));
-                warn!("pending residual on {m} lingered/too-large; flattening {side:?} {qty} reduce-only on Aster (exceptional)");
-                self.journal.record(now_ns, "flatten_pending", Some(m.0.clone()), serde_json::json!({"side": side.as_str(), "qty": qty.to_string()}));
-                let client_id = self.orders.next_flatten_client_id(&m);
-                // Stamp the hot action: a snapshot straddling this flatten's execution must
-                // not be trusted by the orphan backstop (same reason as maker fills).
-                self.last_hot_action_ns.insert(m.clone(), now_ns);
-                match self.try_send_aster_cmd(
-                    ExecCommand::FlattenAster { market: m.clone(), side, qty, client_id },
-                    AsterCommandPriority::Safety,
-                    now_ns,
-                ) {
-                    ExecDispatch::Sent => {}
-                    ExecDispatch::BudgetBlocked => {
-                        self.note_aster_budget_block(now_ns, "pending_flatten", AsterCommandPriority::Safety);
-                        self.freeze(now_ns, "pending_flatten_budget_blocked");
-                    }
-                    ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                        error!("CRITICAL: pending-residual FlattenAster for {m} dropped (queue/backpressure); freezing");
-                        self.freeze(now_ns, "pending_flatten_dispatch_failed");
-                    }
+            let mut expired = Vec::new();
+            for (m, inv) in &self.pending {
+                let mark = self.book(m, VenueTag::Aster).and_then(|b| b.mid()).unwrap_or(inv.avg_aster_px);
+                if inventory::check_pending_limits(inv, self.cfg.live.partials.max_pending_notional_usd,
+                    self.cfg.live.partials.max_pending_age_ms, mark, Utc::now()).is_some() {
+                    expired.push(m.clone());
                 }
             }
+            for m in expired {
+                if self.correction_needed.insert(m.clone()) {
+                    self.journal.reason(now_ns, "pending_limit", Some(m.0), "pending age/notional limit");
+                }
+                self.freeze_and_sweep(now_ns, "pending_limit");
+            }
         }
-        // Bound the hedge map + clear stale resolved intents (a Reconciled hedge is done).
-        self.hedges.retain(|_, h| !h.state.is_resolved());
-        // Active orphan recovery: AFTER the timeout pass (so a timed-out hedge is no longer
-        // in-flight and its net delta is recoverable here).
         self.recover_orphans(now_ns);
-        // Dead-man heartbeat (§3.4): refresh each eligible market's countdown.
-        if self.cfg.live.aster.deadman_enabled {
+        self.publish_execution_queries();
+        if self.cfg.live.aster.deadman_enabled && !self.draining {
             for m in self.markets.clone() {
                 if self.ctx.get(&m).is_some_and(|c| c.eligible) {
-                    match self.try_send_aster_cmd(ExecCommand::RefreshDeadman { market: m.clone() }, AsterCommandPriority::Deadman, now_ns) {
-                        ExecDispatch::Sent | ExecDispatch::BudgetBlocked | ExecDispatch::QueueFull => {}
-                        ExecDispatch::QueueClosed => self.freeze(now_ns, "deadman_queue_closed"),
+                    if self.try_send_aster_cmd(ExecCommand::RefreshDeadman { market: m }, AsterCommandPriority::Deadman, now_ns) == ExecDispatch::QueueClosed {
+                        self.freeze(now_ns, "deadman_queue_closed");
                     }
                 }
             }
         }
     }
 
-    /// Active orphan-recovery backstop (§6/§10) — the safety net the architecture promised.
-    /// Using the reconciled snapshot (ground truth) plus in-flight hedge deltas, detect any
-    /// persistent net delta per market and ACTIVELY neutralize it: hedge the net on HL if it
-    /// clears the HL minimum, else flatten each leg reduce-only on its own venue. A
-    /// missed/dropped/rejected/timed-out hedge all surface here as a net delta and get RESOLVED,
-    /// not merely frozen. Live only; throttled per market so it can't re-fire before the action
-    /// lands in the next snapshot; folding in-flight hedges prevents a double-hedge in the normal
-    /// post-fill window.
     fn recover_orphans(&mut self, now_ns: i64) {
         if !self.exec_mode.sends_real_orders() {
-            return; // paper has no real positions
-        }
-        let snap = self.account.load();
-        if snap.source_ts_ns == 0 {
-            return; // no snapshot yet
-        }
-        // Only act on a reasonably fresh snapshot; a stale one is handled by the maker-gate freeze.
-        if now_ns.saturating_sub(snap.source_ts_ns) / 1_000_000 > self.cfg.live.max_account_snapshot_age_ms * 2 {
+            self.hedges.retain(|_, h| !h.state.is_resolved());
             return;
         }
-        let recovery_cooldown_ns = self.cfg.live.max_unhedged_age_ms.max(1000) * 2 * 1_000_000;
-        let hl_min = self.cfg.partials.hyperliquid_min_notional;
-        let dust = Decimal::new(5, 1); // $0.50: below the acceptance tolerance, above rounding noise
-        let emerg_slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
-
+        let snap = self.account.load();
+        if snap.source_ts_ns == 0 || now_ns.saturating_sub(snap.source_ts_ns) / 1_000_000 > self.cfg.live.max_account_snapshot_age_ms { return; }
+        let mut need_maker_backfill = !self.uncertain_makers.is_empty();
         for m in self.markets.clone() {
-            // STRADDLE GUARD (T2.2): trust a snapshot for this market ONLY if its REST reads BEGAN
-            // STRICTLY AFTER the market's last hot action (a maker fill / primary hedge dispatch);
-            // otherwise skip it. A snapshot whose reads began at-or-before the action cannot yet
-            // reflect it, so acting on it — or even seeding the persistence gate from it — could
-            // double-hedge during the fast-network window where the fill is visible but the hedge is
-            // not. `read_start_ns` is stamped at the START of the reconcile reads (not after, which
-            // `source_ts_ns` is). The compare is `<=`, not `<`: `mono_now_ns()` (QueryPerformanceCounter
-            // on Windows, ~100ns granularity) can return the SAME value for two calls in one tick, so on
-            // a fast VPS `read_start_ns == action_ns` is reachable and means "the read may have queried
-            // the venue the same instant the hedge was dispatched, before it propagated" — untrustworthy,
-            // so defer. Self-clocking, no constant; mirrors the strictly-newer `heal_confirm` gate. A
-            // genuine orphan still recovers: a failed hedge FREEZES quoting → fills stop → last_hot_action
-            // stops advancing → a later snapshot's read_start clears the guard. So this only ever DEFERS
-            // recovery, never skips it.
-            if self.last_hot_action_ns.get(&m).is_some_and(|&action_ns| snap.read_start_ns <= action_ns) {
-                continue;
-            }
-            // Recovery sizes/sides emergency orders off the HL mid: with the HL stream
-            // KNOWN-down that mid is blind (it may predate the disconnect while still
-            // reading young), so defer this tick (mirrors the no-mark skip just below) —
-            // recovery resumes as soon as the reconnect's full snapshot clears the flag.
-            let hl_trusted = self
-                .registry
-                .cell(&m, VenueTag::Hyperliquid)
-                .is_some_and(|c| !c.stream_down());
-            if !hl_trusted {
-                continue;
-            }
-            let mark = self
-                .book(&m, VenueTag::Hyperliquid)
-                .and_then(|b| b.mid())
-                .unwrap_or(Decimal::ZERO);
-            if mark <= Decimal::ZERO {
-                continue; // no mark ⇒ can't size/judge
-            }
-            let rep_a = snap.reported_position(super::account::Venue::Aster, &m);
-            let rep_h = snap.reported_position(super::account::Venue::Hyperliquid, &m);
-            // In-flight hedges will change reality soon; fold their signed remaining qty in so we
-            // don't double-hedge during the normal post-fill window.
-            let in_flight: Decimal = self
-                .hedges
-                .values()
-                .filter(|h| h.market == m && h.state.is_in_flight())
-                .map(|h| SignedPosition::signed(h.hedge_side, h.remaining_qty()))
-                .sum();
-            // Exclude the legitimately-accumulating sub-min pending inventory: it is EXPECTED to be
-            // unhedged (it's batching toward a hedgeable chunk) and is resolved by the accumulation
-            // path or the pending-age flatten — NOT an orphan. Subtracting it prevents the backstop
-            // from taker-flattening a healthy accumulation (which would lose money).
-            let pending_signed = self.pending.get(&m).map(|p| p.signed_qty).unwrap_or(Decimal::ZERO);
-            let effective_net = rep_a + rep_h + in_flight - pending_signed;
-            let net_notional = effective_net.abs() * mark;
-            if net_notional <= dust {
-                // Delta-neutral enough. CRITICAL: sync predicted to reported HERE TOO (not only in
-                // the orphan branch) before retiring dangerous intents — otherwise a missed
-                // reduce-only fill can leave predicted stale within the mismatch tolerance, and the
-                // self-heal below would un-freeze on a phantom position. Syncing makes
-                // positions_reconciled see ground truth, so the unfreeze is only ever legitimate.
-                self.aster_pos.entry(m.clone()).or_default().qty = rep_a;
-                self.hl_pos.entry(m.clone()).or_default().qty = rep_h;
-                self.hedges.retain(|_, h| !(h.market == m && h.state.is_dangerous()));
-                self.orphan_seen.remove(&m); // orphan resolved — reset the persistence record
-                self.orphan_crosscheck_defers.remove(&m); // neutral again — reset the escalation
-                continue;
-            }
-            // ── SNAPSHOT-PREDICTED CROSS-CHECK ──
-            // The predicted positions were synced to reported from the PREVIOUS good snapshot (in
-            // the dust branch above). If they show balanced (predicted_net ≤ dust) but the CURRENT
-            // snapshot disagrees, a venue REST read likely returned stale/empty data (e.g. HL
-            // position momentarily reads as 0). Acting on a phantom would round-trip (sell then buy
-            // back), burning fees. Skip with a warning; a real orphan shows up in BOTH predicted
-            // and snapshot because the missed fill updated aster_pos via the user stream.
+            // An Unknown remains a live reservation. Position snapshots cannot
+            // prove that a queued/accepted transaction will never execute later.
+            if self.hedges.values().any(|h| h.market == m && h.unresolved()) { continue; }
+            let last_terminal = self.hedges.values().filter(|h| h.market == m)
+                .filter_map(|h| h.terminal_ns).max().unwrap_or(0);
+            let last_action = self.last_hot_action_ns.get(&m).copied().unwrap_or(0).max(last_terminal);
+            if snap.read_start_ns <= last_action { continue; }
+            let rep_a = snap.reported_position(Venue::Aster, &m);
+            let rep_h = snap.reported_position(Venue::Hyperliquid, &m);
             let pred_a = self.aster_pos.get(&m).map(|p| p.qty).unwrap_or_default();
             let pred_h = self.hl_pos.get(&m).map(|p| p.qty).unwrap_or_default();
-            let predicted_net = pred_a + pred_h + in_flight - pending_signed;
-            if predicted_net.abs() * mark <= dust && net_notional > dust {
-                // ── ESCALATION BACKSTOP ──
-                // Count DISTINCT snapshots only (the tick cadence re-reads the same snapshot):
-                // a transient venue read clears within a snapshot or two; a disagreement that
-                // persists across ORPHAN_CROSSCHECK_MAX_DEFERS distinct snapshots means the
-                // PREDICTED side drifted (e.g. a missed fill), and deferring forever would leave
-                // real exposure unhedged with the maker gate closed. Past the threshold, treat
-                // reported as truth: fall through into the persistence gate below, which STILL
-                // requires the orphan confirmed in a strictly newer snapshot before acting.
-                let (mut count, last_src) =
-                    self.orphan_crosscheck_defers.get(&m).copied().unwrap_or((0, 0));
-                let distinct = snap.source_ts_ns > last_src;
-                if distinct {
-                    count += 1;
-                }
-                self.orphan_crosscheck_defers
-                    .insert(m.clone(), (count, last_src.max(snap.source_ts_ns)));
-                if count <= ORPHAN_CROSSCHECK_MAX_DEFERS {
-                    warn!("orphan skip {m}: predicted balanced (pred_a={pred_a} pred_h={pred_h} net={predicted_net}) \
-                           but snapshot disagrees (rep_a={rep_a} rep_h={rep_h} eff={effective_net} ${net_notional}) — \
-                           likely a transient venue read; deferring ({count}/{ORPHAN_CROSSCHECK_MAX_DEFERS})");
-                    self.orphan_seen.remove(&m);
-                    continue;
-                }
-                if distinct {
-                    error!("orphan cross-check ESCALATION {m}: predicted balanced (pred_a={pred_a} pred_h={pred_h} \
-                            net={predicted_net}) but {count} distinct snapshots disagree (rep_a={rep_a} rep_h={rep_h} \
-                            eff={effective_net} ${net_notional}) — treating reported as truth; persistence gate \
-                            must still confirm in a newer snapshot before recovery acts");
-                    self.journal.record(now_ns, "orphan_crosscheck_escalation", Some(m.0.clone()), serde_json::json!({
-                        "distinct_snapshots": count,
-                        "pred_a": pred_a.to_string(),
-                        "pred_h": pred_h.to_string(),
-                        "rep_a": rep_a.to_string(),
-                        "rep_h": rep_h.to_string(),
-                        "effective_net": effective_net.to_string(),
-                        "net_notional_usd": net_notional.to_string(),
-                    }));
-                }
-                // FALL THROUGH (no `continue`): the counter stays latched past the threshold so
-                // every subsequent snapshot also reaches the persistence gate — resetting it here
-                // would let the interleaved defers wipe the gate's first-sighting record forever.
-                // It clears via the dust branch / condition-false path once reality is restored.
-            } else {
-                self.orphan_crosscheck_defers.remove(&m);
-            }
-            // ── PERSISTENCE GATE ──
-            // Only ACT once this orphan has persisted into a STRICTLY NEWER snapshot than first
-            // seen (same sign, at least half the size). Filters transient snapshot lag.
-            let confirmed = matches!(
-                self.orphan_seen.get(&m),
-                Some(&(prev_net, prev_src))
-                    if snap.source_ts_ns > prev_src
-                        && (prev_net > Decimal::ZERO) == (effective_net > Decimal::ZERO)
-                        && effective_net.abs() * Decimal::from(2) >= prev_net.abs()
-            );
-            if !confirmed {
-                self.orphan_seen.insert(m.clone(), (effective_net, snap.source_ts_ns));
-                continue; // first sighting — wait for a newer snapshot to confirm it's real
-            }
-            // Confirmed real orphan ⇒ reality (reported) is the truth (events were missed/failed):
-            // sync predicted to it so the maker gate / capital / reconcile see the real position.
-            self.aster_pos.entry(m.clone()).or_default().qty = rep_a;
-            self.hl_pos.entry(m.clone()).or_default().qty = rep_h;
-            // ── OUTSTANDING-RECOVERY GUARD ──
-            // Never race a second recovery order onto the wire for this market while one is
-            // still in flight. Its signed remaining qty is already folded into
-            // `effective_net` above, so this only fires in the arithmetic edge where a net
-            // remains anyway — skip, do NOT overwrite the outstanding intent's record.
-            if self
-                .hedges
-                .values()
-                .any(|h| h.market == m && h.recovery && h.state.is_in_flight())
-            {
-                warn!("orphan recovery skip {m}: a recovery hedge is still in flight; deferring");
+            if pred_a != rep_a || pred_h != rep_h {
+                // Backfill native cumulative maker execution before changing the
+                // economic ledger. Late private fills then apply zero extra delta.
+                need_maker_backfill |= pred_a != rep_a;
+                self.freeze_and_sweep(now_ns, "position_mismatch_reconcile");
                 continue;
             }
-            // ── THROTTLE + ANTI-FLIP GUARD ──
-            // Re-fire only when the wall-clock cooldown elapsed AND a STRICTLY NEWER snapshot
-            // arrived. Additionally: if the recovery would REVERSE direction from the last action
-            // (sell→buy or vice-versa) within 3× cooldown, suppress it — a flip that fast is
-            // almost certainly a transient snapshot oscillation, not a real orphan reversal.
-            let hedge_side = if effective_net > Decimal::ZERO { Side::Sell } else { Side::Buy };
-            if let Some(&(last_ns, last_src, last_side)) = self.last_recovery.get(&m) {
-                if now_ns.saturating_sub(last_ns) < recovery_cooldown_ns || snap.source_ts_ns <= last_src {
-                    continue;
-                }
-                if let Some(prev_side) = last_side {
-                    if prev_side != hedge_side && now_ns.saturating_sub(last_ns) < recovery_cooldown_ns * 3 {
-                        warn!("orphan anti-flip {m}: would reverse {prev_side:?}→{hedge_side:?} within 3× cooldown; \
-                               suppressing (rep_a={rep_a} rep_h={rep_h} eff={effective_net})");
-                        continue;
+            let completed: Vec<String> = self.hedges.iter().filter(|(_, h)| h.market == m && h.terminal)
+                .map(|(id, _)| id.clone()).collect();
+            let corrected = completed.iter().any(|id| self.hedges[id].purpose == IntentPurpose::ReduceDelta);
+            for id in completed {
+                if let Some(mut h) = self.hedges.remove(&id) {
+                    h.mark_reconciled();
+                    self.journal.progress(now_ns, &h);
+                    if let Some(client) = h.client_id {
+                        self.maker_coverage.insert(client, MakerCoverage { logical_id: h.logical_id, qty: h.filled_qty, quote: h.filled_quote_usd });
                     }
                 }
             }
-            // Diagnostic logging — capture all inputs for post-incident analysis.
-            warn!("orphan recovery ACT {m}: rep_a={rep_a} rep_h={rep_h} in_flight={in_flight} \
-                   pending={pending_signed} → eff_net={effective_net} (${net_notional}) \
-                   pred_a={pred_a} pred_h={pred_h} side={hedge_side:?}");
-            self.last_recovery.insert(m.clone(), (now_ns, snap.source_ts_ns, Some(hedge_side)));
-
-            if net_notional >= hl_min {
-                let qty = effective_net.abs();
-                // Supersede any DANGEROUS (Unknown/timed-out/partial) recovery record for
-                // this market before re-dispatching: reality was just re-confirmed by two
-                // snapshots and predicted is synced to reported above, so the old record's
-                // uncertainty is subsumed — and keeping it would wedge the self-heal's
-                // `hedges.is_empty()` condition forever. Journaled for the audit trail.
-                let superseded: Vec<String> = self
-                    .hedges
-                    .iter()
-                    .filter(|(_, h)| h.market == m && h.recovery && h.state.is_dangerous())
-                    .map(|(hex, _)| hex.clone())
-                    .collect();
-                for hex in superseded {
-                    if let Some(old) = self.hedges.remove(&hex) {
-                        self.journal.record(now_ns, "recovery_superseded", Some(m.0.clone()), serde_json::json!({
-                            "cloid": hex,
-                            "state": old.state.as_str(),
-                            "qty": old.qty.to_string(),
-                            "filled_qty": old.filled_qty.to_string(),
-                        }));
-                    }
-                }
-                // Fresh salted cloid per dispatch — the venue does not dedupe indices, so a
-                // reused id against a possibly-live earlier order would cross-attribute fills.
-                let attempt = {
-                    let seq = self.recovery_attempt_seq.entry(m.clone()).or_insert(0);
-                    let cur = *seq;
-                    *seq = seq.saturating_add(1);
-                    cur
-                };
-                let cloid = super::ids::Cloid::recovery_attempt(&m, super::fills::cum_scaled(effective_net), attempt);
-                let cloid_hex = cloid.to_hex();
-                let aggressive_px = cap_aggressive_px(mark, hedge_side, emerg_slip);
-                warn!("orphan recovery: net {effective_net} on {m} (${net_notional}); HL hedge {hedge_side:?} {qty} (cloid {cloid_hex} attempt {attempt})");
-                self.journal.record(now_ns, "recover_hedge", Some(m.0.clone()), serde_json::json!({"net": effective_net.to_string(), "side": hedge_side.as_str(), "qty": qty.to_string(), "attempt": attempt}));
-                let mut intent = HedgeIntent::with_qty(cloid, m.clone(), hedge_side, qty, mark, now_ns);
-                intent.recovery = true;
-                intent.mark_submitted(now_ns);
-                self.hedges.insert(cloid_hex.clone(), intent.clone());
-                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: emerg_slip, emergency: true }).is_err() {
-                    if let Some(h) = self.hedges.get_mut(&cloid_hex) {
-                        h.mark_unknown();
-                    }
-                    self.freeze(now_ns, "recovery_dispatch_failed");
-                }
-            } else {
-                let orphan_a = rep_a - pending_signed;
-                warn!("orphan recovery: sub-min net {effective_net} on {m} (${net_notional}); flatten orphan reduce-only (orphan_a={orphan_a} hl={rep_h})");
-                self.journal.record(now_ns, "recover_flatten", Some(m.0.clone()), serde_json::json!({"net": effective_net.to_string(), "orphan_a": orphan_a.to_string(), "hl": rep_h.to_string()}));
-                if orphan_a.abs() * mark > dust {
-                    let side = if orphan_a > Decimal::ZERO { Side::Sell } else { Side::Buy };
-                    let client_id = self.orders.next_flatten_client_id(&m);
-                    // Stamp the hot action: a snapshot straddling this flatten must not be
-                    // trusted by the backstop (mirrors the maker-fill stamp).
-                    self.last_hot_action_ns.insert(m.clone(), now_ns);
-                    match self.try_send_aster_cmd(
-                        ExecCommand::FlattenAster { market: m.clone(), side, qty: orphan_a.abs(), client_id },
-                        AsterCommandPriority::Safety,
-                        now_ns,
-                    ) {
-                        ExecDispatch::Sent => {}
-                        ExecDispatch::BudgetBlocked => {
-                            self.note_aster_budget_block(now_ns, "recovery_flatten", AsterCommandPriority::Safety);
-                            self.freeze(now_ns, "recovery_flatten_budget_blocked");
-                        }
-                        ExecDispatch::QueueFull | ExecDispatch::QueueClosed => {
-                            error!("CRITICAL: recovery FlattenAster for {m} dropped (queue/backpressure); freezing — orphan unresolved");
-                            self.freeze(now_ns, "recovery_flatten_dispatch_failed");
-                        }
-                    }
-                }
-                if rep_h.abs() * mark > dust {
-                    let side = if rep_h > Decimal::ZERO { Side::Sell } else { Side::Buy };
-                    let aggressive_px = cap_aggressive_px(mark, side, emerg_slip);
-                    if self.hedge_tx.try_send(HedgeCommand::Flatten { market: m.clone(), side, qty: rep_h.abs(), aggressive_px, slippage_bps: emerg_slip }).is_err() {
-                        error!("CRITICAL: recovery HL Flatten for {m} dropped (queue full); freezing — orphan unresolved");
-                        self.freeze(now_ns, "recovery_flatten_dispatch_failed");
-                    }
-                }
+            let net = pred_a + pred_h;
+            if net == Decimal::ZERO {
+                self.pending.remove(&m);
+                self.correction_needed.remove(&m);
+                self.correction_attempts.remove(&m);
+                self.orphan_seen.remove(&m);
+                if self.uncertain_makers.is_empty() && !self.orders.live_slots().iter().any(|(market, _)| market == &m) { self.logical_ids.remove(&m); }
+                continue;
             }
+            if corrected {
+                if let Some(pending) = self.pending.get_mut(&m) { pending.signed_qty = net; }
+                self.correction_needed.insert(m.clone());
+            }
+            let pending = self.pending.get(&m).map(|p| p.signed_qty).unwrap_or_default();
+            if !self.correction_needed.contains(&m) && net == pending { continue; }
+            if !self.correction_needed.contains(&m) {
+                let confirmed = self.orphan_seen.get(&m).is_some_and(|&(old_net, src)| old_net == net && snap.source_ts_ns > src);
+                if !confirmed { self.orphan_seen.insert(m.clone(), (net, snap.source_ts_ns)); continue; }
+                self.correction_needed.insert(m.clone());
+                self.freeze_and_sweep(now_ns, "confirmed_residual");
+            }
+            self.dispatch_correction(&m, net, pred_a, pred_h, now_ns);
         }
-        // SELF-HEAL: once there is no outstanding hedge work (the map holds only non-resolved
-        // intents; empty ⇒ none in-flight or dangerous) and positions reconcile, clear a latched
-        // freeze. This lets a TRANSIENT issue the backstop already resolved (a single timed-out or
-        // rejected hedge) stop halting the bot — important for a long multi-round live run — while
-        // staying conservative: it un-freezes ONLY when verifiably clean + delta-neutral AND the
-        // Aster fill stream is fresh (so we trust that corrective fills are being delivered and the
-        // synced predicted positions reflect reality, not a silent-stream phantom).
-        let stream_fresh = self
-            .aster_stream
-            .as_ref()
-            .is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms);
-        let no_open_bot_orders = !self.has_open_aster_bot_orders_in(&snap);
-        let clean = self.frozen
-            && stream_fresh
-            && self.hedges.is_empty()
-            && self.positions_reconciled()
-            && self.sweep_pending.is_none()
-            && no_open_bot_orders;
+        let queries_empty = self.account.maker_queries().is_empty();
+        if need_maker_backfill && queries_empty { self.account.publish_maker_queries(self.orders.recent_makers()); }
+        else if !need_maker_backfill && !queries_empty { self.account.publish_maker_queries(Vec::new()); }
+        let stream_fresh = self.aster_stream.as_ref().is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms);
+        let clean = self.frozen && !self.draining && !self.breaker_tripped && self.journal.healthy()
+            && self.uncertain_makers.is_empty() && self.correction_needed.is_empty() && self.hedges.is_empty()
+            && self.positions_reconciled() && stream_fresh && self.sweep_pending.is_none()
+            && !self.has_open_aster_bot_orders_in(&snap)
+            && !self.hedge_tx.is_closed() && !self.exec_tx.is_closed()
+            && self.hedge_readiness.as_ref().is_none_or(|r| r.is_ready());
         if clean {
-            // T2.1 PERSISTENCE: require the clean condition to hold again in a STRICTLY NEWER snapshot
-            // before clearing the freeze, so a transient snapshot lag (positions momentarily reading
-            // neutral) can't unfreeze on a phantom-clean reading. Mirrors the `orphan_seen` gate.
             match self.heal_confirm {
-                Some(first_src) if snap.source_ts_ns > first_src => {
+                Some(src) if snap.source_ts_ns > src => {
                     self.frozen = false;
-                    self.account.hot.set_trading_allowed(true);
                     self.heal_confirm = None;
-                    warn!("freeze cleared (self-healed): clean across two snapshots (no outstanding hedges + reconciled)");
-                    self.journal.record(now_ns, "unfreeze", None, serde_json::json!({"reason": "self_healed"}));
+                    self.journal.reason(now_ns, "unfreeze", None, "terminal executions and positions reconciled");
                 }
-                Some(_) => {} // first-seen snapshot not yet superseded — keep waiting
-                None => self.heal_confirm = Some(snap.source_ts_ns), // first clean sighting — record it
+                None => self.heal_confirm = Some(snap.source_ts_ns),
+                _ => {}
             }
-        } else {
-            self.heal_confirm = None; // condition broke (or not frozen) — reset the persistence record
-        }
+        } else { self.heal_confirm = None; }
     }
+
+    fn dispatch_correction(&mut self, market: &MarketId, net: Decimal, aster: Decimal, lighter: Decimal, now_ns: i64) {
+        if self.correction_attempts.get(market).copied().unwrap_or(0) >= 2 { return; }
+        if self.hedges.values().any(|h| &h.market == market && !h.state.is_resolved()) { return; }
+        let Some(ctx) = self.ctx.get(market) else { return };
+        let aster_step = ctx.spec.step;
+        let lighter_step = ctx.spec.hl_qty_step;
+        let side = if net > Decimal::ZERO { Side::Sell } else { Side::Buy };
+        let same_sign = |q: Decimal| q != Decimal::ZERO && (q > Decimal::ZERO) == (net > Decimal::ZERO);
+        let a_qty = if same_sign(aster) { crate::decimal::floor_to_step(net.abs().min(aster.abs()), aster_step) } else { Decimal::ZERO };
+        let h_qty = if same_sign(lighter) { crate::decimal::floor_to_step(net.abs().min(lighter.abs()), lighter_step) } else { Decimal::ZERO };
+        let slip = self.cfg.live.hyperliquid.emergency_slippage_bps;
+        let selected = if a_qty > Decimal::ZERO {
+            self.fresh_aster_touch_book(market, now_ns).and_then(|b| b.book.mid().map(|p| (Venue::Aster, a_qty, p, b.source.as_str(), b.age_ms)))
+        } else { None }.or_else(|| {
+            if h_qty <= Decimal::ZERO { return None; }
+            self.fresh_hl_hedge_book_hot_first(market, now_ns, side, h_qty)
+                .and_then(|b| crossing_hedge_px(&b.book, side, slip).map(|p| (Venue::Hyperliquid, h_qty, p, b.path.as_str(b.source), b.age_ms)))
+        });
+        let Some((venue, qty, price, source, age_ms)) = selected else { return };
+        let cloid = self.orders.next_attempt_id(market);
+        let logical_id = self.logical_id(market);
+        let mut intent = HedgeIntent::with_qty(cloid, market.clone(), side, qty, price, now_ns);
+        intent.logical_id = logical_id;
+        intent.venue = venue;
+        intent.book_source = Some(source);
+        intent.book_age_ms = Some(age_ms);
+        intent.purpose = IntentPurpose::ReduceDelta;
+        intent.recovery = true;
+        intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
+        intent.mark_submitted(now_ns);
+        let sent = if venue == Venue::Aster {
+            let client_id = self.orders.next_flatten_client_id(market);
+            intent.client_id = Some(client_id.clone());
+            self.hedges.insert(cloid.to_hex(), intent.clone());
+            self.try_send_aster_cmd(ExecCommand::FlattenAster { intent, client_id }, AsterCommandPriority::Safety, now_ns) == ExecDispatch::Sent
+        } else {
+            self.hedges.insert(cloid.to_hex(), intent.clone());
+            self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px: price, slippage_bps: slip, emergency: true }).is_ok()
+        };
+        if sent {
+            *self.correction_attempts.entry(market.clone()).or_insert(0) += 1;
+            self.last_hot_action_ns.insert(market.clone(), now_ns);
+        } else if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
+            h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
+        }
+        if let Some(h) = self.hedges.get(&cloid.to_hex()) { self.journal.progress(now_ns, h); }
+    }
+
 }
 
 const PRIORITY_DRAIN_LIMIT: usize = 64;
+
+async fn dispatch_execution_event(strat: &mut Strategy, ev: ExecEvent, now_ns: i64) {
+    match ev {
+        ExecEvent::MakerFill(fill) => strat.handle_maker_fill(fill, now_ns).await,
+        ExecEvent::MakerOrderProgress { market, side, client_id, order_id, cumulative_qty, cumulative_quote_usd, terminal, event_time_ms } => {
+            strat.handle_maker_order_progress(market, side, client_id, order_id, cumulative_qty,
+                cumulative_quote_usd, terminal, event_time_ms, now_ns).await;
+        }
+        ev => strat.handle_exec_event(ev, now_ns),
+    }
+}
 
 /// Drain latency-critical events between markets during a tick/wake reprice sweep.
 /// This prevents a maker fill from waiting behind a full all-market reprice batch.
@@ -3562,7 +3068,7 @@ async fn drain_priority_events(
         }
 
         if let Ok(ev) = exec_events.try_recv() {
-            strat.handle_exec_event(ev, now_ns);
+            dispatch_execution_event(strat, ev, now_ns).await;
             continue;
         }
 
@@ -3585,7 +3091,7 @@ pub async fn run_strategy(
     mut maker_fills: Receiver<AsterFill>,
     mut trade_prints: Receiver<TradePrint>,
     shutdown: tokio_util::sync::CancellationToken,
-) {
+) -> anyhow::Result<()> {
     use crate::hotpath::clock::mono_now_ns;
     info!("strategy loop started ({} markets)", strat.markets.len());
     let mut tick = tokio::time::interval(tokio::time::Duration::from_millis(
@@ -3609,7 +3115,7 @@ pub async fn run_strategy(
                 strat.handle_maker_fill(fill, mono_now_ns()).await;
             }
             Some(ev) = exec_events.recv() => {
-                strat.handle_exec_event(ev, mono_now_ns());
+                dispatch_execution_event(&mut strat, ev, mono_now_ns()).await;
             }
             Some(print) = trade_prints.recv() => {
                 strat.handle_trade_print(print, mono_now_ns()).await;
@@ -3700,32 +3206,38 @@ pub async fn run_strategy(
             }
         }
     }
-    // Shutdown fill-drain: a maker fill already queued when ctrl-c landed must still be
-    // dispatched to the hedge worker. The workers stay up until this function returns —
-    // run() waits on the strategy supervision channel before sending the worker Shutdown
-    // commands. The userstream's shutdown arm drops its fill sender, so the drain normally
-    // completes in milliseconds; the deadline bounds abnormal cases (paper mode keeps a
-    // sender alive for the session).
-    let drain_deadline =
-        tokio::time::Instant::now() + tokio::time::Duration::from_secs(3);
+    strat.revoke_makers();
+    strat.draining = true;
+    strat.frozen = true;
+    strat.correction_needed.extend(strat.pending.keys().cloned());
+    for m in strat.markets.clone() { strat.cancel_both_sides(&m, mono_now_ns()); }
+    if let Some(control) = &strat.drain_control { control.quiesced.store(true, std::sync::atomic::Ordering::Release); }
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(65);
+    let mut drain_tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
     loop {
-        // Exec events first: acks/rejects that update slot state consumed by fill handling.
-        while let Ok(ev) = exec_events.try_recv() {
-            strat.handle_exec_event(ev, mono_now_ns());
+        drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+        let now_ns = mono_now_ns();
+        let barrier_ns = strat.drain_control.as_ref().map(|c| c.maker_barrier.completed_ns()).unwrap_or(1);
+        let snap = strat.account.load();
+        let maker_clear = if strat.exec_mode.sends_real_orders() {
+            barrier_ns > 0 && snap.read_start_ns > barrier_ns && !strat.has_open_aster_bot_orders_in(&snap)
+        } else { true };
+        if maker_clear && strat.uncertain_makers.is_empty() && strat.hedges.is_empty() && strat.pending.is_empty() && strat.correction_needed.is_empty()
+            && maker_fills.is_empty() && exec_events.is_empty() && strat.orders.live_slots().is_empty() {
+            info!("strategy quiesced with all execution evidence reconciled");
+            return Ok(());
         }
-        match tokio::time::timeout_at(drain_deadline, maker_fills.recv()).await {
-            Ok(Some(fill)) => {
-                warn!("shutdown drain: dispatching maker fill queued at shutdown");
-                strat.handle_maker_fill(fill, mono_now_ns()).await;
-            }
-            Ok(None) => break, // fill senders dropped and queue empty — nothing can race
-            Err(_) => {
-                warn!("shutdown drain: 3s deadline reached with fill senders still open");
-                break;
+        tokio::select! {
+            biased;
+            Some(fill) = maker_fills.recv() => strat.handle_maker_fill(fill, mono_now_ns()).await,
+            Some(ev) = exec_events.recv() => dispatch_execution_event(&mut strat, ev, mono_now_ns()).await,
+            _ = drain_tick.tick() => { strat.refresh_mark_cache(); strat.on_tick(now_ns).await; }
+            _ = tokio::time::sleep_until(deadline) => {
+                strat.journal.reason(mono_now_ns(), "shutdown_unresolved", None, "execution or residual unresolved after bounded drain");
+                anyhow::bail!("shutdown retains {} execution attempts and {} residual obligations", strat.hedges.len(), strat.correction_needed.len());
             }
         }
     }
-    info!("strategy loop stopped");
 }
 
 #[cfg(test)]
@@ -3868,7 +3380,7 @@ mod tests {
 
     #[test]
     fn fill_telemetry_hl_source_prefers_fresh_bbo() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -3887,7 +3399,7 @@ mod tests {
 
     #[test]
     fn fill_telemetry_hl_source_falls_back_when_bbo_crossed() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -3911,7 +3423,7 @@ mod tests {
 
     #[test]
     fn fill_hedge_source_falls_back_when_bbo_depth_insufficient() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -3934,7 +3446,7 @@ mod tests {
 
     #[test]
     fn fill_hedge_source_uses_bbo_with_depth_factor() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -3957,7 +3469,7 @@ mod tests {
 
     #[test]
     fn hot_hl_bbo_selected_when_fresh_and_10x_deep() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -3979,7 +3491,7 @@ mod tests {
 
     #[test]
     fn hot_hl_bbo_depth_check_is_side_specific() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -4005,7 +3517,7 @@ mod tests {
 
     #[test]
     fn hot_hl_bbo_older_than_l2_is_ignored() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -4030,7 +3542,7 @@ mod tests {
 
     #[tokio::test]
     async fn primary_fill_hedge_prefers_hot_bbo_when_deep_enough() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -4049,6 +3561,8 @@ mod tests {
             cum_filled_qty: dec!(0.2),
             event_time_ms: 1_700_000_000_000,
             reduce_only: false,
+            commission: None,
+            commission_asset: None,
         };
 
         strat.handle_maker_fill(fill, 2_000_000).await;
@@ -4068,7 +3582,7 @@ mod tests {
     #[tokio::test]
     async fn priority_lane_routes_acked_cancels_and_falls_back_when_full() {
         use crate::livebot::exec::command::ExecCommand;
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(8);
         let (htx, _hrx) = tokio::sync::mpsc::channel(8);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -4118,7 +3632,7 @@ mod tests {
         // A maker fill already queued when the shutdown token fires must still reach
         // the hedge dispatch: the loop exits into a bounded drain instead of dropping
         // the queue on the floor (run() keeps the workers up until this returns).
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
         let strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -4126,7 +3640,7 @@ mod tests {
         publish_hl_bbo_hot(&strat, hl_bbo_at(dec!(2.1), dec!(2.1), ts()), 1_000_000);
 
         let wake = Arc::new(tokio::sync::Notify::new());
-        let (_ev_tx, ev_rx) = tokio::sync::mpsc::channel(16);
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(16);
         let (fill_tx, fill_rx) = tokio::sync::mpsc::channel(16);
         let (_tp_tx, tp_rx) = tokio::sync::mpsc::channel(16);
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -4143,92 +3657,23 @@ mod tests {
                 cum_filled_qty: dec!(0.2),
                 event_time_ms: 1_700_000_000_000,
                 reduce_only: false,
+            commission: None,
+            commission_asset: None,
             })
             .await
             .unwrap();
         drop(fill_tx); // mirrors the userstream's shutdown arm dropping its sender
 
-        run_strategy(strat, wake, ev_rx, fill_rx, tp_rx, shutdown).await;
-
-        let cmd = hrx.try_recv().expect("queued fill must be hedged during the drain");
+        let task = tokio::spawn(run_strategy(strat, wake, ev_rx, fill_rx, tp_rx, shutdown));
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), hrx.recv()).await.unwrap().unwrap();
         assert!(matches!(cmd, HedgeCommand::Hedge { .. }));
+        for event in super::super::exec::PaperExec::new().on_hedge_command(cmd) { ev_tx.send(event).await.unwrap(); }
+        tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
     }
 
-    #[test]
-    fn fill_telemetry_buy_touch_distance_marks_invalid_when_too_close_or_wrong_side() {
-        let book = Arc::new(OrderBook::from_levels(
-            vec![(dec!(100.00), dec!(5))],
-            vec![(dec!(100.50), dec!(5))],
-            ts(),
-            ts(),
-        ));
-        let valid = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book: book.clone(), age_ms: 0 },
-            Side::Buy,
-            dec!(99.75),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(!valid.quote_invalid_at_fill);
-        assert!(valid.distance_bps > dec!(20.0));
 
-        let too_close = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book: book.clone(), age_ms: 0 },
-            Side::Buy,
-            dec!(99.90),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(too_close.quote_invalid_at_fill);
 
-        let wrong_side = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book, age_ms: 0 },
-            Side::Buy,
-            dec!(100.01),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(wrong_side.quote_invalid_at_fill);
-        assert!(wrong_side.signed_distance_bps < Decimal::ZERO);
-    }
 
-    #[test]
-    fn fill_telemetry_sell_touch_distance_marks_invalid_when_too_close_or_wrong_side() {
-        let book = Arc::new(OrderBook::from_levels(
-            vec![(dec!(99.50), dec!(5))],
-            vec![(dec!(100.00), dec!(5))],
-            ts(),
-            ts(),
-        ));
-        let valid = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book: book.clone(), age_ms: 0 },
-            Side::Sell,
-            dec!(100.30),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(!valid.quote_invalid_at_fill);
-        assert!(valid.distance_bps > dec!(20.0));
-
-        let too_close = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book: book.clone(), age_ms: 0 },
-            Side::Sell,
-            dec!(100.10),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(too_close.quote_invalid_at_fill);
-
-        let wrong_side = aster_fill_touch_context(
-            SelectedAsterTouch { source: AsterQuoteSource::L2, book, age_ms: 0 },
-            Side::Sell,
-            dec!(99.99),
-            dec!(20.0),
-        )
-        .unwrap();
-        assert!(wrong_side.quote_invalid_at_fill);
-        assert!(wrong_side.signed_distance_bps < Decimal::ZERO);
-    }
 
     #[test]
     fn hl_bbo_selected_when_fresh_and_sufficient() {
@@ -4506,22 +3951,7 @@ mod tests {
         assert!(crossing_hedge_px(&empty, Side::Sell, slip).is_none());
     }
 
-    #[test]
-    fn effective_aster_cap_shrinks_to_real_collateral() {
-        // Real ~$124 collateral, $26 buffer, 1x lev, single market: cap = (124-26)*1 = 98, below the
-        // $200 static config cap, so the dynamic margin cap binds (this is the incident fix).
-        assert_eq!(effective_aster_cap_notional(dec!(200), dec!(124), dec!(26), dec!(1), dec!(0)), dec!(98));
-        // Buffer >= collateral => zero cap (the increasing side stops quoting entirely).
-        assert_eq!(effective_aster_cap_notional(dec!(200), dec!(20), dec!(26), dec!(1), dec!(0)), dec!(0));
-        // The static config cap is the smaller of the two => it still wins.
-        assert_eq!(effective_aster_cap_notional(dec!(50), dec!(124), dec!(26), dec!(1), dec!(0)), dec!(50));
-        // Leverage scales the usable notional; still clamped by the static cap.
-        assert_eq!(effective_aster_cap_notional(dec!(200), dec!(124), dec!(26), dec!(2), dec!(0)), dec!(196));
-        // Account-wide collateral: OTHER markets' Aster notional is deducted first.
-        assert_eq!(effective_aster_cap_notional(dec!(200), dec!(124), dec!(26), dec!(1), dec!(40)), dec!(58));
-        // Other markets consume more than the usable collateral => clamp to zero (never negative).
-        assert_eq!(effective_aster_cap_notional(dec!(200), dec!(124), dec!(26), dec!(1), dec!(200)), dec!(0));
-    }
+
 
     #[test]
     fn gate_closed_cancels_resting_holds_empty() {
@@ -4641,7 +4071,7 @@ lighter_symbol = "BTC"
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
         reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
-        let account = AccountState::new(rust_decimal_macros::dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
@@ -4677,7 +4107,7 @@ lighter_symbol = "BTC"
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
         reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
-        let account = AccountState::new(rust_decimal_macros::dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
@@ -4704,85 +4134,24 @@ lighter_symbol = "BTC"
     }
 
     #[test]
-    fn recovery_defers_on_hl_stream_down_and_resumes_after_publish() {
-        // The orphan backstop prices emergency orders off the HL mid — with the HL stream
-        // known-down that mid is blind, so recovery must DEFER (not act, not seed the gate)
-        // and resume once a fresh snapshot lands.
-        let account = AccountState::new(dec!(50));
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
-        let m: MarketId = "BTC".into();
-        strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
-        strat.registry.cell(&m, VenueTag::Hyperliquid).unwrap().mark_stream_down();
-
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 10_000_000, 9_000_000));
-        strat.recover_orphans(11_000_000);
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 20_000_000_000, 19_000_000_000));
-        strat.recover_orphans(21_000_000_000);
-        assert!(hrx.try_recv().is_err(), "recovery must defer while the HL stream is known-down");
-        assert!(!strat.orphan_seen.contains_key(&m), "deferred ticks must not seed the persistence gate");
-
-        // A fresh full snapshot restores trust; the persistence gate then confirms as usual.
-        let (_, hb) = books();
-        strat.registry.cell(&m, VenueTag::Hyperliquid).unwrap().publish(hb);
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 30_000_000_000, 29_000_000_000));
-        strat.recover_orphans(31_000_000_000);
-        assert!(hrx.try_recv().is_err(), "first trusted sighting only seeds the gate");
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 40_000_000_000, 39_000_000_000));
-        strat.recover_orphans(41_000_000_000);
-        assert!(
-            matches!(hrx.try_recv(), Ok(HedgeCommand::Hedge { .. })),
-            "recovery must resume and dispatch after a fresh publish"
-        );
+    fn correction_waits_for_its_venue_and_reduces_only_the_net_delta() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account,ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().mark_stream_down(); strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),now);
+        assert!(hrx.try_recv().is_err() && erx.try_recv().is_err()); let (_,book)=books(); strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().publish(book);
+        strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),crate::hotpath::clock::mono_now_ns());
+        let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("reduce-only hedge expected")};
+        assert_eq!((intent.venue,intent.purpose,intent.hedge_side,intent.qty),(Venue::Hyperliquid,IntentPurpose::ReduceDelta,Side::Sell,dec!(0.05)));
+        assert!(erx.try_recv().is_err());
     }
 
-    #[tokio::test]
-    async fn orphan_hedge_names_gate_reason_and_substep_fill_reconciles() {
-        use crate::hotpath::clock::mono_now_ns;
-        let specs = vec![spec()];
-        let elig: HashMap<MarketId, bool> = [("BTC".into(), true)].into_iter().collect();
-        let reg = Arc::new(VenueRegistry::new(&["BTC".into()]));
-        let (ab, hb) = books();
-        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
-        reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
-        let account = AccountState::new(dec!(5));
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = Strategy::new(
-            full_cfg(), &specs, &elig, reg.clone(), account, Journal::null(),
-            SessionId::from_tag("t"), etx, htx, ExecMode::Paper,
-        );
-        strat.mark_clean_start();
-        let now = mono_now_ns();
-        assert_eq!(strat.maker_gate_reason(&"BTC".into(), now), None, "gate open before any orphan");
-
-        // Inject a partially-filled (dangerous/orphan) hedge. The gate must NAME the cause as
-        // ORPHAN_HEDGE — not silently suppress quoting (the bug) nor mislabel it FEED_STALE.
-        let cloid = crate::livebot::ids::Cloid::recovery(&"BTC".into(), 1);
-        let mut h = HedgeIntent::with_qty(cloid, "BTC".into(), Side::Sell, dec!(0.5), dec!(100), now);
-        h.mark_submitted(now);
-        strat.hedges.insert(cloid.to_hex(), h);
-        // A HedgeFill leaving only a SUB-STEP remainder (qty step is 0.001) must RECONCILE — the leg
-        // is hedged to within an untradeable increment, so it must not latch PartiallyFilled forever.
-        strat.handle_exec_event(ExecEvent::HedgeFill { cloid, filled_qty: dec!(0.4995), px: dec!(100), fee_usd: Decimal::ZERO }, now);
-        assert!(
-            strat.hedges.values().all(|h| !h.state.is_dangerous()),
-            "sub-step remainder must reconcile, not orphan"
-        );
-        assert_eq!(strat.maker_gate_reason(&"BTC".into(), now), None, "gate reopens once the orphan reconciles");
-
-        // And a GENUINE shortfall (bigger than the step) stays an orphan and the gate names it.
-        let cloid2 = crate::livebot::ids::Cloid::recovery(&"BTC".into(), 2);
-        let mut h2 = HedgeIntent::with_qty(cloid2, "BTC".into(), Side::Sell, dec!(0.5), dec!(100), now);
-        h2.mark_submitted(now);
-        strat.hedges.insert(cloid2.to_hex(), h2);
-        strat.handle_exec_event(ExecEvent::HedgeFill { cloid: cloid2, filled_qty: dec!(0.2), px: dec!(100), fee_usd: Decimal::ZERO }, now);
-        assert_eq!(
-            strat.maker_gate_reason(&"BTC".into(), now),
-            Some("ORPHAN_HEDGE"),
-            "a real partial (remainder > step) keeps the gate closed with a NAMED reason"
-        );
+    #[test]
+    fn terminal_partial_keeps_one_executable_lot_as_a_residual() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account,ExecMode::Paper); let m:MarketId="BTC".into(); let id=strat.orders.next_attempt_id(&m);
+        strat.hedges.insert(id.to_hex(),HedgeIntent::with_qty(id,m.clone(),Side::Sell,dec!(0.5),dec!(100),1));
+        strat.apply_execution_progress(id,dec!(0.499),Some(dec!(49.9)),Some(dec!(0)),true,None,Some(1700000000000),2);
+        assert_eq!(strat.hedges[&id.to_hex()].remaining_qty(),dec!(0.001)); assert!(!strat.hedges[&id.to_hex()].state.is_resolved()); assert!(strat.correction_needed.contains(&m));
     }
 
     #[tokio::test]
@@ -4794,7 +4163,7 @@ lighter_symbol = "BTC"
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
         reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
@@ -4849,6 +4218,18 @@ lighter_symbol = "BTC"
 
     // --- fast-VPS hardening tests (Tier 1/2) ---
 
+    fn funded_snapshot(src: i64, a: Decimal, h: Decimal) -> AccountSnapshot {
+        let mut snap = AccountSnapshot::empty();
+        snap.source_ts_ns=src; snap.read_start_ns=src; snap.aster_margin_source_ns=src; snap.hl_margin_source_ns=src;
+        snap.aster_available_usd=dec!(1000); snap.aster_wallet_usd=dec!(1000); snap.hl_withdrawable_usd=dec!(1000);
+        snap.aster_equity_usd=dec!(1000); snap.hl_equity_usd=dec!(1000);
+        for (venue, qty) in [(Venue::Aster,a),(Venue::Hyperliquid,h)] {
+            let pos = crate::livebot::account::ScaledPosition { venue, market:"BTC".into(), signed_qty:qty, entry_px:dec!(100) };
+            if venue==Venue::Aster { snap.aster_positions.push(pos); } else { snap.hl_positions.push(pos); }
+        }
+        snap
+    }
+
     fn live_strat(
         etx: tokio::sync::mpsc::Sender<ExecCommand>,
         htx: tokio::sync::mpsc::Sender<HedgeCommand>,
@@ -4866,7 +4247,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn touch_guard_status_expires_to_base_guard_after_timeout() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -4894,7 +4275,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn zero_touch_hysteresis_timeout_keeps_latch_until_rearm() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -4912,11 +4293,36 @@ lighter_symbol = "BTC"
     }
 
     #[tokio::test]
+    async fn queued_maker_is_not_sent_after_freeze_cancel_or_book_change() {
+        for cause in ["freeze", "targeted_cancel", "book_update"] {
+            let (etx, mut erx) = tokio::sync::mpsc::channel(64);
+            let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+            let mut strat = live_strat(etx, htx, AccountState::default(), ExecMode::Paper);
+            let market: MarketId = "BTC".into();
+            let now = crate::hotpath::clock::mono_now_ns();
+            let versions = (strat.ctx[&market].aster_cell.content_version(), strat.ctx[&market].hedge_cell.content_version());
+            let decision = evaluate_side(&edge(), &qcfg(), &books().0, &books().1, Side::Buy,
+                &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true);
+            strat.apply_decision_with_books(&market, Side::Buy, decision, &MarketScale::from_spec(&spec()), now, Some(versions)).await;
+            let command = erx.try_recv().expect("quote enqueued before invalidation");
+            match cause {
+                "freeze" => strat.freeze(now, "test"),
+                "targeted_cancel" => { strat.cancel_target(&market, Side::Buy, now); }
+                _ => strat.ctx[&market].hedge_cell.publish(books().1),
+            }
+            let events = crate::livebot::exec::paper::PaperExec::new().on_exec_command(command);
+            assert!(matches!(events.as_slice(), [ExecEvent::PlaceReject { .. }]), "{cause}: revoked quote must never ack");
+            for event in events { strat.handle_exec_event(event, now); }
+            assert!(!strat.orders.slot(&market, Side::Buy).unwrap().is_live());
+        }
+    }
+
+    #[tokio::test]
     async fn min_requote_interval_throttles_nonurgent_replace_only() {
         // T1.4: the live path now honors `min_requote_interval_ms`. NON-URGENT replaces (price/qty
         // drift) are throttled; an urgent `NoLongerProfitable` replace BYPASSES. (`Place`/`Cancel`
         // are never gated.) Mirrors the SimEngine.
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Paper);
@@ -4957,7 +4363,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn live_reduce_only_no_longer_profitable_uses_cancel_only() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -4993,7 +4399,7 @@ lighter_symbol = "BTC"
         // T2.1: a latched freeze clears only when the clean condition (no outstanding hedges +
         // positions reconciled + stream fresh) holds again in a STRICTLY NEWER snapshot.
         use crate::livebot::account::AccountSnapshot;
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5002,6 +4408,9 @@ lighter_symbol = "BTC"
         let now = 1_000_000_000_i64;
         let flat = |src: i64| AccountSnapshot {
             aster_available_usd: dec!(1000),
+            aster_wallet_usd: dec!(1000),
+            aster_margin_source_ns: src,
+            hl_margin_source_ns: src,
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
@@ -5028,7 +4437,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn frozen_after_clean_start_is_not_reported_as_not_reconciled() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -5045,7 +4454,7 @@ lighter_symbol = "BTC"
     #[test]
     fn clean_safety_sweep_is_not_immediately_requeued_by_frozen_gate() {
         use crate::livebot::account::AccountSnapshot;
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5060,6 +4469,9 @@ lighter_symbol = "BTC"
 
         account.publish(AccountSnapshot {
             aster_available_usd: dec!(1000),
+            aster_wallet_usd: dec!(1000),
+            aster_margin_source_ns: 200,
+            hl_margin_source_ns: 200,
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
@@ -5082,7 +4494,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn failed_cancel_dispatch_freezes_and_arms_safety_sweep() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(1);
         let etx_fill = etx.clone();
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
@@ -5106,7 +4518,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn sweep_pending_suppresses_targeted_cancel_spam() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -5131,7 +4543,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn pending_cancel_retry_backoff_suppresses_repeat_cancel() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -5157,7 +4569,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn urgent_no_longer_profitable_respects_aster_command_budget() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -5170,6 +4582,7 @@ lighter_symbol = "BTC"
             other => panic!("expected place, got {other:?}"),
         };
         let t0 = 1_000_000_000_i64;
+        strat.account.publish(funded_snapshot(t0, dec!(0), dec!(0)));
 
         strat.apply_decision(&m, Side::Buy, SideDecision::Place(Box::new(desired.clone())), &scale, t0).await;
         let cid = match erx.try_recv() {
@@ -5194,7 +4607,7 @@ lighter_symbol = "BTC"
 
     #[tokio::test]
     async fn aster_rate_limit_event_freezes_and_backs_off_commands() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account, ExecMode::Live);
@@ -5226,7 +4639,7 @@ lighter_symbol = "BTC"
         // `mono_now_ns()` collision must not be trusted). Only reads that began STRICTLY AFTER the
         // action are trusted (seed the gate).
         use crate::livebot::account::{AccountSnapshot, ScaledPosition, Venue};
-        let account = AccountState::new(dec!(50));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5239,6 +4652,9 @@ lighter_symbol = "BTC"
         strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
         let orphan = |src: i64, read_start: i64| AccountSnapshot {
             aster_available_usd: dec!(1000),
+            aster_wallet_usd: dec!(1000),
+            aster_margin_source_ns: src,
+            hl_margin_source_ns: src,
             hl_withdrawable_usd: dec!(1000),
             aster_equity_usd: dec!(1000),
             hl_equity_usd: dec!(1000),
@@ -5287,7 +4703,7 @@ lighter_symbol = "BTC"
     fn recovery_skips_redispatch_while_recovery_in_flight() {
         // An in-flight recovery intent that only partially covers the net must NOT trigger a
         // second overlapping recovery order — skip and defer, keep the outstanding record.
-        let account = AccountState::new(dec!(50));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5314,48 +4730,16 @@ lighter_symbol = "BTC"
     }
 
     #[test]
-    fn recovery_redispatches_salted_cloid_after_dangerous() {
-        // After a dangerous (Unknown) recovery attempt, a confirmed persistent orphan may be
-        // re-dispatched — but ONLY under a fresh salted cloid (the venue does not dedupe
-        // client order indices), and the superseded dangerous record must be removed.
-        let account = AccountState::new(dec!(50));
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
-        let m: MarketId = "BTC".into();
-        strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
-        let base_cloid = crate::livebot::ids::Cloid::recovery(&m, crate::livebot::fills::cum_scaled(dec!(0.5)));
-        let mut dangerous = HedgeIntent::with_qty(base_cloid, m.clone(), Side::Sell, dec!(0.5), dec!(100), 1);
-        dangerous.recovery = true;
-        dangerous.mark_submitted(1);
-        dangerous.mark_unknown();
-        strat.hedges.insert(base_cloid.to_hex(), dangerous);
-        // Simulate that attempt 0 was already consumed by the dangerous dispatch.
-        strat.recovery_attempt_seq.insert(m.clone(), 1);
-
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 10_000_000, 9_000_000));
-        strat.recover_orphans(11_000_000);
-        assert!(hrx.try_recv().is_err(), "first sighting must not dispatch");
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), 20_000_000_000, 19_000_000_000));
-        strat.recover_orphans(21_000_000_000);
-
-        let cmd = hrx.try_recv().expect("confirmed persistent orphan must redispatch");
-        let HedgeCommand::Hedge { intent, .. } = cmd else {
-            panic!("expected a hedge command");
-        };
-        assert_ne!(
-            intent.cloid.to_hex(),
-            base_cloid.to_hex(),
-            "redispatch must use a fresh salted cloid, never reuse the dangerous one"
-        );
-        assert!(
-            !strat.hedges.contains_key(&base_cloid.to_hex()),
-            "superseded dangerous record must be removed"
-        );
-        assert!(
-            strat.hedges.contains_key(&intent.cloid.to_hex()),
-            "new intent must be tracked under the salted cloid"
-        );
+    fn claimed_timeout_never_redispatches_from_position_snapshots() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        strat.aster_pos.insert(m.clone(),SignedPosition { qty:dec!(0.5),avg_px:dec!(100) });
+        let id=strat.orders.next_attempt_id(&m); let mut h=HedgeIntent::with_qty(id,m.clone(),Side::Sell,dec!(0.5),dec!(100),now-9_000_000_000);
+        h.arm_admission(8000); h.mark_submitted(h.created_ns); assert!(h.admission.try_claim(h.created_ns+1)); h.check_timeout(now,8_000_000_000);
+        assert!(!h.terminal); strat.hedges.insert(id.to_hex(),h);
+        assert!(strat.fresh_hl_hedge_book_hot_first(&m,now,Side::Sell,dec!(0.5)).is_some());
+        for tick in 1..=3 { account.publish(funded_snapshot(now+tick,dec!(0.5),dec!(0))); strat.recover_orphans(now+tick+1); }
+        assert!(hrx.try_recv().is_err()); assert!(strat.hedges[&id.to_hex()].unresolved());
     }
 
     // --- startup position adoption (F2) + cross-check escalation ---
@@ -5388,7 +4772,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn adopt_seeds_predicted_from_snapshot() {
-        let account = AccountState::new(dec!(50));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5404,7 +4788,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn adopt_refuses_stale_snapshot() {
-        let account = AccountState::new(dec!(50));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5422,7 +4806,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn adopt_is_noop_in_paper() {
-        let account = AccountState::new(dec!(50));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Paper);
@@ -5434,85 +4818,26 @@ lighter_symbol = "BTC"
     }
 
     #[test]
-    fn restart_with_nonneutral_imbalance_recovers() {
-        // THE F2 regression: bot restarts with a prior-session +0.5 Aster leg and no Lighter
-        // hedge. Predicted maps start empty, so the old code hit the snapshot-predicted
-        // cross-check every snapshot ("predicted balanced but snapshot disagrees") and deferred
-        // FOREVER — maker gate closed, exposure unhedged. With adoption, predicted is seeded
-        // from the startup snapshot and the ordinary persistence-gated recovery dispatches.
-        let account = AccountState::new(dec!(50));
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
-        let m: MarketId = "BTC".into();
-        assert!(strat.aster_pos.is_empty(), "precondition: predicted starts empty");
-
-        // Startup snapshot: rep_a=+0.5, rep_h=0. Adopt it (fresh).
-        let src0 = 10_000_000_000_i64;
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), src0, src0 - 1_000_000));
-        strat.adopt_reported_positions(src0 + 1_000_000);
-        assert_eq!(strat.aster_pos.get(&m).map(|p| p.qty), Some(dec!(0.5)));
-
-        // First backstop pass: seeds the persistence gate (no dispatch yet).
-        strat.recover_orphans(src0 + 2_000_000);
-        assert!(hrx.try_recv().is_err(), "first sighting must not dispatch");
-        assert!(strat.orphan_seen.contains_key(&m), "cross-check must NOT defer after adoption");
-
-        // Confirming strictly-newer snapshot: recovery dispatches the neutralizing hedge.
-        let src1 = src0 + 2_000_000_000;
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), src1, src1 - 1_000_000));
-        strat.recover_orphans(src1 + 1_000_000);
-        match hrx.try_recv().expect("confirmed restart imbalance must dispatch recovery") {
-            HedgeCommand::Hedge { intent, .. } => {
-                assert_eq!(intent.market, m);
-                assert_eq!(intent.hedge_side, Side::Sell);
-                assert_eq!(intent.qty, dec!(0.5));
-            }
-            other => panic!("expected a recovery hedge, got {other:?}"),
-        }
+    fn confirmed_restart_imbalance_reduces_the_excess_leg() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let now=crate::hotpath::clock::mono_now_ns();
+        account.publish(funded_snapshot(now,dec!(0.5),dec!(0))); strat.adopt_reported_positions(now+1); strat.recover_orphans(now+2);
+        account.publish(funded_snapshot(now+3,dec!(0.5),dec!(0))); strat.recover_orphans(now+4);
+        assert!(std::iter::from_fn(||erx.try_recv().ok()).any(|cmd| matches!(cmd,ExecCommand::FlattenAster { intent,.. } if intent.qty==dec!(0.5) && intent.hedge_side==Side::Sell && intent.purpose==IntentPurpose::ReduceDelta)));
+        assert!(hrx.try_recv().is_err());
     }
 
-    #[test]
-    fn crosscheck_escalates_after_n_distinct_snapshots() {
-        // Mid-session predicted drift (predicted balanced, snapshot imbalanced) must not defer
-        // forever: after ORPHAN_CROSSCHECK_MAX_DEFERS DISTINCT snapshots the cross-check
-        // escalates and lets the persistence gate confirm + act. Repeated ticks on the SAME
-        // snapshot never consume defers.
-        let account = AccountState::new(dec!(50));
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
-        let m: MarketId = "BTC".into();
-        // Predicted left EMPTY (balanced) while every snapshot reports +0.5 on Aster.
-        let step = 2_000_000_000_i64;
-        let mut src = 10_000_000_000_i64;
-        for i in 1..=ORPHAN_CROSSCHECK_MAX_DEFERS {
-            account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
-            strat.recover_orphans(src + 1_000_000);
-            assert!(hrx.try_recv().is_err(), "defer {i} must not dispatch");
-            assert!(!strat.orphan_seen.contains_key(&m), "defer {i} must clear the persistence gate");
-            assert_eq!(strat.orphan_crosscheck_defers.get(&m), Some(&(i, src)));
-            // Re-tick on the SAME snapshot: must not consume a defer.
-            strat.recover_orphans(src + 1_500_000);
-            assert_eq!(strat.orphan_crosscheck_defers.get(&m), Some(&(i, src)), "same snapshot must not count");
-            src += step;
-        }
-        // Next DISTINCT snapshot escalates: falls through to the persistence gate (seeds it).
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
-        strat.recover_orphans(src + 1_000_000);
-        assert!(hrx.try_recv().is_err(), "escalation snapshot seeds the gate; no dispatch yet");
-        assert!(strat.orphan_seen.contains_key(&m), "escalation must seed the persistence gate");
-        // A further strictly-newer snapshot confirms the orphan and dispatches recovery.
-        src += step;
-        account.publish(orphan_snapshot_for(&m, dec!(0.5), src, src - 1_000_000));
-        strat.recover_orphans(src + 1_000_000);
-        match hrx.try_recv().expect("escalated + confirmed orphan must dispatch recovery") {
-            HedgeCommand::Hedge { intent, .. } => {
-                assert_eq!(intent.hedge_side, Side::Sell);
-                assert_eq!(intent.qty, dec!(0.5));
-            }
-            other => panic!("expected a recovery hedge, got {other:?}"),
-        }
+    #[tokio::test]
+    async fn maker_backfill_then_late_private_fill_hedges_quantity_once() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let client=strat.orders.next_client_id(&m,Side::Buy).unwrap(); strat.orders.on_place_sent(&m,Side::Buy,client.clone(),10000,500,now);
+        strat.orders.on_acked(&m,Side::Buy,"17".into()); account.publish(funded_snapshot(now+1,dec!(0.5),dec!(0))); strat.recover_orphans(now+2);
+        assert!(!account.maker_queries().is_empty()); assert!(hrx.try_recv().is_err());
+        strat.handle_maker_order_progress(m.clone(),Side::Buy,client.clone(),"17".into(),dec!(0.5),Some(dec!(50)),true,1700000000000,now+3).await;
+        let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")}; assert_eq!(intent.qty,dec!(0.5));
+        let late=AsterFill { market:m.clone(),aster_side:Side::Buy,order_id:"17".into(),trade_id:"99".into(),client_id:client,last_fill_qty:dec!(0.5),last_fill_px:dec!(100),cum_filled_qty:dec!(0.5),event_time_ms:1700000000000,reduce_only:false,commission:Some(dec!(0)),commission_asset:Some("USDT".into()) };
+        strat.handle_maker_fill(late,now+4).await; assert!(hrx.try_recv().is_err()); assert_eq!(strat.aster_pos[&m].qty,dec!(0.5)); assert_eq!(strat.logical_ids[&m],intent.logical_id);
     }
 
     // --- circuit breaker ---
@@ -5535,7 +4860,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn circuit_breaker_trips_on_equity_drawdown_and_latches() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5550,9 +4875,9 @@ lighter_symbol = "BTC"
 
         let mut t = 1_000_000_000_i64;
         // Baseline arms from the MEDIAN of the first K fresh marked samples; not before.
-        for _ in 0..BREAKER_BASELINE_SAMPLES {
+        for sample in [dec!(100), dec!(1), dec!(10000), dec!(99), dec!(101)] {
             assert!(strat.breaker_baseline_equity.is_none());
-            account.publish(equity_snap(dec!(100), t));
+            account.publish(equity_snap(sample, t));
             strat.check_circuit_breaker(t);
             t += 1_000_000;
         }
@@ -5583,7 +4908,9 @@ lighter_symbol = "BTC"
         t += 1_000_000;
         assert!(strat.breaker_tripped);
         assert!(tok.is_cancelled(), "breaker must cancel the shutdown token to halt the process");
-        assert!(trip.exists(), "breaker must write the trip latch");
+        assert!(!trip.exists(), "hot path cannot persist");
+        strat.journal.persist_trip_cold().unwrap();
+        assert!(trip.exists(), "cold writer persists the latch");
         assert!(
             flag.load(std::sync::atomic::Ordering::Acquire),
             "breaker must set the in-memory trip flag for the shutdown exit-code backstop"
@@ -5604,7 +4931,7 @@ lighter_symbol = "BTC"
         // If write_trip fails (unwritable runs/ dir), the persistent latch never lands and the
         // shutdown check_shutdown() passes — the in-memory flag is the exit-code backstop. It
         // (and the halt token) must be set BEFORE / regardless of the latch write outcome.
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5631,6 +4958,7 @@ lighter_symbol = "BTC"
             t += 1_000_000;
         }
         assert!(strat.breaker_tripped);
+        assert!(strat.journal.persist_trip_cold().is_err());
         assert!(!trip.exists(), "precondition: the latch write must actually have failed");
         assert!(tok.is_cancelled(), "halt must not depend on the latch write succeeding");
         assert!(
@@ -5642,7 +4970,7 @@ lighter_symbol = "BTC"
 
     #[test]
     fn circuit_breaker_inert_in_paper_and_never_trips_on_stale_or_zero() {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         // Paper mode: breaker is gated off entirely even with a huge drawdown.
@@ -5686,7 +5014,7 @@ lighter_symbol = "BTC"
     fn armed_breaker_strat(
         tag: &str,
     ) -> (Strategy, AccountState, CancellationToken, i64) {
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5762,7 +5090,7 @@ lighter_symbol = "BTC"
     #[test]
     fn breaker_unmarked_sample_resets_streak_and_never_arms() {
         // Unmarked samples must never ARM a baseline...
-        let account = AccountState::new(dec!(5));
+        let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
         let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
@@ -5817,4 +5145,62 @@ lighter_symbol = "BTC"
         assert!(!tok.is_cancelled());
         let _ = std::fs::remove_file(tmp_trip_path("same_gen"));
     }
+    #[test]
+    fn real_margin_reserves_resting_hedges_but_allows_reduction() {
+        let account=AccountState::default();
+        let (etx,_erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into();
+        let now=crate::hotpath::clock::mono_now_ns();
+        let mut snap=funded_snapshot(now,dec!(0),dec!(0)); snap.hl_withdrawable_usd=dec!(1); account.publish(snap);
+        assert!(!strat.margin_allows(&m,Side::Buy,dec!(0.13),dec!(100),now));
+        let mut snap=funded_snapshot(now,dec!(-1),dec!(1)); snap.hl_withdrawable_usd=dec!(0); account.publish(snap);
+        strat.aster_pos.insert(m.clone(),SignedPosition { qty:dec!(-1),avg_px:dec!(100) });
+        strat.hl_pos.insert(m.clone(),SignedPosition { qty:dec!(1),avg_px:dec!(100) });
+        assert!(strat.margin_allows(&m,Side::Buy,dec!(0.05),dec!(100),now));
+        strat.aster_pos.clear(); strat.hl_pos.clear();
+        let mut snap=funded_snapshot(now,dec!(0),dec!(0)); snap.hl_withdrawable_usd=dec!(40); account.publish(snap);
+        assert!(strat.margin_allows(&m,Side::Buy,dec!(0.13),dec!(100),now));
+        strat.orders.on_place_sent(&m,Side::Buy,"existing".into(),10000,130,now);
+        assert!(!strat.margin_allows(&m,Side::Buy,dec!(0.13),dec!(100),now), "existing maker can still require its own hedge");
+    }
+
+    #[test]
+    fn correction_dispatch_has_two_attempt_incident_limit() {
+        let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account,ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        for attempt in 0..2 {
+            strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+attempt);
+            let command=erx.try_recv().unwrap();
+            let ExecCommand::FlattenAster { intent,.. }=command else {panic!("correction expected")};
+            assert_eq!(intent.qty,dec!(0.05));
+            // Completed rejection is reconciled before a fresh attempt; do not reset incident count.
+            strat.hedges.remove(&intent.cloid.to_hex());
+        }
+        strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+3);
+        assert!(erx.try_recv().is_err()); assert_eq!(strat.correction_attempts[&m],2);
+    }
+
+    #[tokio::test]
+    async fn partials_netting_and_retry_share_one_economic_logical_id() {
+        let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(128); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
+        let mut strat=live_strat(etx,htx,account,ExecMode::Paper); let m:MarketId="BTC".into();
+        let (journal,rx)=Journal::channel(); strat.journal=journal.clone();
+        let fill=|client:&str,side:Side,id:&str,last:Decimal,cum:Decimal| AsterFill { market:m.clone(),aster_side:side,order_id:client.into(),trade_id:id.into(),client_id:client.into(),last_fill_qty:last,last_fill_px:dec!(100),cum_filled_qty:cum,event_time_ms:1700000000000,reduce_only:false,commission:Some(dec!(0)),commission_asset:Some("USDT".into()) };
+        let now=crate::hotpath::clock::mono_now_ns();
+        strat.handle_maker_fill(fill("buy",Side::Buy,"1",dec!(0.03),dec!(0.03)),now).await;
+        let logical=strat.logical_ids[&m]; assert!(hrx.try_recv().is_err());
+        strat.handle_maker_fill(fill("sell",Side::Sell,"2",dec!(0.01),dec!(0.01)),now+1).await;
+        assert_eq!(strat.pending[&m].signed_qty,dec!(0.02));
+        strat.handle_maker_fill(fill("buy",Side::Buy,"3",dec!(0.03),dec!(0.06)),now+2).await;
+        let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")};
+        assert_eq!(intent.qty,dec!(0.05)); assert_eq!(intent.logical_id,logical);
+        strat.handle_exec_event(ExecEvent::AttemptNotSent { cloid:intent.cloid,reason:"not sent".into() },now+3);
+        let HedgeCommand::Hedge { intent:retry,.. }=hrx.try_recv().unwrap() else {panic!("retry expected")};
+        assert_ne!(retry.cloid,intent.cloid); assert_eq!(retry.logical_id,logical);
+        drop(strat); drop(journal); let mut bytes=Vec::new(); super::super::journal::run_journal_writer(rx,&mut bytes).await.unwrap();
+        let rows:Vec<serde_json::Value>=String::from_utf8(bytes).unwrap().lines().map(|l|serde_json::from_str(l).unwrap()).collect();
+        let maker:Vec<_>=rows.iter().filter(|r|r["kind"]=="maker_fill").collect(); assert_eq!(maker.len(),3);
+        assert!(maker.iter().all(|r|r["detail"]["logical_id"]==logical.to_hex()));
+    }
+
 }

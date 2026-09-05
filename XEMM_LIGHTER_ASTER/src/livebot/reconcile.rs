@@ -174,6 +174,7 @@ pub struct Reconciler {
     mark_max_age_ms: i64,
     /// Throttle for the "uPnL unmarked" warn (mono ns of the last emit).
     last_upnl_warn_ns: std::sync::atomic::AtomicI64,
+    maker_query_cursor: std::sync::atomic::AtomicUsize,
 }
 
 impl Reconciler {
@@ -191,6 +192,7 @@ impl Reconciler {
             hl_coin_to_market,
             mark_max_age_ms,
             last_upnl_warn_ns: std::sync::atomic::AtomicI64::new(0),
+            maker_query_cursor: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -224,20 +226,21 @@ impl Reconciler {
         // cancellation transiently imperfect inside a single snapshot.
         // Aster: balance + positions + open orders (signed).
         // HL: clearinghouse state + open orders (unsigned /info).
-        let (bal, pos, oo, ch, hloo) = tokio::join!(
+        let (bal, pos, oo, ch, hloo, available) = tokio::join!(
             self.aster.balance(),
             self.aster.position_risk(),
             self.aster.open_orders(None),
             self.hl.clearinghouse_state(),
             self.hl.open_orders_info(),
+            self.aster.account_available_balance(),
         );
-        let (bal, pos, oo, ch, hloo) = (bal?, pos?, oo?, ch?, hloo?);
+        let (bal, pos, oo, ch, hloo, aster_available_usd) = (bal?, pos?, oo?, ch?, hloo?, available?);
 
         // Aster available USD = the NET wallet balance across USD-pegged rows (`balance`),
         // NOT `availableBalance` (an inflated cross-margin projection). SIGNED sum: a
         // negative stablecoin row is real debt (see `fold_aster_balance_rows`). Junk rows
         // are skip-with-warn (understating equity trips the breaker EARLY — fail-safe).
-        let aster_available_usd = fold_aster_balance_rows(&bal);
+        let aster_wallet_usd = fold_aster_balance_rows(&bal);
         let hl_withdrawable_usd = parse_decimal_field(&ch.withdrawable, "lighter.withdrawable")?;
 
         // TOTAL (mark-to-market) equity per venue for the circuit breaker — NOT the free-margin
@@ -246,7 +249,7 @@ impl Reconciler {
         // includes unrealized). For a delta-neutral book the unrealized legs cancel ⇒ stable equity.
         let (aster_unrealized_usd, aster_net) =
             fold_aster_position_rows(&pos, &self.aster_sym_to_market)?;
-        let aster_equity_usd = aster_available_usd + aster_unrealized_usd;
+        let aster_equity_usd = aster_wallet_usd + aster_unrealized_usd;
         let hl_equity_usd = parse_decimal_field(&ch.margin_summary.account_value, "lighter.marginSummary.accountValue")?;
 
         let aster_positions: Vec<ScaledPosition> = aster_net
@@ -342,6 +345,9 @@ impl Reconciler {
         };
         Ok(AccountSnapshot {
             aster_available_usd,
+            aster_wallet_usd,
+            aster_margin_source_ns: read_start_ns,
+            hl_margin_source_ns: ch.margin_source_ns,
             hl_withdrawable_usd,
             aster_equity_usd,
             hl_equity_usd,
@@ -435,6 +441,51 @@ impl Reconciler {
         Ok(())
     }
 
+    pub fn hedge_readiness(&self) -> super::exec::hyperliquid::HedgeReadiness { self.hl.readiness() }
+
+    async fn resolve_aster_attempts(&self, account: &AccountState, events: &tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
+        for intent in account.pending_exec().iter() {
+            if intent.venue != Venue::Aster || !intent.unresolved()
+                || !intent.admission.is_claimed()
+                || mono_now_ns().saturating_sub(intent.created_ns) > 60_000_000_000 { continue; }
+            let Some(client) = intent.client_id.as_deref() else { continue };
+            let Ok(row) = self.aster.query_order(&intent.market, client).await else { continue };
+            if row.get("clientOrderId").and_then(|v| v.as_str()) != Some(client) { continue; }
+            let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if !matches!(status, "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED") { continue; }
+            let Some(qty) = row.get("executedQty").and_then(|v| v.as_str()).and_then(|v| v.parse::<Decimal>().ok()) else { continue };
+            if qty < Decimal::ZERO || qty > intent.qty { continue; }
+            let quote = row.get("cumQuote").and_then(|v| v.as_str()).and_then(|v| v.parse::<Decimal>().ok());
+            let oid = row.get("orderId").map(|v| v.as_i64().map(|x| x.to_string()).or_else(|| v.as_str().map(str::to_owned))).flatten();
+            let _ = events.send(super::exec::command::ExecEvent::ExecutionProgress {
+                cloid: intent.cloid, cumulative_qty: qty, cumulative_quote_usd: quote,
+                cumulative_fee_usd: (qty == Decimal::ZERO).then_some(Decimal::ZERO), terminal: true, venue_order_id: oid, event_time_ms: row.get("updateTime").and_then(|v| v.as_i64()),
+            }).await;
+        }
+    }
+
+    async fn backfill_maker_orders(&self, account: &AccountState, events: &tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
+        let queries = account.maker_queries();
+        if queries.is_empty() { return; }
+        for _ in 0..queries.len().min(8) {
+            let index = self.maker_query_cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % queries.len();
+            let query = &queries[index];
+            let Ok(row) = self.aster.query_order(&query.market, &query.client_id).await else { continue };
+            if row.get("clientOrderId").and_then(|v| v.as_str()) != Some(&query.client_id) { continue; }
+            let Some(qty) = row.get("executedQty").and_then(|v| v.as_str()).and_then(|v| v.parse::<Decimal>().ok()) else { continue };
+            let status = row.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let terminal = matches!(status, "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED");
+            let quote = row.get("cumQuote").and_then(|v| v.as_str()).and_then(|v| v.parse::<Decimal>().ok());
+            let oid = row.get("orderId").map(|v| v.as_i64().map(|x| x.to_string()).or_else(|| v.as_str().map(str::to_owned))).flatten();
+            let Some(order_id) = oid else { continue };
+            let _ = events.send(super::exec::command::ExecEvent::MakerOrderProgress {
+                market: query.market.clone(), side: query.side, client_id: query.client_id.clone(), order_id,
+                cumulative_qty: qty, cumulative_quote_usd: quote, terminal,
+                event_time_ms: row.get("updateTime").and_then(|v| v.as_i64()).unwrap_or(0),
+            }).await;
+        }
+    }
+
     /// Reconcile once and publish. Returns the published snapshot.
     pub async fn reconcile_and_publish(&self, account: &AccountState) -> Result<AccountSnapshot> {
         let snap = self.snapshot().await?;
@@ -446,7 +497,7 @@ impl Reconciler {
     /// read keeps the prior snapshot (the strategy's `account_fresh` gate then closes quoting if
     /// it ages out — fail-safe). The snapshot must refresh well within
     /// `max_account_snapshot_age_ms`, so `interval` should be a fraction of it.
-    pub async fn run(self, account: AccountState, shutdown: CancellationToken, interval: Duration) {
+    pub async fn run(self, account: AccountState, shutdown: CancellationToken, interval: Duration, events: tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
         info!("account reconciler started (interval {:?})", interval);
         // A single reconcile must NEVER wedge the loop. It awaits sequential signed REST reads; a
         // black-holed connection (no response AND no error) would otherwise hang the await forever —
@@ -460,6 +511,8 @@ impl Reconciler {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tick.tick() => {
+                    let _ = tokio::time::timeout(budget, self.resolve_aster_attempts(&account, &events)).await;
+                    let _ = tokio::time::timeout(budget, self.backfill_maker_orders(&account, &events)).await;
                     match tokio::time::timeout(budget, self.reconcile_and_publish(&account)).await {
                         Ok(Ok(_)) => {
                             if consecutive_stalls > 0 {

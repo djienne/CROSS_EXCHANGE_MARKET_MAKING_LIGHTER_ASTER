@@ -71,17 +71,15 @@ impl SimulationCfg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PartialsCfg {
     pub strict_all_partials_must_be_hedgeable: bool,
-    pub accumulate_sub_min_fills: bool,
     #[serde(alias = "lighter_min_notional")]
     pub hyperliquid_min_notional: Decimal,
     pub max_pending_inventory_notional: Decimal,
     pub max_pending_inventory_age_ms: i64,
-    pub mark_pending_inventory_to_market: bool,
 }
 
 /// Per-exchange capital backing each leg. Both legs are perpetual futures, so at
 /// `leverage` the maximum position notional a leg may carry is `capital * leverage`.
-/// The cap is enforced per `(market, queue_model)` simulation state: each pair gets
+/// The cap is enforced separately for each simulation scenario: each pair gets
 /// its own capital, and each queue-model world is an independent hypothetical.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapitalCfg {
@@ -343,9 +341,6 @@ pub struct LiveQuoteCfg {
     /// Minimum spacing (ms) between requotes of the same side. Default 20.
     #[serde(default = "default_min_requote_interval_ms")]
     pub min_requote_interval_ms: u64,
-    /// Price move (ticks) needed to trigger a non-urgent requote. Default 1.
-    #[serde(default = "default_price_change_ticks")]
-    pub price_change_ticks_to_requote: u32,
     /// Replace-rate ceiling per symbol per minute (venue rate-limit guard). Default 100.
     #[serde(default = "default_max_replaces_per_min")]
     pub max_replaces_per_minute_per_symbol: u32,
@@ -358,7 +353,6 @@ impl Default for LiveQuoteCfg {
             reduce_position_only: true,
             replace_immediately_if_unprofitable: true,
             min_requote_interval_ms: default_min_requote_interval_ms(),
-            price_change_ticks_to_requote: default_price_change_ticks(),
             max_replaces_per_minute_per_symbol: default_max_replaces_per_min(),
         }
     }
@@ -386,9 +380,6 @@ pub struct LivePartialsCfg {
     /// Accumulation age cap (ms). Default 0 (strict).
     #[serde(default)]
     pub max_pending_age_ms: i64,
-    /// Max number of accumulated sub-min fills before forced resolution. Default 3.
-    #[serde(default = "default_max_pending_count")]
-    pub max_pending_count: u32,
 }
 
 impl Default for LivePartialsCfg {
@@ -397,7 +388,6 @@ impl Default for LivePartialsCfg {
             policy: PartialPolicy::default(),
             max_pending_notional_usd: Decimal::ZERO,
             max_pending_age_ms: 0,
-            max_pending_count: default_max_pending_count(),
         }
     }
 }
@@ -492,9 +482,6 @@ pub struct LiveHyperliquidCfg {
     /// Emergency (second-attempt) IOC hedge slippage cap (bps). Default "20".
     #[serde(default = "default_emergency_slippage_bps")]
     pub emergency_slippage_bps: Decimal,
-    /// `expiresAfter` window (ms) on hedge actions; 0 disables it. Default 1000.
-    #[serde(default = "default_expires_after_ms")]
-    pub expires_after_ms: i64,
     /// Max wait for an accepted Lighter transaction to surface as an account trade.
     #[serde(default = "default_lighter_fill_timeout_ms")]
     pub fill_timeout_ms: i64,
@@ -513,7 +500,6 @@ impl Default for LiveHyperliquidCfg {
             hedge_order_type: default_hedge_order_type(),
             normal_slippage_bps: default_normal_slippage_bps(),
             emergency_slippage_bps: default_emergency_slippage_bps(),
-            expires_after_ms: default_expires_after_ms(),
             fill_timeout_ms: default_lighter_fill_timeout_ms(),
             ws_account_max_age_ms: default_ws_account_max_age_ms(),
         }
@@ -629,11 +615,14 @@ impl LiveCfg {
         if self.margin_guard.aster_safety_buffer_usd < Decimal::ZERO {
             bail!("live.margin_guard.aster_safety_buffer_usd must be non-negative");
         }
+        if self.margin_guard.lighter_safety_buffer_usd < Decimal::ZERO {
+            bail!("live.margin_guard.lighter_safety_buffer_usd must be non-negative");
+        }
         Ok(())
     }
 }
 
-/// `[live.margin_guard]` — proactive Aster margin cap derived from real collateral.
+/// Per-venue reserve held back from fresh free margin before admitting exposure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveMarginGuardCfg {
     /// Master switch for the proactive guard. Inert in paper regardless. Default true.
@@ -643,11 +632,17 @@ pub struct LiveMarginGuardCfg {
     /// in-flight/stale quote plus mark movement over the reconcile/forced-tick cadence. Default "25".
     #[serde(default = "default_margin_safety_buffer")]
     pub aster_safety_buffer_usd: Decimal,
+    #[serde(default = "default_margin_safety_buffer")]
+    pub lighter_safety_buffer_usd: Decimal,
 }
 
 impl Default for LiveMarginGuardCfg {
     fn default() -> Self {
-        LiveMarginGuardCfg { enabled: true, aster_safety_buffer_usd: default_margin_safety_buffer() }
+        LiveMarginGuardCfg {
+            enabled: true,
+            aster_safety_buffer_usd: default_margin_safety_buffer(),
+            lighter_safety_buffer_usd: default_margin_safety_buffer(),
+        }
     }
 }
 
@@ -679,14 +674,8 @@ fn default_max_user_stream_staleness_ms() -> i64 {
 fn default_min_requote_interval_ms() -> u64 {
     20
 }
-fn default_price_change_ticks() -> u32 {
-    1
-}
 fn default_max_replaces_per_min() -> u32 {
     100
-}
-fn default_max_pending_count() -> u32 {
-    3
 }
 fn default_aster_base_url() -> String {
     "https://fapi.asterdex.com".to_string()
@@ -712,9 +701,6 @@ fn default_normal_slippage_bps() -> Decimal {
 }
 fn default_emergency_slippage_bps() -> Decimal {
     Decimal::from(20)
-}
-fn default_expires_after_ms() -> i64 {
-    1_000
 }
 fn default_deadman_countdown_ms() -> i64 {
     5_000
@@ -761,9 +747,29 @@ impl Config {
         let path = path.as_ref();
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text)
+        let value: toml::Value = toml::from_str(&text)
             .with_context(|| format!("parsing config {}", path.display()))?;
+        for retired in [
+            "partials.accumulate_sub_min_fills",
+            "partials.mark_pending_inventory_to_market",
+            "live.partials.max_pending_count",
+            "live.quote.price_change_ticks_to_requote",
+            "live.lighter.expires_after_ms",
+            "live.hyperliquid.expires_after_ms",
+        ] {
+            if retired.split('.').try_fold(&value, |v, key| v.get(key)).is_some() {
+                bail!("retired no-op setting {retired}; remove it (requote ticks belong in [quote])");
+            }
+        }
+        let cfg: Config = value.try_into().context("parsing config fields")?;
         cfg.validate()?;
+        // File-loaded operational configs may perform I/O. Recorded headers are
+        // deserialized directly, so offline replay does not depend on obsolete URLs.
+        if cfg.live.aster.base_url.trim_end_matches('/') != default_aster_base_url()
+            || cfg.live.hyperliquid.base_url.trim_end_matches('/') != default_hl_base_url()
+        {
+            bail!("operational venue URLs must use the supported Aster and Lighter mainnet origins");
+        }
         Ok(cfg)
     }
 
@@ -805,6 +811,15 @@ impl Config {
         }
         if self.simulation.hedge_latency_buckets_ms.iter().any(|&b| b < 0) {
             bail!("hedge latency buckets must be non-negative");
+        }
+        if self.simulation.simulated_aster_place_latency_ms < 0
+            || self.simulation.simulated_aster_cancel_latency_ms < 0
+            || self.simulation.quote_ttl_ms <= 0
+            || self.simulation.max_book_staleness_ms < 0
+            || self.partials.max_pending_inventory_age_ms < 0
+            || self.partials.max_pending_inventory_notional < Decimal::ZERO
+        {
+            bail!("simulation latencies and risk bounds must be non-negative, and quote_ttl_ms must be positive");
         }
         if self.capital.aster_capital_usd <= Decimal::ZERO
             || self.capital.hyperliquid_capital_usd <= Decimal::ZERO
@@ -898,11 +913,9 @@ halt_trading_on_stale_feed = true
 
 [partials]
 strict_all_partials_must_be_hedgeable = false
-accumulate_sub_min_fills = true
 lighter_min_notional = "10"
 max_pending_inventory_notional = "25"
 max_pending_inventory_age_ms = 1000
-mark_pending_inventory_to_market = true
 
 [capital]
 aster_capital_usd = "1000"
@@ -1070,6 +1083,7 @@ lighter_symbol = "DOGE"
         cfg.validate().unwrap();
         assert!(cfg.live.margin_guard.enabled);
         assert_eq!(cfg.live.margin_guard.aster_safety_buffer_usd, dec!(25));
+        assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(25));
         // Explicit block parses and overrides the buffer.
         let explicit = format!(
             "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.margin_guard]\nenabled = true\naster_safety_buffer_usd = \"26\"\n"
@@ -1077,6 +1091,35 @@ lighter_symbol = "DOGE"
         let cfg: Config = toml::from_str(&explicit).unwrap();
         cfg.validate().unwrap();
         assert_eq!(cfg.live.margin_guard.aster_safety_buffer_usd, dec!(26));
+    }
+
+    #[test]
+    fn file_loading_rejects_retired_controls_and_mixed_environments() {
+        let dir = std::env::temp_dir().join(format!("xemm-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("config.toml");
+        for extra in [
+            "[live.partials]\nmax_pending_count=2",
+            "[live.quote]\nprice_change_ticks_to_requote=2",
+            "[live.lighter]\nexpires_after_ms=1000",
+            "[live.hyperliquid]\nexpires_after_ms=1000",
+        ] {
+            std::fs::write(&path, format!("{SAMPLE}\n{extra}\n")).unwrap();
+            assert!(Config::load(&path).unwrap_err().to_string().contains("retired no-op"));
+        }
+        for key in ["accumulate_sub_min_fills", "mark_pending_inventory_to_market"] {
+            std::fs::write(&path, SAMPLE.replace("[partials]", &format!("[partials]\n{key}=true"))).unwrap();
+            assert!(Config::load(&path).unwrap_err().to_string().contains("retired no-op"));
+        }
+        std::fs::write(&path, format!("{SAMPLE}\n[live.aster]\nbase_url=\"https://example.test\"\n")).unwrap();
+        assert!(Config::load(&path).unwrap_err().to_string().contains("mainnet origins"));
+        for sample in [include_str!("../config-live-lighter.toml"), include_str!("../config-paper-lighter.toml")] {
+            std::fs::write(&path, sample).unwrap();
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

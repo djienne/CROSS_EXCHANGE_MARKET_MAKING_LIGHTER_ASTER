@@ -95,6 +95,10 @@ pub struct VenueBook {
     /// Separate version counter for BBO updates. `quote_generation()` combines this
     /// with the L2 generation so BBO-only changes wake and reprice the live strategy.
     bbo_generation: AtomicU64,
+    /// Publication sequence for send-time quote validation. Odd while a book write
+    /// is in progress; even after all raw/hot cells are installed. Unlike wake
+    /// generations, this also changes for coalesced size-only BBO updates.
+    content_version: AtomicU64,
     /// Optional coalescing strategy wakeup. When a live strategy loop is attached
     /// ([`VenueBook::with_wake`]) every `publish` calls `notify_one`, so the loop wakes
     /// on the next book change instead of sleep-polling (plan §5.2). `None` on the
@@ -103,6 +107,12 @@ pub struct VenueBook {
     /// When set, each `publish`/`publish_hot` marks this market dirty in the shared
     /// bitset so the strategy loop can reprice only changed markets on wake.
     dirty: Option<(Arc<super::dirty::DirtyMarkets>, crate::types::MarketIdx)>,
+}
+
+struct BookPublication<'a>(&'a AtomicU64);
+
+impl Drop for BookPublication<'_> {
+    fn drop(&mut self) { self.0.fetch_add(1, Ordering::Release); }
 }
 
 #[inline]
@@ -138,6 +148,17 @@ impl Default for VenueBook {
 }
 
 impl VenueBook {
+    /// Capture before reading a quote's books and compare again immediately before
+    /// sending. Odd values are never admissible. Publishers are single-owner.
+    #[inline]
+    pub fn content_version(&self) -> u64 { self.content_version.load(Ordering::Acquire) }
+
+    #[inline]
+    fn begin_publication(&self) -> BookPublication<'_> {
+        self.content_version.fetch_add(1, Ordering::AcqRel);
+        BookPublication(&self.content_version)
+    }
+
     pub fn new() -> Self {
         Self::build(None)
     }
@@ -165,6 +186,7 @@ impl VenueBook {
             stream_down: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             bbo_generation: AtomicU64::new(0),
+            content_version: AtomicU64::new(0),
             wake,
             dirty: None,
         }
@@ -187,6 +209,7 @@ impl VenueBook {
             self.touch(); // frame arrived, but do not roll book content/generation backwards
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         self.book.store(Some(Arc::new(book)));
         // Clear the hot-only guard only AFTER the raw book is installed: clearing first
@@ -200,6 +223,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -211,12 +235,15 @@ impl VenueBook {
     /// Hot publish: store both the raw `OrderBook` and its integer `HotBook` projection.
     /// Used when a `MarketScale` is available (live mode with `Tap.scale` set).
     #[inline]
-    pub fn publish_hot(&self, book: OrderBook, hot: HotBook) {
+    pub fn publish_hot(&self, book: OrderBook, mut hot: HotBook) {
         if !accept_exch_ts(&self.last_book_exch_ms, exch_ms(&book)) {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
+        hot.source_age_at_recv_ms = crate::hot_types::source_age_at_receive_ms(
+            book.exch_ts.timestamp_millis(), book.local_recv_ts.timestamp_millis());
         self.hot.store(Some(Arc::new(hot)));
         self.book.store(Some(Arc::new(book)));
         // Guard cleared only after BOTH stores (see publish()).
@@ -228,6 +255,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -245,6 +273,7 @@ impl VenueBook {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         self.hot.store(Some(Arc::new(hot)));
         let ns = mono_now_ns();
@@ -252,6 +281,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -268,6 +298,7 @@ impl VenueBook {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         self.bbo.store(Some(Arc::new(book)));
         // Guard cleared only after the raw BBO is installed (see publish()).
@@ -277,6 +308,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -287,12 +319,15 @@ impl VenueBook {
 
     /// Publish a fast BBO assist plus its integer projection.
     #[inline]
-    pub fn publish_bbo_hot(&self, book: OrderBook, hot: HotBook) {
+    pub fn publish_bbo_hot(&self, book: OrderBook, mut hot: HotBook) {
         if !accept_exch_ts(&self.last_bbo_exch_ms, exch_ms(&book)) {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
+        hot.source_age_at_recv_ms = crate::hot_types::source_age_at_receive_ms(
+            book.exch_ts.timestamp_millis(), book.local_recv_ts.timestamp_millis());
         self.bbo_hot.store(Some(Arc::new(hot)));
         self.bbo.store(Some(Arc::new(book)));
         // Guard cleared only after BOTH stores (see publish()).
@@ -302,6 +337,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -319,6 +355,7 @@ impl VenueBook {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         self.bbo_hot.store(Some(Arc::new(hot)));
         let ns = mono_now_ns();
@@ -326,6 +363,7 @@ impl VenueBook {
         self.last_msg_ns.store(ns, Ordering::Release);
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
+        drop(publication);
         if let Some((dirty, idx)) = &self.dirty {
             dirty.mark(*idx);
         }
@@ -352,6 +390,7 @@ impl VenueBook {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         let price_changed = self.bbo_price_changed(&book);
         self.bbo.store(Some(Arc::new(book)));
@@ -363,6 +402,7 @@ impl VenueBook {
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
+        drop(publication);
         if price_changed || had_hot_only {
             self.bbo_generation.fetch_add(1, Ordering::Release);
             if let Some((dirty, idx)) = &self.dirty {
@@ -376,13 +416,16 @@ impl VenueBook {
 
     /// Publish a coalesced BBO assist plus its integer projection.
     #[inline]
-    pub fn publish_bbo_price_wake_hot(&self, book: OrderBook, hot: HotBook) {
+    pub fn publish_bbo_price_wake_hot(&self, book: OrderBook, mut hot: HotBook) {
         if !accept_exch_ts(&self.last_bbo_exch_ms, exch_ms(&book)) {
             self.touch();
             return;
         }
+        let publication = self.begin_publication();
         let t0 = mono_now_ns();
         let price_changed = self.bbo_price_changed(&book);
+        hot.source_age_at_recv_ms = crate::hot_types::source_age_at_receive_ms(
+            book.exch_ts.timestamp_millis(), book.local_recv_ts.timestamp_millis());
         self.bbo_hot.store(Some(Arc::new(hot)));
         self.bbo.store(Some(Arc::new(book)));
         // Clear the hot-only guard only AFTER both stores (matching publish_bbo_hot):
@@ -393,6 +436,7 @@ impl VenueBook {
         self.last_bbo_ns.store(ns, Ordering::Release);
         self.last_msg_ns.store(ns, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
+        drop(publication);
         if price_changed || had_hot_only {
             self.bbo_generation.fetch_add(1, Ordering::Release);
             if let Some((dirty, idx)) = &self.dirty {
@@ -496,7 +540,10 @@ impl VenueBook {
         if last == 0 {
             i64::MAX
         } else {
-            now_ns.saturating_sub(last) / 1_000_000
+            let source_age = self.book.load().as_ref().map(|book|
+                crate::hot_types::source_age_at_receive_ms(book.exch_ts.timestamp_millis(),
+                    book.local_recv_ts.timestamp_millis())).unwrap_or(i64::MAX);
+            (now_ns.saturating_sub(last).max(0) / 1_000_000).saturating_add(source_age)
         }
     }
 
@@ -507,7 +554,10 @@ impl VenueBook {
         if last == 0 {
             i64::MAX
         } else {
-            now_ns.saturating_sub(last) / 1_000_000
+            let source_age = self.bbo.load().as_ref().map(|book|
+                crate::hot_types::source_age_at_receive_ms(book.exch_ts.timestamp_millis(),
+                    book.local_recv_ts.timestamp_millis())).unwrap_or(i64::MAX);
+            (now_ns.saturating_sub(last).max(0) / 1_000_000).saturating_add(source_age)
         }
     }
 
@@ -615,6 +665,38 @@ mod tests {
     fn book(bid: rust_decimal::Decimal) -> OrderBook {
         let now = Utc::now();
         OrderBook::from_levels(vec![(bid, dec!(1))], vec![(bid + dec!(1), dec!(1))], now, now)
+    }
+
+    #[test]
+    fn publication_version_covers_partial_and_coalesced_updates() {
+        use crate::livebot::scale::{build_hot_book, MarketScale};
+        let vb = VenueBook::new();
+        assert_eq!(vb.content_version(), 0);
+        {
+            let publication = vb.begin_publication();
+            assert_eq!(vb.content_version(), 1, "mid-publish quotes are inadmissible");
+            drop(publication);
+        }
+        assert_eq!(vb.content_version(), 2);
+        let b = book_at(2_000, dec!(100));
+        let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
+        let hot = build_hot_book(&b, &scale, 0, 12345);
+        vb.publish(b.clone());
+        vb.publish_hot(b.clone(), hot);
+        vb.publish_hot_only(hot, b.exch_ts);
+        vb.publish_bbo(b.clone());
+        vb.publish_bbo_hot(b.clone(), hot);
+        vb.publish_bbo_hot_only(hot, b.exch_ts);
+        vb.publish_bbo_price_wake(b.clone());
+        let generation = vb.quote_generation();
+        let mut size_only = b.clone();
+        size_only.bids[0].qty = dec!(5);
+        vb.publish_bbo_price_wake_hot(size_only, hot);
+        assert_eq!(vb.quote_generation(), generation, "size-only update stays coalesced");
+        assert_eq!(vb.content_version(), 18, "all eight publication paths increment twice");
+        vb.touch();
+        vb.publish(book_at(1_000, dec!(99)));
+        assert_eq!(vb.content_version(), 18, "liveness and rejected old frames do not mutate content");
     }
 
     #[test]
