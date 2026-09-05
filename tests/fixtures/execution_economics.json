@@ -1,0 +1,575 @@
+[
+  {
+    "name": "partial",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "0.20",
+          "px": "100",
+          "fee_usd": "0",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "0.12",
+          "px": "101",
+          "notional_usd": null,
+          "fee_usd": "0.01",
+          "maker": null,
+          "fee_ticks": null,
+          "order_id": "L1",
+          "trade_id": "T1"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "0.12",
+          "cumulative_quote_usd": "12.12",
+          "cumulative_fee_usd": "0.01",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.12",
+      "fees_usdc": "0.01",
+      "net_pnl_usdc": "0.11",
+      "matched_qty": "0.12",
+      "residual_qty": "0.08",
+      "economic_status": "confirmed",
+      "qty": "0.20"
+    }
+  },
+  {
+    "name": "split_fee_rate",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "1",
+          "px": "100",
+          "fee_usd": "0.01",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "0.2",
+          "px": "101",
+          "notional_usd": "20.2",
+          "fee_usd": "0.0002",
+          "maker": false,
+          "fee_ticks": "200",
+          "order_id": "L1",
+          "trade_id": "T1"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000002,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "0.4",
+          "px": "101",
+          "notional_usd": "40.4",
+          "fee_usd": "0.0002",
+          "maker": false,
+          "fee_ticks": "200",
+          "order_id": "L1",
+          "trade_id": "T2"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000002,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "0.4",
+          "px": "101",
+          "notional_usd": "40.4",
+          "fee_usd": "0.0002",
+          "maker": false,
+          "fee_ticks": "200",
+          "order_id": "L1",
+          "trade_id": "T2"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "0.6",
+          "cumulative_quote_usd": "60.6",
+          "cumulative_fee_usd": "0.0004",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.6",
+      "fees_usdc": "0.02212",
+      "net_pnl_usdc": "0.57788",
+      "matched_qty": "0.6",
+      "residual_qty": "0.4",
+      "economic_status": "confirmed",
+      "qty": "1"
+    }
+  },
+  {
+    "name": "closing_recovery",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "0.05",
+          "px": "100",
+          "fee_usd": "0.0005",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "aster",
+          "side": "Sell",
+          "qty": "0.05",
+          "px": "99",
+          "notional_usd": null,
+          "fee_usd": "0.00198",
+          "maker": null,
+          "fee_ticks": null,
+          "order_id": "A2",
+          "trade_id": "T1"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "aster",
+          "side": "Sell",
+          "purpose": "reduce_delta",
+          "cumulative_qty": "0.05",
+          "cumulative_quote_usd": "4.95",
+          "cumulative_fee_usd": "0.00198",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "-0.05",
+      "fees_usdc": "0.00248",
+      "net_pnl_usdc": "-0.05248",
+      "matched_qty": "0",
+      "residual_qty": "0",
+      "economic_status": "confirmed",
+      "qty": "0.05"
+    }
+  },
+  {
+    "name": "unknown_fee",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "1",
+          "px": "100",
+          "fee_usd": "0",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "incomplete",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "1",
+          "px": "101",
+          "notional_usd": null,
+          "fee_usd": null,
+          "maker": null,
+          "fee_ticks": null,
+          "order_id": "L1",
+          "trade_id": "T1"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "1",
+          "cumulative_quote_usd": "101",
+          "cumulative_fee_usd": null,
+          "fee_complete": false,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "1",
+      "fees_usdc": null,
+      "net_pnl_usdc": null,
+      "matched_qty": "1",
+      "residual_qty": "0",
+      "economic_status": "incomplete",
+      "qty": "1"
+    }
+  },
+  {
+    "name": "legacy_unverified",
+    "rows": [
+      {
+        "schema_version": 1,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "fill",
+        "market": "HYPE",
+        "detail": {
+          "cloid": "a",
+          "side": "SELL",
+          "qty": "0.20",
+          "avg_aster_px": "100"
+        }
+      },
+      {
+        "schema_version": 1,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "hedge_fill",
+        "market": "HYPE",
+        "detail": {
+          "cloid": "a",
+          "side": "SELL",
+          "qty": "0.12",
+          "px": "101",
+          "fee_usd": "0.01"
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.12",
+      "fees_usdc": null,
+      "net_pnl_usdc": null,
+      "matched_qty": "0.12",
+      "residual_qty": "0.08",
+      "economic_status": "legacy_unverified",
+      "qty": "0.20"
+    }
+  },
+  {
+    "name": "cumulative_only",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "0.20",
+          "px": "100",
+          "fee_usd": "0",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "0.12",
+          "cumulative_quote_usd": "12.12",
+          "cumulative_fee_usd": "0.01",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.12",
+      "fees_usdc": "0.01",
+      "net_pnl_usdc": "0.11",
+      "matched_qty": "0.12",
+      "residual_qty": "0.08",
+      "economic_status": "confirmed",
+      "qty": "0.20"
+    }
+  },
+  {
+    "name": "unidentified_trade_not_covered_by_old_partial",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "1",
+          "px": "100",
+          "fee_usd": "0",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "1",
+          "px": "101",
+          "notional_usd": null,
+          "fee_usd": "0.01",
+          "maker": null,
+          "fee_ticks": null,
+          "order_id": "L1",
+          "trade_id": "T1",
+          "identity_complete": false
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "0.5",
+          "cumulative_quote_usd": "50.5",
+          "cumulative_fee_usd": "0.01",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.5",
+      "fees_usdc": "0.01",
+      "net_pnl_usdc": null,
+      "matched_qty": "0.5",
+      "residual_qty": "0.5",
+      "economic_status": "incomplete",
+      "qty": "1"
+    }
+  },
+  {
+    "name": "closing_recovery_maker_stream",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "0.05",
+          "px": "100",
+          "fee_usd": "0.0005",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Sell",
+          "qty": "0.05",
+          "px": "99",
+          "fee_usd": "0.00198",
+          "fee_complete": true,
+          "reduce_only": true,
+          "order_id": "A2",
+          "trade_id": "M2",
+          "client_id": "close-a"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "aster",
+          "side": "Sell",
+          "purpose": "reduce_delta",
+          "cumulative_qty": "0.05",
+          "cumulative_quote_usd": "4.95",
+          "cumulative_fee_usd": "0.00198",
+          "fee_complete": true,
+          "terminal": true,
+          "client_id": "close-a"
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "-0.05",
+      "fees_usdc": "0.00248",
+      "net_pnl_usdc": "-0.05248",
+      "matched_qty": "0",
+      "residual_qty": "0",
+      "economic_status": "confirmed",
+      "qty": "0.05"
+    }
+  }
+]

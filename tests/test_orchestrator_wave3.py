@@ -83,6 +83,8 @@ class XemmOrdersClearTests(unittest.TestCase):
                 self._status({"aster_open_orders": "x", "lighter_open_orders": 0})
             )
         )
+        for invalid in (False, 0.5):
+            self.assertFalse(Orchestrator.xemm_orders_clear(self._status({"aster_open_orders":invalid,"lighter_open_orders":0})))
 
     def test_zero_counts_clear_and_nonzero_not(self) -> None:
         self.assertTrue(
@@ -150,11 +152,13 @@ class StatusSchemaTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             orch = self._orch(Path(tmp))
+            orch.args.aster_nonce_dir = Path(tmp)/"shared-nonces"
             fake = subprocess.CompletedProcess(
                 args=[], returncode=0, stdout=json.dumps(VALID_TAKER_STATUS), stderr=""
             )
-            with mock.patch("orchestrator.subprocess.run", return_value=fake):
+            with mock.patch("orchestrator.subprocess.run", return_value=fake) as run:
                 status = orch.read_status(TAKER_BOT)
+                self.assertEqual(run.call_args.kwargs["env"]["ASTER_NONCE_DIR"],str(orch.args.aster_nonce_dir.resolve()))
             self.assertIsNotNone(status)
             self.assertEqual("HYPE", status["market"])
 
@@ -323,7 +327,7 @@ class RecoveryDedupKeyTests(unittest.TestCase):
             tracker = TradeTracker(args, now - timedelta(hours=1), lambda kind, **d: None)
             tracker.read_xemm_trades = lambda: []
             self.assertEqual(2, len(tracker.poll()))
-            self.assertEqual(Decimal("-3.0"), tracker.summary()["net_pnl_usdc"])
+            self.assertEqual(Decimal("-3.0"), tracker.summary()["risk_net_pnl_usdc"])
 
 
 class XemmCorrectionTests(unittest.TestCase):
@@ -332,6 +336,9 @@ class XemmCorrectionTests(unittest.TestCase):
             "cloid": cloid,
             "market": "HYPE",
             "hedge_side": "Sell",
+            "schema_version": 2,
+            "economic_status": "confirmed",
+            "timestamp": iso(utc_now()),
             "qty": "0.2",
             "gross_pnl": gross if gross is not None else net,
             "aster_fee": "0",
@@ -362,6 +369,8 @@ class XemmCorrectionTests(unittest.TestCase):
             self.assertEqual(1, len(rows))
             self.assertEqual("XEMM_CORRECTION", rows[0]["direction"])
             self.assertEqual(Decimal("0.25"), tracker.net_total)
+            self.assertEqual(1, tracker.trade_count)
+            self.assertEqual(Decimal("1"), tracker.summary()["win_rate"])
 
     def test_unchanged_reemission_books_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,7 +392,7 @@ class XemmCorrectionTests(unittest.TestCase):
             # Fresh tracker replays the normalized JSONL written by the first.
             replayed = self._tracker(state_dir)
             self.assertEqual(Decimal("0.25"), replayed.net_total)
-            self.assertEqual(2, replayed.trade_count)
+            self.assertEqual(1, replayed.trade_count)
             # And a further unchanged re-emission after restart books nothing.
             replayed.read_xemm_trades = lambda: [self._trade("0.25")]
             self.assertEqual(0, len(replayed.poll()))

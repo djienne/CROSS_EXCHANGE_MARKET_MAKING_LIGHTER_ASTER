@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 import sqlite3
 import sys
 import tempfile
@@ -17,14 +18,24 @@ import trade_history  # noqa: E402
 
 
 def write_jsonl(path: Path, rows: list[dict]) -> None:
+    # Current producer fixtures explicitly carry venue fee evidence.
+    for row in rows:
+        legs=[row.get("aster_fill"),row.get("lighter_fill")]
+        if all(isinstance(f,dict) and "fee_usd" in f for f in legs):
+            row.update(schema_version=2,economic_status="confirmed")
+            for f in legs: f["fee_provenance"]="venue"
     path.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
 
 
 class TradeHistoryTests(unittest.TestCase):
-    def open_db(self, path: Path) -> sqlite3.Connection:
+    @contextmanager
+    def open_db(self, path: Path):
         conn = trade_history.open_db(path)
         trade_history.init_db(conn)
-        return conn
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def test_taker_ingest_prefers_producer_actual_fields(self) -> None:
         # Producer rows carry matched-qty economics in actual_*; the report must
@@ -207,45 +218,27 @@ class TradeHistoryTests(unittest.TestCase):
             self.assertEqual(trade_count, 1)
             self.assertEqual(fill_count, 2)
 
-    def test_xemm_orchestrator_ingest_uses_zero_policy_fees(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            taker_path = root / "taker.jsonl"
-            orch_path = root / "orchestrator.jsonl"
-            db_path = root / "history.sqlite"
-            write_jsonl(taker_path, [])
-            write_jsonl(
-                orch_path,
-                [
-                    {
-                        "timestamp": "2026-01-02T00:00:00Z",
-                        "key": "xemm:abc",
-                        "bot": "XEMM_LIGHTER_ASTER",
-                        "market": "HYPE",
-                        "direction": "ASTER_MAKER_HEDGE_Sell",
-                        "qty": "1",
-                        "aster_px": "100",
-                        "lighter_px": "99",
-                        "gross_pnl_usdc": "999",
-                        "fees_usdc": "999",
-                        "net_pnl_usdc": "999",
-                        "cloid": "abc",
-                    }
-                ],
-            )
-            with self.open_db(db_path) as conn:
-                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
-                report = trade_history.report_from_db(
-                    conn,
-                    market="HYPE",
-                    since=combined_pnl.parse_dt("2026-01-01T00:00:00Z"),
-                    now=combined_pnl.parse_dt("2026-01-03T00:00:00Z"),
-                    db_path=db_path,
-                )
-            self.assertEqual(report["total"]["trades"], 1)
-            self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("-1"))
-            self.assertEqual(report["total"]["policy_fees_usdc"], Decimal("0"))
-            self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("-1"))
+    def test_xemm_orchestrator_preserves_matched_economics_and_folds_corrections(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td)
+            row={"timestamp":"2026-01-02T00:00:00Z","key":"xemm:abc","cloid":"abc","bot":"XEMM_LIGHTER_ASTER",
+                "market":"HYPE","direction":"ASTER_MAKER_HEDGE_SELL","qty":"0.20","aster_qty":"0.20","lighter_qty":"0.12",
+                "matched_qty":"0.12","residual_qty":"0.08","aster_px":"100","lighter_px":"101",
+                "gross_pnl_usdc":"0.12","fees_usdc":"0.01","net_pnl_usdc":"0.11","aster_fee_usdc":"0","lighter_fee_usdc":"0.01",
+                "schema_version":2,"economic_status":"confirmed"}
+            final=dict(row,lighter_qty="0.20",matched_qty="0.20",residual_qty="0",lighter_px="100.5",
+                gross_pnl_usdc="0.10",fees_usdc="0.02",net_pnl_usdc="0.08",lighter_fee_usdc="0.02")
+            correction={"timestamp":"2026-01-02T00:00:01Z","key":"xemm:abc#rev1","cloid":"abc","bot":"XEMM_LIGHTER_ASTER",
+                "market":"HYPE","direction":"XEMM_CORRECTION","corrected_trade":final}
+            path=root/"orchestrator.jsonl"
+            write_jsonl(path,[row,correction])
+            with self.open_db(root/"history.sqlite") as conn:
+                trade_history.ingest_orchestrator_xemm(conn,path,mode="lan",market="HYPE")
+                values=conn.execute("SELECT net_pnl_usdc,matched_qty FROM strategy_trades").fetchall()
+                self.assertEqual(len(values),1)
+                self.assertEqual(tuple(values[0]),("0.08","0.2"))
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM venue_fills").fetchone()[0],0,
+                    "aggregate reports must not invent native fill identities")
 
     def test_report_filters_by_time_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,8 +313,8 @@ class TradeHistoryTests(unittest.TestCase):
             write_jsonl(
                 journal_path,
                 [
-                    {"ts_ms": ms("2026-01-02T00:00:00Z"), "kind": "fill", "market": "HYPE", "detail": {"cloid": "abc", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
-                    {"ts_ms": ms("2026-01-02T00:00:01Z"), "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "abc", "side": "BUY", "qty": "1", "px": "99", "fee_usd": "0.01"}},
+                    {"schema_version":2,"economic_status":"confirmed","ts_ms":ms("2026-01-02T00:00:00Z"),"kind":"maker_fill","market":"HYPE","detail":{"logical_id":"abc","maker_side":"Sell","qty":"1","px":"100","fee_usd":"0","fee_complete":True,"order_id":"A1","trade_id":"M1","client_id":"m1"}},
+                    {"schema_version":2,"economic_status":"confirmed","ts_ms":ms("2026-01-02T00:00:01Z"),"kind":"execution_trade","market":"HYPE","detail":{"logical_id":"abc","attempt_id":"h1","venue":"lighter","side":"Buy","qty":"1","px":"99","fee_usd":"0.01","order_id":"H1","trade_id":"T1"}},
                 ],
             )
             with self.open_db(db_path) as conn:

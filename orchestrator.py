@@ -11,10 +11,13 @@ import signal
 import subprocess
 import sys
 import time
+import tempfile
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from economics import optional_decimal, event_time
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -93,14 +96,15 @@ def prune_old_logs(
 
 
 def parse_decimal(value: Any, default: Decimal | None = None) -> Decimal | None:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return value
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return default
+    parsed=optional_decimal(value)
+    return parsed if parsed is not None else default
+
+
+def bot_environment(args) -> dict[str,str]:
+    env=dict(os.environ)
+    directory=getattr(args,"aster_nonce_dir",None) or env.get("ASTER_NONCE_DIR") or Path(tempfile.gettempdir())/"lighter-aster-nonces"
+    env["ASTER_NONCE_DIR"]=str(Path(directory).expanduser().resolve())
+    return env
 
 
 def dec_or_zero(value: Any) -> Decimal:
@@ -282,10 +286,11 @@ class LockFile:
 
 
 class BotProcess:
-    def __init__(self, name: str, cwd: Path, command: list[str], log_path: Path):
+    def __init__(self, name: str, cwd: Path, command: list[str], log_path: Path, env: dict[str,str] | None = None):
         self.name = name
         self.cwd = cwd
         self.command = command
+        self.env = env
         self.log_path = log_path
         self.proc: subprocess.Popen[bytes] | None = None
         self.log_file: Any = None
@@ -309,6 +314,7 @@ class BotProcess:
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=self.env,
         )
         self.started_at = utc_now()
 
@@ -364,219 +370,168 @@ class BotProcess:
 
 
 class TradeTracker:
+    """One current economic record per logical trade; journal revisions remain append-only."""
     def __init__(self, args: argparse.Namespace, since: datetime, event):
-        self.args = args
-        self.market = args.market
-        self.since = since
-        self.event = event
-        self.trades_path = args.state_dir / f"orchestrator_trades_{self.market}.jsonl"
-        self.seen: set[str] = set()
-        # Running aggregates instead of an unbounded in-memory row list: the breaker
-        # and status output only need the sums/counters plus the best/worst rows, and
-        # a supervisor that runs for weeks must not grow with every trade.
-        self.trade_count = 0
-        self.wins = 0
-        self.net_total = Decimal("0")
-        self.gross_total = Decimal("0")
-        self.fees_total = Decimal("0")
-        self.by_bot: dict[str, dict[str, Any]] = {}
-        self.best: dict[str, Any] | None = None
-        self.worst: dict[str, Any] | None = None
-        # Byte offset of the last fully-consumed line of the taker trades file, so
-        # poll() parses only appended lines instead of the whole file every 15s.
-        self.taker_trades_offset = 0
-        self.xemm_report_failures = 0
-        # Last-recorded XEMM economics per cloid: the live-report re-emits every
-        # cloid in its window each poll, and a partially-hedged trade's numbers
-        # change once the remaining hedge fills land. Bounded by the PnL horizon,
-        # same growth class as `seen`.
-        self.xemm_econ: dict[str, tuple[Decimal, Decimal, Decimal]] = {}
-        self.xemm_rev_count: dict[str, int] = {}
+        self.args,self.market,self.since,self.event=args,args.market,since,event
+        self.trades_path=args.state_dir/f"orchestrator_trades_{self.market}.jsonl"
+        self.seen: set[str]=set()
+        self.rows: dict[str,dict[str,Any]]={}
+        self.primed: dict[str,dict[str,Any]]={}
+        self.xemm_rev_count: dict[str,int]={}
+        self.trade_count=self.wins=self.incomplete_trades=0
+        self.net_total=self.known_net_total=self.gross_total=self.fees_total=Decimal(0)
+        self.by_bot: dict[str,dict[str,Any]]={}
+        self.taker_trades_offset=0
+        self.xemm_report_failures=self.xemm_report_malformed=0
         self.load_existing_normalized()
 
-    def note_trade(self, row: dict[str, Any]) -> None:
-        net = dec_or_zero(row.get("net_pnl_usdc"))
-        self.trade_count += 1
-        self.wins += int(net > 0)
-        self.net_total += net
-        self.gross_total += dec_or_zero(row.get("gross_pnl_usdc"))
-        self.fees_total += dec_or_zero(row.get("fees_usdc"))
-        bucket = self.by_bot.setdefault(
-            str(row.get("bot")),
-            {
-                "trades": 0,
-                "net_pnl_usdc": Decimal("0"),
-                "gross_pnl_usdc": Decimal("0"),
-                "fees_usdc": Decimal("0"),
-                "wins": 0,
-            },
-        )
-        bucket["trades"] += 1
-        bucket["net_pnl_usdc"] += net
-        bucket["gross_pnl_usdc"] += dec_or_zero(row.get("gross_pnl_usdc"))
-        bucket["fees_usdc"] += dec_or_zero(row.get("fees_usdc"))
-        bucket["wins"] += int(net > 0)
-        if self.best is None or net > dec_or_zero(self.best.get("net_pnl_usdc")):
-            self.best = row
-        if self.worst is None or net < dec_or_zero(self.worst.get("net_pnl_usdc")):
-            self.worst = row
+    @staticmethod
+    def impact(row: dict[str,Any]) -> tuple[bool,Decimal,Decimal,Decimal,Decimal]:
+        gross=parse_decimal(row.get("gross_pnl_usdc"))
+        fees=parse_decimal(row.get("fees_usdc"))
+        net=parse_decimal(row.get("net_pnl_usdc"))
+        known=row.get("schema_version",1)>=2 and row.get("economic_status")=="confirmed"
+        known=known and gross is not None and fees is not None and net is not None
+        known=known and abs(gross-fees-net)<=Decimal("0.00000001")
+        # Unverified gains cannot offset a verified loss; conservative loss estimates can stop risk.
+        risk=net if known else min(Decimal(0),net or Decimal(0))
+        return bool(known),risk,net if known else Decimal(0),gross if known else Decimal(0),fees if known else Decimal(0)
+
+    def adjust(self, row: dict[str,Any], sign: int) -> None:
+        known,risk,net,gross,fees=self.impact(row)
+        self.trade_count+=sign
+        self.incomplete_trades+=sign*int(not known)
+        self.wins+=sign*int(known and net>0)
+        self.net_total+=sign*risk
+        self.known_net_total+=sign*net
+        self.gross_total+=sign*gross
+        self.fees_total+=sign*fees
+        b=self.by_bot.setdefault(str(row.get("bot")),{"trades":0,"wins":0,"incomplete_trades":0,
+            "net_pnl_usdc":Decimal(0),"risk_net_pnl_usdc":Decimal(0),"gross_pnl_usdc":Decimal(0),"fees_usdc":Decimal(0)})
+        for key,value in [("trades",1),("wins",int(known and net>0)),("incomplete_trades",int(not known)),
+            ("net_pnl_usdc",net),("risk_net_pnl_usdc",risk),("gross_pnl_usdc",gross),("fees_usdc",fees)]:
+            b[key]+=sign*value
+
+    def note_trade(self, row: dict[str,Any]) -> None:
+        key=str(row.get("key",""))
+        if not key: return
+        base=key.split("#rev",1)[0]
+        if "#rev" in key or row.get("direction")=="XEMM_CORRECTION":
+            if isinstance(row.get("corrected_trade"),dict):
+                current=dict(row["corrected_trade"])
+            else:
+                current=dict(self.rows.get(base,{"key":base,"cloid":row.get("cloid"),"market":self.market,"bot":XEMM_BOT,
+                    "timestamp":row.get("timestamp"),"schema_version":1,"economic_status":"legacy_unverified"}))
+                for field in ("gross_pnl_usdc","fees_usdc","net_pnl_usdc"):
+                    absolute="corrected_"+field
+                    if absolute in row: current[field]=row[absolute]
+                    elif current.get(field) is not None and row.get(field) is not None:
+                        current[field]=dec_to_json(dec_or_zero(current[field])+dec_or_zero(row[field]))
+                    else: current[field]=None
+            current["key"]=base
+        else:
+            current=dict(row)
+        previous=self.rows.get(base)
+        if previous is not None: self.adjust(previous,-1)
+        self.rows[base]=current
+        self.adjust(current,1)
 
     def load_existing_normalized(self) -> None:
-        if not self.trades_path.exists():
-            return
-        with self.trades_path.open("r", encoding="utf-8") as f:
-            for idx, line in enumerate(f, 1):
-                row = load_json_line(line, self.trades_path, idx)
-                if not row:
-                    continue
-                key = str(row.get("key", ""))
-                if key:
-                    self.seen.add(key)
-                self.replay_xemm_econ(row, key)
-                ts = self.row_ts(row)
-                if ts is None or ts >= self.since:
-                    self.note_trade(row)
+        if not self.trades_path.exists(): return
+        with self.trades_path.open(encoding="utf-8") as stream:
+            for line_no,line in enumerate(stream,1):
+                row=load_json_line(line,self.trades_path,line_no)
+                if not row: continue
+                key=str(row.get("key",""))
+                if key: self.seen.add(key)
+                if "#rev" in key and row.get("cloid") is not None:
+                    try: rev=int(key.rsplit("#rev",1)[1])
+                    except ValueError: rev=1
+                    self.xemm_rev_count[str(row["cloid"])]=max(rev,self.xemm_rev_count.get(str(row["cloid"]),0))
+                ts=self.row_ts(row.get("corrected_trade") or row)
+                if ts is None or ts>=self.since: self.note_trade(row)
 
     def prime_sources(self) -> None:
-        if self.args.backfill_existing_trades:
-            return
-        for row in self.read_taker_trades():
-            self.seen.add(self.taker_key(row))
+        if self.args.backfill_existing_trades: return
+        for row in self.read_taker_trades(): self.seen.add(self.taker_key(row))
         for trade in self.read_xemm_trades():
-            self.seen.add(self.xemm_key(trade))
+            row=self.xemm_row(trade)
+            self.seen.add(row["key"])
+            self.primed[row["key"]]=row
 
-    def poll(self) -> list[dict[str, Any]]:
-        new_rows = []
+    def xemm_row(self, trade: dict[str,Any]) -> dict[str,Any]:
+        timestamp=event_time(trade)
+        if timestamp is None:
+            timestamp=event_time({"ts_ms":trade.get("last_ts_ms",trade.get("timestamp_ms"))})
+        a=parse_decimal(trade.get("aster_fee"))
+        h=parse_decimal(trade.get("lighter_fee"))
+        return {"schema_version":trade.get("schema_version",1),"economic_status":trade.get("economic_status","legacy_unverified"),
+            "timestamp":iso(timestamp) if timestamp else None,"key":self.xemm_key(trade),"bot":XEMM_BOT,
+            "market":trade.get("market",self.market),"direction":f"ASTER_MAKER_HEDGE_{trade.get('hedge_side','')}",
+            "qty":trade.get("qty"),"aster_qty":trade.get("aster_qty",trade.get("qty")),
+            "lighter_qty":trade.get("lighter_qty",trade.get("hedged_qty")),"matched_qty":trade.get("matched_qty"),
+            "residual_qty":trade.get("residual_qty"),"gross_pnl_usdc":trade.get("gross_pnl"),
+            "fees_usdc":dec_to_json(a+h) if a is not None and h is not None else None,
+            "aster_fee_usdc":trade.get("aster_fee"),"lighter_fee_usdc":trade.get("lighter_fee"),
+            "net_pnl_usdc":trade.get("net_pnl"),"net_pnl_bps":None,"cloid":trade.get("cloid",trade.get("logical_id")),
+            "aster_px":trade.get("aster_px"),"lighter_px":trade.get("lighter_px"),"terminal":trade.get("terminal")}
+
+    @staticmethod
+    def changed(old: dict[str,Any], new: dict[str,Any]) -> bool:
+        return any(old.get(key)!=new.get(key) for key in ("schema_version","economic_status","qty","aster_qty","lighter_qty",
+            "matched_qty","residual_qty","gross_pnl_usdc","fees_usdc","net_pnl_usdc","aster_fee_usdc","lighter_fee_usdc",
+            "aster_px","lighter_px","terminal"))
+
+    def poll(self) -> list[dict[str,Any]]:
+        new_rows=[]
         for raw in self.read_taker_trades():
-            key = self.taker_key(raw)
-            if key in self.seen:
-                continue
-            ts = self.parse_ts(raw.get("timestamp")) or utc_now()
-            if ts < self.since:
+            key=self.taker_key(raw)
+            if key in self.seen: continue
+            ts=self.parse_ts(raw.get("timestamp"))
+            if ts is not None and ts<self.since:
                 self.seen.add(key)
                 continue
-            row = {
-                "timestamp": iso(ts),
-                "key": key,
-                "bot": TAKER_BOT,
-                "market": raw.get("market", self.market),
-                "direction": raw.get("direction"),
-                "qty": raw.get("qty"),
-                "gross_pnl_usdc": raw.get("actual_gross_usd"),
-                "fees_usdc": raw.get("actual_fees_usd"),
-                "net_pnl_usdc": raw.get("actual_net_usd"),
-                "net_pnl_bps": raw.get("actual_net_bps"),
-                "aster_order_id": raw.get("aster_order_id"),
-                "lighter_client_order_index": raw.get("lighter_client_order_index"),
-                "final_aster_position": raw.get("final_aster_position"),
-                "final_lighter_position": raw.get("final_lighter_position"),
-            }
-            self.record(row, new_rows)
+            row={"timestamp":iso(ts) if ts else None,"key":key,"bot":TAKER_BOT,"market":raw.get("market",self.market),
+                "schema_version":raw.get("schema_version",1),"economic_status":raw.get("economic_status","legacy_unverified"),
+                "direction":raw.get("direction"),"qty":raw.get("qty"),"gross_pnl_usdc":raw.get("actual_gross_usd"),
+                "fees_usdc":raw.get("actual_fees_usd"),"net_pnl_usdc":raw.get("actual_net_usd"),
+                "net_pnl_bps":raw.get("actual_net_bps"),"aster_order_id":raw.get("aster_order_id"),
+                "lighter_client_order_index":raw.get("lighter_client_order_index")}
+            self.record(row,new_rows)
         for trade in self.read_xemm_trades():
-            key = self.xemm_key(trade)
-            cloid = trade.get("cloid")
-            gross = dec_or_zero(trade.get("gross_pnl"))
-            fees = dec_or_zero(trade.get("aster_fee")) + dec_or_zero(trade.get("lighter_fee"))
-            net = dec_or_zero(trade.get("net_pnl"))
-            if key in self.seen:
-                self.maybe_record_xemm_correction(cloid, gross, fees, net, new_rows)
+            row=self.xemm_row(trade)
+            key=row["key"]
+            if key in self.rows:
+                self.maybe_record_xemm_correction(row,new_rows)
+            elif key in self.primed and not self.changed(self.primed[key],row):
                 continue
-            row = {
-                "timestamp": iso(),
-                "key": key,
-                "bot": XEMM_BOT,
-                "market": trade.get("market", self.market),
-                "direction": f"ASTER_MAKER_HEDGE_{trade.get('hedge_side', '')}",
-                "qty": trade.get("qty"),
-                "gross_pnl_usdc": trade.get("gross_pnl"),
-                "fees_usdc": dec_to_json(fees),
-                "net_pnl_usdc": trade.get("net_pnl"),
-                "net_pnl_bps": None,
-                "cloid": cloid,
-                "first_mono_ns": trade.get("first_mono_ns"),
-                "last_mono_ns": trade.get("last_mono_ns"),
-                "aster_px": trade.get("aster_px"),
-                "lighter_px": trade.get("lighter_px"),
-            }
-            if cloid is not None:
-                self.xemm_econ[str(cloid)] = (gross, fees, net)
-            self.record(row, new_rows)
-        if new_rows:
-            self.event("trades_ingested", count=len(new_rows))
+            else:
+                self.record(row,new_rows)
+                self.primed.pop(key,None)
+        if new_rows: self.event("trades_ingested",count=len(new_rows))
         return new_rows
 
-    def record(self, row: dict[str, Any], out: list[dict[str, Any]]) -> None:
+    def record(self, row: dict[str,Any], out: list[dict[str,Any]]) -> None:
+        append_jsonl(self.trades_path,row)
         self.seen.add(str(row["key"]))
         self.note_trade(row)
-        append_jsonl(self.trades_path, row)
         out.append(row)
 
-    def maybe_record_xemm_correction(
-        self,
-        cloid: Any,
-        gross: Decimal,
-        fees: Decimal,
-        net: Decimal,
-        out: list[dict[str, Any]],
-    ) -> None:
-        """A seen cloid re-emitted with different economics (a partial hedge whose
-        remaining fills landed). Book the delta as an additive correction row so
-        aggregates, the JSONL, and restart replay all converge on the corrected
-        value; permanent cloid dedup alone would drop the completion forever."""
-        if cloid is None:
-            return
-        prev = self.xemm_econ.get(str(cloid))
-        if prev is None or prev == (gross, fees, net):
-            return
-        revision = self.xemm_rev_count.get(str(cloid), 0) + 1
-        self.xemm_rev_count[str(cloid)] = revision
-        rev_key = f"xemm:{cloid}#rev{revision}"
-        if rev_key in self.seen:
-            return
-        row = {
-            "timestamp": iso(),
-            "key": rev_key,
-            "bot": XEMM_BOT,
-            "market": self.market,
-            "direction": "XEMM_CORRECTION",
-            "qty": None,
-            "gross_pnl_usdc": dec_to_json(gross - prev[0]),
-            "fees_usdc": dec_to_json(fees - prev[1]),
-            "net_pnl_usdc": dec_to_json(net - prev[2]),
-            "net_pnl_bps": None,
-            "cloid": cloid,
-            # Absolute values after this correction, for audit.
-            "corrected_gross_pnl_usdc": dec_to_json(gross),
-            "corrected_fees_usdc": dec_to_json(fees),
-            "corrected_net_pnl_usdc": dec_to_json(net),
-        }
-        self.xemm_econ[str(cloid)] = (gross, fees, net)
-        self.record(row, out)
-        self.event("xemm_trade_corrected", cloid=str(cloid), revision=revision, net_delta=dec_to_json(net - prev[2]))
-
-    def replay_xemm_econ(self, row: dict[str, Any], key: str) -> None:
-        """Rebuild per-cloid economics state from the normalized ledger on restart.
-        Base rows set the entry; correction rows add their deltas — replaying the
-        JSONL therefore reproduces exactly the totals that were live."""
-        if row.get("bot") != XEMM_BOT:
-            return
-        cloid = row.get("cloid")
-        if cloid is None:
-            return
-        cloid = str(cloid)
-        gross = dec_or_zero(row.get("gross_pnl_usdc"))
-        fees = dec_or_zero(row.get("fees_usdc"))
-        net = dec_or_zero(row.get("net_pnl_usdc"))
-        if "#rev" in key:
-            base = self.xemm_econ.get(cloid, (Decimal("0"), Decimal("0"), Decimal("0")))
-            self.xemm_econ[cloid] = (base[0] + gross, base[1] + fees, base[2] + net)
-            try:
-                revision = int(key.rsplit("#rev", 1)[1])
-            except (ValueError, IndexError):
-                revision = self.xemm_rev_count.get(cloid, 0) + 1
-            self.xemm_rev_count[cloid] = max(self.xemm_rev_count.get(cloid, 0), revision)
-        else:
-            self.xemm_econ[cloid] = (gross, fees, net)
+    def maybe_record_xemm_correction(self, updated: dict[str,Any], out: list[dict[str,Any]]) -> None:
+        previous=self.rows[updated["key"]]
+        if not self.changed(previous,updated): return
+        cloid=str(updated["cloid"])
+        revision=self.xemm_rev_count.get(cloid,0)+1
+        row={"timestamp":iso(),"key":f"xemm:{cloid}#rev{revision}","bot":XEMM_BOT,"market":self.market,
+            "direction":"XEMM_CORRECTION","cloid":cloid,"corrected_trade":updated,
+            "schema_version":2,"economic_status":updated["economic_status"]}
+        for field in ("gross_pnl_usdc","fees_usdc","net_pnl_usdc"):
+            old=parse_decimal(previous.get(field)); new=parse_decimal(updated.get(field))
+            row[field]=dec_to_json(new-old) if new is not None and old is not None else None
+            row["corrected_"+field]=updated.get(field)
+        self.record(row,out)
+        self.xemm_rev_count[cloid]=revision
+        self.event("xemm_trade_corrected",cloid=cloid,revision=revision,net_delta=row["net_pnl_usdc"])
 
     def read_taker_trades(self) -> list[dict[str, Any]]:
         path = self.args.taker_trades
@@ -635,9 +590,10 @@ class TradeTracker:
                 capture_output=True,
                 timeout=self.args.status_timeout_sec,
                 check=True,
+                env=bot_environment(self.args),
             )
             report = extract_json_object(proc.stdout)
-            if not isinstance(report, dict) or "summary" not in report:
+            if not isinstance(report, dict) or not isinstance(report.get("summary"),dict) or not isinstance(report["summary"].get("trades",[]),list):
                 # A fragment or truncated payload must count as a failure — an empty
                 # trade list here silently starves the realized-loss breaker.
                 raise ValueError("live-report payload missing summary")
@@ -659,28 +615,31 @@ class TradeTracker:
                 )
             return []
         self.xemm_report_failures = 0
+        self.xemm_report_malformed = int(report["summary"].get("malformed_rows",0))
         return report.get("summary", {}).get("trades", []) or []
 
-    def summary(self) -> dict[str, Any]:
-        by_bot: dict[str, dict[str, Any]] = {}
-        for bot, agg in self.by_bot.items():
-            bucket = dict(agg)
-            trades = Decimal(bucket["trades"])
-            bucket["avg_net_pnl_usdc"] = bucket["net_pnl_usdc"] / trades if trades else None
-            bucket["win_rate"] = Decimal(bucket["wins"]) / trades if trades else None
-            by_bot[bot] = bucket
-        total = self.trade_count
-        return {
-            "trades": total,
-            "by_bot": by_bot,
-            "net_pnl_usdc": self.net_total,
-            "gross_pnl_usdc": self.gross_total,
-            "fees_usdc": self.fees_total,
-            "avg_net_pnl_usdc": self.net_total / Decimal(total) if total else None,
-            "win_rate": Decimal(self.wins) / Decimal(total) if total else None,
-            "best_trade": self.best,
-            "worst_trade": self.worst,
-        }
+    def summary(self) -> dict[str,Any]:
+        by_bot={}
+        for bot,values in self.by_bot.items():
+            b=dict(values)
+            total=b["trades"]
+            b["known_net_pnl_usdc"]=b["net_pnl_usdc"]
+            complete=b["incomplete_trades"]==0
+            b["avg_net_pnl_usdc"]=b["net_pnl_usdc"]/Decimal(total) if total and complete else None
+            b["win_rate"]=Decimal(b["wins"])/Decimal(total) if total and complete else None
+            if not complete:
+                for field in ("gross_pnl_usdc","fees_usdc","net_pnl_usdc"): b[field]=None
+            by_bot[bot]=b
+        known=[row for row in self.rows.values() if self.impact(row)[0]]
+        complete=self.incomplete_trades==0 and self.xemm_report_malformed==0
+        return {"trades":self.trade_count,"by_bot":by_bot,"incomplete_trades":self.incomplete_trades,
+            "net_pnl_usdc":self.known_net_total if complete else None,"risk_net_pnl_usdc":self.net_total,
+            "known_net_pnl_usdc":self.known_net_total,"gross_pnl_usdc":self.gross_total if complete else None,
+            "fees_usdc":self.fees_total if complete else None,
+            "avg_net_pnl_usdc":self.known_net_total/Decimal(self.trade_count) if self.trade_count and complete else None,
+            "win_rate":Decimal(self.wins)/Decimal(self.trade_count) if self.trade_count and complete else None,
+            "best_trade":max(known,key=lambda r:dec_or_zero(r["net_pnl_usdc"]),default=None),
+            "worst_trade":min(known,key=lambda r:dec_or_zero(r["net_pnl_usdc"]),default=None)}
 
     @staticmethod
     def taker_key(row: dict[str, Any]) -> str:
@@ -897,7 +856,7 @@ class PnlTracker:
             pnl = self.last_equity - self.baseline_equity
             if pnl <= -max_loss:
                 return f"equity_drawdown {pnl} <= -{max_loss}"
-        realized = dec_or_zero(trade_summary.get("net_pnl_usdc"))
+        realized = dec_or_zero(trade_summary.get("risk_net_pnl_usdc",trade_summary.get("net_pnl_usdc")))
         if realized <= -max_loss:
             return f"realized_trade_pnl {realized} <= -{max_loss}"
         return None
@@ -1097,7 +1056,10 @@ class Orchestrator:
         self.event("reduce_burst_switch_start", signal=signal_row)
         # Fresh confirm windows for the new mode (see sustained()).
         self.condition_since.clear()
-        self.stop_active("reduce_burst_signal", grace_sec=self.args.fast_xemm_stop_sec)
+        stopped = self.stop_active("reduce_burst_signal", grace_sec=self.args.fast_xemm_stop_sec)
+        if stopped and (stopped.get("alive_after_sigkill") or stopped.get("exit_code") not in (None, 0)):
+            self.safe_halt("xemm_shutdown_unresolved", stop_result=stopped)
+            return
         ok, status = self.verify_xemm_orders_clear()
         if not ok:
             self.safe_halt("xemm_orders_not_clear_for_reduce_arb", xemm_status=status, signal=signal_row)
@@ -1146,6 +1108,8 @@ class Orchestrator:
         if aster_raw is None or lighter_raw is None:
             return False
         try:
+            if isinstance(aster_raw, (bool, float)) or isinstance(lighter_raw, (bool, float)):
+                return False
             aster_open = int(aster_raw)
             lighter_open = int(lighter_raw)
         except (TypeError, ValueError):
@@ -1461,6 +1425,7 @@ class Orchestrator:
                 capture_output=True,
                 timeout=self.args.status_timeout_sec,
                 check=False,
+                env=bot_environment(self.args),
             )
             if proc.returncode != 0:
                 self.event(
@@ -1740,6 +1705,9 @@ class Orchestrator:
                 # the NEW bot while the unkillable one kept running.)
                 self.safe_halt("bot_survived_sigkill", stop_result=stop_result)
                 return
+            if stop_result and stop_result.get("exit_code") not in (None, 0):
+                self.safe_halt("bot_shutdown_unresolved", stop_result=stop_result)
+                return
             if stopping_xemm_for_taker:
                 # The reduce promotion verifies this; the normal resume must too. A
                 # wedged XEMM that ate the SIGKILL path skipped its cancel-on-shutdown:
@@ -1798,7 +1766,7 @@ class Orchestrator:
             self.revoke_reduce_lease(reason)
         child = self.children.get(self.active_bot)
         result = None
-        if child and child.is_running():
+        if child:
             result = child.stop(grace_sec if grace_sec is not None else self.args.stop_grace_sec)
             self.event("bot_stopped", bot=self.active_bot, reason=reason, **result)
             self.track_if_unkilled(child, result)
@@ -1909,7 +1877,7 @@ class Orchestrator:
                     self.args.market,
                     *self.args.taker_arg,
                 ]
-            return BotProcess(bot, self.args.taker_repo, cmd, log)
+            return BotProcess(bot, self.args.taker_repo, cmd, log, bot_environment(self.args))
         out = self.args.state_dir / f"orchestrator_xemm_{self.args.market}_{stamp()}.jsonl.zst"
         self.current_xemm_tape = out
         cmd = [
@@ -1927,12 +1895,12 @@ class Orchestrator:
             str(self.args.xemm_db),
             *self.args.xemm_arg,
         ]
-        return BotProcess(bot, self.args.xemm_repo, cmd, log)
+        return BotProcess(bot, self.args.xemm_repo, cmd, log, bot_environment(self.args))
 
     def make_taker_observer_child(self) -> BotProcess:
         log = self.args.state_dir / f"orchestrator_taker_observer_{self.args.market}_{stamp()}.log"
         cmd = self.reduce_taker_command()
-        return BotProcess(TAKER_OBSERVER, self.args.taker_repo, cmd, log)
+        return BotProcess(TAKER_OBSERVER, self.args.taker_repo, cmd, log, bot_environment(self.args))
 
     def reduce_taker_command(self) -> list[str]:
         cmd = [
@@ -2242,6 +2210,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ack-breaker", action="store_true", help="Archive an existing orchestrator breaker file after operator review and allow startup.")
     parser.add_argument("--backfill-existing-trades", action="store_true")
     parser.add_argument("--state-dir", type=existing_file_or_path, default=stack_root / "runs")
+    parser.add_argument("--aster-nonce-dir", type=existing_file_or_path, default=None, help="Shared signer nonce mappings for bot and status processes (default: ASTER_NONCE_DIR or OS temp/lighter-aster-nonces).")
     parser.add_argument("--taker-repo", type=existing_file_or_path, default=taker_root)
     parser.add_argument("--xemm-repo", type=existing_file_or_path, default=xemm_root)
     parser.add_argument("--taker-bin", type=existing_file_or_path, default=taker_root / "target/release/lighter_aster_taker_arb")

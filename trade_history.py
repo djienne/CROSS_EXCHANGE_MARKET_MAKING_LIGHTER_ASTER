@@ -2,7 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
+import hashlib
+import os
+import re
+import uuid
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -11,16 +16,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
+
 from combined_pnl import DEFAULT_SINCE, dec, iso, json_default, latest_capital_from_state, parse_dt, projection, utc_now
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
 XEMM_BOT = "XEMM_LIGHTER_ASTER"
-
-ASTER_TAKER_FEE_RATE = Decimal("0.0004")
-ASTER_MAKER_FEE_RATE = Decimal("0")
-LIGHTER_FEE_RATE = Decimal("0")
-
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -35,13 +37,13 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     timestamp_us INTEGER,
     direction TEXT,
     qty TEXT NOT NULL,
-    gross_pnl_usdc TEXT NOT NULL,
-    policy_fees_usdc TEXT NOT NULL,
-    net_pnl_usdc TEXT NOT NULL,
-    aster_fee_usdc TEXT NOT NULL,
-    lighter_fee_usdc TEXT NOT NULL,
-    aster_fee_rate TEXT NOT NULL,
-    lighter_fee_rate TEXT NOT NULL,
+    gross_pnl_usdc TEXT,
+    policy_fees_usdc TEXT,
+    net_pnl_usdc TEXT,
+    aster_fee_usdc TEXT,
+    lighter_fee_usdc TEXT,
+    aster_fee_rate TEXT,
+    lighter_fee_rate TEXT,
     aster_order_id TEXT,
     lighter_client_order_index TEXT,
     cloid TEXT,
@@ -54,7 +56,13 @@ CREATE TABLE IF NOT EXISTS strategy_trades (
     source_line INTEGER,
     raw_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    economic_status TEXT NOT NULL DEFAULT 'legacy_unverified',
+    matched_qty TEXT,
+    residual_qty TEXT,
+    aster_qty TEXT,
+    lighter_qty TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_strategy_trades_market_ts
@@ -73,11 +81,11 @@ CREATE TABLE IF NOT EXISTS venue_fills (
     timestamp_us INTEGER,
     side TEXT,
     qty TEXT NOT NULL,
-    price TEXT NOT NULL,
-    notional_usdc TEXT NOT NULL,
+    price TEXT,
+    notional_usdc TEXT,
     liquidity TEXT NOT NULL,
-    fee_rate TEXT NOT NULL,
-    policy_fee_usdc TEXT NOT NULL,
+    fee_rate TEXT,
+    policy_fee_usdc TEXT,
     confirmation_status TEXT NOT NULL DEFAULT 'local_only',
     confirmed_at TEXT,
     external_trade_id TEXT,
@@ -89,6 +97,9 @@ CREATE TABLE IF NOT EXISTS venue_fills (
     raw_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    economic_status TEXT NOT NULL DEFAULT 'legacy_unverified',
+    fee_provenance TEXT NOT NULL DEFAULT 'unknown',
     FOREIGN KEY(trade_key) REFERENCES strategy_trades(trade_key) ON DELETE CASCADE
 );
 
@@ -145,18 +156,12 @@ class IngestStats:
         }
 
 
-def decimal_str(value: Decimal) -> str:
-    return format(value.normalize(), "f")
+def decimal_str(value: Decimal | None) -> str | None:
+    return None if value is None else format(value.normalize(), "f")
 
 
 def raw_json(row: dict[str, Any]) -> str:
     return json.dumps(row, sort_keys=True, separators=(",", ":"))
-
-
-def parse_timestamp(raw: Any) -> str | None:
-    if raw is None or raw == "":
-        return None
-    return iso(parse_dt(str(raw)))
 
 
 def timestamp_us(dt: datetime) -> int:
@@ -169,10 +174,6 @@ def parse_timestamp_us(raw: Any) -> int | None:
     if raw is None or raw == "":
         return None
     return timestamp_us(parse_dt(str(raw)))
-
-
-def abs_fee(notional: Decimal, rate: Decimal) -> Decimal:
-    return abs(notional) * rate
 
 
 def open_db(path: Path) -> sqlite3.Connection:
@@ -194,6 +195,17 @@ def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
 
 
 def migrate_schema(conn: sqlite3.Connection) -> None:
+    additions = {
+        "strategy_trades": {"schema_version":"INTEGER NOT NULL DEFAULT 1", "economic_status":"TEXT NOT NULL DEFAULT 'legacy_unverified'",
+            "matched_qty":"TEXT", "residual_qty":"TEXT", "aster_qty":"TEXT", "lighter_qty":"TEXT"},
+        "venue_fills": {"schema_version":"INTEGER NOT NULL DEFAULT 1", "economic_status":"TEXT NOT NULL DEFAULT 'legacy_unverified'",
+            "fee_provenance":"TEXT NOT NULL DEFAULT 'unknown'"},
+    }
+    for table, fields in additions.items():
+        existing = table_columns(conn,table)
+        for name, declaration in fields.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
     for table, key_column in [("strategy_trades", "trade_key"), ("venue_fills", "fill_key")]:
         if "timestamp_us" not in table_columns(conn, table):
             conn.execute(f"ALTER TABLE {table} ADD COLUMN timestamp_us INTEGER")
@@ -210,39 +222,71 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
                 (ts_us, row[key_column]),
             )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_strategy_trades_market_ts_us ON strategy_trades(market, timestamp_us)")
+    migrate_nullable_economics(conn)
 
 
-def iter_jsonl(path: Path):
+def migrate_nullable_economics(conn: sqlite3.Connection) -> None:
+    """Preserve historical values and extensions while allowing unknown economics."""
+    fields = {
+        "strategy_trades": {"gross_pnl_usdc", "policy_fees_usdc", "net_pnl_usdc", "aster_fee_usdc",
+            "lighter_fee_usdc", "aster_fee_rate", "lighter_fee_rate"},
+        "venue_fills": {"price", "notional_usdc", "fee_rate", "policy_fee_usdc"},
+    }
+    pending = []
+    for table, names in fields.items():
+        if any(row[1] in names and row[3] for row in conn.execute(f"PRAGMA table_info({table})")):
+            pending.append((table, names))
+    if not pending:
+        return
+    conn.commit()
+    foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    legacy_alter = conn.execute("PRAGMA legacy_alter_table").fetchone()[0]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.execute("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for table, names in pending:
+            sql = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
+            auxiliaries = [row[0] for row in conn.execute(
+                "SELECT sql FROM sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL", (table,))]
+            for name in names:
+                sql = re.sub(rf'(\b{re.escape(name)}\s+\w+\s+)NOT\s+NULL\b', r'\1', sql, flags=re.IGNORECASE)
+            replacement = table + "_nullable_migration"
+            sql = re.sub(r'(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)["`\[]?' + table + r'["`\]]?',
+                lambda match: match[1] + replacement, sql, count=1, flags=re.IGNORECASE)
+            conn.execute(sql)
+            columns = ','.join('"' + row[1].replace('"', '""') + '"' for row in conn.execute(f"PRAGMA table_info({table})"))
+            conn.execute(f"INSERT INTO {replacement} ({columns}) SELECT {columns} FROM {table}")
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f"ALTER TABLE {replacement} RENAME TO {table}")
+            for statement in auxiliaries:
+                conn.execute(statement)
+        if conn.execute("PRAGMA foreign_key_check").fetchall():
+            raise ValueError("foreign key violation during nullable economics migration")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute(f"PRAGMA legacy_alter_table={legacy_alter}")
+        conn.execute(f"PRAGMA foreign_keys={foreign_keys}")
+
+
+def iter_jsonl(path: Path, errors: list[str] | None = None):
     with path.open(encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                yield line_no, json.loads(line)
-            except json.JSONDecodeError as exc:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("expected a JSON object")
+                yield line_no, row
+            except (json.JSONDecodeError, ValueError) as exc:
+                if errors is not None:
+                    errors.append(f"line {line_no}: {exc}")
                 print(f"warn: skipping invalid JSON in {path}:{line_no}: {exc}", file=sys.stderr)
-
-
-def nested_dec(row: dict[str, Any], key: str, default: Decimal = Decimal("0")) -> Decimal:
-    return dec(row.get(key), default)
-
-
-def notional_from_fill(fill: dict[str, Any], qty: Decimal, px: Decimal) -> Decimal:
-    if fill.get("notional") is not None:
-        return dec(fill.get("notional"))
-    return qty * px
-
-
-def taker_sides(direction: Any) -> tuple[str | None, str | None]:
-    # The taker producer emits exactly SELL_ASTER_BUY_LIGHTER and
-    # SELL_LIGHTER_BUY_ASTER (Direction::as_str in arb.rs).
-    direction_upper = str(direction or "").upper()
-    if direction_upper == "SELL_ASTER_BUY_LIGHTER":
-        return "sell", "buy"
-    if direction_upper == "SELL_LIGHTER_BUY_ASTER":
-        return "buy", "sell"
-    return None, None
 
 
 def xemm_sides_from_hedge(direction: Any) -> tuple[str | None, str | None]:
@@ -254,346 +298,86 @@ def xemm_sides_from_hedge(direction: Any) -> tuple[str | None, str | None]:
     return None, None
 
 
-def taker_trade_from_row(
-    row: dict[str, Any],
-    *,
-    mode: str,
-    path: Path,
-    line_no: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
-    aster_fill = row.get("aster_fill") or {}
-    lighter_fill = row.get("lighter_fill") or {}
-    if not isinstance(aster_fill, dict) or not isinstance(lighter_fill, dict):
-        return None
-
-    aster_order_id = row.get("aster_order_id")
-    lighter_client_order_index = row.get("lighter_client_order_index")
-    if aster_order_id is None or lighter_client_order_index is None:
-        return None
-
-    raw_timestamp = row.get("timestamp")
-    timestamp = parse_timestamp(raw_timestamp)
-    ts_us = parse_timestamp_us(raw_timestamp)
-    market = str(row.get("market") or "")
-    direction = row.get("direction")
-    if str(direction or "").upper() == "RECOVERY":
-        return recovery_trade_from_row(row, mode=mode, path=path, line_no=line_no)
-    aster_side, lighter_side = taker_sides(direction)
-    if not market or aster_side is None or lighter_side is None:
-        return None
-
-    qty = nested_dec(row, "qty")
-    aster_px = nested_dec(aster_fill, "vwap")
-    lighter_px = nested_dec(lighter_fill, "vwap")
-    aster_notional = notional_from_fill(aster_fill, qty, aster_px)
-    lighter_notional = notional_from_fill(lighter_fill, qty, lighter_px)
-    if row.get("actual_net_usd") is not None:
-        # Producer economics: matched-qty PnL (min of the two legs at their VWAPs)
-        # and actual venue fees. Recomputing from full per-leg notionals fabricates
-        # PnL whenever the fills are unequal.
-        gross = nested_dec(row, "actual_gross_usd")
-        fees = nested_dec(row, "actual_fees_usd")
-        net = nested_dec(row, "actual_net_usd")
-        aster_fee = dec(aster_fill.get("fee_usd"))
-        lighter_fee = dec(lighter_fill.get("fee_usd"))
-    else:
-        # Legacy rows without actual_* fields: policy recompute from leg notionals.
-        if aster_side == "sell":
-            gross = aster_notional - lighter_notional
-        else:
-            gross = lighter_notional - aster_notional
-        aster_fee = abs_fee(aster_notional, ASTER_TAKER_FEE_RATE)
-        lighter_fee = Decimal("0")
-        fees = aster_fee + lighter_fee
-        net = gross - fees
-    trade_key = f"taker:{aster_order_id}:{lighter_client_order_index}"
+def database_records(n: dict[str, Any], *, mode: str, path: Path, line_no: int, source: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     now = iso(utc_now())
-    source = "taker_local_ledger"
-    raw = raw_json(row)
-
+    at = n.get("timestamp")
+    timestamp = iso(at) if at is not None else None
+    at_us = timestamp_us(at) if at is not None else None
+    strategy = "TAKER" if n["key"].startswith("taker:") else "XEMM"
+    status = n.get("economic_status", "legacy_unverified")
+    raw = raw_json(n.get("raw") or {})
+    a_fee, h_fee = n.get("aster_fee_usdc"), n.get("lighter_fee_usdc")
     trade = {
-        "trade_key": trade_key,
-        "mode": mode,
-        "strategy": "TAKER",
-        "bot": TAKER_BOT,
-        "market": market,
-        "timestamp": timestamp,
-        "timestamp_us": ts_us,
-        "direction": str(direction or ""),
-        "qty": decimal_str(qty),
-        "gross_pnl_usdc": decimal_str(gross),
-        "policy_fees_usdc": decimal_str(fees),
-        "net_pnl_usdc": decimal_str(net),
-        "aster_fee_usdc": decimal_str(aster_fee),
-        "lighter_fee_usdc": decimal_str(lighter_fee),
-        "aster_fee_rate": decimal_str(ASTER_TAKER_FEE_RATE),
-        "lighter_fee_rate": decimal_str(LIGHTER_FEE_RATE),
-        "aster_order_id": str(aster_order_id),
-        "lighter_client_order_index": str(lighter_client_order_index),
-        "cloid": None,
-        "aster_px": decimal_str(aster_px),
-        "lighter_px": decimal_str(lighter_px),
-        "confirmation_status": "local_only",
-        "confirmed_at": None,
-        "source": source,
-        "source_path": str(path),
-        "source_line": line_no,
-        "raw_json": raw,
-        "created_at": now,
-        "updated_at": now,
+        "trade_key":n["key"], "mode":mode, "strategy":strategy,
+        "bot":TAKER_BOT if strategy == "TAKER" else XEMM_BOT,
+        "market":n["market"], "timestamp":timestamp, "timestamp_us":at_us,
+        "direction":n.get("direction") or f"ASTER_MAKER_HEDGE_{str(n.get('hedge_side','')).upper()}",
+        "qty":decimal_str(dec(n.get("qty"))),
+        "gross_pnl_usdc":decimal_str(n.get("gross_pnl_usdc")),
+        "policy_fees_usdc":decimal_str(n.get("fees_usdc")),
+        "net_pnl_usdc":decimal_str(n.get("net_pnl_usdc")),
+        "aster_fee_usdc":decimal_str(a_fee), "lighter_fee_usdc":decimal_str(h_fee),
+        "aster_fee_rate":None, "lighter_fee_rate":None,
+        "aster_order_id":n.get("aster_order_id"), "lighter_client_order_index":n.get("lighter_client_order_index"),
+        "cloid":n.get("cloid"),
+        "aster_px":None if n.get("aster_px") is None else decimal_str(n["aster_px"]),
+        "lighter_px":None if n.get("lighter_px") is None else decimal_str(n["lighter_px"]),
+        "confirmation_status":"local_only", "confirmed_at":None,
+        "source":source,"source_path":str(path),"source_line":line_no,"raw_json":raw,
+        "created_at":now,"updated_at":now,"schema_version":2,"economic_status":status,
+        **{key:None if n.get(key) is None else decimal_str(n[key]) for key in ("matched_qty","residual_qty","aster_qty","lighter_qty")},
     }
-    fills = [
-        {
-            "fill_key": f"local:{trade_key}:aster:{aster_order_id}",
-            "trade_key": trade_key,
-            "mode": mode,
-            "venue": "aster",
-            "market": market,
-            "timestamp": timestamp,
-            "timestamp_us": ts_us,
-            "side": aster_side,
-            "qty": decimal_str(dec(aster_fill.get("qty"), qty)),
-            "price": decimal_str(aster_px),
-            "notional_usdc": decimal_str(aster_notional),
-            "liquidity": "taker",
-            "fee_rate": decimal_str(ASTER_TAKER_FEE_RATE),
-            "policy_fee_usdc": decimal_str(aster_fee),
-            "confirmation_status": "local_only",
-            "confirmed_at": None,
-            "external_trade_id": None,
-            "order_id": str(aster_order_id),
-            "client_order_id": None,
-            "source": source,
-            "source_path": str(path),
-            "source_line": line_no,
-            "raw_json": raw,
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "fill_key": f"local:{trade_key}:lighter:{lighter_client_order_index}",
-            "trade_key": trade_key,
-            "mode": mode,
-            "venue": "lighter",
-            "market": market,
-            "timestamp": timestamp,
-            "timestamp_us": ts_us,
-            "side": lighter_side,
-            "qty": decimal_str(dec(lighter_fill.get("qty"), qty)),
-            "price": decimal_str(lighter_px),
-            "notional_usdc": decimal_str(lighter_notional),
-            "liquidity": "unknown",
-            "fee_rate": decimal_str(LIGHTER_FEE_RATE),
-            "policy_fee_usdc": decimal_str(lighter_fee),
-            "confirmation_status": "local_only",
-            "confirmed_at": None,
-            "external_trade_id": None,
-            "order_id": None,
-            "client_order_id": str(lighter_client_order_index),
-            "source": source,
-            "source_path": str(path),
-            "source_line": line_no,
-            "raw_json": raw,
-            "created_at": now,
-            "updated_at": now,
-        },
-    ]
+    fills = []
+    for fill in n.get("fills", []):
+        detail = fill.source.get("detail", fill.source)
+        known = fill.quote is not None and fill.fee is not None
+        price = fill.quote/fill.qty if fill.quote is not None and fill.qty else None
+        ft = iso(fill.timestamp) if fill.timestamp is not None else timestamp
+        fu = timestamp_us(fill.timestamp) if fill.timestamp is not None else at_us
+        fills.append({
+            "fill_key":fill.stored_key or f"local:{n['key']}:{fill.identity}","trade_key":n["key"],"mode":mode,"venue":fill.venue,
+            "market":n["market"],"timestamp":ft,"timestamp_us":fu,"side":fill.side,"qty":decimal_str(fill.qty),
+            "price":decimal_str(price),"notional_usdc":decimal_str(fill.quote),
+            "liquidity":"maker" if detail.get("maker") is True else ("taker" if detail.get("maker") is False else "unknown"),
+            "fee_rate":decimal_str(fill.fee/fill.quote) if fill.fee is not None and fill.quote else None,
+            "policy_fee_usdc":decimal_str(fill.fee),"confirmation_status":"local_only","confirmed_at":None,
+            "external_trade_id":detail.get("trade_id"),"order_id":detail.get("order_id"),
+            "client_order_id":fill.attempt_id or None,"source":source,"source_path":str(path),"source_line":line_no,
+            "raw_json":raw_json(fill.source),"created_at":now,"updated_at":now,
+            "schema_version":2,"economic_status":"confirmed" if known else status,
+            "fee_provenance":"venue" if fill.fee is not None else "unknown",
+        })
     return trade, fills
 
 
-def recovery_trade_from_row(
-    row: dict[str, Any],
-    *,
-    mode: str,
-    path: Path,
-    line_no: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
-    """Emergency-recovery ledger rows: qty 0, no per-venue fills, a booked loss in
-    actual_net_usd. Key mirrors the orchestrator's recovery dedup key (timestamp
-    component) so rows from old binaries stamped 0:0 stay distinct."""
-    aster_order_id = row.get("aster_order_id")
-    lighter_client_order_index = row.get("lighter_client_order_index")
-    if aster_order_id is None or lighter_client_order_index is None:
-        return None
-    raw_timestamp = row.get("timestamp")
-    timestamp = parse_timestamp(raw_timestamp)
-    ts_us = parse_timestamp_us(raw_timestamp)
-    market = str(row.get("market") or "")
-    if not market:
-        return None
-    gross = nested_dec(row, "actual_gross_usd")
-    fees = nested_dec(row, "actual_fees_usd")
-    net = nested_dec(row, "actual_net_usd")
-    trade_key = f"taker:recovery:{aster_order_id}:{lighter_client_order_index}:{raw_timestamp}"
-    now = iso(utc_now())
-    trade = {
-        "trade_key": trade_key,
-        "mode": mode,
-        "strategy": "TAKER",
-        "bot": TAKER_BOT,
-        "market": market,
-        "timestamp": timestamp,
-        "timestamp_us": ts_us,
-        "direction": "RECOVERY",
-        "qty": "0",
-        "gross_pnl_usdc": decimal_str(gross),
-        "policy_fees_usdc": decimal_str(fees),
-        "net_pnl_usdc": decimal_str(net),
-        "aster_fee_usdc": "0",
-        "lighter_fee_usdc": "0",
-        "aster_fee_rate": decimal_str(ASTER_TAKER_FEE_RATE),
-        "lighter_fee_rate": decimal_str(LIGHTER_FEE_RATE),
-        "aster_order_id": str(aster_order_id),
-        "lighter_client_order_index": str(lighter_client_order_index),
-        "cloid": None,
-        "aster_px": None,
-        "lighter_px": None,
-        "confirmation_status": "local_only",
-        "confirmed_at": None,
-        "source": "taker_local_ledger",
-        "source_path": str(path),
-        "source_line": line_no,
-        "raw_json": raw_json(row),
-        "created_at": now,
-        "updated_at": now,
-    }
-    return trade, []
+def taker_trade_from_row(row: dict[str, Any], *, mode: str, path: Path, line_no: int) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+    n = taker_economics(row)
+    return database_records(n,mode=mode,path=path,line_no=line_no,source="taker_local_ledger") if n else None
 
 
-def xemm_trade_from_orchestrator_row(
-    row: dict[str, Any],
-    *,
-    mode: str,
-    path: Path,
-    line_no: int,
-) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
-    if row.get("bot") != XEMM_BOT:
+def xemm_trade_from_orchestrator_row(row: dict[str, Any], *, mode: str, path: Path, line_no: int):
+    if row.get("bot") != XEMM_BOT or row.get("direction") == "XEMM_CORRECTION":
         return None
-    trade_key = str(row.get("key") or "")
-    if not trade_key:
-        cloid = row.get("cloid")
-        if cloid is None:
-            return None
-        trade_key = f"xemm:{cloid}"
-
-    raw_timestamp = row.get("timestamp")
-    timestamp = parse_timestamp(raw_timestamp)
-    ts_us = parse_timestamp_us(raw_timestamp)
-    market = str(row.get("market") or "")
-    direction = row.get("direction")
-    aster_side, lighter_side = xemm_sides_from_hedge(direction)
-    if not market or aster_side is None or lighter_side is None:
-        return None
-
-    qty = nested_dec(row, "qty")
-    aster_px = nested_dec(row, "aster_px")
-    lighter_px = nested_dec(row, "lighter_px")
-    if lighter_side == "buy":
-        gross = qty * (aster_px - lighter_px)
-    elif lighter_side == "sell":
-        gross = qty * (lighter_px - aster_px)
-    else:
-        return None
-
-    aster_notional = qty * aster_px
-    lighter_notional = qty * lighter_px
-    aster_fee = abs_fee(aster_notional, ASTER_MAKER_FEE_RATE)
-    lighter_fee = abs_fee(lighter_notional, LIGHTER_FEE_RATE)
-    fees = aster_fee + lighter_fee
-    net = gross - fees
-    now = iso(utc_now())
-    source = "orchestrator_normalized_ledger"
-    raw = raw_json(row)
     cloid = row.get("cloid")
-
-    trade = {
-        "trade_key": trade_key,
-        "mode": mode,
-        "strategy": "XEMM",
-        "bot": XEMM_BOT,
-        "market": market,
-        "timestamp": timestamp,
-        "timestamp_us": ts_us,
-        "direction": str(direction or ""),
-        "qty": decimal_str(qty),
-        "gross_pnl_usdc": decimal_str(gross),
-        "policy_fees_usdc": decimal_str(fees),
-        "net_pnl_usdc": decimal_str(net),
-        "aster_fee_usdc": decimal_str(aster_fee),
-        "lighter_fee_usdc": decimal_str(lighter_fee),
-        "aster_fee_rate": decimal_str(ASTER_MAKER_FEE_RATE),
-        "lighter_fee_rate": decimal_str(LIGHTER_FEE_RATE),
-        "aster_order_id": None,
-        "lighter_client_order_index": None,
-        "cloid": None if cloid is None else str(cloid),
-        "aster_px": decimal_str(aster_px),
-        "lighter_px": decimal_str(lighter_px),
-        "confirmation_status": "local_only",
-        "confirmed_at": None,
-        "source": source,
-        "source_path": str(path),
-        "source_line": line_no,
-        "raw_json": raw,
-        "created_at": now,
-        "updated_at": now,
-    }
-    fills = [
-        {
-            "fill_key": f"local:{trade_key}:aster:{cloid or line_no}",
-            "trade_key": trade_key,
-            "mode": mode,
-            "venue": "aster",
-            "market": market,
-            "timestamp": timestamp,
-            "timestamp_us": ts_us,
-            "side": aster_side,
-            "qty": decimal_str(qty),
-            "price": decimal_str(aster_px),
-            "notional_usdc": decimal_str(aster_notional),
-            "liquidity": "maker",
-            "fee_rate": decimal_str(ASTER_MAKER_FEE_RATE),
-            "policy_fee_usdc": decimal_str(aster_fee),
-            "confirmation_status": "local_only",
-            "confirmed_at": None,
-            "external_trade_id": None,
-            "order_id": None,
-            "client_order_id": None if cloid is None else str(cloid),
-            "source": source,
-            "source_path": str(path),
-            "source_line": line_no,
-            "raw_json": raw,
-            "created_at": now,
-            "updated_at": now,
-        },
-        {
-            "fill_key": f"local:{trade_key}:lighter:{cloid or line_no}",
-            "trade_key": trade_key,
-            "mode": mode,
-            "venue": "lighter",
-            "market": market,
-            "timestamp": timestamp,
-            "timestamp_us": ts_us,
-            "side": lighter_side,
-            "qty": decimal_str(qty),
-            "price": decimal_str(lighter_px),
-            "notional_usdc": decimal_str(lighter_notional),
-            "liquidity": "hedge",
-            "fee_rate": decimal_str(LIGHTER_FEE_RATE),
-            "policy_fee_usdc": decimal_str(lighter_fee),
-            "confirmation_status": "local_only",
-            "confirmed_at": None,
-            "external_trade_id": None,
-            "order_id": None,
-            "client_order_id": None if cloid is None else str(cloid),
-            "source": source,
-            "source_path": str(path),
-            "source_line": line_no,
-            "raw_json": raw,
-            "created_at": now,
-            "updated_at": now,
-        },
-    ]
-    return trade, fills
+    if cloid is None or not row.get("market"):
+        return None
+    a_side,h_side = xemm_sides_from_hedge(row.get("direction"))
+    if a_side is None:
+        return None
+    confirmed = row.get("schema_version",1) >= 2 and row.get("economic_status") == "confirmed"
+    n = {name:optional_decimal(row.get(name)) for name in ("qty","aster_qty","lighter_qty","matched_qty","residual_qty",
+        "aster_px","lighter_px","gross_pnl_usdc","fees_usdc","net_pnl_usdc","aster_fee_usdc","lighter_fee_usdc")}
+    n.update(key=f"xemm:{cloid}",cloid=str(cloid),market=str(row["market"]),direction=row.get("direction"),
+        timestamp=event_time(row),raw=row,economic_status="confirmed" if confirmed else "legacy_unverified",fills=[])
+    if not confirmed:
+        n["net_pnl_usdc"] = None
+    else:
+        gross,fees,net = n["gross_pnl_usdc"],n["fees_usdc"],n["net_pnl_usdc"]
+        if gross is None or fees is None or net is None or abs(gross-fees-net)>Decimal("0.00000001"):
+            n["economic_status"]="incomplete"
+            n["net_pnl_usdc"]=None
+    # Aggregate rows have no native trade identities. Do not fabricate venue fills.
+    return database_records(n,mode=mode,path=path,line_no=line_no,source="orchestrator_normalized_ledger")
 
 
 def upsert_row(conn: sqlite3.Connection, table: str, key_column: str, row: dict[str, Any], preserve: set[str]) -> None:
@@ -609,24 +393,43 @@ def upsert_row(conn: sqlite3.Connection, table: str, key_column: str, row: dict[
     conn.execute(sql, [row[column] for column in columns])
 
 
-def upsert_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> None:
-    upsert_row(
-        conn,
-        "strategy_trades",
-        "trade_key",
-        trade,
-        preserve={"confirmation_status", "confirmed_at", "created_at"},
-    )
+def upsert_trade(conn: sqlite3.Connection, trade: dict[str, Any]) -> bool:
+    previous=conn.execute("SELECT confirmation_status,source,schema_version,economic_status,aster_qty,lighter_qty FROM strategy_trades WHERE trade_key=?",(trade["trade_key"],)).fetchone()
+    if previous is not None:
+        if previous["confirmation_status"]=="exchange_confirmed":
+            return False
+        if previous["source"]=="raw_execution_fills" and previous["economic_status"]=="confirmed" and (
+            trade["source"]!="raw_execution_fills" or trade["economic_status"]!="confirmed"
+        ):
+            grew=any(dec(trade.get(k))>dec(previous[k]) for k in ("aster_qty","lighter_qty"))
+            if not grew:
+                return False
+        if previous["source"]=="xemm_journal" and previous["schema_version"]>=2 and trade["source"]=="orchestrator_normalized_ledger":
+            return False
+    upsert_row(conn,"strategy_trades","trade_key",trade,preserve={"confirmation_status","confirmed_at","created_at"})
+    return True
 
 
 def upsert_fill(conn: sqlite3.Connection, fill: dict[str, Any]) -> None:
-    upsert_row(
-        conn,
-        "venue_fills",
-        "fill_key",
-        fill,
-        preserve={"confirmation_status", "confirmed_at", "external_trade_id", "created_at"},
-    )
+    if fill.get("external_trade_id") is not None and conn.execute(
+        "SELECT 1 FROM venue_fills WHERE trade_key=? AND venue=? AND external_trade_id=? "
+        "AND order_id IS ? AND confirmation_status='exchange_confirmed'",
+        (fill["trade_key"],fill["venue"],fill["external_trade_id"],fill.get("order_id")),
+    ).fetchone():
+        return
+    existing=conn.execute("SELECT confirmation_status FROM venue_fills WHERE fill_key=?",(fill["fill_key"],)).fetchone()
+    if existing and existing["confirmation_status"]=="exchange_confirmed":
+        return
+    upsert_row(conn,"venue_fills","fill_key",fill,preserve={"confirmation_status","confirmed_at","external_trade_id","created_at"})
+
+
+def replace_trade_records(conn: sqlite3.Connection, trade: dict[str, Any], fills: list[dict[str, Any]]) -> bool:
+    if not upsert_trade(conn,trade):
+        return False
+    conn.execute("DELETE FROM venue_fills WHERE trade_key=? AND confirmation_status!='exchange_confirmed'",(trade["trade_key"],))
+    for fill in fills:
+        upsert_fill(conn,fill)
+    return True
 
 
 def update_sync_state(conn: sqlite3.Connection, stats: IngestStats, *, mode: str, market: str) -> None:
@@ -666,7 +469,8 @@ def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, mode: str, mark
         update_sync_state(conn, stats, mode=mode, market=market)
         return stats
 
-    for line_no, row in iter_jsonl(path):
+    errors: list[str] = []
+    for line_no, row in iter_jsonl(path, errors):
         stats.read += 1
         if row.get("market") != market:
             stats.skipped += 1
@@ -681,11 +485,12 @@ def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, mode: str, mark
             stats.skipped += 1
             continue
         trade, fills = parsed
-        upsert_trade(conn, trade)
-        stats.upserted_trades += 1
-        for fill in fills:
-            upsert_fill(conn, fill)
-            stats.upserted_fills += 1
+        if replace_trade_records(conn,trade,fills):
+            stats.upserted_trades += 1
+            stats.upserted_fills += len(fills)
+    if errors:
+        stats.error = "; ".join(errors[:3])
+        stats.skipped += len(errors)
     update_sync_state(conn, stats, mode=mode, market=market)
     return stats
 
@@ -697,228 +502,72 @@ def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, mode: str,
         update_sync_state(conn, stats, mode=mode, market=market)
         return stats
 
-    for line_no, row in iter_jsonl(path):
+    logical_rows = {}
+    errors: list[str] = []
+    for line_no,row in iter_jsonl(path, errors):
         stats.read += 1
-        if row.get("market") != market:
+        if row.get("market") != market or row.get("bot") != XEMM_BOT or row.get("cloid") is None:
             stats.skipped += 1
             continue
+        cloid = str(row["cloid"])
+        if row.get("direction") == "XEMM_CORRECTION":
+            base = logical_rows.get(cloid)
+            if base is None:
+                old = conn.execute("SELECT raw_json FROM strategy_trades WHERE trade_key=?",(f"xemm:{cloid}",)).fetchone()
+                if old:
+                    candidate = json.loads(old["raw_json"])
+                    if candidate.get("bot") == XEMM_BOT:
+                        base = (line_no,candidate)
+            if base is None:
+                stats.skipped += 1
+                continue
+            merged = dict(base[1])
+            if isinstance(row.get("corrected_trade"),dict):
+                merged.update(row["corrected_trade"])
+            else:
+                for field in ("gross_pnl_usdc","fees_usdc","net_pnl_usdc"):
+                    absolute = row.get("corrected_"+field)
+                    merged[field] = absolute if absolute is not None else decimal_str(dec(merged.get(field))+dec(row.get(field)))
+            merged.update(key=f"xemm:{cloid}",cloid=cloid)
+            logical_rows[cloid]=(line_no,merged)
+        else:
+            logical_rows[cloid]=(line_no,row)
+    for line_no,row in logical_rows.values():
         try:
-            parsed = xemm_trade_from_orchestrator_row(row, mode=mode, path=path, line_no=line_no)
-        except Exception as exc:
+            parsed=xemm_trade_from_orchestrator_row(row,mode=mode,path=path,line_no=line_no)
+            if parsed is None:
+                stats.skipped += 1
+                continue
+            trade,fills=parsed
+            if replace_trade_records(conn,trade,fills):
+                stats.upserted_trades += 1
+                stats.upserted_fills += len(fills)
+        except (ValueError,TypeError) as exc:
             stats.skipped += 1
-            stats.error = str(exc)
-            continue
-        if parsed is None:
-            stats.skipped += 1
-            continue
-        trade, fills = parsed
-        upsert_trade(conn, trade)
-        stats.upserted_trades += 1
-        for fill in fills:
-            upsert_fill(conn, fill)
-            stats.upserted_fills += 1
+            stats.error=str(exc)
+    if errors:
+        stats.error = "; ".join(errors[:3])
+        stats.skipped += len(errors)
     update_sync_state(conn, stats, mode=mode, market=market)
     return stats
 
 
-def xemm_journal_row_ts(row: dict[str, Any]) -> tuple[str | None, int | None]:
-    ts_ms = row.get("ts_ms")
-    if isinstance(ts_ms, (int, float)) and ts_ms > 0:
-        dt = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
-        return iso(dt), timestamp_us(dt)
-    return None, None
-
-
 def ingest_xemm_journal(conn: sqlite3.Connection, path: Path, *, mode: str, market: str) -> IngestStats:
-    """Ingest XEMM trades directly from the bot journal (fill/hedge_fill pairs by cloid).
-
-    The journal is bot-written, so trades that filled while the orchestrator was down are
-    still captured, and `ts_ms` is the actual trade time — unlike the orchestrator ledger,
-    whose rows are stamped at poll time. Runs AFTER the orchestrator-ledger ingestion so
-    the journal's timestamps and actual hedge fees win on shared `xemm:{cloid}` keys.
-    Legacy rows without ts_ms are left to the orchestrator-ledger source.
-    """
-    stats = IngestStats("xemm_journal", path)
+    stats = IngestStats("xemm_journal",path)
     if not path.exists():
-        stats.missing = True
-        update_sync_state(conn, stats, mode=mode, market=market)
-        return stats
-
-    fills: dict[str, dict[str, Any]] = {}
-    hedges: dict[str, dict[str, Any]] = {}
-    for line_no, row in iter_jsonl(path):
-        stats.read += 1
-        if row.get("market") != market:
-            stats.skipped += 1
-            continue
-        kind = row.get("kind")
-        detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
-        cloid = detail.get("cloid")
-        if kind not in ("fill", "hedge_fill") or cloid is None:
-            stats.skipped += 1
-            continue
-        timestamp, ts_us = xemm_journal_row_ts(row)
-        if timestamp is None:
-            stats.skipped += 1  # legacy row without ts_ms: orchestrator ledger covers it
-            continue
-        cloid = str(cloid)
-        try:
-            qty = Decimal(str(detail.get("qty", "0")))
-        except Exception:
-            stats.skipped += 1
-            continue
-        if kind == "fill":
-            try:
-                aster_px = Decimal(str(detail.get("avg_aster_px", "0")))
-            except Exception:
-                stats.skipped += 1
-                continue
-            fills[cloid] = {
-                "qty": qty,
-                "aster_px": aster_px,
-                "side": str(detail.get("side", "")).lower(),
-                "timestamp": timestamp,
-                "ts_us": ts_us,
-                "line_no": line_no,
-                "raw": row,
-            }
-        else:
-            try:
-                px = Decimal(str(detail.get("px", "0")))
-            except Exception:
-                stats.skipped += 1
-                continue
-            fee_raw = detail.get("fee_usd")
-            try:
-                fee = Decimal(str(fee_raw)) if fee_raw is not None else None
-            except Exception:
-                fee = None
-            agg = hedges.setdefault(
-                cloid,
-                {
-                    "qty": Decimal("0"),
-                    "notional": Decimal("0"),
-                    "fee": Decimal("0"),
-                    "fee_missing_notional": Decimal("0"),
-                    "side": str(detail.get("side", "")).lower(),
-                    "timestamp": timestamp,
-                    "ts_us": ts_us,
-                },
-            )
-            agg["qty"] += qty
-            agg["notional"] += qty * px
-            if fee is not None:
-                agg["fee"] += fee
-            else:
-                agg["fee_missing_notional"] += qty * px
-            if ts_us is not None and (agg["ts_us"] is None or ts_us > agg["ts_us"]):
-                agg["timestamp"], agg["ts_us"] = timestamp, ts_us
-
-    now = iso(utc_now())
-    for cloid, fill in fills.items():
-        hedge = hedges.get(cloid)
-        if hedge is None or hedge["qty"] <= 0 or fill["qty"] != hedge["qty"] or fill["side"] != hedge["side"]:
-            stats.skipped += 1
-            continue
-        lighter_px = hedge["notional"] / hedge["qty"]
-        qty = fill["qty"]
-        aster_px = fill["aster_px"]
-        # Journal `side` is the HEDGE side: hedge buy means the maker leg sold on Aster.
-        if fill["side"] == "buy":
-            gross = qty * (aster_px - lighter_px)
-            aster_side, lighter_side = "sell", "buy"
-        elif fill["side"] == "sell":
-            gross = qty * (lighter_px - aster_px)
-            aster_side, lighter_side = "buy", "sell"
-        else:
-            stats.skipped += 1
-            continue
-        aster_notional = qty * aster_px
-        lighter_notional = qty * lighter_px
-        aster_fee = abs_fee(aster_notional, ASTER_MAKER_FEE_RATE)
-        lighter_fee = hedge["fee"] + abs_fee(hedge["fee_missing_notional"], LIGHTER_FEE_RATE)
-        fees = aster_fee + lighter_fee
-        trade_key = f"xemm:{cloid}"
-        timestamp = max(
-            (t for t in [fill["timestamp"], hedge["timestamp"]] if t is not None),
-            default=fill["timestamp"],
-        )
-        ts_us = max(
-            (t for t in [fill["ts_us"], hedge["ts_us"]] if t is not None),
-            default=fill["ts_us"],
-        )
-        raw = raw_json(fill["raw"])
-        trade = {
-            "trade_key": trade_key,
-            "mode": mode,
-            "strategy": "XEMM",
-            "bot": XEMM_BOT,
-            "market": market,
-            "timestamp": timestamp,
-            "timestamp_us": ts_us,
-            "direction": fill["side"],
-            "qty": decimal_str(qty),
-            "gross_pnl_usdc": decimal_str(gross),
-            "policy_fees_usdc": decimal_str(fees),
-            "net_pnl_usdc": decimal_str(gross - fees),
-            "aster_fee_usdc": decimal_str(aster_fee),
-            "lighter_fee_usdc": decimal_str(lighter_fee),
-            "aster_fee_rate": decimal_str(ASTER_MAKER_FEE_RATE),
-            "lighter_fee_rate": decimal_str(LIGHTER_FEE_RATE),
-            "aster_order_id": None,
-            "lighter_client_order_index": None,
-            "cloid": cloid,
-            "aster_px": decimal_str(aster_px),
-            "lighter_px": decimal_str(lighter_px),
-            "confirmation_status": "local_only",
-            "confirmed_at": None,
-            "source": "xemm_journal",
-            "source_path": str(path),
-            "source_line": fill["line_no"],
-            "raw_json": raw,
-            "created_at": now,
-            "updated_at": now,
-        }
-        fill_rows = []
-        for venue, side, px, notional, liquidity, fee_rate, fee_usd in [
-            ("aster", aster_side, aster_px, aster_notional, "maker", ASTER_MAKER_FEE_RATE, aster_fee),
-            ("lighter", lighter_side, lighter_px, lighter_notional, "hedge", LIGHTER_FEE_RATE, lighter_fee),
-        ]:
-            fill_rows.append(
-                {
-                    "fill_key": f"local:{trade_key}:{venue}:{cloid}",
-                    "trade_key": trade_key,
-                    "mode": mode,
-                    "venue": venue,
-                    "market": market,
-                    "timestamp": timestamp,
-                    "timestamp_us": ts_us,
-                    "side": side,
-                    "qty": decimal_str(qty),
-                    "price": decimal_str(px),
-                    "notional_usdc": decimal_str(notional),
-                    "liquidity": liquidity,
-                    "fee_rate": decimal_str(fee_rate),
-                    "policy_fee_usdc": decimal_str(fee_usd),
-                    "confirmation_status": "local_only",
-                    "confirmed_at": None,
-                    "external_trade_id": None,
-                    "order_id": None,
-                    "client_order_id": cloid,
-                    "source": "xemm_journal",
-                    "source_path": str(path),
-                    "source_line": fill["line_no"],
-                    "raw_json": raw,
-                    "created_at": now,
-                    "updated_at": now,
-                }
-            )
-        upsert_trade(conn, trade)
-        stats.upserted_trades += 1
-        for fill_row in fill_rows:
-            upsert_fill(conn, fill_row)
-            stats.upserted_fills += 1
-    update_sync_state(conn, stats, mode=mode, market=market)
+        stats.missing=True
+    else:
+        parsed=xemm_journal(path,market)
+        stats.skipped=parsed["malformed_rows"]
+        for index,n in enumerate(parsed["trades"],1):
+            stats.read+=1
+            trade,fills=database_records(n,mode=mode,path=path,line_no=n.get("source_line",index),source="xemm_journal")
+            if replace_trade_records(conn,trade,fills):
+                stats.upserted_trades+=1
+                stats.upserted_fills+=len(fills)
+        if parsed["malformed_rows"]:
+            stats.error=f"{parsed['malformed_rows']} malformed economic rows; source preserved"
+    update_sync_state(conn,stats,mode=mode,market=market)
     return stats
 
 
@@ -942,99 +591,267 @@ def refresh_lan(
     return stats
 
 
-def empty_bucket(strategy: str) -> dict[str, Any]:
-    return {
-        "strategy": strategy,
-        "trades": 0,
-        "gross_pnl_usdc": Decimal("0"),
-        "policy_fees_usdc": Decimal("0"),
-        "net_pnl_usdc": Decimal("0"),
-        "aster_fees_usdc": Decimal("0"),
-        "lighter_fees_usdc": Decimal("0"),
-        "local_only_trades": 0,
-        "exchange_confirmed_trades": 0,
-    }
 
+OWNED_TABLES = ("strategy_trades", "venue_fills", "sync_state", "reconciliation_events")
 
-def report_from_db(
-    conn: sqlite3.Connection,
-    *,
-    market: str,
-    since: datetime,
-    now: datetime,
-    db_path: Path,
-    capital_usdc: Decimal | None = None,
-    orchestrator_state: Path | None = None,
-) -> dict[str, Any]:
-    buckets = {"TAKER": empty_bucket("TAKER"), "XEMM": empty_bucket("XEMM")}
-    confirmation_counts: dict[str, int] = {}
-    rows = conn.execute(
-        """
-        SELECT strategy, gross_pnl_usdc, policy_fees_usdc, net_pnl_usdc,
-               aster_fee_usdc, lighter_fee_usdc, confirmation_status
-        FROM strategy_trades
-        WHERE market = ? AND timestamp_us IS NOT NULL AND timestamp_us >= ? AND timestamp_us <= ?
-        ORDER BY timestamp_us ASC, timestamp ASC, trade_key ASC
-        """,
-        (market, timestamp_us(since), timestamp_us(now)),
-    ).fetchall()
+def database_fingerprint(conn: sqlite3.Connection, schema: str = "main") -> str:
+    """Concurrency guard for reviewed replacements, not a scientific validity test."""
+    digest=hashlib.sha256()
+    for table in OWNED_TABLES:
+        info=conn.execute(f"PRAGMA {schema}.table_info({table})").fetchall()
+        if not info:
+            continue
+        names=sorted(str(r[1]) for r in info)
+        quoted=",".join('"'+name.replace('"','""')+'"' for name in names)
+        key={"strategy_trades":"trade_key","venue_fills":"fill_key","sync_state":"source","reconciliation_events":"id"}[table]
+        digest.update(json.dumps([table,names]).encode())
+        for row in conn.execute(f"SELECT type,name,sql FROM {schema}.sqlite_master WHERE tbl_name=? ORDER BY type,name", (table,)):
+            digest.update(json.dumps(list(row)).encode())
+        for row in conn.execute(f"SELECT {quoted} FROM {schema}.{table} ORDER BY {key}"):
+            digest.update(json.dumps(list(row),default=str,separators=(",",":")).encode())
+    return digest.hexdigest()
+
+def database_overview(conn: sqlite3.Connection) -> dict[str, Any]:
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='strategy_trades'").fetchone():
+        return {"trades":0,"known_net_pnl_usdc":"0","incomplete_trades":0}
+    rows=conn.execute("SELECT * FROM strategy_trades").fetchall()
+    known=Decimal(0)
+    incomplete=0
     for row in rows:
-        strategy = str(row["strategy"])
-        bucket = buckets.setdefault(strategy, empty_bucket(strategy))
-        status = str(row["confirmation_status"])
-        confirmation_counts[status] = confirmation_counts.get(status, 0) + 1
-        bucket["trades"] += 1
-        bucket["gross_pnl_usdc"] += dec(row["gross_pnl_usdc"])
-        bucket["policy_fees_usdc"] += dec(row["policy_fees_usdc"])
-        bucket["net_pnl_usdc"] += dec(row["net_pnl_usdc"])
-        bucket["aster_fees_usdc"] += dec(row["aster_fee_usdc"])
-        bucket["lighter_fees_usdc"] += dec(row["lighter_fee_usdc"])
-        if status == "exchange_confirmed":
-            bucket["exchange_confirmed_trades"] += 1
-        elif status == "local_only":
-            bucket["local_only_trades"] += 1
+        values=confirmed_economics(row)
+        if values is not None:
+            known+=values[2]
+        else:
+            incomplete+=1
+    return {"trades":len(rows),"known_net_pnl_usdc":decimal_str(known),"incomplete_trades":incomplete}
 
-    total = empty_bucket("TOTAL")
-    for bucket in buckets.values():
-        total["trades"] += bucket["trades"]
-        total["gross_pnl_usdc"] += bucket["gross_pnl_usdc"]
-        total["policy_fees_usdc"] += bucket["policy_fees_usdc"]
-        total["net_pnl_usdc"] += bucket["net_pnl_usdc"]
-        total["aster_fees_usdc"] += bucket["aster_fees_usdc"]
-        total["lighter_fees_usdc"] += bucket["lighter_fees_usdc"]
-        total["local_only_trades"] += bucket["local_only_trades"]
-        total["exchange_confirmed_trades"] += bucket["exchange_confirmed_trades"]
+def confirmed_economics(row) -> list[Decimal] | None:
+    columns=set(row.keys())
+    confirmed=row["confirmation_status"]=="exchange_confirmed" or (
+        "economic_status" in columns and row["economic_status"]=="confirmed" and row["schema_version"]>=2)
+    values=[optional_decimal(row[c]) for c in ("gross_pnl_usdc","policy_fees_usdc","net_pnl_usdc","aster_fee_usdc","lighter_fee_usdc")]
+    if not confirmed or any(v is None for v in values):
+        return None
+    gross,fees,net,aster,lighter=values
+    if abs(gross-fees-net)>Decimal("0.00000001") or abs(fees-aster-lighter)>Decimal("0.00000001"):
+        return None
+    return values
 
-    capital_source = "cli"
-    capital = capital_usdc
+def repair_raw_fees(conn: sqlite3.Connection, paths: list[Path], market: str) -> dict[str, int]:
+    """Use own-account, order-identified raw fills only when quantity coverage agrees."""
+    trades=conn.execute("SELECT * FROM strategy_trades WHERE market=?",(market,)).fetchall()
+    evidence: dict[tuple[str,str], dict[str,Fill]]={}
+    malformed=[]
+    for path in paths:
+        for line,row in iter_jsonl(path,malformed):
+            d=row.get("detail",row)
+            if not isinstance(d,dict) or row.get("market",d.get("market"))!=market:
+                continue
+            venue=venue_name(d.get("venue"))
+            qty=optional_decimal(d.get("qty",d.get("size")))
+            px=optional_decimal(d.get("px",d.get("price")))
+            quote=optional_decimal(d.get("notional_usd",d.get("usd_amount")))
+            if quote is None and qty is not None and px is not None:
+                quote=qty*px
+            side=str(d.get("side","")).lower()
+            trade_id=d.get("trade_id")
+            if venue not in {"aster","lighter"} or qty is None or qty<=0 or quote is None or quote<=0 or trade_id is None or side not in {"buy","sell"}:
+                malformed.append(f"{path}:{line}: raw fill lacks own-order evidence")
+                continue
+            fee=fill_fee(d,trusted=row.get("schema_version",1)>=2 and row.get("economic_status")=="confirmed")
+            if venue=="aster" and d.get("commission_asset") in {"USD","USDT","USDC"}:
+                fee=optional_decimal(d.get("commission"))
+            identity=f"{venue}:{d.get('order_id')}:{trade_id}"
+            for trade in trades:
+                logical=d.get("logical_id")
+                matches=(logical is not None and trade["trade_key"]==f"xemm:{logical}")
+                if venue=="aster" and trade["aster_order_id"] is not None:
+                    matches |= str(d.get("order_id"))==trade["aster_order_id"]
+                if venue=="lighter" and trade["lighter_client_order_index"] is not None:
+                    matches |= str(d.get("client_order_index"))==trade["lighter_client_order_index"]
+                if matches:
+                    evidence.setdefault((trade["trade_key"],venue),{})[identity]=Fill(
+                        venue,side,qty,quote,fee,event_time(row),identity,str(d.get("attempt_id","")),row)
+    repaired=0
+    for trade in trades:
+        if trade["confirmation_status"]=="exchange_confirmed":
+            continue
+        replacement=[]
+        changed=False
+        for venue in ("aster","lighter"):
+            old=conn.execute("SELECT * FROM venue_fills WHERE trade_key=? AND venue=?",(trade["trade_key"],venue)).fetchall()
+            raw=list(evidence.get((trade["trade_key"],venue),{}).values())
+            expected=optional_decimal(trade[f"{venue}_qty"])
+            if expected is None:
+                expected=sum((dec(r["qty"]) for r in old),Decimal(0)) if old else None
+            if raw and expected is not None and sum((f.qty for f in raw),Decimal(0))==expected:
+                replacement.extend(raw)
+                changed=True
+            else:
+                for r in old:
+                    quantity=dec(r["qty"])
+                    quote=optional_decimal(r["notional_usdc"])
+                    if quote==0 and quantity>0: quote=None
+                    replacement.append(Fill(venue,r["side"],quantity,quote,
+                        optional_decimal(r["policy_fee_usdc"]) if r["fee_provenance"]=="venue" or r["confirmation_status"]=="exchange_confirmed" else None,
+                        parse_dt(r["timestamp"]) if r["timestamp"] else None,r["fill_key"],r["client_order_id"] or "",
+                        json.loads(r["raw_json"]),stored_key=r["fill_key"]))
+        if not changed:
+            continue
+        # Never upgrade a legacy aggregate whose other executed leg is unrepresented.
+        if any(optional_decimal(trade[f"{venue}_qty"]) is None for venue in ("aster","lighter")):
+            continue
+        n=calculate(replacement)
+        if trade["strategy"]=="XEMM":
+            n["qty"]=dec(trade["qty"])  # fee repair must not relabel corrective taker volume as maker volume
+        n.update(key=trade["trade_key"],market=trade["market"],direction=trade["direction"],
+            cloid=trade["cloid"],aster_order_id=trade["aster_order_id"],lighter_client_order_index=trade["lighter_client_order_index"],
+            timestamp=max((f.timestamp for f in replacement if f.timestamp is not None),
+                default=parse_dt(trade["timestamp"]) if trade["timestamp"] else None),
+            raw={"repair":"individual own-account fills","previous_source":trade["source"]})
+        records,fills=database_records(n,mode="lan",path=paths[0],line_no=0,source="raw_execution_fills")
+        repaired+=int(replace_trade_records(conn,records,fills))
+    return {"repaired_trades":repaired,"unusable_raw_rows":len(malformed)}
+
+def build_repaired_database(args: argparse.Namespace) -> dict[str, Any]:
+    target=args.rebuild_out or args.db.with_name(args.db.stem+".rebuilt.sqlite")
+    if target.resolve()==args.db.resolve():
+        raise ValueError("--rebuild-out must differ from the original database")
+    target.parent.mkdir(parents=True,exist_ok=True)
+    tmp=target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    conn=open_db(tmp)
+    before={"trades":0,"known_net_pnl_usdc":"0","incomplete_trades":0}
+    original_hash=None
+    try:
+        if args.db.exists():
+            with closing(sqlite3.connect(args.db.resolve().as_uri()+"?mode=ro",uri=True)) as original:
+                original.row_factory=sqlite3.Row
+                original.backup(conn)
+                original_hash=database_fingerprint(conn)
+                before=database_overview(conn)
+        init_db(conn)
+        stats=refresh_lan(conn,market=args.market,taker_trades=args.taker_trades,
+            orchestrator_trades=args.orchestrator_trades,xemm_journal=args.xemm_journal)
+        raw=repair_raw_fees(conn,args.raw_fills,args.market) if args.raw_fills else {"repaired_trades":0,"unusable_raw_rows":0}
+        conn.commit()
+        if conn.execute("PRAGMA integrity_check").fetchone()[0]!="ok" or conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("rebuilt database failed SQLite consistency checks")
+        result={"original":str(args.db.resolve()),"candidate":str(target.resolve()),
+            "original_fingerprint":original_hash,"candidate_fingerprint":database_fingerprint(conn),
+            "before":before,"after":database_overview(conn),"raw_repair":raw,
+            "refresh":[st.as_dict() for st in stats]}
+    finally:
+        conn.close()
+    tmp.replace(target)
+    target.with_suffix(".summary.json").write_text(json.dumps(result,default=json_default,indent=2)+"\n",encoding="utf-8")
+    return result
+
+def replace_reviewed_database(args: argparse.Namespace) -> dict[str, Any]:
+    target=args.rebuild_out or args.db.with_name(args.db.stem+".rebuilt.sqlite")
+    if target.resolve()==args.db.resolve():
+        raise ValueError("candidate must differ from original database")
+    summary_path=target.with_suffix(".summary.json")
+    reviewed=json.loads(summary_path.read_text(encoding="utf-8"))
+    if reviewed["original"]!=str(args.db.resolve()) or reviewed["candidate"]!=str(target.resolve()):
+        raise ValueError("reviewed rebuild paths do not match")
+    backup=None
+    conn=open_db(args.db)
+    try:
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute("ATTACH DATABASE ? AS reviewed",(str(target.resolve()),))
+        conn.execute("BEGIN IMMEDIATE")
+        expected=reviewed["original_fingerprint"]
+        if expected is None and conn.execute("SELECT 1 FROM main.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchone():
+            raise ValueError("original database appeared since review; rebuild before replacing")
+        if (database_fingerprint(conn) if expected is not None else None)!=expected:
+            raise ValueError("original database changed since review; rebuild before replacing")
+        if database_fingerprint(conn,"reviewed")!=reviewed["candidate_fingerprint"]:
+            raise ValueError("candidate changed since review; rebuild before replacing")
+        if expected is not None:
+            backup=args.db.with_name(args.db.stem+"-before-repair-"+datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f")+".sqlite")
+            source=sqlite3.connect(args.db.resolve().as_uri()+"?mode=ro",uri=True)
+            destination=sqlite3.connect(backup)
+            try: source.backup(destination)
+            finally:
+                destination.close()
+                source.close()
+        # Replace only this tool's tables in one transaction; other database content survives.
+        for table in reversed(OWNED_TABLES):
+            conn.execute(f"DROP TABLE IF EXISTS {table}")
+        for table in OWNED_TABLES:
+            ddl=conn.execute("SELECT sql FROM reviewed.sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()[0]
+            conn.execute(ddl)
+            names=[r[1] for r in conn.execute(f"PRAGMA reviewed.table_info({table})")]
+            quoted=",".join('"'+n.replace('"','""')+'"' for n in names)
+            conn.execute(f"INSERT INTO main.{table} ({quoted}) SELECT {quoted} FROM reviewed.{table}")
+        for table in OWNED_TABLES:
+            for (ddl,) in conn.execute("SELECT sql FROM reviewed.sqlite_master WHERE tbl_name=? AND type IN ('index','trigger') AND sql IS NOT NULL",(table,)):
+                conn.execute(ddl)
+        if conn.execute("PRAGMA foreign_key_check").fetchone():
+            raise ValueError("candidate contains broken fill references")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {"replaced":str(args.db),"backup":str(backup) if backup else None,"comparison":reviewed}
+
+
+def empty_bucket(strategy: str) -> dict[str, Any]:
+    return {"strategy":strategy,"trades":0,"incomplete_trades":0,"local_only_trades":0,"exchange_confirmed_trades":0,
+        "gross_pnl_usdc":Decimal(0),"policy_fees_usdc":Decimal(0),"net_pnl_usdc":Decimal(0),
+        "aster_fees_usdc":Decimal(0),"lighter_fees_usdc":Decimal(0),
+        "known_net_pnl_usdc":Decimal(0),"estimated_net_pnl_usdc":Decimal(0)}
+
+
+def report_from_db(conn: sqlite3.Connection, *, market: str, since: datetime, now: datetime, db_path: Path,
+    capital_usdc: Decimal | None = None, orchestrator_state: Path | None = None) -> dict[str, Any]:
+    buckets={"TAKER":empty_bucket("TAKER"),"XEMM":empty_bucket("XEMM")}
+    confirmation_counts={}
+    rows=conn.execute(
+        "SELECT * FROM strategy_trades WHERE market=? AND timestamp_us>=? AND timestamp_us<=? ORDER BY timestamp_us,trade_key",
+        (market,timestamp_us(since),timestamp_us(now))).fetchall()
+    totals=("gross_pnl_usdc","policy_fees_usdc","net_pnl_usdc","aster_fees_usdc","lighter_fees_usdc")
+    for row in rows:
+        b=buckets.setdefault(str(row["strategy"]),empty_bucket(str(row["strategy"])))
+        status=str(row["confirmation_status"])
+        confirmation_counts[status]=confirmation_counts.get(status,0)+1
+        b["trades"]+=1
+        b["exchange_confirmed_trades" if status=="exchange_confirmed" else "local_only_trades"]+=1
+        values=confirmed_economics(row)
+        if values is not None:
+            for dest,value in zip(totals,values):
+                b[dest]+=value
+            b["known_net_pnl_usdc"]+=values[2]
+        else:
+            b["incomplete_trades"]+=1
+            if row["economic_status"]=="estimated":
+                b["estimated_net_pnl_usdc"]+=dec(row["net_pnl_usdc"])
+    total=empty_bucket("TOTAL")
+    for b in buckets.values():
+        for name,value in b.items():
+            if name!="strategy": total[name]+=value
+    source_errors=[r[0] for r in conn.execute("SELECT last_error FROM sync_state WHERE market=? AND last_error IS NOT NULL",(market,))]
+    for b in [*buckets.values(),total]:
+        if b["incomplete_trades"] or (b is total and source_errors):
+            for name in totals: b[name]=None
+    capital_source="cli"
+    capital=capital_usdc
     if capital is None and orchestrator_state is not None:
-        capital, capital_source = latest_capital_from_state(orchestrator_state)
-    proj = projection(total["net_pnl_usdc"], capital, since, now)
-    return {
-        "mode": "lan",
-        "db": db_path,
-        "market": market,
-        "since": since,
-        "now": now,
-        "fee_policy": {
-            "aster_taker": ASTER_TAKER_FEE_RATE,
-            "aster_maker": ASTER_MAKER_FEE_RATE,
-            "lighter": LIGHTER_FEE_RATE,
-        },
-        "by_strategy": [buckets[key] for key in sorted(buckets.keys())],
-        "total": total,
-        "confirmation_counts": confirmation_counts,
-        "projection": proj,
-        "capital_source": capital_source,
-        "notes": [
-            "LAN mode reads local bot artifacts only and makes no exchange API calls.",
-            "Taker PnL/fees come from the producer's actual_* fields (matched-qty economics) when present; policy recompute (Aster taker 0.04%, Aster maker 0%, Lighter 0%) is the legacy fallback.",
-            "confirmation_status stays local_only until exchange-history adapters confirm or repair rows.",
-        ],
-    }
+        capital,capital_source=latest_capital_from_state(orchestrator_state)
+    return {"mode":"lan","db":db_path,"market":market,"since":since,"now":now,
+        "by_strategy":[buckets[k] for k in sorted(buckets)],"total":total,
+        "confirmation_counts":confirmation_counts,"source_errors":source_errors,
+        "projection":projection(total["net_pnl_usdc"],capital,since,now),"capital_source":capital_source,
+        "notes":["Local execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
+            "Fees require venue evidence. Legacy, estimated and incomplete rows suppress full net totals; their original evidence is preserved.",
+            "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately."]}
 
 
-def fmt_money(value: Decimal, signed: bool = True, places: int = 8) -> str:
+def fmt_money(value: Decimal | None, signed: bool = True, places: int = 8) -> str:
+    if value is None:
+        return "unavailable"
     sign = "+" if signed else ""
     return f"{value:{sign}.{places}f}"
 
@@ -1140,12 +957,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--db", type=Path, default=stack_root / "runs/trade_history.sqlite")
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--orchestrator-trades", type=Path, default=None)
-    parser.add_argument("--xemm-journal", type=Path, default=None, help="XEMM bot journal (fill/hedge_fill pairs); the authoritative trade-time source.")
+    parser.add_argument("--xemm-journal", type=Path, default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps.")
     parser.add_argument("--orchestrator-state", type=Path, default=None)
     parser.add_argument("--capital-usdc", type=Decimal, default=None)
     parser.add_argument("--no-refresh", action="store_true", help="Report existing DB contents without reading local ledgers first.")
     parser.add_argument("--refresh-only", action="store_true", help="Refresh the DB and skip the PnL report.")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
+    repair = parser.add_mutually_exclusive_group()
+    repair.add_argument("--rebuild", action="store_true", help="Build and compare a separate repaired database; preserve the original.")
+    repair.add_argument("--replace-rebuilt", action="store_true", help="Apply the previously reviewed candidate, retaining an original backup.")
+    parser.add_argument("--rebuild-out", type=Path, help="Candidate path (default: <db-stem>.rebuilt.sqlite).")
+    parser.add_argument("--raw-fills", type=Path, action="append", default=[], help="Own-account execution_trade JSONL with venue/order identities, notional and fee evidence; repeatable.")
     args = parser.parse_args()
     args.mode = "lan"
     if args.taker_trades is None:
@@ -1161,10 +983,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.rebuild or args.replace_rebuilt:
+        result = build_repaired_database(args) if args.rebuild else replace_reviewed_database(args)
+        print(json.dumps(result,default=json_default,indent=2))
+        return 0
     since = parse_dt(args.since)
     now = parse_dt(args.now) if args.now else utc_now()
-    with open_db(args.db) as conn:
+    with closing(open_db(args.db)) as conn:
         init_db(conn)
+        conn.commit()
         stats: list[IngestStats] = []
         if not args.no_refresh:
             stats = refresh_lan(

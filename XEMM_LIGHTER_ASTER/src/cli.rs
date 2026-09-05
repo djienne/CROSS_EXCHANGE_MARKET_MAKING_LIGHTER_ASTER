@@ -58,7 +58,7 @@ pub enum Commands {
         out: PathBuf,
     },
 
-    /// Summarize a livebot journal into completed trades and realized PnL.
+    /// Summarize a livebot journal into logical trades and versioned execution economics.
     LiveReport {
         /// Livebot results DB; used to infer `<db-stem>-journal.jsonl` when --journal is omitted.
         #[arg(long, default_value = "runs/live-hype-lighter.sqlite")]
@@ -69,12 +69,11 @@ pub enum Commands {
         /// Restrict to one market id, e.g. HYPE.
         #[arg(long)]
         market: Option<String>,
-        /// Only include journal rows stamped at/after this epoch-milliseconds timestamp
-        /// (rows without a ts_ms stamp are excluded). Keeps periodic callers from
-        /// re-scanning the whole append-forever journal.
+        /// Include logical trades at/after this epoch-milliseconds timestamp.
+        /// Pair cumulative and individual evidence before filtering by economic time.
         #[arg(long)]
         since_ms: Option<i64>,
-        /// Print one row per completed fill/hedge pair.
+        /// Print one row per logical trade, including incomplete economics.
         #[arg(long, default_value_t = false)]
         details: bool,
         /// Print a machine-readable JSON summary.

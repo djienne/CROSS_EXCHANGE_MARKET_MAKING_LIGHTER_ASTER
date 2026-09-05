@@ -28,9 +28,29 @@ class XemmSummaryTests(unittest.TestCase):
         aster_fee_rate: Decimal = Decimal("0"),
         lighter_fee_rate: Decimal = Decimal("0"),
         include_untimestamped: bool = False,
+        current_schema: bool = True,
     ) -> dict:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "journal.jsonl"
+            if current_schema:
+                converted=[]
+                for index,row in enumerate(rows):
+                    row=dict(row)
+                    d=dict(row.get("detail",{}))
+                    logical=d.get("cloid","")
+                    if row.get("kind")=="fill":
+                        row["kind"]="maker_fill"
+                        d={"logical_id":logical,"maker_side":"Sell" if d.get("side")=="BUY" else "Buy",
+                            "qty":d.get("qty"),"px":d.get("avg_aster_px"),"fee_usd":"0","fee_complete":True,
+                            "order_id":f"A-{logical}","trade_id":f"M-{index}","client_id":f"maker-{logical}"}
+                    elif row.get("kind")=="hedge_fill":
+                        row["kind"]="execution_trade"
+                        d={"logical_id":logical,"attempt_id":logical,"venue":"lighter","side":d.get("side"),
+                            "qty":d.get("qty"),"px":d.get("px"),"fee_usd":d.get("fee_usd"),
+                            "order_id":f"L-{logical}","trade_id":f"H-{index}"}
+                    row.update(schema_version=2,economic_status="confirmed",detail=d)
+                    converted.append(row)
+                rows=converted
             write_jsonl(path, rows)
             return combined_pnl.summarize_xemm_journal(
                 path,
@@ -65,25 +85,25 @@ class XemmSummaryTests(unittest.TestCase):
         self.assertEqual(out["lighter_config_fallback_fees_usdc"], Decimal("0"))
         self.assertEqual(out["net_pnl_usdc"], Decimal("0.9"))
 
-    def test_configured_lighter_fee_is_fallback_when_journal_fee_missing(self) -> None:
+    def test_missing_venue_fee_remains_unknown_despite_configured_rate(self) -> None:
         rows = [
             {"timestamp": "2026-01-02T00:00:00Z", "kind": "fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
             {"timestamp": "2026-01-02T00:00:01Z", "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "px": "99"}},
         ]
         out = self.summarize(rows, lighter_fee_rate=Decimal("0.01"))
-        self.assertEqual(out["lighter_callback_fees_usdc"], Decimal("0"))
-        self.assertEqual(out["lighter_config_fallback_fees_usdc"], Decimal("0.99"))
-        self.assertEqual(out["net_pnl_usdc"], Decimal("0.01"))
+        self.assertIsNone(out["lighter_callback_fees_usdc"])
+        self.assertEqual(out["lighter_config_fallback_fees_usdc"], Decimal("0"))
+        self.assertIsNone(out["net_pnl_usdc"])
 
-    def test_mismatched_xemm_pair_is_excluded_from_pnl(self) -> None:
+    def test_mismatched_pair_keeps_matched_economics_and_exposes_residual(self) -> None:
         rows = [
             {"timestamp": "2026-01-02T00:00:00Z", "kind": "fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
             {"timestamp": "2026-01-02T00:00:01Z", "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "2", "px": "99", "fee_usd": "0"}},
         ]
         out = self.summarize(rows)
-        self.assertEqual(out["trades"], 0)
+        self.assertEqual(out["trades"], 1)
         self.assertEqual(out["qty_mismatches"], 1)
-        self.assertEqual(out["net_pnl_usdc"], Decimal("0"))
+        self.assertEqual(out["net_pnl_usdc"], Decimal("1"))
 
     def test_timestamped_xemm_rows_are_filtered_by_since_now(self) -> None:
         rows = [
@@ -120,8 +140,8 @@ class XemmSummaryTests(unittest.TestCase):
             {"kind": "fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
             {"kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "px": "99", "fee_usd": "0"}},
         ]
-        strict = self.summarize(rows, include_untimestamped=False)
-        legacy = self.summarize(rows, include_untimestamped=True)
+        strict = self.summarize(rows, include_untimestamped=False, current_schema=False)
+        legacy = self.summarize(rows, include_untimestamped=True, current_schema=False)
         self.assertEqual(strict["trades"], 0)
         self.assertEqual(strict["skipped_untimestamped_trades"], 1)
         self.assertEqual(legacy["trades"], 1)

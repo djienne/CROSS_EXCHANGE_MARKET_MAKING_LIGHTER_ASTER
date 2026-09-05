@@ -57,6 +57,8 @@ class ObserverBackoffTests(unittest.TestCase):
             orch.children[TAKER_OBSERVER] = StubChild(TAKER_OBSERVER, uptime_sec=3600)
             orch.check_child_exits()
             self.assertEqual(1, orch.observer_exit_count)
+            self.assertGreater((orch.observer_retry_after-utc_now()).total_seconds(), 55)
+            self.assertLessEqual((orch.observer_retry_after-utc_now()).total_seconds(), 60)
 
     def test_crash_loop_still_escalates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -65,6 +67,8 @@ class ObserverBackoffTests(unittest.TestCase):
             orch.children[TAKER_OBSERVER] = StubChild(TAKER_OBSERVER, uptime_sec=30)
             orch.check_child_exits()
             self.assertEqual(3, orch.observer_exit_count)
+            self.assertGreater((orch.observer_retry_after-utc_now()).total_seconds(), 235)
+            self.assertLessEqual((orch.observer_retry_after-utc_now()).total_seconds(), 240)
 
 
 class NotePnlSampleTests(unittest.TestCase):

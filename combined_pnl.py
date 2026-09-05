@@ -11,6 +11,8 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from economics import optional_decimal, xemm_journal, taker_economics
+
 
 SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
 DEFAULT_SINCE = "2026-06-28T00:00:00Z"
@@ -39,14 +41,13 @@ def iso(dt: datetime) -> str:
 
 
 def dec(value: Any, default: Decimal = Decimal("0")) -> Decimal:
-    if value is None:
-        return default
-    if isinstance(value, Decimal):
-        return value
-    try:
-        return Decimal(str(value))
-    except (InvalidOperation, ValueError):
-        return default
+    parsed = optional_decimal(value)
+    return parsed if parsed is not None else default
+
+
+def sum_optional(rows, key: str) -> Decimal | None:
+    values = [optional_decimal(row.get(key)) for row in rows]
+    return sum(values, Decimal(0)) if all(v is not None for v in values) else None
 
 
 def dec_json(value: Decimal) -> str:
@@ -102,30 +103,28 @@ def row_timestamp(row: dict[str, Any]) -> datetime | None:
 
 
 def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> dict[str, Any]:
-    out = {
-        "trades": 0,
-        "gross_pnl_usdc": Decimal("0"),
-        "fees_usdc": Decimal("0"),
-        "net_pnl_usdc": Decimal("0"),
-        "path": path,
-    }
-    if not path.exists():
-        return out
-    for row in load_jsonl(path):
-        if row.get("market") != market:
-            continue
+    rows = []
+    if path.exists():
+        for row in load_jsonl(path):
+            if not isinstance(row, dict) or row.get("market") != market:
+                continue
+            ts = row_timestamp(row)
+            if ts is not None and since <= ts <= now:
+                rows.append(row)
+    normalized = []
+    for row in rows:
         try:
-            ts = parse_dt(str(row.get("timestamp", "")))
-        except (ValueError, TypeError) as exc:
-            print(f"warn: skipping taker row with bad timestamp in {path}: {exc}", file=sys.stderr)
-            continue
-        if ts < since or ts > now:
-            continue
-        out["trades"] += 1
-        out["gross_pnl_usdc"] += dec(row.get("actual_gross_usd"))
-        out["fees_usdc"] += dec(row.get("actual_fees_usd"))
-        out["net_pnl_usdc"] += dec(row.get("actual_net_usd"))
-    return out
+            normalized.append(taker_economics(row))
+        except (ValueError, TypeError, InvalidOperation):
+            normalized.append(None)
+    confirmed = [r for r in normalized if r is not None and r["economic_status"] == "confirmed"]
+    unknown = len(rows)-len(confirmed)
+    net = sum((r["net_pnl_usdc"] for r in confirmed),Decimal(0))
+    return {"trades":len(rows),"path":path,
+        "gross_pnl_usdc":sum_optional(confirmed,"gross_pnl_usdc") if not unknown else None,
+        "fees_usdc":sum_optional(confirmed,"fees_usdc") if not unknown else None,
+        "net_pnl_usdc":net if not unknown else None,
+        "known_net_pnl_usdc":net,"incomplete_trades":unknown}
 
 
 def parse_xemm_fee_bps(config_path: Path) -> tuple[Decimal, Decimal]:
@@ -162,140 +161,43 @@ def normalize_side(value: Any) -> str:
 
 
 def summarize_xemm_journal(
-    path: Path,
-    market: str,
-    aster_fee_rate: Decimal,
-    lighter_fee_rate: Decimal,
-    since: datetime,
-    now: datetime,
-    include_untimestamped: bool,
+    path: Path, market: str, aster_fee_rate: Decimal, lighter_fee_rate: Decimal,
+    since: datetime, now: datetime, include_untimestamped: bool,
 ) -> dict[str, Any]:
-    fills: dict[str, dict[str, Any]] = {}
-    hedges: dict[str, dict[str, Any]] = {}
-    out = {
-        "path": path,
-        "trades": 0,
-        "gross_pnl_usdc": Decimal("0"),
-        "aster_fees_usdc": Decimal("0"),
-        "lighter_fees_usdc": Decimal("0"),
-        "lighter_callback_fees_usdc": Decimal("0"),
-        "lighter_config_fallback_fees_usdc": Decimal("0"),
-        "fees_usdc": Decimal("0"),
-        "net_pnl_usdc": Decimal("0"),
-        "unmatched_fills": 0,
-        "unmatched_hedges": 0,
-        "qty_mismatches": 0,
-        "malformed_rows": 0,
-        "untimestamped_trades": 0,
-        "skipped_untimestamped_trades": 0,
-        "time_filtered_trades": 0,
-    }
-    for row in load_jsonl(path):
-        try:
-            if row.get("market") != market:
-                continue
-            detail = row.get("detail") or {}
-            kind = row.get("kind")
-            ts = row_timestamp(row)
-            if kind == "fill":
-                cloid = str(detail.get("cloid", ""))
-                if not cloid:
-                    continue
-                fills[cloid] = {
-                    "side": normalize_side(detail.get("side")),
-                    "qty": detail_dec(detail, "qty"),
-                    "aster_px": detail_dec(detail, "avg_aster_px"),
-                    "timestamp": ts,
-                }
-            elif kind == "hedge_fill":
-                cloid = str(detail.get("cloid", ""))
-                if not cloid:
-                    continue
-                qty = detail_dec(detail, "qty")
-                px = detail_dec(detail, "px")
-                fee_raw = detail.get("fee_usd")
-                side = normalize_side(detail.get("side"))
-                hedge = hedges.setdefault(
-                    cloid,
-                    {
-                        "side": side,
-                        "qty": Decimal("0"),
-                        "notional": Decimal("0"),
-                        "fee_usd": Decimal("0"),
-                        "fee_missing_notional": Decimal("0"),
-                        "first_timestamp": ts,
-                        "last_timestamp": ts,
-                        "side_mismatch": False,
-                    },
-                )
-                if hedge["side"] != side:
-                    hedge["side_mismatch"] = True
-                hedge["qty"] += qty
-                hedge["notional"] += qty * px
-                if fee_raw is None:
-                    hedge["fee_missing_notional"] += qty * px
-                else:
-                    hedge["fee_usd"] += dec(fee_raw)
-                if ts is not None:
-                    if hedge["first_timestamp"] is None or ts < hedge["first_timestamp"]:
-                        hedge["first_timestamp"] = ts
-                    if hedge["last_timestamp"] is None or ts > hedge["last_timestamp"]:
-                        hedge["last_timestamp"] = ts
-        except (ValueError, TypeError, InvalidOperation) as exc:
-            out["malformed_rows"] += 1
-            print(f"warn: skipping malformed XEMM journal row in {path}: {exc}", file=sys.stderr)
-
-    for cloid in sorted(set(fills) | set(hedges)):
-        fill = fills.get(cloid)
-        hedge = hedges.get(cloid)
-        if fill and not hedge:
-            out["unmatched_fills"] += 1
-            continue
-        if hedge and not fill:
-            out["unmatched_hedges"] += 1
-            continue
-        if not fill or not hedge:
-            continue
-        if hedge["qty"] <= 0:
-            out["qty_mismatches"] += 1
-            continue
-        trade_ts = max(
-            [ts for ts in [fill.get("timestamp"), hedge.get("last_timestamp")] if ts is not None],
-            default=None,
-        )
-        if trade_ts is None:
+    # Configured fees are estimates, not proof of historical venue commissions.
+    parsed = xemm_journal(path, market, now=now)
+    trades = []
+    missing_time = skipped_time = filtered = 0
+    for trade in parsed["trades"]:
+        ts = trade["timestamp"]
+        if ts is None:
             if not include_untimestamped:
-                out["skipped_untimestamped_trades"] += 1
+                skipped_time += 1
                 continue
-            out["untimestamped_trades"] += 1
-        elif trade_ts < since or trade_ts > now:
-            out["time_filtered_trades"] += 1
+            missing_time += 1
+        elif not since <= ts <= now:
+            filtered += 1
             continue
-        lighter_px = hedge["notional"] / hedge["qty"]
-        if fill["qty"] != hedge["qty"] or fill["side"] != hedge["side"] or hedge.get("side_mismatch"):
-            out["qty_mismatches"] += 1
-            continue
-        if fill["side"] == "buy":
-            gross = fill["qty"] * (fill["aster_px"] - lighter_px)
-        elif fill["side"] == "sell":
-            gross = fill["qty"] * (lighter_px - fill["aster_px"])
-        else:
-            out["qty_mismatches"] += 1
-            continue
-        aster_fee = fill["qty"] * fill["aster_px"] * aster_fee_rate
-        callback_fee = hedge["fee_usd"]
-        fallback_fee = hedge["fee_missing_notional"] * lighter_fee_rate
-        lighter_fee = callback_fee + fallback_fee
-        net = gross - aster_fee - lighter_fee
-        out["trades"] += 1
-        out["gross_pnl_usdc"] += gross
-        out["aster_fees_usdc"] += aster_fee
-        out["lighter_fees_usdc"] += lighter_fee
-        out["lighter_callback_fees_usdc"] += callback_fee
-        out["lighter_config_fallback_fees_usdc"] += fallback_fee
-        out["fees_usdc"] += aster_fee + lighter_fee
-        out["net_pnl_usdc"] += net
-    return out
+        trades.append(trade)
+    incomplete = sum(t["net_pnl_usdc"] is None for t in trades)
+    uncertain = incomplete > 0 or parsed["malformed_rows"] > 0
+    known_net = sum((t["net_pnl_usdc"] for t in trades if t["net_pnl_usdc"] is not None), Decimal(0))
+    lighter_fees = sum_optional(trades, "lighter_fee_usdc")
+    return {"path": path, "trades": len(trades),
+        "gross_pnl_usdc": sum_optional(trades,"gross_pnl_usdc"),
+        "aster_fees_usdc": sum_optional(trades,"aster_fee_usdc"),
+        "lighter_fees_usdc": lighter_fees,
+        "lighter_callback_fees_usdc": lighter_fees,
+        "lighter_config_fallback_fees_usdc": Decimal(0),
+        "fees_usdc": sum_optional(trades,"fees_usdc"),
+        "net_pnl_usdc": None if uncertain else known_net,
+        "known_net_pnl_usdc": known_net, "incomplete_trades": incomplete,
+        "unmatched_fills": sum(t["residual_qty"] != 0 and t["lighter_qty"] == 0 for t in trades),
+        "unmatched_hedges": sum(t["residual_qty"] != 0 and t["aster_qty"] == 0 for t in trades),
+        "qty_mismatches": sum(t["residual_qty"] != 0 for t in trades),
+        "malformed_rows": parsed["malformed_rows"],
+        "untimestamped_trades": missing_time, "skipped_untimestamped_trades": skipped_time,
+        "time_filtered_trades": filtered}
 
 
 def selected_xemm_journals(
@@ -307,8 +209,12 @@ def selected_xemm_journals(
     if paths:
         included = []
         skipped = []
+        seen: set[Path] = set()
         for raw_path in paths:
             path = raw_path.expanduser().resolve()
+            if path in seen:
+                continue
+            seen.add(path)
             if require_paths and not path.is_file():
                 raise SystemExit(f"error: --xemm-journal file not found: {path}")
             if path.is_file() and (require_paths or path.stat().st_size > 0):
@@ -357,7 +263,7 @@ def latest_capital_from_state(path: Path, active_preference: str | None = None) 
     return None, None
 
 
-def projection(net: Decimal, capital: Decimal | None, since: datetime, now: datetime) -> dict[str, Any]:
+def projection(net: Decimal | None, capital: Decimal | None, since: datetime, now: datetime) -> dict[str, Any]:
     elapsed = Decimal(max(1, int((now - since).total_seconds())))
     out: dict[str, Any] = {
         "elapsed_seconds": elapsed,
@@ -367,7 +273,7 @@ def projection(net: Decimal, capital: Decimal | None, since: datetime, now: date
         "simple_annualized_return_pct": None,
         "projected_cagr_pct": None,
     }
-    if capital is None or capital <= 0:
+    if net is None or capital is None or capital <= 0:
         return out
     window_return = net / capital
     annual_factor = SECONDS_PER_YEAR / elapsed
@@ -375,7 +281,12 @@ def projection(net: Decimal, capital: Decimal | None, since: datetime, now: date
     out["simple_annualized_return_pct"] = window_return * annual_factor * Decimal(100)
     base = 1.0 + float(window_return)
     if base > 0:
-        out["projected_cagr_pct"] = Decimal(str((math.pow(base, float(annual_factor)) - 1.0) * 100.0))
+        try:
+            projected = (math.pow(base, float(annual_factor)) - 1.0) * 100.0
+            if math.isfinite(projected):
+                out["projected_cagr_pct"] = Decimal(str(projected))
+        except OverflowError:
+            pass
     return out
 
 
@@ -406,13 +317,15 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     ]
     xemm = {
         "trades": sum(j["trades"] for j in xemm_journals),
-        "gross_pnl_usdc": sum((j["gross_pnl_usdc"] for j in xemm_journals), Decimal("0")),
-        "aster_fees_usdc": sum((j["aster_fees_usdc"] for j in xemm_journals), Decimal("0")),
-        "lighter_fees_usdc": sum((j["lighter_fees_usdc"] for j in xemm_journals), Decimal("0")),
-        "fees_usdc": sum((j["fees_usdc"] for j in xemm_journals), Decimal("0")),
-        "lighter_callback_fees_usdc": sum((j["lighter_callback_fees_usdc"] for j in xemm_journals), Decimal("0")),
-        "lighter_config_fallback_fees_usdc": sum((j["lighter_config_fallback_fees_usdc"] for j in xemm_journals), Decimal("0")),
-        "net_pnl_usdc": sum((j["net_pnl_usdc"] for j in xemm_journals), Decimal("0")),
+        "incomplete_trades": sum(j["incomplete_trades"] for j in xemm_journals),
+        "known_net_pnl_usdc": sum((j["known_net_pnl_usdc"] for j in xemm_journals),Decimal(0)),
+        "gross_pnl_usdc": sum_optional(xemm_journals, "gross_pnl_usdc"),
+        "aster_fees_usdc": sum_optional(xemm_journals, "aster_fees_usdc"),
+        "lighter_fees_usdc": sum_optional(xemm_journals, "lighter_fees_usdc"),
+        "fees_usdc": sum_optional(xemm_journals, "fees_usdc"),
+        "lighter_callback_fees_usdc": sum_optional(xemm_journals, "lighter_callback_fees_usdc"),
+        "lighter_config_fallback_fees_usdc": sum_optional(xemm_journals, "lighter_config_fallback_fees_usdc"),
+        "net_pnl_usdc": sum_optional(xemm_journals, "net_pnl_usdc"),
         "unmatched_fills": sum(j["unmatched_fills"] for j in xemm_journals),
         "unmatched_hedges": sum(j["unmatched_hedges"] for j in xemm_journals),
         "qty_mismatches": sum(j["qty_mismatches"] for j in xemm_journals),
@@ -431,9 +344,11 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     }
     total = {
         "trades": taker["trades"] + xemm["trades"],
-        "gross_pnl_usdc": taker["gross_pnl_usdc"] + xemm["gross_pnl_usdc"],
-        "fees_usdc": taker["fees_usdc"] + xemm["fees_usdc"],
-        "net_pnl_usdc": taker["net_pnl_usdc"] + xemm["net_pnl_usdc"],
+        "incomplete_trades": taker["incomplete_trades"] + xemm["incomplete_trades"],
+        "known_net_pnl_usdc": taker["known_net_pnl_usdc"] + xemm["known_net_pnl_usdc"],
+        "gross_pnl_usdc": sum_optional([taker,xemm], "gross_pnl_usdc"),
+        "fees_usdc": sum_optional([taker,xemm], "fees_usdc"),
+        "net_pnl_usdc": sum_optional([taker,xemm], "net_pnl_usdc"),
     }
     capital = args.capital_usdc
     capital_source = "cli"
@@ -444,8 +359,8 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
             capital, capital_source = latest_capital_from_state(fallback_state)
     proj = projection(total["net_pnl_usdc"], capital, since, now)
     notes = [
-        "PnL is realized completed-trade PnL only; unrealized mark-to-market is excluded.",
-        "XEMM net uses configured Aster maker bps and actual Lighter journal fees; configured Lighter taker bps is only a fallback when a hedge_fill lacks fee_usd.",
+        "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
+        "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "By default XEMM includes only production live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
     ]
     if xemm["untimestamped_trades"]:
@@ -474,7 +389,9 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def fmt_money(value: Decimal, signed: bool = True, places: int = 8) -> str:
+def fmt_money(value: Decimal | None, signed: bool = True, places: int = 8) -> str:
+    if value is None:
+        return "unavailable"
     sign = "+" if signed else ""
     return f"{value:{sign}.{places}f}"
 
@@ -521,7 +438,7 @@ def print_human(result: dict[str, Any]) -> None:
     xemm = result["xemm"]
 
     print_table(
-        "PnL",
+        "Execution economics (marks and funding excluded)",
         ["Source", "Trades", "Gross USDC", "Fees USDC", "Net USDC", "Lighter Journal Fees"],
         [
             [
@@ -552,6 +469,7 @@ def print_human(result: dict[str, Any]) -> None:
         right_align={1, 2, 3, 4, 5},
     )
     print()
+    print(f"Known net subtotal: {fmt_money(result['total']['known_net_pnl_usdc'])}; incomplete trades: {result['total']['incomplete_trades']}")
     print_table(
         "Projection",
         ["Metric", "Value"],
@@ -603,7 +521,7 @@ def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
     taker_root = stack_root / "LIGHTER_ASTER_TAKER_ARB"
     xemm_root = stack_root / "XEMM_LIGHTER_ASTER"
-    parser = argparse.ArgumentParser(description="Combined realized PnL report for taker arb + XEMM.")
+    parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
     parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--market", default="HYPE")

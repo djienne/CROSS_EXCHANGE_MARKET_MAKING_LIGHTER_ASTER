@@ -176,6 +176,16 @@ class EnsureBotSafetyTests(unittest.TestCase):
             self.assertEqual([], orch.halts)
             self.assertEqual([TAKER_BOT], orch.started)
 
+    def test_unresolved_shutdown_blocks_switch_even_with_zero_open_orders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            orch = self._live_orch(Path(tmp))
+            orch.active_bot = XEMM_BOT
+            orch.stop_active = lambda reason, grace_sec=None: {"exit_code": 1}
+            orch.verify_xemm_orders_clear = lambda: (True, {})
+            orch.ensure_bot(TAKER_BOT, "resume_taker", {})
+            self.assertEqual(["bot_shutdown_unresolved"], [r for r, _ in orch.halts])
+            self.assertEqual([], orch.started)
+
 
 class CrashLoopTests(unittest.TestCase):
     def test_three_short_clean_exits_halt(self) -> None:
@@ -222,6 +232,10 @@ class TradeTrackerIncrementalTests(unittest.TestCase):
             "aster_order_id": n,
             "lighter_client_order_index": n,
             "actual_net_usd": "0.5",
+            "actual_gross_usd": "0.5",
+            "actual_fees_usd": "0",
+            "schema_version": 2,
+            "economic_status": "confirmed",
         }
 
     def test_poll_reads_only_appended_lines_and_survives_truncation(self) -> None:

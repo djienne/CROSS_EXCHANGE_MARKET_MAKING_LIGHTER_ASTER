@@ -1,4 +1,7 @@
-//! `live-report`: summarize livebot journal fills into realized two-leg PnL.
+//! Execution economics from observed fills: same-venue realized closes plus the
+//! spread on opposite remaining positions. This is not portfolio mark-to-market.
+//! Raw trades cover cumulative progress before residual coverage is added; missing
+//! fees/prices remain unknown. Logical obligations are paired before time filtering.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
@@ -6,423 +9,565 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::types::Side;
 
-#[derive(Debug, Clone)]
-struct FillRec {
-    market: String,
-    mono_ns: i64,
-    hedge_side: Side,
-    qty: Decimal,
-    aster_px: Decimal,
-}
-
-#[derive(Debug, Clone)]
-struct HedgeRec {
-    market: String,
-    first_mono_ns: i64,
-    last_mono_ns: i64,
-    hedge_side: Side,
-    qty: Decimal,
-    notional: Decimal,
-    fee_usd: Decimal,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct TradeSummary {
+    pub schema_version: u32,
+    pub economic_status: &'static str,
     pub cloid: String,
+    pub logical_id: String,
+    pub attempt_ids: Vec<String>,
     pub market: String,
+    pub timestamp_ms: Option<i64>,
     pub first_mono_ns: i64,
     pub last_mono_ns: i64,
-    pub hedge_side: Side,
-    /// Maker (Aster) fill quantity — the trade's maker volume (also what `total_qty` sums).
-    /// NOT necessarily what got hedged: see `hedged_qty` / `qty_mismatch`.
+    pub hedge_side: Option<Side>,
+    /// Observed maker volume; correction volume is reported separately in aster_qty.
     pub qty: Decimal,
-    pub aster_px: Decimal,
-    pub lighter_px: Decimal,
-    /// Two-leg spread PnL on the MATCHED quantity only (`min(qty, hedged_qty)`, zero on a
-    /// side/market-mismatched pairing) — the unhedged remainder has no realized spread.
-    pub gross_pnl: Decimal,
-    pub aster_fee: Decimal,
-    pub lighter_fee: Decimal,
-    pub net_pnl: Decimal,
-    /// Lighter hedge quantity actually filled under this cloid.
+    pub aster_qty: Decimal,
+    pub lighter_qty: Decimal,
     pub hedged_qty: Decimal,
-    /// True when the maker and hedge legs disagree (qty, side, or market) — mirrors the
-    /// summary-level `qty_mismatches` counter, per trade.
+    pub matched_qty: Decimal,
+    pub residual_qty: Decimal,
+    pub aster_residual_qty: Decimal,
+    pub lighter_residual_qty: Decimal,
+    pub aster_quote: Option<Decimal>,
+    pub lighter_quote: Option<Decimal>,
+    /// Volume-weighted execution prices, including corrections.
+    pub aster_px: Option<Decimal>,
+    pub lighter_px: Option<Decimal>,
+    pub gross_pnl: Option<Decimal>,
+    pub venue_realized_pnl_usdc: Option<Decimal>,
+    pub execution_spread_usdc: Option<Decimal>,
+    pub aster_fee: Option<Decimal>,
+    pub lighter_fee: Option<Decimal>,
+    pub fees: Option<Decimal>,
+    pub known_fees: Decimal,
+    pub net_pnl: Option<Decimal>,
     pub qty_mismatch: bool,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LiveReportSummary {
+    pub schema_version: u32,
+    pub economic_status: &'static str,
     pub trades: Vec<TradeSummary>,
     pub unmatched_fills: usize,
     pub unmatched_hedges: usize,
     pub qty_mismatches: usize,
-    pub gross_pnl: Decimal,
-    pub aster_fees: Decimal,
-    pub lighter_fees: Decimal,
-    pub net_pnl: Decimal,
+    pub malformed_rows: usize,
+    pub gross_pnl: Option<Decimal>,
+    pub venue_realized_pnl_usdc: Option<Decimal>,
+    pub execution_spread_usdc: Option<Decimal>,
+    pub aster_fees: Option<Decimal>,
+    pub lighter_fees: Option<Decimal>,
+    pub net_pnl: Option<Decimal>,
+    pub known_fees: Decimal,
     pub total_qty: Decimal,
 }
 
-#[derive(Debug, Serialize)]
-struct LiveReportJson<'a> {
-    journal_path: &'a str,
-    summary: &'a LiveReportSummary,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Venue { Aster, Lighter }
+impl Venue {
+    fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "aster" => Some(Self::Aster),
+            "lighter" | "hyperliquid" | "hl" => Some(Self::Lighter),
+            _ => None,
+        }
+    }
+    fn index(self) -> usize { if self == Self::Aster { 0 } else { 1 } }
+    fn name(self) -> &'static str { if self == Self::Aster { "aster" } else { "lighter" } }
 }
 
-#[derive(Debug, Deserialize)]
-struct JournalLine {
-    #[serde(default)]
-    mono_ns: i64,
-    /// Wall-clock stamp (epoch ms) written by JournalRecord since 2026-07; absent on
-    /// legacy rows.
-    #[serde(default)]
-    ts_ms: Option<i64>,
-    kind: String,
-    market: Option<String>,
-    detail: Value,
+#[derive(Clone)]
+struct Fill {
+    venue: Venue,
+    side: Side,
+    qty: Decimal,
+    quote: Option<Decimal>,
+    fee: Option<Decimal>,
+    timestamp_ms: Option<i64>,
+    ordinal: usize,
+    attempt: String,
+    client_id: Option<String>,
+    order_id: Option<String>,
+    maker_origin: bool,
+}
+
+struct Progress {
+    venue: Venue,
+    side: Option<Side>,
+    qty: Decimal,
+    quote: Option<Decimal>,
+    fee: Option<Decimal>,
+    timestamp_ms: Option<i64>,
+    ordinal: usize,
+    client_id: Option<String>,
+    order_id: Option<String>,
+    maker_origin: bool,
+    terminal: bool,
+}
+
+#[derive(Default)]
+struct Group {
+    fills: BTreeMap<String, Fill>,
+    progress: BTreeMap<String, Progress>,
+    unidentified: BTreeMap<String, Option<Decimal>>,
+    legacy: bool,
+    first_mono_ns: i64,
+    last_mono_ns: i64,
+}
+
+#[derive(Default)]
+struct Position {
+    qty: Decimal,
+    average: Decimal,
+    realized: Decimal,
+    volume: Decimal,
+    quote: Decimal,
+    fee: Decimal,
+    price_unknown: bool,
+    fee_unknown: bool,
+}
+
+fn amount(value: Option<&Value>) -> Option<Decimal> {
+    match value? {
+        Value::String(value) => value.parse().ok(),
+        Value::Number(value) => value.to_string().parse().ok(),
+        _ => None,
+    }
+}
+
+fn identifier(value: &Value, key: &str) -> Option<String> {
+    match value.get(key)? {
+        Value::String(value) if !value.is_empty() => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn side(value: Option<&Value>) -> Option<Side> {
+    match value?.as_str()?.to_ascii_lowercase().as_str() {
+        "buy" => Some(Side::Buy),
+        "sell" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+fn timestamp_ms(row: &Value) -> Option<i64> {
+    for object in row.get("detail").into_iter().chain(std::iter::once(row)) {
+        for key in ["event_time_ms", "timestamp_ms", "ts_ms"] {
+            if let Some(value) = amount(object.get(key)).and_then(|value| value.to_i64()).filter(|value| *value > 0) {
+                if chrono::DateTime::from_timestamp_millis(value).is_some() { return Some(value); }
+            }
+        }
+        for key in ["timestamp", "ts", "time", "created_at"] {
+            let Some(value) = object.get(key).and_then(Value::as_str) else { continue; };
+            if let Ok(value) = chrono::DateTime::parse_from_rfc3339(value) { return Some(value.timestamp_millis()); }
+            for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+                if let Ok(value) = chrono::NaiveDateTime::parse_from_str(value, format) {
+                    return Some(value.and_utc().timestamp_millis());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn fee(detail: &Value, trusted: bool) -> Option<Decimal> {
+    let notional = amount(detail.get("notional_usd").or_else(|| detail.get("usd_amount")));
+    let ticks = amount(detail.get("fee_ticks"));
+    if detail.get("fee_ticks").is_some_and(|value| !value.is_null()) {
+        if !detail.get("maker").is_some_and(Value::is_boolean)
+            || detail.get("fee_complete").and_then(Value::as_bool) == Some(false) { return None; }
+        return notional?.abs().checked_mul(ticks?)?.checked_div(Decimal::from(1_000_000));
+    }
+    if trusted && detail.get("fee_complete").and_then(Value::as_bool).unwrap_or(true) {
+        amount(detail.get("fee_usd"))
+    } else { None }
+}
+
+fn checked(value: Option<Decimal>) -> Result<Decimal> {
+    value.context("execution amount exceeds the decimal range")
+}
+
+fn parse_fill(row: &Value, detail: &Value, kind: &str, logical: &str, ordinal: usize) -> Result<(String, Fill)> {
+    let trusted = row.get("schema_version").and_then(Value::as_u64).unwrap_or(1) >= 2
+        && row.get("economic_status").and_then(Value::as_str) == Some("confirmed");
+    let (venue, fill_side, price, identity, attempt) = match kind {
+        "maker_fill" => (
+            Venue::Aster, side(detail.get("maker_side")), amount(detail.get("px")),
+            format!("aster:{}:{}", identifier(detail, "order_id").unwrap_or_default(), identifier(detail, "trade_id").unwrap_or_default()),
+            identifier(detail, "client_id").or_else(|| identifier(detail, "order_id")).unwrap_or_default(),
+        ),
+        "execution_trade" => {
+            let venue = detail.get("venue").and_then(Value::as_str).and_then(Venue::parse).context("invalid execution venue")?;
+            (venue, side(detail.get("side")), amount(detail.get("px")),
+                format!("{}:{}:{}", venue.name(), identifier(detail, "order_id").unwrap_or_default(), identifier(detail, "trade_id").unwrap_or_default()),
+                identifier(detail, "attempt_id").unwrap_or_default())
+        }
+        "fill" => (
+            Venue::Aster, side(detail.get("side")).map(Side::opposite), amount(detail.get("avg_aster_px")),
+            format!("legacy-maker:{logical}"), logical.to_string(),
+        ),
+        _ => (
+            Venue::Lighter, side(detail.get("side")), amount(detail.get("px")),
+            format!("legacy-hedge:{logical}:{}", identifier(detail, "trade_id")
+                .or_else(|| identifier(row, "mono_ns")).unwrap_or_else(|| ordinal.to_string())),
+            logical.to_string(),
+        ),
+    };
+    let qty = amount(detail.get("qty")).filter(|value| *value >= Decimal::ZERO).context("invalid fill quantity")?;
+    let quote = amount(detail.get("notional_usd")).or_else(|| price.filter(|p| *p > Decimal::ZERO).and_then(|p| qty.checked_mul(p)));
+    if quote.is_some_and(|value| value < Decimal::ZERO || (qty > Decimal::ZERO && value.is_zero())) {
+        anyhow::bail!("invalid fill quote amount");
+    }
+    Ok((identity, Fill {
+        venue, side: fill_side.context("invalid fill side")?, qty, quote, fee: fee(detail, trusted),
+        timestamp_ms: timestamp_ms(row), ordinal, attempt,
+        client_id: identifier(detail, "client_id"), order_id: identifier(detail, "order_id"),
+        maker_origin: kind == "fill" || (kind == "maker_fill"
+            && detail.get("reduce_only").and_then(Value::as_bool) != Some(true)),
+    }))
+}
+
+fn apply(position: &mut Position, fill: &Fill) -> Result<()> {
+    position.volume = checked(position.volume.checked_add(fill.qty))?;
+    position.quote = checked(position.quote.checked_add(fill.quote.unwrap_or(Decimal::ZERO)))?;
+    match fill.fee {
+        Some(fee) => position.fee = checked(position.fee.checked_add(fee))?,
+        None => position.fee_unknown = true,
+    }
+    let delta = if fill.side == Side::Buy { fill.qty } else { -fill.qty };
+    let old = position.qty;
+    position.qty = checked(old.checked_add(delta))?;
+    if fill.qty.is_zero() { return Ok(()); }
+    let Some(quote) = fill.quote else { position.price_unknown = true; return Ok(()); };
+    let price = checked(quote.checked_div(fill.qty))?;
+    if old.is_zero() || old.is_sign_positive() == delta.is_sign_positive() {
+        let previous = checked(old.abs().checked_mul(position.average))?;
+        position.average = checked(checked(previous.checked_add(quote))?.checked_div(checked(old.abs().checked_add(fill.qty))?))?;
+    } else {
+        let closed = old.abs().min(fill.qty);
+        let change = checked(price.checked_sub(position.average))?;
+        let pnl = checked(closed.checked_mul(change))?;
+        position.realized = checked(position.realized.checked_add(if old > Decimal::ZERO { pnl } else { -pnl }))?;
+        if position.qty.is_zero() {
+            position.average = Decimal::ZERO;
+        } else if position.qty.is_sign_positive() != old.is_sign_positive() {
+            position.average = price;
+        }
+    }
+    Ok(())
+}
+
+fn coverage(group: &Group, malformed: &mut usize) -> Result<Vec<Fill>> {
+    let mut fills: Vec<_> = group.fills.values().cloned().collect();
+    for (attempt, progress) in &group.progress {
+        let covered: Vec<_> = fills.iter().filter(|fill| fill.venue == progress.venue && (
+            fill.attempt == *attempt
+            || (progress.client_id.is_some() && fill.client_id == progress.client_id)
+            || (progress.order_id.is_some() && fill.order_id == progress.order_id)
+        )).collect();
+        let raw_qty = covered.iter().try_fold(Decimal::ZERO, |total, fill| checked(total.checked_add(fill.qty)))?;
+        if raw_qty >= progress.qty { continue; }
+        let sum = |field: fn(&Fill) -> Option<Decimal>| -> Option<Decimal> {
+            covered.iter().try_fold(Decimal::ZERO, |total, fill| total.checked_add(field(fill)?))
+        };
+        let quote = progress.quote.and_then(|total| total.checked_sub(sum(|fill| fill.quote)?));
+        let fee = progress.fee.and_then(|total| total.checked_sub(sum(|fill| fill.fee)?));
+        let qty = checked(progress.qty.checked_sub(raw_qty))?;
+        let Some(fill_side) = progress.side else { *malformed += 1; continue; };
+        if quote.is_some_and(|quote| quote <= Decimal::ZERO) { *malformed += 1; continue; }
+        fills.push(Fill {
+            venue: progress.venue, side: fill_side, qty, quote, fee,
+            timestamp_ms: progress.timestamp_ms, ordinal: progress.ordinal, attempt: attempt.clone(),
+            client_id: progress.client_id.clone(), order_id: progress.order_id.clone(),
+            maker_origin: progress.maker_origin,
+        });
+    }
+    fills.sort_by_key(|fill| (fill.timestamp_ms.unwrap_or(i64::MIN), fill.ordinal));
+    Ok(fills)
+}
+
+fn calculate(market: String, logical: String, group: &Group, fills: &[Fill]) -> Result<TradeSummary> {
+    let mut positions = [Position::default(), Position::default()];
+    for fill in fills { apply(&mut positions[fill.venue.index()], fill)?; }
+    let [aster, lighter] = positions;
+    let opposite = !aster.qty.is_zero() && !lighter.qty.is_zero()
+        && aster.qty.is_sign_positive() != lighter.qty.is_sign_positive();
+    let matched = if opposite { aster.qty.abs().min(lighter.qty.abs()) } else { Decimal::ZERO };
+    let realized = checked(aster.realized.checked_add(lighter.realized))?;
+    let spread = if opposite {
+        let price_difference = checked(lighter.average.checked_sub(aster.average))?;
+        let matched_pnl = checked(matched.checked_mul(price_difference))?;
+        if aster.qty > Decimal::ZERO { matched_pnl } else { -matched_pnl }
+    } else { Decimal::ZERO };
+    let prices_known = !aster.price_unknown && !lighter.price_unknown;
+    let gross = prices_known.then_some(checked(realized.checked_add(spread))?);
+    let known_fees = checked(aster.fee.checked_add(lighter.fee))?;
+    let fees = (!aster.fee_unknown && !lighter.fee_unknown).then_some(known_fees);
+    let mut net = gross.zip(fees).and_then(|(gross, fees)| gross.checked_sub(fees));
+    let unidentified = group.unidentified.iter().any(|(attempt, lower)| {
+        !group.progress.get(attempt).is_some_and(|progress|
+            progress.terminal && lower.is_some_and(|lower| progress.qty >= lower))
+    });
+    if unidentified { net = None; }
+    let status = if unidentified { "incomplete" } else if net.is_some() { "confirmed" } else if group.legacy { "legacy_unverified" } else { "incomplete" };
+    let maker_qty = fills.iter().filter(|fill| fill.maker_origin)
+        .try_fold(Decimal::ZERO, |total, fill| checked(total.checked_add(fill.qty)))?;
+    let residual = checked(aster.qty.checked_add(lighter.qty))?;
+    let attempts: BTreeSet<_> = fills.iter().map(|fill| fill.attempt.clone())
+        .chain(group.progress.keys().cloned()).filter(|id| !id.is_empty()).collect();
+    Ok(TradeSummary {
+        schema_version: 2, economic_status: status, cloid: logical.clone(), logical_id: logical,
+        attempt_ids: attempts.into_iter().collect(), market,
+        timestamp_ms: fills.iter().filter_map(|fill| fill.timestamp_ms).max(),
+        first_mono_ns: group.first_mono_ns, last_mono_ns: group.last_mono_ns,
+        hedge_side: fills.iter().find(|fill| fill.venue == Venue::Aster).map(|fill| fill.side.opposite()),
+        qty: maker_qty, aster_qty: aster.volume, lighter_qty: lighter.volume, hedged_qty: lighter.volume,
+        matched_qty: matched, residual_qty: residual, aster_residual_qty: aster.qty, lighter_residual_qty: lighter.qty,
+        aster_quote: (!aster.price_unknown).then_some(aster.quote),
+        lighter_quote: (!lighter.price_unknown).then_some(lighter.quote),
+        aster_px: (!aster.price_unknown && aster.volume > Decimal::ZERO).then(|| aster.quote / aster.volume),
+        lighter_px: (!lighter.price_unknown && lighter.volume > Decimal::ZERO).then(|| lighter.quote / lighter.volume),
+        gross_pnl: gross, venue_realized_pnl_usdc: prices_known.then_some(realized),
+        execution_spread_usdc: prices_known.then_some(spread), aster_fee: (!aster.fee_unknown).then_some(aster.fee),
+        lighter_fee: (!lighter.fee_unknown).then_some(lighter.fee), fees, known_fees, net_pnl: net,
+        qty_mismatch: !residual.is_zero(),
+        terminal: !group.progress.is_empty() && group.progress.values().all(|progress| progress.terminal),
+    })
 }
 
 pub fn inferred_journal_path(db: &Path) -> PathBuf {
     let stem = db.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-    let dir = db
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("runs"));
-    dir.join(format!("{stem}-journal.jsonl"))
+    let directory = db.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("runs"));
+    directory.join(format!("{stem}-journal.jsonl"))
 }
 
-pub fn summarize_path(
-    path: &Path,
-    cfg: &Config,
-    market_filter: Option<&str>,
-    since_ms: Option<i64>,
-) -> Result<LiveReportSummary> {
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    summarize_reader(BufReader::new(file), cfg, market_filter, since_ms)
+pub fn summarize_path(path: &Path, cfg: &Config, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+    summarize_reader(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?), cfg, market, since_ms)
 }
 
-pub fn summarize_reader<R: BufRead>(
-    reader: R,
-    cfg: &Config,
-    market_filter: Option<&str>,
-    since_ms: Option<i64>,
-) -> Result<LiveReportSummary> {
-    summarize_reader_with_aster_fee(reader, cfg.edge.aster_maker_fee_rate(), market_filter, since_ms)
+pub fn summarize_reader<R: BufRead>(reader: R, _cfg: &Config, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+    summarize(reader, market, since_ms)
 }
 
-fn summarize_reader_with_aster_fee<R: BufRead>(
-    reader: R,
-    aster_fee_rate: Decimal,
-    market_filter: Option<&str>,
-    since_ms: Option<i64>,
-) -> Result<LiveReportSummary> {
-    let mut fills: BTreeMap<String, FillRec> = BTreeMap::new();
-    let mut hedges: BTreeMap<String, HedgeRec> = BTreeMap::new();
-
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading journal line {}", idx + 1))?;
-        if line.trim().is_empty() {
-            continue;
+fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+    let mut groups: BTreeMap<(String, String), Group> = BTreeMap::new();
+    let mut malformed = 0;
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("reading journal line {}", index + 1))?;
+        if line.trim().is_empty() { continue; }
+        let row: Value = match serde_json::from_str(&line) { Ok(row) => row, Err(_) => { malformed += 1; continue; } };
+        let Some(market) = row.get("market").and_then(Value::as_str) else { continue; };
+        if market_filter.is_some_and(|wanted| wanted != market) { continue; }
+        let kind = row.get("kind").and_then(Value::as_str).unwrap_or_default();
+        if !matches!(kind, "maker_fill" | "execution_trade" | "execution_progress" | "maker_order_progress" | "fill" | "hedge_fill") { continue; }
+        let Some(detail) = row.get("detail").filter(|detail| detail.is_object()) else { malformed += 1; continue; };
+        let Some(logical) = identifier(detail, "logical_id").or_else(|| identifier(detail, "cloid")) else { malformed += 1; continue; };
+        let group = groups.entry((market.to_string(), logical.clone())).or_default();
+        group.legacy |= row.get("schema_version").and_then(Value::as_u64).unwrap_or(1) < 2;
+        if let Some(mono) = row.get("mono_ns").and_then(Value::as_i64).filter(|value| *value > 0) {
+            if group.first_mono_ns == 0 { group.first_mono_ns = mono; }
+            group.first_mono_ns = group.first_mono_ns.min(mono);
+            group.last_mono_ns = group.last_mono_ns.max(mono);
         }
-        let rec: JournalLine = serde_json::from_str(&line).with_context(|| format!("parsing journal line {}", idx + 1))?;
-        let Some(market) = rec.market else {
-            continue;
-        };
-        if market_filter.is_some_and(|want| want != market.as_str()) {
-            continue;
-        }
-        // Window filter: with --since-ms, rows older than the window (and legacy rows
-        // without a wall-clock stamp, which predate it by construction) are skipped, so
-        // the scan cost of the append-forever journal stops growing without bound for
-        // periodic callers like the orchestrator's breaker feed.
-        if let Some(since) = since_ms {
-            if rec.ts_ms.is_none_or(|ts| ts < since) {
-                continue;
-            }
-        }
-        match rec.kind.as_str() {
-            "fill" => {
-                let cloid = detail_str(&rec.detail, "cloid")?.to_string();
-                fills.insert(
-                    cloid,
-                    FillRec {
-                        market,
-                        mono_ns: rec.mono_ns,
-                        hedge_side: parse_side(detail_str(&rec.detail, "side")?)?,
-                        qty: detail_dec(&rec.detail, "qty")?,
-                        aster_px: detail_dec(&rec.detail, "avg_aster_px")?,
-                    },
-                );
-            }
-            "hedge_fill" => {
-                let cloid = detail_str(&rec.detail, "cloid")?.to_string();
-                let qty = detail_dec(&rec.detail, "qty")?;
-                let px = detail_dec(&rec.detail, "px")?;
-                let fee_usd = detail_dec(&rec.detail, "fee_usd").unwrap_or(Decimal::ZERO);
-                hedges
-                    .entry(cloid)
-                    .and_modify(|h| {
-                        if h.first_mono_ns == 0 || (rec.mono_ns > 0 && rec.mono_ns < h.first_mono_ns) {
-                            h.first_mono_ns = rec.mono_ns;
-                        }
-                        h.last_mono_ns = h.last_mono_ns.max(rec.mono_ns);
-                        h.qty += qty;
-                        h.notional += qty * px;
-                        h.fee_usd += fee_usd;
-                    })
-                    .or_insert(HedgeRec {
-                        market,
-                        first_mono_ns: rec.mono_ns,
-                        last_mono_ns: rec.mono_ns,
-                        hedge_side: parse_side(detail_str(&rec.detail, "side")?)?,
-                        qty,
-                        notional: qty * px,
-                        fee_usd,
-                    });
-            }
-            _ => {}
-        }
-    }
-
-    let keys: BTreeSet<String> = fills.keys().chain(hedges.keys()).cloned().collect();
-    let mut out = LiveReportSummary::default();
-
-    for cloid in keys {
-        match (fills.get(&cloid), hedges.get(&cloid)) {
-            (Some(fill), Some(hedge)) => {
-                let lighter_px = if hedge.qty > Decimal::ZERO { hedge.notional / hedge.qty } else { Decimal::ZERO };
-                let side_or_market_mismatch =
-                    fill.hedge_side != hedge.hedge_side || fill.market != hedge.market;
-                let qty_mismatch = fill.qty != hedge.qty || side_or_market_mismatch;
-                if qty_mismatch {
-                    out.qty_mismatches += 1;
-                }
-                // Honest partial-hedge accounting: only the MATCHED quantity realized the
-                // two-leg spread — the unhedged remainder is open exposure, not PnL. A
-                // side- or market-mismatched pairing is not a hedge at all: zero gross,
-                // flagged via qty_mismatch. Fees stay on the ACTUALS (the full maker fill
-                // and the hedge's journaled fee were really paid).
-                let matched_qty = if side_or_market_mismatch { Decimal::ZERO } else { fill.qty.min(hedge.qty) };
-                let gross = match fill.hedge_side {
-                    // The journal side is the Lighter hedge side. BUY hedge means Aster sold.
-                    Side::Buy => matched_qty * (fill.aster_px - lighter_px),
-                    Side::Sell => matched_qty * (lighter_px - fill.aster_px),
-                };
-                let aster_fee = fill.qty * fill.aster_px * aster_fee_rate;
-                let lighter_fee = hedge.fee_usd;
-                let net = gross - aster_fee - lighter_fee;
-                out.total_qty += fill.qty;
-                out.gross_pnl += gross;
-                out.aster_fees += aster_fee;
-                out.lighter_fees += lighter_fee;
-                out.net_pnl += net;
-                out.trades.push(TradeSummary {
-                    cloid,
-                    market: fill.market.clone(),
-                    first_mono_ns: [fill.mono_ns, hedge.first_mono_ns]
-                        .into_iter()
-                        .filter(|v| *v > 0)
-                        .min()
-                        .unwrap_or(0),
-                    last_mono_ns: fill.mono_ns.max(hedge.last_mono_ns),
-                    hedge_side: fill.hedge_side,
-                    qty: fill.qty,
-                    aster_px: fill.aster_px,
-                    lighter_px,
-                    gross_pnl: gross,
-                    aster_fee,
-                    lighter_fee,
-                    net_pnl: net,
-                    hedged_qty: hedge.qty,
-                    qty_mismatch,
+        if matches!(kind, "execution_progress" | "maker_order_progress") {
+            let attempt = identifier(detail, "attempt_id").or_else(|| identifier(detail, "client_id"));
+            let qty = amount(detail.get("cumulative_qty")).filter(|qty| *qty >= Decimal::ZERO);
+            let venue = detail.get("venue").and_then(Value::as_str).unwrap_or("aster");
+            let (Some(attempt), Some(qty), Some(venue)) = (attempt, qty, Venue::parse(venue)) else { malformed += 1; continue; };
+            if group.progress.get(&attempt).is_none_or(|old| qty >= old.qty) {
+                let (economic_time, economic_ordinal) = group.progress.get(&attempt)
+                    .filter(|old| old.qty == qty)
+                    .map(|old| (old.timestamp_ms, old.ordinal))
+                    .unwrap_or((timestamp_ms(&row), index));
+                group.progress.insert(attempt, Progress {
+                    venue, side: side(detail.get("side")), qty, quote: amount(detail.get("cumulative_quote_usd")),
+                    fee: detail.get("fee_complete").and_then(Value::as_bool).unwrap_or(false)
+                        .then(|| amount(detail.get("cumulative_fee_usd"))).flatten(),
+                    timestamp_ms: economic_time, ordinal: economic_ordinal,
+                    client_id: identifier(detail, "client_id"), order_id: identifier(detail, "venue_order_id"),
+                    maker_origin: kind == "maker_order_progress",
+                    terminal: detail.get("terminal").and_then(Value::as_bool).unwrap_or(false),
                 });
             }
-            (Some(_), None) => out.unmatched_fills += 1,
-            (None, Some(_)) => out.unmatched_hedges += 1,
-            (None, None) => {}
+        } else {
+            if kind == "execution_trade" && detail.get("identity_complete").and_then(Value::as_bool) == Some(false) {
+                let attempt = identifier(detail, "attempt_id").unwrap_or_default();
+                let lower = amount(detail.get("qty")).filter(|qty| *qty >= Decimal::ZERO);
+                group.unidentified.entry(attempt).and_modify(|old| {
+                    *old = old.zip(lower).map(|(old, next)| old.max(next));
+                }).or_insert(lower);
+                continue;
+            }
+            match parse_fill(&row, detail, kind, &logical, index) {
+                Ok((identity, mut fill)) => {
+                    if let Some(old) = group.fills.get(&identity) { fill.ordinal = old.ordinal; }
+                    group.fills.insert(identity, fill);
+                }
+                Err(_) => malformed += 1,
+            }
         }
     }
+    let mut output = LiveReportSummary {
+        schema_version: 2, economic_status: "confirmed", gross_pnl: Some(Decimal::ZERO),
+        venue_realized_pnl_usdc: Some(Decimal::ZERO), execution_spread_usdc: Some(Decimal::ZERO),
+        aster_fees: Some(Decimal::ZERO), lighter_fees: Some(Decimal::ZERO), net_pnl: Some(Decimal::ZERO),
+        ..LiveReportSummary::default()
+    };
+    let sum = |a: Option<Decimal>, b: Option<Decimal>| a.zip(b).and_then(|(a,b)| a.checked_add(b));
+    for ((market, logical), group) in groups {
+        let fills = coverage(&group, &mut malformed)?;
+        if !fills.iter().any(|fill| fill.qty > Decimal::ZERO) { continue; }
+        let trade = calculate(market, logical, &group, &fills)?;
+        if since_ms.is_some_and(|since| trade.timestamp_ms.is_none_or(|time| time < since)) { continue; }
+        output.unmatched_fills += usize::from(trade.qty > Decimal::ZERO && trade.lighter_qty.is_zero() && !trade.residual_qty.is_zero());
+        output.unmatched_hedges += usize::from(trade.qty.is_zero() && trade.lighter_qty > Decimal::ZERO);
+        output.qty_mismatches += usize::from(trade.qty_mismatch);
+        output.gross_pnl = sum(output.gross_pnl, trade.gross_pnl);
+        output.venue_realized_pnl_usdc = sum(output.venue_realized_pnl_usdc, trade.venue_realized_pnl_usdc);
+        output.execution_spread_usdc = sum(output.execution_spread_usdc, trade.execution_spread_usdc);
+        output.aster_fees = sum(output.aster_fees, trade.aster_fee);
+        output.lighter_fees = sum(output.lighter_fees, trade.lighter_fee);
+        output.net_pnl = sum(output.net_pnl, trade.net_pnl);
+        output.known_fees = checked(output.known_fees.checked_add(trade.known_fees))?;
+        output.total_qty = checked(output.total_qty.checked_add(trade.qty))?;
+        output.trades.push(trade);
+    }
+    output.trades.sort_by_key(|trade| (trade.timestamp_ms, trade.last_mono_ns));
+    output.malformed_rows = malformed;
+    if malformed > 0 {
+        output.net_pnl = None;
+        output.economic_status = "incomplete";
+    } else if output.trades.iter().any(|trade| trade.economic_status == "incomplete") {
+        output.economic_status = "incomplete";
+    } else if output.trades.iter().any(|trade| trade.economic_status == "legacy_unverified") {
+        output.economic_status = "legacy_unverified";
+    }
+    Ok(output)
+}
 
-    Ok(out)
+fn display(value: Option<Decimal>) -> String {
+    value.map(|value| value.round_dp(6).normalize().to_string()).unwrap_or_else(|| "unknown".into())
 }
 
 pub fn print_summary(path: &Path, summary: &LiveReportSummary, details: bool) {
     println!("live-report: {}", path.display());
-    println!("completed trades: {}", summary.trades.len());
-    println!("unmatched fills: {}", summary.unmatched_fills);
-    println!("unmatched hedge fills: {}", summary.unmatched_hedges);
-    println!("qty/side mismatches: {}", summary.qty_mismatches);
-    println!("total qty: {}", dec6(summary.total_qty));
-    println!("gross pnl: {} USDC", dec6(summary.gross_pnl));
-    println!("aster fees (configured): {} USDC", dec6(summary.aster_fees));
-    println!("lighter fees (journal): {} USDC", dec6(summary.lighter_fees));
-    println!("net pnl: {} USDC", dec6(summary.net_pnl));
-
+    println!("Economics: same-venue closes + matched entry spreads - observed fees.");
+    println!("execution groups: {} ({})", summary.trades.len(), summary.economic_status);
+    println!("unmatched makers/hedges: {}/{}; residual groups: {}; malformed rows: {}",
+        summary.unmatched_fills, summary.unmatched_hedges, summary.qty_mismatches, summary.malformed_rows);
+    println!("maker qty: {}", summary.total_qty.normalize());
+    println!("venue realized: {}; matched entry spread: {} USD",
+        display(summary.venue_realized_pnl_usdc), display(summary.execution_spread_usdc));
+    println!("gross pnl: {}; Aster fees: {}; Lighter fees: {}; net pnl: {} USD",
+        display(summary.gross_pnl), display(summary.aster_fees), display(summary.lighter_fees), display(summary.net_pnl));
     if details {
-        println!();
-        println!(
-            "{:<6} {:<4} {:>10} {:>12} {:>12} {:>12} {:>12}",
-            "market", "hedge", "qty", "aster_px", "lighter_px", "gross", "net"
-        );
-        for t in &summary.trades {
-            println!(
-                "{:<6} {:<4} {:>10} {:>12} {:>12} {:>12} {:>12}",
-                t.market,
-                t.hedge_side.as_str(),
-                dec6(t.qty),
-                dec6(t.aster_px),
-                dec6(t.lighter_px),
-                dec6(t.gross_pnl),
-                dec6(t.net_pnl)
-            );
+        for trade in &summary.trades {
+            println!("{} {} matched={} residual={} gross={} net={} {}",
+                trade.market, trade.logical_id, trade.matched_qty.normalize(), trade.residual_qty.normalize(),
+                display(trade.gross_pnl), display(trade.net_pnl), trade.economic_status);
         }
     }
 }
 
 pub fn print_summary_json(path: &Path, summary: &LiveReportSummary) -> Result<()> {
-    let path_s = path.to_string_lossy();
-    let out = LiveReportJson {
-        journal_path: &path_s,
-        summary,
-    };
-    println!("{}", serde_json::to_string_pretty(&out)?);
+    println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+        "journal_path": path.to_string_lossy(), "summary": summary
+    }))?);
     Ok(())
-}
-
-fn parse_side(s: &str) -> Result<Side> {
-    match s.trim().to_ascii_uppercase().as_str() {
-        "BUY" => Ok(Side::Buy),
-        "SELL" => Ok(Side::Sell),
-        other => anyhow::bail!("unknown side {other:?}"),
-    }
-}
-
-fn detail_str<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .with_context(|| format!("journal detail missing string field {key:?}"))
-}
-
-fn detail_dec(v: &Value, key: &str) -> Result<Decimal> {
-    match v.get(key) {
-        Some(Value::String(s)) => s.parse().with_context(|| format!("parsing decimal field {key:?}: {s:?}")),
-        Some(Value::Number(n)) => n.to_string().parse().with_context(|| format!("parsing decimal field {key:?}: {n}")),
-        _ => anyhow::bail!("journal detail missing decimal field {key:?}"),
-    }
-}
-
-fn dec6(d: Decimal) -> String {
-    d.round_dp(6).normalize().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
     use std::io::Cursor;
 
+    fn rows_text(rows: &[Value]) -> String {
+        rows.iter().map(|row| serde_json::to_string(row).unwrap()).collect::<Vec<_>>().join("\n")
+    }
+
     #[test]
-    fn summarizes_completed_live_trades_from_hedge_side() {
-        let text = r#"
-{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60.65200","cloid":"a","qty":"0.20","side":"BUY"}}
-{"mono_ns":2,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"a","fee_usd":"0.000028","px":"60.5944","qty":"0.20","side":"BUY"}}
-{"mono_ns":3,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60.46600","cloid":"b","qty":"0.21","side":"SELL"}}
-{"mono_ns":4,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"b","fee_usd":"0.000032","px":"60.4967","qty":"0.21","side":"SELL"}}
-"#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
-        assert_eq!(s.trades.len(), 2);
-        assert_eq!(s.gross_pnl.round_dp(6), dec!(0.017967));
-        assert_eq!(s.lighter_fees, dec!(0.000060));
-        assert_eq!(s.net_pnl.round_dp(6), dec!(0.017907));
-        assert_eq!(s.qty_mismatches, 0);
-        // Fully-hedged trades: the partial-hedge fields are inert and the output identical.
-        for t in &s.trades {
-            assert_eq!(t.hedged_qty, t.qty);
-            assert!(!t.qty_mismatch);
+    fn malformed_selected_fee_rate_cannot_fall_back_to_a_derived_amount() {
+        let native = serde_json::json!({"notional_usd":"1000","fee_ticks":"280","maker":false,"fee_usd":"0.00028"});
+        assert_eq!(fee(&native, false), Some("0.28".parse().unwrap()));
+        for replacement in [serde_json::json!({"fee_ticks":"NaN"}), serde_json::json!({"maker":null}),
+            serde_json::json!({"notional_usd":null}), serde_json::json!({"fee_complete":false})] {
+            let mut invalid = native.clone();
+            invalid.as_object_mut().unwrap().extend(replacement.as_object().unwrap().clone());
+            assert_eq!(fee(&invalid, true), None, "{invalid}");
         }
-        assert_eq!(s.total_qty, dec!(0.41));
+        let optional = serde_json::json!({"fee_ticks":null,"fee_usd":"0.5"});
+        assert_eq!(fee(&optional, true), Some("0.5".parse().unwrap()));
     }
 
     #[test]
-    fn partial_hedge_grosses_on_matched_qty_and_fees_on_actuals() {
-        // Maker filled 0.20 but only 0.12 got hedged: the spread is realized on 0.12 ONLY
-        // (the old code grossed the full 0.20 — overstating profit on the unhedged 0.08),
-        // while the fees remain what was actually paid (maker fee on 0.20, journal hedge fee).
-        let text = r#"
-{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"100","cloid":"a","qty":"0.20","side":"SELL"}}
-{"mono_ns":2,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"a","fee_usd":"0.01","px":"101","qty":"0.12","side":"SELL"}}
-"#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), dec!(0.001), None, None).unwrap();
-        assert_eq!(s.trades.len(), 1);
-        let t = &s.trades[0];
-        assert_eq!(t.qty, dec!(0.20), "qty keeps meaning maker volume");
-        assert_eq!(t.hedged_qty, dec!(0.12));
-        assert!(t.qty_mismatch);
-        assert_eq!(s.qty_mismatches, 1);
-        // gross on matched 0.12: 0.12 * (101 - 100) = 0.12 (SELL hedge: lighter - aster).
-        assert_eq!(t.gross_pnl, dec!(0.12));
-        // aster fee on the FULL maker fill: 0.20 * 100 * 0.001 = 0.02; lighter fee = journal actual.
-        assert_eq!(t.aster_fee, dec!(0.020000));
-        assert_eq!(t.lighter_fee, dec!(0.01));
-        assert_eq!(t.net_pnl, dec!(0.09));
-        assert_eq!(s.total_qty, dec!(0.20), "total_qty keeps summing maker volume");
+    fn shared_hand_calculated_execution_fixtures() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../tests/fixtures/execution_economics.json")).unwrap();
+        for fixture in fixtures {
+            let rows = fixture["rows"].as_array().unwrap();
+            let report = summarize(Cursor::new(rows_text(rows)), Some("HYPE"), None).unwrap();
+            assert_eq!(report.trades.len(), 1, "{}", fixture["name"]);
+            let trade = &report.trades[0];
+            let expected = &fixture["expected"];
+            assert_eq!(trade.qty, amount(expected.get("qty")).unwrap(), "{}", fixture["name"]);
+            assert_eq!(trade.gross_pnl, amount(expected.get("gross_pnl_usdc")), "{}", fixture["name"]);
+            assert_eq!(trade.venue_realized_pnl_usdc.zip(trade.execution_spread_usdc)
+                .and_then(|(realized, spread)| realized.checked_add(spread)), trade.gross_pnl);
+            for (key, actual) in [("execution_spread_usdc", trade.execution_spread_usdc),
+                ("venue_realized_pnl_usdc", trade.venue_realized_pnl_usdc)] {
+                if expected.get(key).is_some() { assert_eq!(actual, amount(expected.get(key)), "{} {key}", fixture["name"]); }
+            }
+            assert_eq!(trade.fees, amount(expected.get("fees_usdc")), "{}", fixture["name"]);
+            assert_eq!(trade.net_pnl, amount(expected.get("net_pnl_usdc")), "{}", fixture["name"]);
+            assert_eq!(trade.matched_qty, amount(expected.get("matched_qty")).unwrap(), "{}", fixture["name"]);
+            assert_eq!(trade.residual_qty, amount(expected.get("residual_qty")).unwrap(), "{}", fixture["name"]);
+            assert_eq!(trade.economic_status, expected["economic_status"].as_str().unwrap(), "{}", fixture["name"]);
+        }
+    }
+
+
+    #[test]
+    fn unchanged_cumulative_refinement_does_not_move_the_economic_window() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../tests/fixtures/execution_economics.json")).unwrap();
+        let case = fixtures.iter().find(|case| case["name"] == "cumulative_only").unwrap();
+        let mut rows = case["rows"].as_array().unwrap().clone();
+        let mut later = rows.last().unwrap().clone();
+        later["ts_ms"] = serde_json::json!(1767312010000i64);
+        rows.push(later);
+        let text = rows_text(&rows);
+        let all = summarize(Cursor::new(&text), None, None).unwrap();
+        assert_eq!(all.trades[0].timestamp_ms, Some(1767312000003));
+        let recent = summarize(Cursor::new(&text), None, Some(1767312005000)).unwrap();
+        assert!(recent.trades.is_empty());
     }
 
     #[test]
-    fn side_mismatched_pairing_is_not_a_hedge_zero_gross_flagged() {
-        let text = r#"
-{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"100","cloid":"a","qty":"0.20","side":"BUY"}}
-{"mono_ns":2,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"a","fee_usd":"0.01","px":"90","qty":"0.20","side":"SELL"}}
-"#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
-        assert_eq!(s.trades.len(), 1);
-        let t = &s.trades[0];
-        assert!(t.qty_mismatch);
-        assert_eq!(s.qty_mismatches, 1);
-        assert_eq!(t.gross_pnl, dec!(0), "a same-direction pairing realized no spread");
-        assert_eq!(t.net_pnl, dec!(-0.01), "fees actually paid still count");
-        assert_eq!(t.hedged_qty, dec!(0.20));
-    }
-
-    #[test]
-    fn reports_unmatched_records_and_filters_markets() {
-        let text = r#"
-{"mono_ns":1,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"a","qty":"1","side":"BUY"}}
-{"mono_ns":2,"kind":"hedge_fill","market":"ETH","detail":{"cloid":"b","fee_usd":"0","px":"10","qty":"1","side":"SELL"}}
-{"mono_ns":3,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"c","fee_usd":"0","px":"61","qty":"1","side":"BUY"}}
-"#;
-        let s = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, Some("HYPE"), None).unwrap();
-        assert_eq!(s.trades.len(), 0);
-        assert_eq!(s.unmatched_fills, 1);
-        assert_eq!(s.unmatched_hedges, 1);
-    }
-
-    #[test]
-    fn since_ms_windows_rows_and_excludes_legacy_unstamped() {
-        let text = r#"
-{"mono_ns":1,"ts_ms":1000,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"old","qty":"1","side":"BUY"}}
-{"mono_ns":2,"ts_ms":1001,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"old","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
-{"mono_ns":3,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"legacy","qty":"1","side":"BUY"}}
-{"mono_ns":4,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"legacy","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
-{"mono_ns":5,"ts_ms":2000,"kind":"fill","market":"HYPE","detail":{"avg_aster_px":"60","cloid":"new","qty":"1","side":"BUY"}}
-{"mono_ns":6,"ts_ms":2001,"kind":"hedge_fill","market":"HYPE","detail":{"cloid":"new","fee_usd":"0","px":"59","qty":"1","side":"BUY"}}
-"#;
-        // No window: all three pair up.
-        let all = summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, None).unwrap();
-        assert_eq!(all.trades.len(), 3);
-        // Windowed: only the pair stamped at/after since_ms survives; legacy rows without
-        // ts_ms are excluded by construction (they predate the stamp's introduction).
-        let windowed =
-            summarize_reader_with_aster_fee(Cursor::new(text), Decimal::ZERO, None, Some(1500)).unwrap();
-        assert_eq!(windowed.trades.len(), 1);
+    fn windowing_happens_after_pairing_and_unknown_fees_remain_null() {
+        let fixtures: Vec<Value> = serde_json::from_str(include_str!("../../tests/fixtures/execution_economics.json")).unwrap();
+        let partial = &fixtures[0];
+        let rows = partial["rows"].as_array().unwrap();
+        let report = summarize(Cursor::new(rows_text(rows)), None, Some(1767312000001)).unwrap();
+        assert_eq!(report.trades.len(), 1);
+        assert_eq!(report.trades[0].qty, "0.20".parse::<Decimal>().unwrap());
+        assert_eq!(report.net_pnl, Some("0.11".parse::<Decimal>().unwrap()));
+        let legacy = fixtures.iter().find(|fixture| fixture["name"] == "legacy_unverified").unwrap();
+        let report = summarize(Cursor::new(rows_text(legacy["rows"].as_array().unwrap())), None, None).unwrap();
+        assert!(serde_json::to_value(&report).unwrap()["net_pnl"].is_null());
+        let malformed = rows_text(rows) + "\nnot json";
+        let report = summarize(Cursor::new(malformed), None, None).unwrap();
+        assert_eq!(report.malformed_rows, 1);
+        assert!(report.net_pnl.is_none());
     }
 }
