@@ -27,7 +27,7 @@ and can be overridden.
 
 ## Local Native Run
 ```bash
-cargo build --release
+cargo build --release --locked
 
 ./target/release/xemm_lighter_aster --config config-live-lighter.toml fetch-specs --markets HYPE
 ./target/release/xemm_lighter_aster --config config-live-lighter.toml probe lighter-balance --market HYPE
@@ -35,6 +35,23 @@ cargo build --release
 ./target/release/xemm_lighter_aster --config config-live-lighter.toml probe lighter-order-dry-run --market HYPE
 ./target/release/xemm_lighter_aster --config config-live-lighter.toml verify-books --markets HYPE --secs 8
 ```
+
+## Shared nonce directory and user
+
+The builder and crate manifests use Rust 1.92. Compose runs as UID/GID 1000 by
+default. Match the host-side taker, observer and status process user, and create
+writable output and nonce directories before starting any container:
+
+```bash
+export XEMM_UID="$(id -u)" XEMM_GID="$(id -g)"
+export ASTER_NONCE_DIR=/tmp/lighter-aster-nonces
+mkdir -p runs "$ASTER_NONCE_DIR"
+chmod 700 "$ASTER_NONCE_DIR"
+```
+
+Propagate the same `ASTER_NONCE_DIR` to host processes; compose maps it to `/nonce`.
+Do not delete counters while any signer process is running. Compose allows 90 seconds
+for SIGINT draining and has no automatic restart policy.
 
 ## Docker Run
 ```bash
@@ -46,7 +63,7 @@ docker compose run --rm --name xemm-hype xemm \
   --db runs/live-hype.sqlite --out runs/live-hype.jsonl.zst
 ```
 
-Stop gracefully with `docker kill --signal=SIGINT xemm-hype`. Shutdown cancels resting orders and leaves positions open; it does not flatten.
+Stop gracefully with `docker kill --signal=SIGINT xemm-hype`. Shutdown quiesces admission, cancels makers, drains outcomes and verifies final orders/positions. Paired positions can remain open. A nonzero exit or retained active-session marker blocks automatic replacement; see [LIVE_RUNBOOK.md](LIVE_RUNBOOK.md).
 
 ## Lighter Market Probe
 ```bash

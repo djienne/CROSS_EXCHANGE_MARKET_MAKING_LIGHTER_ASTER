@@ -1,7 +1,7 @@
 # Aster/Lighter Cross-Exchange Market Making and Arbitrage
 
 A live Aster/Lighter trading stack that coordinates two strategies: a
-taker–taker arbitrage bot and an XEMM maker/taker hedging bot. The top-level
+takerâ€“taker arbitrage bot and an XEMM maker/taker hedging bot. The top-level
 orchestrator supervises switching, risk state, logs, and combined PnL across
 both bots.
 
@@ -20,9 +20,9 @@ modes before any live run.
   one market, switches between them based on status and margin conditions,
   writes risk/log state into `runs/`, and can keep the taker-arb bot in
   reduce-only standby while XEMM is active.
-- `combined_pnl.py` reports combined realized PnL across taker-arb trade logs
+- `combined_pnl.py` reports combined execution economics across taker-arb trade logs
   and XEMM hedge journals.
-- `LIGHTER_ASTER_TAKER_ARB/` is the standalone taker–taker arbitrage bot. It
+- `LIGHTER_ASTER_TAKER_ARB/` is the standalone takerâ€“taker arbitrage bot. It
   checks both Aster-sell/Lighter-buy and Lighter-sell/Aster-buy directions and
   only trades when top-of-book edge clears fees and configured margin.
 - `XEMM_LIGHTER_ASTER/` is the maker/taker XEMM bot. It quotes on Aster and
@@ -32,18 +32,18 @@ modes before any live run.
 
 ```text
 .
-├── orchestrator.py
-├── combined_pnl.py
-├── LIGHTER_ASTER_TAKER_ARB/
-│   ├── configs/live-hype.toml
-│   ├── src/
-│   └── README.md
-└── XEMM_LIGHTER_ASTER/
-    ├── config-live-lighter.toml
-    ├── config-paper-lighter.toml
-    ├── src/
-    ├── DOCKER_DEPLOY.md
-    └── LIVE_RUNBOOK.md
+â”œâ”€â”€ orchestrator.py
+â”œâ”€â”€ combined_pnl.py
+â”œâ”€â”€ LIGHTER_ASTER_TAKER_ARB/
+â”‚   â”œâ”€â”€ configs/live-hype.toml
+â”‚   â”œâ”€â”€ src/
+â”‚   â””â”€â”€ README.md
+â””â”€â”€ XEMM_LIGHTER_ASTER/
+    â”œâ”€â”€ config-live-lighter.toml
+    â”œâ”€â”€ config-paper-lighter.toml
+    â”œâ”€â”€ src/
+    â”œâ”€â”€ DOCKER_DEPLOY.md
+    â””â”€â”€ LIVE_RUNBOOK.md
 ```
 
 Runtime directories such as `runs/` and Rust build directories such as
@@ -58,7 +58,7 @@ Credentials are local files and must not be committed:
 - `XEMM_LIGHTER_ASTER/aster.env`
 - `XEMM_LIGHTER_ASTER/lighter.env`
 
-Keep these files mode `600` on the machine running the bots — the orchestrator
+Keep these files mode `600` on the machine running the bots â€” the orchestrator
 refuses `--live` if any env file is readable by group/other. The top-level and
 bot-level `.gitignore` files ignore env files, run outputs, sqlite databases,
 logs, jsonl/zst tapes, build outputs, PEM/key files, and local tool state.
@@ -73,7 +73,7 @@ Lighter signing path. They are not credential files.
 
 ## Prerequisites
 
-- Rust toolchain compatible with `rust-version = "1.87"` in both Rust crates.
+- Rust 1.92 (both crate manifests and the Docker builder use this version).
 - Python 3 for the orchestrator and reporting scripts.
 - `tmux` for long-running sessions.
 - `jq` is optional but useful for inspecting JSON status output.
@@ -86,8 +86,8 @@ overridden. Keep formatting changes narrow.
 Build both release binaries before live use:
 
 ```bash
-(cd LIGHTER_ASTER_TAKER_ARB && cargo build --release)
-(cd XEMM_LIGHTER_ASTER && cargo build --release)
+(cd LIGHTER_ASTER_TAKER_ARB && cargo build --release --locked)
+(cd XEMM_LIGHTER_ASTER && cargo build --release --locked)
 ```
 
 Expected binaries:
@@ -136,7 +136,7 @@ Useful options:
 - `--once` runs one status/decision cycle.
 - `--poll-sec N` controls the normal supervision interval.
 - `--max-loss-usdc N` sets the orchestrator-level realized-loss stop
-  (default 15 — deliberately above the bot-level `max_loss_usdc` /
+  (default 15 â€” deliberately above the bot-level `max_loss_usdc` /
   `max_cumulative_loss_usdc` of 10, so the bot breaker trips first and the
   supervisor stays a genuine backstop).
 - `--pnl-since startup|now|<RFC3339>` controls the PnL window.
@@ -200,7 +200,7 @@ checks.
 Runtime logs, journals, state files, and bot ledgers are written under `runs/`
 directories and are ignored by git.
 
-Combined realized PnL:
+Combined execution economics (funding and account marks are separate):
 
 ```bash
 python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z
@@ -214,47 +214,51 @@ python3 trade_history.py --mode lan --market HYPE
 python3 trade_history.py --mode lan --market HYPE --json
 ```
 
-LAN mode reads local bot artifacts only, writes `runs/trade_history.sqlite`,
-and recomputes fees from policy instead of trusting venue-reported fee fields.
+LAN mode reads local artifacts and preserves actual fee evidence. Version 2 records
+carry logical/attempt identities, executed quantities, matched quantity, residual
+exposure and fee provenance. Corrections revise the original logical trade without
+adding trades or volume. Lighter fees use each own-account fill's selected fee ticks
+and notional; rebates remain signed. Legacy aggregates without sufficient evidence
+remain incomplete. Unknown economics are `null` in JSON and SQL; reports show a
+known subtotal and incomplete count, and suppress complete totals and projections.
 
-XEMM journal rows carry a `ts_ms` wall-clock stamp (epoch milliseconds) that
-both `combined_pnl.py` and `trade_history.py` use to window trades; rows
-written by binaries built before 2026-07-01 lack it and fall under the
-`--xemm-untimestamped` policy in `combined_pnl.py`. `trade_history.py` also
-ingests the bot journal directly (`--xemm-journal`), so XEMM trades that
-filled while the orchestrator was down still enter the canonical DB with real
-trade times. The `xemm live-report` subcommand accepts `--since-ms` so
-periodic callers do not re-scan the whole append-forever journal.
+Execution economics combine venue-realized closes and spread on matched opposite
+remaining positions, less actual fees. They exclude funding and the marked value
+of unpaired exposure; use account equity and residual positions to assess those.
+Trade evidence is paired before filtering by economic time. The Rust `live-report`
+and Python `scripts/check_hedged_trade.py` entry points use the same fixture contract.
 
-The XEMM results sqlite (`--db`) is self-maintaining as of 2026-07-01: quote
-revisions are stored as per-run aggregates (`quote_revision_stats`) instead of
-per-row (the old firehose grew ~200 MB/day with zero readers), reject rows
-from runs older than 14 days are pruned at startup, and when ≥64 MB is
-reclaimable the file is rebuilt by copying live tables and renamed into place
-(a pre-fix 1.5 GB db shrinks to ~20 MB in under 2 s at the next bot start).
-Per-revision detail remains reconstructable by replaying the tape (`--out`).
-
-Research tapes (`--out *.jsonl.zst`, ~99% book snapshots) are written at zstd
-level 9 as of 2026-07-01 (~25% smaller than the old level 3 for negligible
-CPU; level 19 would save ~39% but needs ~330 MB of encoder memory — unsafe
-next to live bots on a small VPS). The orchestrator deletes finished tapes
-older than `--tape-retention-days` (default 7; 0 keeps everything) in an
-hourly sweep; the active tape is never eligible.
-
-Safety knobs added 2026-07-01: taker-arb `[risk] auto_flatten_on_mismatch`
-(default true) reduce-only flattens a persistent unhedged residual after
-`mismatch_flatten_after_checks` consecutive detections; taker-arb
-`emergency_slippage_bps` must be >= the normal slippage bounds (validated at
-startup); XEMM `[live.hyperliquid] ws_account_max_age_ms` (default 1500)
-bounds how old the WS account cache may be before reconciler reads fall back
-to REST.
-
-XEMM hedge journal summary:
+Historical repair writes a separate candidate and a before/after JSON comparison:
 
 ```bash
-cd XEMM_LIGHTER_ASTER
-python3 scripts/check_hedged_trade.py runs/<journal>.jsonl --config config-live-lighter.toml
+python3 trade_history.py --market HYPE --db runs/trade_history.sqlite --rebuild \
+  --xemm-journal runs/<journal>.jsonl --raw-fills runs/<own-account-fills>.jsonl
+# After inspecting the comparison, apply that unchanged candidate with a backup:
+python3 trade_history.py --market HYPE --db runs/trade_history.sqlite --replace-rebuilt
 ```
+
+`--raw-fills` is optional and repeatable; it accepts individual own-account fills
+with order/trade identities, quantities, notional and fee evidence. Repair never
+multiplies aggregate legacy fees by aggregate notional. Rebuilding is idempotent,
+keeps journals unchanged, and refuses replacement if either database changed since
+review. No production history is included in this checkout.
+
+All signer processes must share `ASTER_NONCE_DIR` (or supervisor
+`--aster-nonce-dir`). The default is the OS temporary directory's
+`lighter-aster-nonces` child. Each signer has a memory-mapped atomic counter;
+initialization uses an OS lock. Keep that directory persistent and writable by the
+same user for host and container processes; see the [Docker runbook](XEMM_LIGHTER_ASTER/DOCKER_DEPLOY.md).
+
+The supervisor blocks replacement after an unresolved or unclean child exit.
+A lease permits only reducing taker trades; cold observations expire after 500 ms
+and transmission checks the lease's actual expiry. See the [taker guide](LIGHTER_ASTER_TAKER_ARB/README.md)
+and [XEMM runbook](XEMM_LIGHTER_ASTER/LIVE_RUNBOOK.md) for execution recovery.
+
+Replay scenarios are independent per market, queue model and hedge latency. Each
+owns positions, quotes, reserved exposure, consumed liquidity and fees. Reports
+use venue-realized P&L plus fresh marks less fees, and show censored future hedges
+and residuals. The smallest latency is the primary display; old rows are labelled
+unassigned and need tape replay for corrected results.
 
 ## Git Hygiene
 

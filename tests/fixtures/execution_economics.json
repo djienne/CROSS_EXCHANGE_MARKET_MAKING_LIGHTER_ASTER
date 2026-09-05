@@ -571,5 +571,80 @@
       "economic_status": "confirmed",
       "qty": "0.05"
     }
+  },
+  {
+    "name": "signed_rebates",
+    "rows": [
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000000,
+        "kind": "maker_fill",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "maker_side": "Buy",
+          "qty": "0.20",
+          "px": "100",
+          "fee_usd": "-0.004",
+          "fee_complete": true,
+          "order_id": "A1",
+          "trade_id": "M1",
+          "client_id": "maker-a",
+          "event_time_ms": 1767312000000
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000001,
+        "kind": "execution_trade",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "qty": "0.12",
+          "px": "101",
+          "notional_usd": "12.12",
+          "fee_usd": "-0.002424",
+          "maker": true,
+          "fee_ticks": "-200",
+          "order_id": "L1",
+          "trade_id": "T1"
+        }
+      },
+      {
+        "schema_version": 2,
+        "economic_status": "confirmed",
+        "ts_ms": 1767312000003,
+        "kind": "execution_progress",
+        "market": "HYPE",
+        "detail": {
+          "logical_id": "a",
+          "attempt_id": "h1",
+          "venue": "lighter",
+          "side": "Sell",
+          "purpose": "hedge",
+          "cumulative_qty": "0.12",
+          "cumulative_quote_usd": "12.12",
+          "cumulative_fee_usd": "0.01",
+          "fee_complete": true,
+          "terminal": true
+        }
+      }
+    ],
+    "expected": {
+      "gross_pnl_usdc": "0.12",
+      "fees_usdc": "-0.006424",
+      "net_pnl_usdc": "0.126424",
+      "matched_qty": "0.12",
+      "residual_qty": "0.08",
+      "economic_status": "confirmed",
+      "qty": "0.20",
+      "execution_spread_usdc": "0.12",
+      "venue_realized_pnl_usdc": "0"
+    }
   }
 ]
