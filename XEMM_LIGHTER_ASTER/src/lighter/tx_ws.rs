@@ -1,85 +1,39 @@
-//! Persistent tx WebSocket — port of `TxWebSocket`. Sends `jsonapi/sendtxbatch` frames
-//! (excluded from the 200 msg/min limit). Preserves the critical outcome semantics:
-//!   * NotSent  — no frame written; REST fallback is SAFE.
-//!   * Unknown  — a frame may have reached Lighter; caller must NOT retry (pause+reconcile).
-//!   * Ok/Rejected — definite outcome from the response code (200 normalized to 0).
-//!
-//! KEEPALIVE (matches the Python `TxWebSocket`): the connection runs a **continuous background
-//! recv loop** plus a **proactive pinger**. Lighter closes any connection that sends no frame
-//! for 2 minutes and disconnects clients that fall behind on reading
-//! (https://apidocs.lighter.xyz/docs/websocket-reference), so an idle connection that is only
-//! read inline during a send (the previous design) gets dropped during quiet periods / the warmup
-//! window — surfacing as `disconnected_after_send` Unknown outcomes. Here:
-//!   * the recv loop ALWAYS reads (so tungstenite flushes auto-pongs, we reply `{"type":"pong"}`
-//!     to Lighter's app-level `{"type":"ping"}`, and we never "fall behind on reading"), and
-//!   * the pinger sends a WS Ping every `PING_INTERVAL` (< the 2-min server timeout).
-//! Sends are serialized upstream (the sign+send Mutex) and a response is correlated 1:1 via the
-//! recv channel (single in-flight request).
+//! Lighter transaction socket. Handshakes/reconnection run in a cold task.
+//! The send path never connects: an unready connection returns NotSent immediately.
+//! A write/response failure is Unknown because the venue may already have executed it.
 
-use crate::types::{TxSendResult, TxSendStatus};
 use anyhow::{Context, Result};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{stream::{SplitSink, SplitStream}, SinkExt, StreamExt};
 use serde_json::Value;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::tungstenite::Message;
+use crate::types::{TxSendResult, TxSendStatus};
 
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = SplitSink<Ws, Message>;
 type WsStream = SplitStream<Ws>;
-
-/// Proactive client-ping interval. Lighter closes connections idle for 2 minutes, so this must
-/// be comfortably under 120s (the Python uses `ping_interval=20`).
 const PING_INTERVAL: Duration = Duration::from_secs(20);
-
-/// Bound on any single sink write. A half-open TCP connection with a full send buffer
-/// otherwise blocks `send()` until the OS gives up (potentially 10+ minutes) — while the
-/// hedge-submission path waits behind this socket. On timeout the connection is marked
-/// dead and the outcome is Unknown (the frame may or may not have left the socket).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(3);
-/// Max wait for a tx response after the frame is written before declaring the outcome Unknown.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Bound on (re)connecting the socket. `send_batch` reconnects inline on the hedge
-/// critical path: an unbounded `connect_async` against a black-holed endpoint (dropped
-/// SYNs, dead LB) otherwise wedges the hedge worker for the kernel's full connect-retry
-/// cycle (~2 minutes) with a naked maker leg — no Terminal event reaches the strategy
-/// and recovery hedges queue behind the wedged send. Timeout maps to NotSent: nothing
-/// on the wire, safe to retry.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// Read-idle watchdog for the recv loop. A healthy connection receives at least our
-/// pinger's Pong every PING_INTERVAL, so 3 intervals of total silence means the socket
-/// is half-open (writes still buffer, reads never arrive): flip `alive` proactively so
-/// the next `send_batch` reconnects up front (degrading to a safe NotSent) instead of a
-/// live hedge paying WRITE/RESPONSE timeouts to discover the dead socket.
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One live connection: the shared write half plus the response channel fed by the recv loop,
-/// and the background task handles (aborted on reconnect/close).
 struct Conn {
-    /// Write half, shared between `send_batch`, the pinger, and the recv loop's pong replies.
     write: Arc<Mutex<WsSink>>,
-    /// Real (non-ping / non-info) responses routed from the recv loop, in order. Single in-flight
-    /// request upstream, so the next item after a send is that send's response.
     resp_rx: mpsc::UnboundedReceiver<Value>,
-    /// False once the recv loop or pinger observes a dead socket.
     alive: Arc<AtomicBool>,
     recv_task: JoinHandle<()>,
     ping_task: JoinHandle<()>,
 }
-
 impl Conn {
-    fn is_alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
-    }
+    fn is_alive(&self) -> bool { self.alive.load(Ordering::Acquire) }
 }
-
 impl Drop for Conn {
     fn drop(&mut self) {
         self.recv_task.abort();
@@ -87,51 +41,107 @@ impl Drop for Conn {
     }
 }
 
-pub struct TxWebSocket {
+struct State {
     url: String,
     conn: Mutex<Option<Conn>>,
+    // Publish the CURRENT connection's own flag, so an old reader cannot invalidate
+    // a newer connection. The hot read is try_read and never waits behind a writer.
+    published_alive: RwLock<Option<Arc<AtomicBool>>>,
+    reconnect: Arc<Notify>,
+}
+impl State {
+    fn is_ready(&self) -> bool {
+        self.published_alive.try_read().ok().is_some_and(|guard|
+            guard.as_ref().is_some_and(|alive| alive.load(Ordering::Acquire)))
+    }
+}
+
+pub struct TxWebSocket {
+    inner: Arc<State>,
+    reconnect_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+impl Drop for TxWebSocket {
+    fn drop(&mut self) {
+        if let Some(task) = self.reconnect_task.get_mut().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+    }
 }
 
 impl TxWebSocket {
     pub fn new(url: &str) -> Self {
         Self {
-            url: url.to_string(),
-            conn: Mutex::new(None),
+            inner: Arc::new(State {
+                url: url.into(), conn: Mutex::new(None),
+                published_alive: RwLock::new(None), reconnect: Arc::new(Notify::new()),
+            }),
+            reconnect_task: std::sync::Mutex::new(None),
         }
     }
 
-    /// Pre-connect (best effort). Safe to call at startup.
+    pub fn is_ready(&self) -> bool { self.inner.is_ready() }
+
+    pub fn request_reconnect(&self) {
+        self.inner.reconnect.notify_one();
+    }
+
+    /// Cold startup entry point. Starts the reconnect task once and bounds readiness.
     pub async fn connect(&self) -> Result<()> {
-        let conn = timeout(CONNECT_TIMEOUT, self.open())
-            .await
-            .map_err(|_| anyhow::anyhow!("tx ws connect timeout"))??;
-        *self.conn.lock().await = Some(conn);
+        {
+            let mut task = self.reconnect_task.lock().unwrap_or_else(|e| e.into_inner());
+            if task.is_none() {
+                *task = Some(tokio::spawn(Self::reconnect_loop(self.inner.clone())));
+            }
+        }
+        self.request_reconnect();
+        timeout(CONNECT_TIMEOUT, async {
+            while !self.is_ready() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.context("Lighter tx websocket connect deadline")?;
         Ok(())
     }
 
-    /// Open a fresh connection, split it, and spawn the recv + ping background tasks.
-    async fn open(&self) -> Result<Conn> {
-        let (ws, _) = connect_async(&self.url).await.context("tx ws connect")?;
+    async fn reconnect_loop(state: Arc<State>) {
+        let mut backoff = Duration::from_millis(250);
+        loop {
+            if state.is_ready() {
+                tokio::select! {
+                    _ = state.reconnect.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+                if state.is_ready() { continue; }
+            }
+            let mut guard = state.conn.lock().await;
+            if guard.as_ref().is_some_and(Conn::is_alive) { continue; }
+            *guard = None; // drop old readers before publishing a replacement
+            *state.published_alive.write().unwrap_or_else(|e| e.into_inner()) = None;
+            match timeout(CONNECT_TIMEOUT, Self::open(&state.url, state.reconnect.clone())).await {
+                Ok(Ok(conn)) => {
+                    let alive = conn.alive.clone();
+                    *guard = Some(conn);
+                    *state.published_alive.write().unwrap_or_else(|e| e.into_inner()) = Some(alive);
+                    backoff = Duration::from_millis(250);
+                    continue;
+                }
+                Ok(Err(error)) => tracing::warn!("Lighter tx reconnect failed: {error:#}"),
+                Err(_) => tracing::warn!("Lighter tx reconnect exceeded 3 seconds"),
+            }
+            drop(guard);
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(10));
+        }
+    }
+
+    async fn open(url: &str, reconnect: Arc<Notify>) -> Result<Conn> {
+        let (ws, _) = connect_async(url).await.context("tx ws connect")?;
         let (sink, stream) = ws.split();
         let write = Arc::new(Mutex::new(sink));
         let alive = Arc::new(AtomicBool::new(true));
-        let (resp_tx, resp_rx) = mpsc::unbounded_channel::<Value>();
-
-        let recv_task = tokio::spawn(recv_loop(stream, write.clone(), alive.clone(), resp_tx));
-        let ping_task = tokio::spawn(ping_loop(write.clone(), alive.clone()));
-
-        tracing::info!(
-            "TxWebSocket connected to {} (keepalive recv-loop + {}s pinger)",
-            self.url,
-            PING_INTERVAL.as_secs()
-        );
-        Ok(Conn {
-            write,
-            resp_rx,
-            alive,
-            recv_task,
-            ping_task,
-        })
+        let (resp_tx, resp_rx) = mpsc::unbounded_channel();
+        let recv_task = tokio::spawn(recv_loop(stream, write.clone(), alive.clone(), resp_tx, reconnect.clone()));
+        let ping_task = tokio::spawn(ping_loop(write.clone(), alive.clone(), reconnect));
+        Ok(Conn { write, resp_rx, alive, recv_task, ping_task })
     }
 
     fn response_payload(resp: &Value) -> &Value {
@@ -190,176 +200,114 @@ impl TxWebSocket {
         }
     }
 
-    /// Send a batch. `tx_types`/`tx_infos` are JSON-encoded into strings inside `data`.
     pub async fn send_batch(&self, tx_types: &[u8], tx_infos: &[String]) -> TxSendResult {
-        let mut guard = self.conn.lock().await;
-
-        // (Re)connect if there is no live connection — bounded: this runs inline on the
-        // hedge path, and NotSent is the safe fast-fail (nothing on the wire).
-        if !guard.as_ref().map(|c| c.is_alive()).unwrap_or(false) {
-            match timeout(CONNECT_TIMEOUT, self.open()).await {
-                Ok(Ok(c)) => *guard = Some(c),
-                Ok(Err(_)) => return TxSendResult::not_sent("connect_failed"),
-                Err(_) => return TxSendResult::not_sent("connect_timeout"),
-            }
+        if !self.is_ready() {
+            self.request_reconnect();
+            return TxSendResult::not_sent("transport_not_ready");
         }
-        let conn = guard.as_mut().unwrap();
-
+        let mut guard = match self.inner.conn.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => return TxSendResult::not_sent("transport_busy"),
+        };
+        let Some(conn) = guard.as_mut().filter(|conn| conn.is_alive()) else {
+            self.request_reconnect();
+            return TxSendResult::not_sent("transport_not_ready");
+        };
         let frame = serde_json::json!({
             "type": "jsonapi/sendtxbatch",
             "data": {
-                "tx_types": serde_json::to_string(tx_types).unwrap_or_default(),
-                "tx_infos": serde_json::to_string(tx_infos).unwrap_or_default(),
+                "tx_types": serde_json::to_string(tx_types).expect("serialize tx types"),
+                "tx_infos": serde_json::to_string(tx_infos).expect("serialize signed tx strings"),
             }
-        })
-        .to_string();
-
-        // Drop any stale responses left over from a previous send before issuing this one.
+        }).to_string();
         while conn.resp_rx.try_recv().is_ok() {}
-
-        // Write the frame, bounded. A write error/timeout means the frame may or may not
-        // have reached the exchange — treat as Unknown (the safe, no-retry outcome).
         {
-            let mut w = conn.write.lock().await;
-            match timeout(WRITE_TIMEOUT, w.send(Message::Text(frame))).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    conn.alive.store(false, Ordering::Release);
-                    return TxSendResult::unknown(format!("send_failed:{e}"));
-                }
-                Err(_) => {
-                    conn.alive.store(false, Ordering::Release);
-                    return TxSendResult::unknown("send_timeout");
-                }
+            // The pinger/reader hold this only for bounded writes.
+            let result = timeout(WRITE_TIMEOUT, async {
+                conn.write.lock().await.send(Message::Text(frame)).await
+            }).await;
+            if !matches!(result, Ok(Ok(()))) {
+                conn.alive.store(false, Ordering::Release);
+                self.request_reconnect();
+                return TxSendResult::unknown("send_failed_or_timeout");
             }
         }
-
-        // Await the response routed by the recv loop (single in-flight request).
         match timeout(RESPONSE_TIMEOUT, conn.resp_rx.recv()).await {
-            Ok(Some(resp)) => {
-                let Some((code, message)) = Self::code_message(&resp) else {
-                    // Outcome-shaped gate passed but no code/error field: ambiguous.
+            Ok(Some(response)) => {
+                let Some((code, message)) = Self::code_message(&response) else {
+                    conn.alive.store(false, Ordering::Release);
+                    self.request_reconnect();
                     return TxSendResult::unknown("unrecognized_response");
                 };
-                let payload = Self::response_payload(&resp);
-                let quota = payload
-                    .get("volume_quota_remaining")
-                    .and_then(|q| q.as_i64());
-                let status = if code == 0 {
-                    TxSendStatus::Ok
-                } else {
-                    TxSendStatus::Rejected
-                };
                 TxSendResult {
-                    status,
-                    code,
-                    message,
-                    quota_remaining: quota,
+                    status: if code == 0 { TxSendStatus::Ok } else { TxSendStatus::Rejected },
+                    code, message,
+                    quota_remaining: Self::response_payload(&response)
+                        .get("volume_quota_remaining").and_then(|v| v.as_i64()),
                 }
             }
-            // recv loop ended (socket closed) — a frame was written, outcome unknown.
-            Ok(None) => {
+            outcome => {
                 conn.alive.store(false, Ordering::Release);
-                TxSendResult::unknown("disconnected_after_send")
-            }
-            Err(_) => {
-                conn.alive.store(false, Ordering::Release);
-                TxSendResult::unknown("response_timeout")
+                self.request_reconnect();
+                TxSendResult::unknown(if outcome.is_err() { "response_timeout" } else { "disconnected_after_send" })
             }
         }
     }
 }
 
-/// Background reader: drains the socket forever, replies to Lighter's app-level `{"type":"ping"}`,
-/// drops info frames, and routes everything else to `resp_tx`. Exits (dropping `resp_tx`, which
-/// unblocks a waiting `send_batch` with `None`) when the socket closes/errors.
 async fn recv_loop(
-    mut stream: WsStream,
-    write: Arc<Mutex<WsSink>>,
-    alive: Arc<AtomicBool>,
-    resp_tx: mpsc::UnboundedSender<Value>,
+    mut stream: WsStream, write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>,
+    resp_tx: mpsc::UnboundedSender<Value>, reconnect: Arc<Notify>,
 ) {
     loop {
-        // Idle watchdog: our pinger elicits a Pong every PING_INTERVAL, so prolonged
-        // total silence means a half-open socket — exit (flipping `alive` below) so the
-        // next send reconnects instead of writing into a dead connection.
-        let msg = match timeout(READ_IDLE_TIMEOUT, stream.next()).await {
-            Ok(Some(msg)) => msg,
-            Ok(None) => break,
-            Err(_) => {
-                tracing::warn!(
-                    "tx socket: no inbound frame for {}s (pinger every {}s) — treating connection as half-open",
-                    READ_IDLE_TIMEOUT.as_secs(),
-                    PING_INTERVAL.as_secs()
-                );
-                break;
-            }
+        let message = match timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(message))) => message,
+            _ => break,
         };
-        match msg {
-            Ok(Message::Text(t)) => {
-                let v: Value = match serde_json::from_str(&t) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                match v.get("type").and_then(|x| x.as_str()) {
+        match message {
+            Message::Text(text) => {
+                let Ok(value) = serde_json::from_str::<Value>(&text) else { continue; };
+                match value.get("type").and_then(|v| v.as_str()) {
                     Some("ping") => {
-                        // Lighter application-level ping -> must reply with a pong frame.
-                        let mut w = write.lock().await;
-                        match timeout(WRITE_TIMEOUT, w.send(Message::Text(r#"{"type":"pong"}"#.into()))).await {
-                            Ok(Ok(())) => {}
-                            _ => break, // write failed or wedged: connection is dead
-                        }
+                        let result = timeout(WRITE_TIMEOUT, async {
+                            write.lock().await.send(Message::Text(r#"{"type":"pong"}"#.into())).await
+                        }).await;
+                        if !matches!(result, Ok(Ok(()))) { break; }
                     }
-                    Some("connected") | Some("subscribed") => {} // informational; drop
-                    _ if TxWebSocket::looks_like_tx_outcome(&v) => {
-                        // Real response (tx outcome). Channel closed => no receiver; stop.
-                        if resp_tx.send(v).is_err() {
-                            break;
-                        }
+                    Some("connected" | "subscribed") => {}
+                    _ if TxWebSocket::looks_like_tx_outcome(&value) => {
+                        if resp_tx.send(value).is_err() { break; }
                     }
-                    other => {
-                        // NOT outcome-shaped: never consume it as the in-flight request's
-                        // response (that would report a possibly-rejected order as Ok).
-                        tracing::debug!("tx socket: dropping non-outcome frame type={other:?}");
-                    }
+                    _ => {}
                 }
             }
-            // Tungstenite auto-queues a Pong for an incoming Ping (flushed on the next write); we
-            // also reply explicitly to be safe. Pongs (from our pings) are discarded.
-            Ok(Message::Ping(p)) => {
-                let mut w = write.lock().await;
-                if timeout(WRITE_TIMEOUT, w.send(Message::Pong(p))).await.is_err() {
-                    break; // write wedged: connection is dead
-                }
+            Message::Ping(payload) => {
+                let result = timeout(WRITE_TIMEOUT, async {
+                    write.lock().await.send(Message::Pong(payload)).await
+                }).await;
+                if !matches!(result, Ok(Ok(()))) { break; }
             }
-            Ok(Message::Pong(_)) => {}
-            Ok(Message::Close(_)) => break,
-            Ok(_) => {} // Binary/Frame — unused
-            Err(_) => break,
+            Message::Close(_) => break,
+            _ => {}
         }
     }
     alive.store(false, Ordering::Release);
-    // resp_tx drops here -> any send_batch awaiting resp_rx.recv() gets None (Unknown).
+    reconnect.notify_one();
 }
 
-/// Background pinger: sends a WS Ping every `PING_INTERVAL` so the connection keeps emitting a
-/// client frame well within Lighter's 2-minute idle-close window. Exits when the socket dies.
-async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>) {
+async fn ping_loop(write: Arc<Mutex<WsSink>>, alive: Arc<AtomicBool>, reconnect: Arc<Notify>) {
     let mut tick = tokio::time::interval(PING_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    tick.tick().await; // first tick fires immediately; skip it (just connected)
-    loop {
+    tick.tick().await;
+    while alive.load(Ordering::Acquire) {
         tick.tick().await;
-        if !alive.load(Ordering::Acquire) {
+        let result = timeout(WRITE_TIMEOUT, async {
+            write.lock().await.send(Message::Ping(Vec::new())).await
+        }).await;
+        if !matches!(result, Ok(Ok(()))) {
+            alive.store(false, Ordering::Release);
+            reconnect.notify_one();
             break;
-        }
-        let mut w = write.lock().await;
-        match timeout(WRITE_TIMEOUT, w.send(Message::Ping(Vec::new()))).await {
-            Ok(Ok(())) => {}
-            _ => {
-                alive.store(false, Ordering::Release);
-                break;
-            }
         }
     }
 }
@@ -427,6 +375,7 @@ mod tests {
         });
 
         let tx_ws = TxWebSocket::new(&url);
+        tx_ws.connect().await.unwrap();
         let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
 
         assert_eq!(result.status, TxSendStatus::Ok);
@@ -452,6 +401,7 @@ mod tests {
         });
 
         let tx_ws = TxWebSocket::new(&url);
+        tx_ws.connect().await.unwrap();
         let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
 
         assert_eq!(result.status, TxSendStatus::Unknown);
@@ -459,20 +409,17 @@ mod tests {
         server.await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn send_batch_fails_fast_as_not_sent_when_connect_hangs() {
-        // Black-holed endpoint (no listener; VPC drops or refuses). Either way the
-        // bounded reconnect must return NotSent quickly — never wedge the hedge worker
-        // through the kernel's multi-minute connect-retry cycle. Paused clock: the
-        // CONNECT_TIMEOUT timer auto-advances if the SYN is silently dropped.
-        let tx_ws = TxWebSocket::new("ws://10.255.255.1:81");
-        let result = tx_ws.send_batch(&[14], &[String::from("signed-tx")]).await;
+    #[tokio::test]
+    async fn cold_connect_is_bounded_and_hot_unready_send_never_connects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let socket = TxWebSocket::new(&url);
+        let before = tokio::time::Instant::now();
+        let result = socket.send_batch(&[14], &["signed-tx".into()]).await;
         assert_eq!(result.status, TxSendStatus::NotSent);
-        assert!(
-            result.message.starts_with("connect"),
-            "expected connect_failed/connect_timeout, got {}",
-            result.message
-        );
+        assert!(before.elapsed() < Duration::from_millis(50));
+        assert!(timeout(Duration::from_secs(4), socket.connect()).await.unwrap().is_err());
+        drop(listener);
     }
 
     #[tokio::test]
@@ -494,13 +441,14 @@ mod tests {
         // Then pause so auto-advance rushes through the 60s idle window instead of
         // the test waiting it out.
         tokio::time::pause();
-        assert!(tx_ws.conn.lock().await.as_ref().unwrap().is_alive());
+        let old_alive = tx_ws.inner.conn.lock().await.as_ref().unwrap().alive.clone();
+        assert!(old_alive.load(Ordering::Acquire));
 
         // The paused clock auto-advances through READ_IDLE_TIMEOUT; poll until the
         // watchdog flips `alive` (bounded so a regression fails instead of hanging).
         let deadline = tokio::time::Instant::now() + READ_IDLE_TIMEOUT * 3;
         loop {
-            if !tx_ws.conn.lock().await.as_ref().unwrap().is_alive() {
+            if !old_alive.load(Ordering::Acquire) {
                 break;
             }
             assert!(

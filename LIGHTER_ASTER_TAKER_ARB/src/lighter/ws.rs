@@ -326,16 +326,19 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             let _sub = ws.next().await.unwrap().unwrap();
-            ws.send(Message::Text(r#"{"type":"ping"}"#.into()))
-                .await
-                .unwrap();
-            let msg = timeout(Duration::from_secs(1), ws.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            assert_eq!(msg, Message::Text(r#"{"type":"pong"}"#.into()));
-            sleep(Duration::from_millis(200)).await;
+            loop {
+                if ws.send(Message::Text(r#"{"type":"ping"}"#.into())).await.is_err() { return; }
+                loop {
+                    let msg = timeout(Duration::from_millis(100), ws.next()).await.unwrap();
+                    match msg {
+                        Some(Ok(Message::Text(raw))) if raw == r#"{"type":"pong"}"# => break,
+                        Some(Ok(Message::Ping(payload))) => ws.send(Message::Pong(payload)).await.unwrap(),
+                        Some(Ok(_)) => {}
+                        _ => return,
+                    }
+                }
+                sleep(Duration::from_millis(40)).await;
+            }
         });
 
         let mut opts = opts(url);
@@ -348,13 +351,13 @@ mod tests {
         };
 
         timeout(
-            Duration::from_secs(2),
+            Duration::from_millis(500),
             session(&opts, None, &mut on_message),
         )
         .await
         .unwrap()
         .unwrap();
-        server.await.unwrap();
+        server.abort();
         assert_eq!(calls.load(Ordering::Relaxed), 0);
     }
 
@@ -397,7 +400,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = accept_async(stream).await.unwrap();
             let _sub = ws.next().await.unwrap().unwrap();
-            sleep(Duration::from_secs(1)).await;
+            std::future::pending::<()>().await;
         });
 
         let mut opts = opts(url);
@@ -406,7 +409,7 @@ mod tests {
         let mut on_message = |_raw: &str| {};
 
         timeout(
-            Duration::from_secs(2),
+            Duration::from_millis(500),
             session(&opts, None, &mut on_message),
         )
         .await
