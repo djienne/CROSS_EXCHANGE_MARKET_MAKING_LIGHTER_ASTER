@@ -8,12 +8,12 @@ through the Docker bind mount (`./runs:/app/runs`), so there is no need to `dock
 container, and it works whether or not the container is running.
 
 Without --runs-dir it searches both latch locations: <crate>/runs (Docker deploys) and the
-stack-level runs/ beside the crate (orchestrator-managed runs).
+stack-level runs/ beside the crate (the retired orchestrator's runs).
 
 Usage (run from the deploy dir, e.g. ~/LIGHTER_ASTER_BOT on the VPS, or the repo root locally):
     python scripts/reset_breaker.py                 # clear ALL *.trip.json latches
-    python scripts/reset_breaker.py --coin ETH      # clear only runs/live-eth.trip.json
-    python scripts/reset_breaker.py --db runs/live-eth.sqlite   # clear that run's latch
+    python scripts/reset_breaker.py --coin HYPE     # clear only runs/bot-HYPE.trip.json (`run`)
+    python scripts/reset_breaker.py --db runs/live-eth.sqlite   # clear the latch of that livebot --db
     python scripts/reset_breaker.py --archive       # rename instead of delete (keeps an audit copy)
     python scripts/reset_breaker.py --runs-dir /path/to/runs    # override the runs directory
 
@@ -28,7 +28,7 @@ from pathlib import Path
 
 
 def _runs_dirs_default() -> list[Path]:
-    # Robust to the cwd: <crate>/runs for Docker deploys, <stack>/runs for orchestrated runs.
+    # Robust to the cwd: <crate>/runs for `run`, <stack>/runs for the retired orchestrator's runs.
     crate = Path(__file__).resolve().parent.parent
     return [d for d in (crate / "runs", crate.parent / "runs") if d.exists()]
 
@@ -57,7 +57,7 @@ def main() -> int:
                     help="runs directory holding the *.trip.json latch(es) "
                          "(default: <crate>/runs and the stack-level runs/)")
     g = ap.add_mutually_exclusive_group()
-    g.add_argument("--coin", help="clear only this coin's latch, e.g. ETH -> runs/live-eth.trip.json")
+    g.add_argument("--coin", help="clear only this market's latch, e.g. HYPE -> runs/bot-HYPE.trip.json")
     g.add_argument("--db", help="clear the latch for this run DB, e.g. runs/live-eth.sqlite")
     ap.add_argument("--archive", action="store_true",
                     help="rename the latch to <name>.cleared.<ts> instead of deleting it")
@@ -74,8 +74,8 @@ def main() -> int:
         if args.db:
             targets.append(runs_dir / _latch_for_db(args.db))
         elif args.coin:
-            # Mirror the live run convention: --db runs/live-<coin>.sqlite -> live-<coin>.trip.json
-            targets.append(runs_dir / f"live-{args.coin.lower()}.trip.json")
+            # Mirror `run`: its XEMM db runs/bot-<MARKET>.sqlite -> bot-<MARKET>.trip.json
+            targets.append(runs_dir / f"bot-{args.coin.upper()}.trip.json")
         else:
             targets.extend(sorted(runs_dir.glob("*.trip.json")))
 
@@ -105,7 +105,7 @@ def main() -> int:
             print(f"ERROR clearing {t}: {e}", file=sys.stderr)
             return 1
 
-    print(f"\nCircuit breaker reset ({cleared} latch(es) cleared). The next livebot run may proceed.")
+    print(f"\nCircuit breaker reset ({cleared} latch(es) cleared). The next run may proceed.")
     return 0
 
 

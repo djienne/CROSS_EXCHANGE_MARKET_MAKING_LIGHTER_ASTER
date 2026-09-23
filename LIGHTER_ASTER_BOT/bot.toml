@@ -1,10 +1,125 @@
-# Live Aster maker / Lighter hedge configuration. Select exactly one market.
+# One Lighter/Aster bot for one market: the taker-taker arbitrage engine ([taker]) and the
+# Aster-maker / Lighter-hedge engine ([maker], "XEMM"), with execution rights switched in
+# memory by the controller ([controller]). Every key is checked at startup; an unknown or
+# misplaced key fails the load.
 #
-# Run with:
-#   lighter_aster_bot --config config-live-lighter.toml livebot --mode live --markets HYPE \
-#       --db runs/livebot-live.sqlite --out runs/livebot-live.jsonl.zst --secs <N>
+# Run with (the mode is a command-line choice only):
+#   lighter_aster_bot run --config bot.toml --market HYPE --mode live
+#   lighter_aster_bot run --config bot.toml --market HYPE --mode paper   # no orders
+#
+# The engines' own commands read their table of this file, e.g.
+#   lighter_aster_bot --config bot.toml livebot --mode paper --markets HYPE
+#   lighter_aster_bot taker run --config bot.toml --market HYPE --observe-only
 
-[edge]
+[controller]
+poll_sec              = 15
+# Normal taker -> XEMM once the taker has been blocked (below the switch clips of position
+# headroom or free margin, with no executable reducing trade) for blocked_confirm_sec.
+blocked_confirm_sec   = 90
+# XEMM -> normal taker once the taker has been ready (near flat, a reducing trade executable,
+# or above the resume clips) for resume_confirm_sec.
+resume_confirm_sec    = 45
+switch_headroom_clips = "2"
+switch_margin_clips   = "2"
+# resume_headroom_clips = "3"   # default: switch clips + 1 (hysteresis)
+# resume_margin_clips   = "3"
+near_flat_notional_usd = "0"    # 0 = one clip
+# While XEMM is active a reduce-only taker observes; a burst of reduce_burst_min_samples
+# reducing opportunities within reduce_burst_window_ms moves the rights to it under a lease.
+observer                 = true
+reduce_signal_fresh_ms   = 60000
+reduce_burst_min_samples = 3
+reduce_burst_window_ms   = 2000
+reduce_lease_sec         = 180
+reduce_lease_max_sec     = 300
+reduce_cooldown_ms       = 5000
+# Cross-engine stop, inclusive: marked equity drawdown from the persisted baseline, or the
+# realized PnL of both engines' trades (unverified gains never count). A trip writes
+# runs/bot-<MARKET>.breaker.json; restart needs --ack-breaker (a drawdown trip also
+# --reset-breaker-baseline).
+max_loss_usdc          = "15"
+baseline_max_gap_hours = 48
+
+[taker.arb]
+desired_notional = "13"
+margin_bps = "2.0"
+aster_taker_fee_bps = "4.0"
+lighter_taker_fee_bps = "0.0"
+max_aster_slippage_bps = "30.0"
+max_lighter_slippage_bps = "30.0"
+# Emergency (naked-leg recovery) bound: must be WIDER than the normal bounds — recovery
+# fires exactly when the market has moved, and an IOC that can't cross a moved/thin book
+# leaves the naked leg open through repeated attempts. (2.5x normal; XEMM uses 90 vs 60.)
+emergency_slippage_bps = "75.0"
+hedge_retry_slippage_bps = "30.0"
+hedge_retry_timeout_ms = 5000
+max_hedge_retry_attempts = 1
+cooldown_ms = 60000
+startup_warmup_ms = 15000
+poll_interval_ms = 10
+max_book_staleness_ms = 2000
+max_recovered_failures_per_hour = 3
+max_recovered_loss_usdc_per_hour = "0.25"
+
+[taker.arb.depth_guard]
+enabled = true
+liquidity_multiple = "10"
+max_levels = 20
+
+[taker.arb.book_sanity]
+enabled = true
+interval_ms = 10000
+max_top_bps = "8.0"
+max_vwap_bps = "8.0"
+required_failures = 2
+required_successes = 2
+block_cooldown_ms = 15000
+rest_depth_levels = 20
+liquidity_multiple = "10"
+
+[taker.arb.entry_gate]
+enabled = true
+mode = "enforce"
+history_window_hours = 72
+sample_interval_ms = 1000
+min_history_samples = 500
+entry_percentile = "90"
+min_extra_bps = "0.5"
+
+[taker.pnl]
+enabled = true
+persist_dir = "runs"
+since = "2026-06-23T23:00:00Z"
+max_loss_usdc = "10"
+
+[taker.live]
+# The taker engine's arming switch: it refuses to start unless enabled and mode = "live".
+# `run --mode paper` keeps it observe-only regardless.
+enabled = true
+mode = "live"
+max_account_snapshot_age_ms = 30000
+
+[taker.venues]
+aster_base_url = "https://fapi.asterdex.com"
+lighter_base_url = "https://mainnet.zklighter.elliot.ai"
+signers_dir = "signers"
+
+[taker.risk]
+max_abs_position_notional_usd = "200"
+max_position_mismatch_usd = "3"
+margin_buffer_usd = "25"
+min_reconcile_interval_ms = 500
+
+[[taker.markets]]
+market_id = "HYPE"
+aster_symbol = "HYPEUSDT"
+lighter_symbol = "HYPE"
+lighter_market_index = 24
+lighter_size_decimals = 2
+lighter_price_decimals = 4
+lighter_min_notional = "10"
+
+[maker.edge]
 # The required quoted edge is 14 + 1.5 + 2 + 1 = 18.5 bps above configured
 # fees. This is an admission estimate; realized outcomes depend on fills and
 # subsequent hedge prices. The loss breaker uses marked account equity.
@@ -16,8 +131,8 @@ funding_buffer_bps   = "0.0"
 aster_maker_fee_bps        = "0.0"
 taker_fee_bps              = "0.0"
 
-[quote]
-# ~$12 per side: > Lighter's min and the $5 Aster min, <= the $15 small-risk cap.
+[maker.quote]
+# $13 per side: > Lighter's $10 min and the $5 Aster min, <= the $15 small-risk cap.
 desired_notional             = "13"
 max_quote_distance_bps       = "50"
 min_aster_touch_distance_bps = "18.0"
@@ -32,7 +147,7 @@ clamp_to_min_lot             = true
 # bps of the resting quote (even if marginally unprofitable). Suppresses sub-bps requote churn.
 min_requote_bps              = "2.0"
 
-[simulation]
+[maker.simulation]
 simulated_aster_place_latency_ms  = 25
 simulated_aster_cancel_latency_ms = 25
 quote_ttl_ms                      = 500
@@ -40,42 +155,41 @@ hedge_latency_buckets_ms          = [50, 100, 250, 500, 1000]
 max_book_staleness_ms             = 10000
 halt_trading_on_stale_feed        = true
 
-[partials]
+[maker.partials]
 strict_all_partials_must_be_hedgeable = false
 lighter_min_notional              = "10"
 max_pending_inventory_notional        = "25"
 max_pending_inventory_age_ms          = 1000
 
-[capital]
+[maker.capital]
 aster_capital_usd       = "200"
 lighter_capital_usd = "200"
 leverage                = "1"
 enforce_position_cap    = true
 
-[queue_model]
+[maker.queue_model]
 models                 = ["optimistic", "visible_queue", "conservative"]
 hidden_queue_multiplier = "1.0"
 
-[runtime]
+[maker.runtime]
 record_path = "runs"
 db_path     = "runs/eval.sqlite"
 
-[book_check]
+[maker.book_check]
 enabled              = true
 interval_secs        = 30
 tolerance_bps        = "50"
 consecutive_breaches = 3
 depth_limit          = 20
 
-[live]
+[maker.live]
 enabled                       = true
-mode                          = "live"       # informational: livebot defaults to --mode paper; only --mode live trades
 post_trade_cooldown_ms        = 3000
 cooldown_scope                = "per_market"
 startup_cancel_all            = true
 shutdown_cancel_all           = true
 require_clean_start           = true
-max_unhedged_notional_usd     = "15"         # allow one ~$12 clip in flight before freezing NEW quotes
+max_unhedged_notional_usd     = "15"         # allow one $13 clip in flight before freezing NEW quotes
 max_unhedged_age_ms           = 8000         # generous: a slow-network hedge RTT must not false-freeze
 max_position_mismatch_usd     = "3"
 max_account_snapshot_age_ms   = 4000
@@ -83,10 +197,10 @@ max_user_stream_staleness_ms  = 15000        # slow dev network
 cancel_all_on_gate_close      = true
 cancel_all_on_user_stream_stale = true
 
-[live.quote]
+[maker.live.quote]
 use_hot_integer_math               = true
 # Inventory-unwind mode: when flat, quote both sides; once cross-venue inventory exists, only post
-# the Aster maker side whose paired Lighter hedge reduces it. Set false for normal two-sided XEMM.
+# the Aster maker side whose paired Lighter hedge reduces it. `run` requires true.
 reduce_position_only               = true
 replace_immediately_if_unprofitable = true
 min_requote_interval_ms            = 150
@@ -94,7 +208,7 @@ min_requote_interval_ms            = 150
 # the global REST write path and reserves room for cancels/sweeps.
 max_replaces_per_minute_per_symbol = 100
 
-[live.partials]
+[maker.live.partials]
 # Accumulate sub-minimum maker fills until hedgeable. Expired/oversized residuals
 # enter tracked, rounded-down reduce-only correction (at most two attempts).
 # Quantization remainders and ambiguous orders remain reserved and explicit.
@@ -102,7 +216,7 @@ policy                  = "accumulate_sub_min"
 max_pending_notional_usd = "15"
 max_pending_age_ms       = 6000
 
-[live.aster]
+[maker.live.aster]
 base_url             = "https://fapi.asterdex.com"
 deadman_enabled      = true
 deadman_countdown_ms = 10000
@@ -114,7 +228,7 @@ cancel_retry_backoff_ms           = 1000
 safety_sweep_retry_ms             = 2000
 rate_limit_backoff_ms             = 5000
 
-[live.lighter]
+[maker.live.lighter]
 base_url              = "https://mainnet.zklighter.elliot.ai"
 signers_dir           = "signers"
 hedge_order_type      = "aggressive_ioc"
@@ -123,7 +237,7 @@ normal_slippage_bps   = "60"
 emergency_slippage_bps = "90"
 fill_timeout_ms       = 2000
 
-[live.margin_guard]
+[maker.live.margin_guard]
 # Opening capacity is bounded by the static 1x cap and actual free margin on
 # each venue after buffers and outstanding directional obligations. Reductions
 # remain eligible. Requires leverage=1 and enforce_position_cap=true.
@@ -131,7 +245,7 @@ enabled                 = true
 aster_safety_buffer_usd = "26"
 lighter_safety_buffer_usd = "26"
 
-[live.circuit_breaker]
+[maker.live.circuit_breaker]
 # Unattended-run safety stop. Measures TOTAL cross-venue marked equity (Aster wallet+unrealized + Lighter
 # portfolio value + marked uPnL) vs a baseline = median of the first 5 fresh samples; if the drawdown
 # exceeds the limit on 3 consecutive fresh samples the bot cancels orders, LEAVES the delta-neutral
@@ -140,14 +254,14 @@ lighter_safety_buffer_usd = "26"
 enabled                  = true
 max_cumulative_loss_usdc = "10"
 
-[[markets]]
+[[maker.markets]]
 aster_symbol = "HYPEUSDT"
 lighter_symbol      = "HYPE"
 
-[[markets]]
+[[maker.markets]]
 aster_symbol = "BNBUSDT"
 lighter_symbol      = "BNB"
 
-[[markets]]
+[[maker.markets]]
 aster_symbol = "ETHUSDT"
 lighter_symbol      = "ETH"

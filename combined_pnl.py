@@ -219,6 +219,13 @@ def selected_xemm_journals(
     return included, skipped
 
 
+def default_state_path(stack_root: Path, market: str) -> Path:
+    """`run`'s controller state, else the retired orchestrator's (same keys)."""
+    current = stack_root / f"LIGHTER_ASTER_BOT/runs/bot-{market}.state.json"
+    legacy = stack_root / f"runs/orchestrator_state_{market}.json"
+    return current if current.exists() or not legacy.exists() else legacy
+
+
 def latest_capital_from_state(path: Path, active_preference: str | None = None) -> tuple[Decimal | None, str | None]:
     if not path.exists():
         return None, None
@@ -328,7 +335,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
-        "By default XEMM includes only production live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
+        "By default XEMM includes only the production run/live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
     ]
     if xemm["untimestamped_trades"]:
         notes.append(
@@ -493,7 +500,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
-    parser.add_argument("--capital-usdc", type=Decimal, default=None, help="Capital denominator for projected CAGR. Defaults to latest active bot equity from orchestrator state.")
+    parser.add_argument("--capital-usdc", type=Decimal, default=None, help="Capital denominator for projected CAGR. Defaults to the latest active bot equity in the controller state file.")
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--xemm-runs-dir", type=Path, action="append", default=None, help="Advanced: scan a directory of XEMM journal files by mtime. Repeatable.")
     parser.add_argument("--xemm-journal", type=Path, action="append", default=[], help="Explicit XEMM journal to include. Repeatable. Overrides default journal selection.")
@@ -503,7 +510,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="How to handle legacy XEMM fill/hedge rows without wall-clock timestamps. auto follows the script default policy, currently exclude for the default recent window.",
     )
-    parser.add_argument("--orchestrator-state", type=Path, default=None)
+    parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file. Default: `run`'s, else the retired orchestrator's.")
     args = parser.parse_args()
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
@@ -515,6 +522,7 @@ def parse_args() -> argparse.Namespace:
         args.xemm_journal = [
             stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl",
             bot_root / f"runs/live-{args.market.lower()}-lighter-journal.jsonl",
+            bot_root / f"runs/bot-{args.market}-journal.jsonl",
         ]
         args.xemm_journal_selection = "default_production_journals"
         args.require_xemm_journal_paths = False
@@ -525,7 +533,7 @@ def parse_args() -> argparse.Namespace:
         args.xemm_journal_selection = "runs_dir_mtime_since"
         args.require_xemm_journal_paths = False
     if args.orchestrator_state is None:
-        args.orchestrator_state = stack_root / f"runs/orchestrator_state_{args.market}.json"
+        args.orchestrator_state = default_state_path(stack_root, args.market)
     if args.xemm_untimestamped == "include":
         args.include_untimestamped_xemm = True
     elif args.xemm_untimestamped == "exclude":

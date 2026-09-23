@@ -14,7 +14,7 @@ async fn main() -> Result<()> {
     // Non-blocking writer: a log line from a hot thread (strategy/ingest/worker) must
     // never be a synchronous write(2) that can stall on a slow disk. The guard flushes
     // the buffer on drop, so shutdown logs survive. ANSI only on a real terminal (the
-    // orchestrator redirects stdout to a file).
+    // stdout is often redirected to a file).
     let (writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(filter)

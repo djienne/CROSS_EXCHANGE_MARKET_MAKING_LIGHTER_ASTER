@@ -6,7 +6,7 @@
 //! Book publication and strategy ownership stay in memory; bounded queues connect
 //! venue workers, cold account reconciliation and persistent journal writing.
 //! Aster uses EIP-712 requests; Lighter uses the native signer and transaction socket.
-//! See `LIVE_RUNBOOK.md` for uncertainty, shutdown and restart handling.
+//! See `RUNBOOK.md` for uncertainty, shutdown and restart handling.
 
 pub mod account;
 pub mod breaker;
@@ -27,4 +27,4 @@ pub mod strategy;
 pub mod userstream;
 
 pub use crate::config::{LiveCfg, LiveMode, PartialPolicy};
-pub use run::run;
+pub use run::{run, STRATEGY_THREAD};

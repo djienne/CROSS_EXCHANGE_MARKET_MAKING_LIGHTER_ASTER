@@ -81,21 +81,33 @@ fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown panic".to_string())
 }
 
-/// Entry point for the `livebot` command.
+/// The strategy thread's name: its panics are caught and shut the bot down in order, so the
+/// abort-on-panic hook of `taker`/`run` lets them unwind.
+pub const STRATEGY_THREAD: &str = "livebot-strategy";
+
+/// Entry point for the `livebot` command and the XEMM engine of `run`.
 ///
-/// In ALL modes a cold **research plane** runs alongside the bot: every ingested event is
+/// With `research`, a cold **research plane** runs alongside the bot: every ingested event is
 /// recorded to a per-run tape AND fed through the deterministic `SimEngine` into a SQLite
 /// results DB (opened in APPEND mode, so it is reused/recovered across stop→restart). So a
 /// paper run gathers ≥ the old research run's information (replay the tape for the identical
-/// report) PLUS the bot's own journal. The bot's hot planes (strategy/exec) run concurrently
-/// off the lock-free `VenueBook` cells; the research plane never touches them.
+/// report) PLUS the bot's own journal. Without it (the `run` controller), the cold thread only
+/// forwards Aster trade prints to the strategy and records a tape when `out` is given. The
+/// bot's hot planes (strategy/exec) run concurrently off the lock-free `VenueBook` cells; the
+/// research plane never touches them. `db_path` also names the journal, trip latch,
+/// active-session marker and residual report (`<db-stem>*`) in every mode.
+///
+/// Cancelling `stop` takes the same bounded drain as an internal safety halt.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
     markets: Vec<MarketCfg>,
     secs: Option<u64>,
-    mode_override: Option<LiveMode>,
+    mode: LiveMode,
     out: Option<PathBuf>,
     db_path: PathBuf,
+    research: bool,
+    stop: CancellationToken,
 ) -> Result<()> {
     if markets.is_empty() {
         bail!("no markets selected for livebot");
@@ -104,7 +116,6 @@ pub async fn run(
     if !cfg.live.enabled {
         bail!("livebot is disabled: set [live] enabled = true in the config to run it");
     }
-    let mode = mode_override.unwrap_or(cfg.live.mode);
     let exec_mode = ExecMode::from_cfg(mode);
     if exec_mode.sends_real_orders() && markets.len() != 1 {
         bail!(
@@ -346,7 +357,7 @@ pub async fn run(
     let strat_shutdown = shutdown.clone();
     let (strat_done_tx, mut strat_done_rx) = oneshot::channel::<std::result::Result<(), String>>();
     let strat_handle = thread::Builder::new()
-        .name("livebot-strategy".into())
+        .name(STRATEGY_THREAD.into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                 crate::hotpath::maybe_pin_core(Some(strat_core_hint));
@@ -362,57 +373,69 @@ pub async fn run(
         })
         .expect("spawn strategy thread");
 
-    // --- cold research plane: record the tape + drive the SimEngine -> SQLite (append) ---
+    // --- cold plane: trade prints -> strategy, plus the optional tape + SimEngine -> SQLite ---
     // Runs on a DEDICATED OS thread so JSONL/SimEngine I/O cannot steal tokio timeslices
     // from the strategy loop. Stops when all ingest_tx senders are dropped (venue thread exit).
     let run_id = Uuid::new_v4().to_string();
     let started_at = Utc::now();
-    let tape_path = out.unwrap_or_else(|| {
+    let tape_path = out.or_else(|| research.then(|| {
         PathBuf::from(format!("runs/livebot-{}.jsonl.zst", started_at.format("%Y%m%dT%H%M%SZ")))
-    });
-    if let Some(p) = tape_path.parent() {
-        if !p.as_os_str().is_empty() {
-            std::fs::create_dir_all(p).ok();
-        }
-    }
-    let mut writer = open_log_writer(&tape_path)?;
+    }));
     let mode_tag = format!("livebot-{}", mode.as_str());
-    let header = RunHeader {
-        run_id: run_id.clone(),
-        started_at,
-        mode: mode_tag.clone(),
-        code_version: env!("CARGO_PKG_VERSION").to_string(),
-        config: cfg.clone(),
-        market_specs: specs.clone(),
+    let writer = match &tape_path {
+        Some(tape_path) => {
+            if let Some(p) = tape_path.parent() {
+                if !p.as_os_str().is_empty() {
+                    std::fs::create_dir_all(p).ok();
+                }
+            }
+            let mut writer = open_log_writer(tape_path)?;
+            let header = RunHeader {
+                run_id: run_id.clone(),
+                started_at,
+                mode: mode_tag.clone(),
+                code_version: env!("CARGO_PKG_VERSION").to_string(),
+                config: cfg.clone(),
+                market_specs: specs.clone(),
+            };
+            write_header(&mut writer, &header)?;
+            Some(writer)
+        }
+        None => None,
     };
-    write_header(&mut writer, &header)?;
-    let mut db = Db::open(&db_path)?;
-    db.insert_run(&run_id, started_at, &mode_tag, tape_path.to_str(), env!("CARGO_PKG_VERSION"), &serde_json::to_string(cfg)?)?;
-    for s in &specs {
-        db.insert_market(s)?;
-    }
-    let engine = SimEngine::new(cfg.clone(), specs.clone())?;
+    let research_plane = if research {
+        let mut db = Db::open(&db_path)?;
+        db.insert_run(&run_id, started_at, &mode_tag, tape_path.as_deref().and_then(|p| p.to_str()), env!("CARGO_PKG_VERSION"), &serde_json::to_string(cfg)?)?;
+        for s in &specs {
+            db.insert_market(s)?;
+        }
+        Some((SimEngine::new(cfg.clone(), specs.clone())?, db))
+    } else {
+        None
+    };
 
-    info!(
-        "livebot running: bot + research recording -> {} (results db {}). Ctrl-C to stop.",
-        tape_path.display(), db_path.display()
-    );
+    let tape_label = tape_path.as_ref().map_or_else(|| "none".to_string(), |p| p.display().to_string());
+    if research {
+        info!("livebot running: bot + research recording -> {tape_label} (results db {}). Ctrl-C to stop.", db_path.display());
+    } else {
+        info!("livebot running: bot only (tape {tape_label}, no research DB). Journal/latches: {}.", db_path.display());
+    }
 
     let cold_cfg = cfg.clone();
-    let cold_tape = tape_path.clone();
+    let cold_tape = tape_label.clone();
     let cold_db_path = db_path.clone();
     let cold_run_id = run_id;
     let cold_handle = thread::Builder::new()
         .name("cold-recorder".into())
         .spawn(move || {
             run_cold_recorder(
-                ingest_rx, trade_tx, writer, engine, db,
+                ingest_rx, trade_tx, writer, research_plane,
                 cold_cfg, cold_tape, cold_db_path, cold_run_id, started_at, cold_drop_count,
             )
         })
         .expect("spawn cold-recorder");
 
-    // --- main orchestrator: wait for ctrl-c, deadline, or an internal safety halt ---
+    // --- main loop: wait for a stop request, deadline, or an internal safety halt ---
     let deadline = secs.map(|s| Instant::now() + Duration::from_secs(s));
     let mut strategy_done_seen = false;
     let mut strategy_error: Option<anyhow::Error> = None;
@@ -450,8 +473,8 @@ pub async fn run(
             info!("duration elapsed: shutting down");
             shutdown.cancel();
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("ctrl-c: shutting down");
+        _ = stop.cancelled() => {
+            info!("stop requested: shutting down");
             shutdown.cancel();
         }
     }
@@ -595,23 +618,28 @@ pub async fn run(
     }
     if breaker_tripped_flag.load(Ordering::Acquire) { bail!("circuit breaker tripped during this run"); }
 
-    info!("livebot stopped. research tape -> {} ; results db -> {}", tape_path.display(), db_path.display());
+    if research {
+        info!("livebot stopped. research tape -> {tape_label} ; results db -> {}", db_path.display());
+    } else {
+        info!("livebot stopped. tape -> {tape_label}");
+    }
     Ok(())
 }
 
-/// Cold research recorder: ingest events → JSONL tape + SimEngine → SQLite. Runs on a
-/// dedicated OS thread with its own single-threaded tokio runtime, so JSONL writes and
-/// SimEngine processing cannot steal timeslices from the main strategy runtime.
-/// Exits when all `ingest_tx` senders are dropped (venue threads stopped), then drains
-/// the buffer, finalizes the SimEngine, and generates the research report.
+/// Cold recorder: ingest events → Aster trade prints for the strategy, plus the optional
+/// JSONL tape and the optional research plane (SimEngine → SQLite). Runs on a dedicated OS
+/// thread with its own single-threaded tokio runtime, so JSONL writes and SimEngine
+/// processing cannot steal timeslices from the main strategy runtime. Exits when all
+/// `ingest_tx` senders are dropped (venue threads stopped), then drains the buffer,
+/// finalizes the SimEngine, and generates the research report.
+#[allow(clippy::too_many_arguments)]
 fn run_cold_recorder(
     ingest_rx: mpsc::Receiver<(MarketId, EventKind)>,
     trade_tx: mpsc::Sender<TradePrint>,
-    mut writer: crate::events::LogWriter,
-    mut engine: SimEngine,
-    mut db: Db,
+    mut writer: Option<crate::events::LogWriter>,
+    mut research: Option<(SimEngine, Db)>,
     cfg: Config,
-    tape_path: PathBuf,
+    tape_label: String,
     db_path: PathBuf,
     run_id: String,
     started_at: DateTime<Utc>,
@@ -644,12 +672,19 @@ fn run_cold_recorder(
                                     market: market.clone(), price: *price, qty: *qty, buyer_is_maker: *buyer_is_maker,
                                 });
                             }
+                            if writer.is_none() && research.is_none() {
+                                continue;
+                            }
                             let now = Utc::now().max(last_ts);
                             last_ts = now;
                             let ev = Event { seq, local_recv_ts: now, market, kind };
                             seq += 1;
-                            write_event(&mut writer, &ev)?;
-                            buffer.push_back(ev);
+                            if let Some(writer) = writer.as_mut() {
+                                write_event(writer, &ev)?;
+                            }
+                            if research.is_some() {
+                                buffer.push_back(ev);
+                            }
                         }
                         None => break,
                     }
@@ -664,22 +699,31 @@ fn run_cold_recorder(
                         );
                         last_drop_log = dropped;
                     }
-                    let cutoff = Utc::now() - delay;
-                    released_ts = release_until(&mut buffer, cutoff, &mut engine, &mut db, released_ts)?;
-                    writer.flush().ok();
+                    if let Some((engine, db)) = research.as_mut() {
+                        let cutoff = Utc::now() - delay;
+                        released_ts = release_until(&mut buffer, cutoff, engine, db, released_ts)?;
+                    }
+                    if let Some(writer) = writer.as_mut() {
+                        writer.flush().ok();
+                    }
                 }
             }
         }
 
-        let far_future = last_ts + chrono::Duration::seconds(3600);
-        released_ts = release_until(&mut buffer, far_future, &mut engine, &mut db, released_ts)?;
-        writer.finish()?;
-        engine.finalize(released_ts.max(last_ts), &mut db)?;
+        if let Some(writer) = writer {
+            writer.finish()?;
+        }
         let dropped = cold_drop_count.load(Ordering::Relaxed);
         if dropped > 0 {
             warn!("cold recorder finalized after dropping {dropped} live ingest events");
         }
-        info!("cold recorder finalized: tape -> {} ; results db -> {}", tape_path.display(), db_path.display());
+        let Some((mut engine, mut db)) = research else {
+            return Ok(());
+        };
+        let far_future = last_ts + chrono::Duration::seconds(3600);
+        released_ts = release_until(&mut buffer, far_future, &mut engine, &mut db, released_ts)?;
+        engine.finalize(released_ts.max(last_ts), &mut db)?;
+        info!("cold recorder finalized: tape -> {tape_label} ; results db -> {}", db_path.display());
         let out_dir = db_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
         crate::report::generate(&db_path, Some(run_id), &out_dir)?;
         Ok(())

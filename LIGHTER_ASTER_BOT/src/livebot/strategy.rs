@@ -762,7 +762,7 @@ pub struct Strategy {
     breaker_tripped: bool,
     /// In-memory trip flag shared with `run.rs` (set via [`Strategy::set_trip_flag`]). Set BEFORE
     /// the persistent latch write so a failed/unwritable trip file still forces a nonzero exit at
-    /// shutdown — otherwise the orchestrator would restart straight back into trading.
+    /// shutdown — otherwise the `run` controller would restart it straight back into trading.
     trip_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Per-market maker-gate suppression tracking, for OBSERVABILITY: `(since_ns, reason, logged)`.
     /// A closed maker gate (orphan hedge / unhedged-over-limit / stale snapshot / stale feed / …)

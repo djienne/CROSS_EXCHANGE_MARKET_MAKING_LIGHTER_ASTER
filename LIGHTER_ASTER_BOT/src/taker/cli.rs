@@ -29,8 +29,8 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    /// Path to the taker TOML config file.
-    #[arg(long, global = true, default_value = "configs/taker-live-hype.toml")]
+    /// Path to the TOML config file (bot.toml; the taker reads its [taker] table).
+    #[arg(long, global = true, default_value = "bot.toml")]
     pub config: PathBuf,
 }
 
@@ -52,21 +52,9 @@ pub enum Commands {
         /// Restrict executable opportunities by exposure effect.
         #[arg(long, value_enum, default_value_t = crate::taker::arb::ExposureFilter::Any)]
         exposure_filter: crate::taker::arb::ExposureFilter,
-        /// Optional JSON lease file. When set, missing/expired/invalid lease prevents execution.
-        #[arg(long)]
-        control_file: Option<PathBuf>,
-        /// Optional JSON output file for confirmed reduce-burst signals.
-        #[arg(long)]
-        signal_file: Option<PathBuf>,
         /// Cooldown after reduce-filtered trades.
         #[arg(long, default_value_t = 5_000)]
         reduce_cooldown_ms: u64,
-        /// Number of reduce opportunities required inside the signal window.
-        #[arg(long, default_value_t = 3)]
-        reduce_signal_min_samples: usize,
-        /// Reduce-burst signal confirmation window.
-        #[arg(long, default_value_t = 2_000)]
-        reduce_signal_window_ms: i64,
     },
     /// Fetch and print resolved market specs (Aster exchangeInfo + Lighter orderBooks).
     FetchSpecs {
@@ -114,7 +102,7 @@ pub enum Commands {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
     },
-    /// Read-only machine-readable account/book/opportunity status for orchestration.
+    /// Read-only account/book/opportunity status: the taker report `run` polls every tick.
     Status {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
@@ -133,16 +121,17 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             min_size,
             observe_only,
             exposure_filter,
-            control_file,
-            signal_file,
             reduce_cooldown_ms,
-            reduce_signal_min_samples,
-            reduce_signal_window_ms,
         } => {
             let selected = cfg.select_markets(markets.as_deref());
             if selected.is_empty() {
                 anyhow::bail!("no markets selected");
             }
+            let _lock = match (observe_only, selected.as_slice()) {
+                (false, [market]) => Some(crate::controller::lock_market(&market.id().0)?),
+                _ => None,
+            };
+            let stop = crate::controller::stop_on_signals();
             crate::taker::arb::run(
                 cfg,
                 selected,
@@ -152,12 +141,10 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     min_size,
                     observe_only,
                     exposure_filter,
-                    control_file,
-                    signal_file,
                     reduce_cooldown_ms,
-                    reduce_signal_min_samples,
-                    reduce_signal_window_ms,
+                    ..Default::default()
                 },
+                stop,
             )
             .await
         }

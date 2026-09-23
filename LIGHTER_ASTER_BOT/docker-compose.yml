@@ -1,36 +1,26 @@
-# Aster/Lighter bot — XEMM livebot (Aster post-only maker -> Lighter IOC hedge) and the
-# taker-taker engine (`taker ...`), one binary.
+# Aster/Lighter bot: `run` holds the taker-taker engine and the reduce-only XEMM engine for
+# one market and switches execution rights between them in memory. One binary, one image.
 #
 # ONE image, supplied a command per run. Secrets are MOUNTED read-only (never baked).
-# The runs/ dir (sqlite + journal + tape) is a persistent bind mount.
+# The runs/ dir (journals, ledgers, latches, controller state) is a persistent bind mount.
 #
-# ---- Typical commands (run from this dir on the VPS) -------------------------------
+# ---- Typical commands (run from this dir on the VPS; config = bot.toml) -----------
 #
 # No-risk credential / connectivity check (signed reads, places NO orders):
 #   docker compose run --rm bot probe aster-balance
 #   docker compose run --rm bot probe lighter-balance
 #   docker compose run --rm bot probe lighter-open-orders
-#   docker compose run --rm bot probe lighter-order-dry-run
-#   docker compose run --rm bot probe aster-open-orders
-#   docker compose run --rm bot taker --config configs/taker-live-hype.toml probe --market HYPE
+#   docker compose run --rm bot taker probe --market HYPE
 #
-# Paper smoke (reads live market data, places NO real orders):
-#   docker compose run --rm bot --config config-live-lighter.toml livebot \
-#     --mode paper --markets HYPE --secs 30
+# Paper (live market data and account reads, NO orders):
+#   docker compose run --rm --name bot-hype-paper bot run --market HYPE --mode paper
 #
-# LIVE single-coin test (real money). Graceful stop cancels resting orders, hedges fills and
-# corrects net residuals during the drain, then leaves the paired position OPEN & delta-neutral:
-#   docker compose run --rm --name xemm-hype bot \
-#     --config config-live-lighter.toml livebot --mode live --markets HYPE \
-#     --secs 900 \
-#     --db runs/live-hype.sqlite --out runs/live-hype.jsonl.zst
+# LIVE (real money):
+#   docker compose run --rm --name bot-hype bot run --market HYPE --mode live
 #
-# Stop a running session early but gracefully (cancels orders, KEEPS the position):
-#   docker kill --signal=SIGINT xemm-hype
-#
-# Repeat with --markets BNB / --markets ETH (one coin at a time; live filters by
-# --markets, and a coin not selected is invisible to the reconciler, so prior
-# coins' open positions are left untouched).
+# Stop gracefully: the active engine cancels resting orders, hedges fills and corrects
+# residuals, then paired positions stay OPEN and delta-neutral:
+#   docker kill --signal=SIGINT bot-hype
 # -----------------------------------------------------------------------------------
 
 services:
@@ -44,23 +34,22 @@ services:
     environment:
       ASTER_NONCE_DIR: /nonce
     volumes:
-      # Mount the WHOLE deploy dir read-only at the working dir, so ANY config
-      # (config-live-lighter.toml, configs/, …), signer binaries, and
-      # the secret env files (aster.env / lighter.env, read from CWD) are present — no
-      # per-file mounts to keep in sync. The binary lives in /usr/local/bin, so
-      # this never shadows it; secrets are still mount-only (never in the image).
+      # Mount the WHOLE deploy dir read-only at the working dir, so bot.toml, the signer
+      # binaries and the secret env files (aster.env / lighter.env, read from CWD) are
+      # present — no per-file mounts to keep in sync. The binary lives in /usr/local/bin,
+      # so this never shadows it; secrets are still mount-only (never in the image).
       - .:/app:ro
-      # Persistent + WRITABLE outputs (sqlite + journal + tape + trip latch); this
-      # nested mount overrides the read-only parent for the runs/ subtree only.
+      # Persistent + WRITABLE outputs; this nested mount overrides the read-only parent
+      # for the runs/ subtree only.
       - ./runs:/app/runs
-      # Shared with host-side taker/observer/status processes on the Linux deployment.
+      # Shared with any host-side signer (probes, reports) on the Linux deployment.
       - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
-    # Graceful drain on SIGINT (the only signal the bot wires). Positions stay OPEN.
+    # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
     # Above the worst-case bounded drain + verification (5+70+65+30+5 = 175 s); a shorter
     # grace SIGKILLs a legitimate drain and leaves fills unhedged.
     stop_grace_period: 200s
-    # The test drives runs manually via `docker compose run`; don't auto-restart.
+    # A halt must stay halted until an operator reviews it; never auto-restart.
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.
     command: ["--help"]

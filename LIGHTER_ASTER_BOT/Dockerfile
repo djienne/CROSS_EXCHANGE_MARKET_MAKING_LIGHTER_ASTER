@@ -1,9 +1,9 @@
 # syntax=docker/dockerfile:1
 #
-# Aster/Lighter bot: the XEMM livebot (Aster post-only maker -> Lighter IOC hedge) and the
-# taker-taker engine (`lighter_aster_bot taker ...`) in one binary.
+# Aster/Lighter bot (`lighter_aster_bot run`): the taker-taker engine and the XEMM engine
+# (Aster post-only maker -> Lighter IOC hedge) in one binary and one process.
 # Multi-stage: a Rust builder compiles the release binary; a slim Debian runtime
-# carries ONLY the binary + the (non-secret) live configs. Secrets
+# carries ONLY the binary + the (non-secret) live config. Secrets
 # (aster.env / lighter.env), signer binaries, and the runs/ output dir are MOUNTED at runtime
 # by docker-compose and are NEVER baked into an image layer.
 #
@@ -51,18 +51,17 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY --from=builder /usr/local/bin/lighter_aster_bot /usr/local/bin/lighter_aster_bot
-# Non-secret live configs baked in as a fallback; compose also bind-mounts them so the
+# Non-secret live config baked in as a fallback; compose also bind-mounts it so the
 # markets/edge can be tuned without rebuilding the image.
-COPY config-live-lighter.toml /app/config-live-lighter.toml
-COPY configs /app/configs
+COPY bot.toml /app/bot.toml
 
-# The bot wires ONLY tokio ctrl_c (SIGINT) for graceful drain (cancel resting orders,
-# finalize tape/DB). Docker's default SIGTERM is UNhandled -> SIGKILL with no cancel.
-# Make SIGINT the stop signal so `docker stop` drains cleanly (fills are hedged and net
-# residuals corrected; paired positions stay open).
+# SIGINT, SIGTERM and SIGHUP all start the same graceful drain (cancel resting orders,
+# hedge fills, correct net residuals, verify; paired positions stay open). The drain can
+# take up to 175 s: stop with `docker stop -t 200` (compose sets stop_grace_period), never
+# the 10 s default, which SIGKILLs a legitimate drain.
 STOPSIGNAL SIGINT
 
 ENTRYPOINT ["lighter_aster_bot"]
 # Safe default: print help and exit. Real runs pass an explicit command via
-# `docker compose run --rm bot <args>` (see docker-compose.yml / DOCKER_DEPLOY.md).
+# `docker compose run --rm bot <args>` (see docker-compose.yml / RUNBOOK.md).
 CMD ["--help"]

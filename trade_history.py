@@ -14,11 +14,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
-from combined_pnl import DEFAULT_SINCE, dec, iso, json_default, latest_capital_from_state, parse_dt, projection, utc_now
+from combined_pnl import DEFAULT_SINCE, dec, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, utc_now
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -577,16 +577,16 @@ def refresh_lan(
     market: str,
     taker_trades: Path,
     orchestrator_trades: Path,
-    xemm_journal: Path | None = None,
+    xemm_journals: Sequence[Path] = (),
 ) -> list[IngestStats]:
     mode = "lan"
     stats = [
         ingest_taker_trades(conn, taker_trades, mode=mode, market=market),
         ingest_orchestrator_xemm(conn, orchestrator_trades, mode=mode, market=market),
     ]
-    if xemm_journal is not None:
+    for journal in xemm_journals:
         # Last so the journal's real trade times + actual hedge fees win on shared keys.
-        stats.append(ingest_xemm_journal(conn, xemm_journal, mode=mode, market=market))
+        stats.append(ingest_xemm_journal(conn, journal, mode=mode, market=market))
     conn.commit()
     return stats
 
@@ -731,7 +731,7 @@ def build_repaired_database(args: argparse.Namespace) -> dict[str, Any]:
                 before=database_overview(conn)
         init_db(conn)
         stats=refresh_lan(conn,market=args.market,taker_trades=args.taker_trades,
-            orchestrator_trades=args.orchestrator_trades,xemm_journal=args.xemm_journal)
+            orchestrator_trades=args.orchestrator_trades,xemm_journals=args.xemm_journal)
         raw=repair_raw_fees(conn,args.raw_fills,args.market) if args.raw_fills else {"repaired_trades":0,"unusable_raw_rows":0}
         conn.commit()
         if conn.execute("PRAGMA integrity_check").fetchone()[0]!="ok" or conn.execute("PRAGMA foreign_key_check").fetchone():
@@ -961,9 +961,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--db", type=Path, default=stack_root / "runs/trade_history.sqlite")
     parser.add_argument("--taker-trades", type=Path, default=None)
-    parser.add_argument("--orchestrator-trades", type=Path, default=None)
-    parser.add_argument("--xemm-journal", type=Path, default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps.")
-    parser.add_argument("--orchestrator-state", type=Path, default=None)
+    parser.add_argument("--orchestrator-trades", type=Path, default=None, help="The retired orchestrator's normalized trade ledger (historical XEMM rows).")
+    parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: the retired orchestrator's journal, then `run`'s.")
+    parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file (capital for projections). Default: `run`'s, else the retired orchestrator's.")
     parser.add_argument("--capital-usdc", type=Decimal, default=None)
     parser.add_argument("--no-refresh", action="store_true", help="Report existing DB contents without reading local ledgers first.")
     parser.add_argument("--refresh-only", action="store_true", help="Refresh the DB and skip the PnL report.")
@@ -980,9 +980,12 @@ def parse_args() -> argparse.Namespace:
     if args.orchestrator_trades is None:
         args.orchestrator_trades = stack_root / f"runs/orchestrator_trades_{args.market}.jsonl"
     if args.xemm_journal is None:
-        args.xemm_journal = stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl"
+        args.xemm_journal = [
+            stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl",
+            bot_root / f"runs/bot-{args.market}-journal.jsonl",
+        ]
     if args.orchestrator_state is None:
-        args.orchestrator_state = stack_root / f"runs/orchestrator_state_{args.market}.json"
+        args.orchestrator_state = default_state_path(stack_root, args.market)
     return args
 
 
@@ -1004,7 +1007,7 @@ def main() -> int:
                 market=args.market,
                 taker_trades=args.taker_trades,
                 orchestrator_trades=args.orchestrator_trades,
-                xemm_journal=args.xemm_journal,
+                xemm_journals=args.xemm_journal,
             )
         report = None
         if not args.refresh_only:

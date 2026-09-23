@@ -1,6 +1,6 @@
-//! Command-line interface: subcommands `record`, `replay`, `report`, `livebot`, `live-report`,
-//! `probe`, `status`, `fetch-specs`, `verify-books`, `verify-db`. The dispatcher wires each to its
-//! module.
+//! Command-line interface: `run` (the bot: both engines, one market) and the XEMM/research
+//! subcommands `record`, `replay`, `report`, `livebot`, `live-report`, `probe`, `status`,
+//! `fetch-specs`, `verify-books`, `verify-db`. The taker engine has its own CLI under `taker`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -10,20 +10,38 @@ use std::path::PathBuf;
 #[command(
     name = "lighter_aster_bot",
     version,
-    about = "Aster/Lighter bot: XEMM maker/hedger (`livebot`), probes and research tools",
-    after_help = "Taker-taker arbitrage engine: `lighter_aster_bot taker --help`."
+    about = "Aster/Lighter bot (`run`): taker-taker arbitrage and an XEMM inventory unwinder with execution rights switched in memory; plus probes and research tools",
+    after_help = "Taker engine on its own: `lighter_aster_bot taker --help`."
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Option<Commands>,
+    pub command: Commands,
 
-    /// Path to the TOML config file.
-    #[arg(long, global = true, default_value = "config-live-lighter.toml")]
+    /// Path to the TOML config file (bot.toml; XEMM commands read its [maker] table).
+    #[arg(long, global = true, default_value = "bot.toml")]
     pub config: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
+    /// Run the bot for one market: the taker holds execution rights while it has margin; a
+    /// reduce-only XEMM unwinds inventory when it does not. REAL orders only with `--mode live`.
+    Run {
+        /// Market id, listed once in both [[taker.markets]] and [[maker.markets]] (e.g. HYPE).
+        #[arg(long)]
+        market: String,
+        /// live | paper (required). Paper runs XEMM on its simulated executor and the taker
+        /// observe-only; account state is still read with the real credentials.
+        #[arg(long)]
+        mode: String,
+        /// Archive a latched bot breaker (`runs/bot-<M>.breaker.json`) and start.
+        #[arg(long, default_value_t = false)]
+        ack_breaker: bool,
+        /// Discard the persisted equity baseline: the drawdown stop re-arms on the first sample.
+        #[arg(long, default_value_t = false)]
+        reset_breaker_baseline: bool,
+    },
+
     /// Record live Aster + Lighter market data to a JSONL event log (no simulation).
     Record {
         /// Comma-separated market ids (e.g. BTC,ETH). Defaults to all config markets.
@@ -63,9 +81,8 @@ pub enum Commands {
     /// Summarize a livebot journal into logical trades and versioned execution economics.
     LiveReport {
         /// Livebot results DB; used to infer `<db-stem>-journal.jsonl` when --journal is omitted.
-        /// The default is a legacy live-run name, not `livebot`'s own `--db` default: pass the
-        /// run's actual `--db` (or `--journal`).
-        #[arg(long, default_value = "runs/live-hype-lighter.sqlite")]
+        /// The default is the live `run` bot's XEMM stem for HYPE.
+        #[arg(long, default_value = "runs/bot-HYPE.sqlite")]
         db: PathBuf,
         /// Explicit journal path. Overrides --db inference.
         #[arg(long)]
@@ -86,23 +103,23 @@ pub enum Commands {
     },
 
 
-    /// Run the trading bot. `--mode paper` (the selected markets, NO real orders) records the
-    /// market tape + persists results. `--mode live` (one market, real funds) is gated behind
-    /// `[live] enabled = true`, explicit live mode, and wired live signers.
+    /// Run the XEMM engine alone. `--mode paper` (the selected markets, NO real orders) records
+    /// the market tape + persists research results. `--mode live` (one market, real funds) is
+    /// gated behind `[live] enabled = true` and wired live signers.
     Livebot {
         #[arg(long, default_value = "HYPE")]
         markets: Option<String>,
-        /// paper | live. Always set (default paper); the config's `[live] mode` is not used.
+        /// paper | live.
         #[arg(long, default_value = "paper")]
-        mode: Option<String>,
-        /// Optional duration in seconds; runs until Ctrl-C if omitted.
+        mode: String,
+        /// Optional duration in seconds; runs until stopped if omitted.
         #[arg(long)]
         secs: Option<u64>,
         /// Market-data tape path.
-        #[arg(long, default_value = "runs/soak-hype-live.jsonl.zst")]
+        #[arg(long, default_value = "runs/livebot.jsonl.zst")]
         out: Option<PathBuf>,
         /// Results database (appended, never recreated — reused/recovered across restarts).
-        #[arg(long, default_value = "runs/soak-hype.sqlite")]
+        #[arg(long, default_value = "runs/livebot.sqlite")]
         db: PathBuf,
     },
 
@@ -125,7 +142,7 @@ pub enum Commands {
         max_usd: rust_decimal::Decimal,
     },
 
-    /// Read-only machine-readable account/book/quote status for orchestration.
+    /// Read-only account/book/quote status: the XEMM report `run` polls every tick.
     Status {
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
@@ -171,14 +188,19 @@ fn parse_live_mode(s: &str) -> Result<crate::config::LiveMode> {
 
 /// Dispatch a parsed CLI to the appropriate module entry point.
 pub async fn dispatch(cli: Cli) -> Result<()> {
-    let command = cli.command.unwrap_or(Commands::Livebot {
-        markets: Some("HYPE".into()),
-        mode: Some("paper".into()),
-        secs: None,
-        out: Some("runs/soak-hype-live.jsonl.zst".into()),
-        db: "runs/soak-hype.sqlite".into(),
-    });
-    match command {
+    match cli.command {
+        #[cfg(feature = "hotpath")]
+        Commands::Run { market, mode, ack_breaker, reset_breaker_baseline } => {
+            let mode = parse_live_mode(&mode)?;
+            crate::taker::abort_on_panic();
+            // Listen from the start: a signal during setup still takes the graceful drain.
+            let stop = crate::controller::stop_on_signals();
+            crate::controller::run(&cli.config, &market, mode, ack_breaker, reset_breaker_baseline, stop).await?;
+        }
+        #[cfg(not(feature = "hotpath"))]
+        Commands::Run { .. } => {
+            anyhow::bail!("`run` requires the 'hotpath' feature (default); rebuild without --no-default-features");
+        }
         Commands::Record { markets, secs, out } => {
             let cfg = crate::config::Config::load(&cli.config)?;
             let selected = cfg.select_markets(markets.as_deref());
@@ -196,7 +218,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         Commands::Replay { events, db } => {
             // Default: use the config recorded in the log header. Override only when
             // the user explicitly passes a non-default --config path.
-            let override_cfg = if cli.config.as_os_str() != "config-live-lighter.toml" {
+            let override_cfg = if cli.config.as_os_str() != "bot.toml" {
                 Some(crate::config::Config::load(&cli.config)?)
             } else {
                 None
@@ -215,9 +237,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             crate::report::generate(&db, run_id, &out)?;
         }
         Commands::LiveReport { db, journal, market, since_ms, details, json } => {
-            let cfg = crate::config::Config::load(&cli.config)?;
             let journal_path = journal.unwrap_or_else(|| crate::live_report::inferred_journal_path(&db));
-            let summary = crate::live_report::summarize_path(&journal_path, &cfg, market.as_deref(), since_ms)?;
+            let summary = crate::live_report::summarize_path(&journal_path, market.as_deref(), since_ms)?;
             if json {
                 crate::live_report::print_summary_json(&journal_path, &summary)?;
             } else {
@@ -231,11 +252,14 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             if selected.is_empty() {
                 anyhow::bail!("no markets selected (check --markets against config [[markets]])");
             }
-            let mode_override = match mode.as_deref() {
-                None => None,
-                Some(m) => Some(parse_live_mode(m)?),
+            let mode = parse_live_mode(&mode)?;
+            let _lock = match (mode.is_real(), selected.as_slice()) {
+                (true, [market]) => Some(crate::controller::lock_market(&market.id().0)?),
+                _ => None,
             };
-            crate::livebot::run(&cfg, selected, secs, mode_override, out, db).await?;
+            // Listen from the start: a signal during setup still takes the graceful drain.
+            let stop = crate::controller::stop_on_signals();
+            crate::livebot::run(&cfg, selected, secs, mode, out, db, true, stop).await?;
         }
         #[cfg(not(feature = "hotpath"))]
         Commands::Livebot { .. } => {

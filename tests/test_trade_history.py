@@ -343,7 +343,7 @@ class TradeHistoryTests(unittest.TestCase):
                     market="HYPE",
                     taker_trades=taker_path,
                     orchestrator_trades=orch_path,
-                    xemm_journal=journal_path,
+                    xemm_journals=[journal_path],
                 )
                 # Idempotent on re-run.
                 trade_history.refresh_lan(
@@ -351,7 +351,7 @@ class TradeHistoryTests(unittest.TestCase):
                     market="HYPE",
                     taker_trades=taker_path,
                     orchestrator_trades=orch_path,
-                    xemm_journal=journal_path,
+                    xemm_journals=[journal_path],
                 )
                 row = conn.execute(
                     "SELECT timestamp, gross_pnl_usdc, net_pnl_usdc, lighter_fee_usdc, source FROM strategy_trades WHERE trade_key = ?",

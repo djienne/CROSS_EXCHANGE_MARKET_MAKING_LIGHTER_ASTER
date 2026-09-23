@@ -16,6 +16,8 @@ runs/
 *.jsonl
 *.jsonl.zst
 *.zst
+# Test fixtures are tracked even when compressed.
+!tests/fixtures/*.zst
 
 # Build outputs
 target/
@@ -34,7 +36,7 @@ __pycache__/
 .claude/
 **/codex-help.md
 
-# Soak-test build outputs (isolated from target/ so the live orchestrator
-# cannot pick up unapproved binaries on a bot restart)
+# Soak-test build outputs (isolated from target/ so a live bot restart cannot
+# pick up unapproved binaries)
 target-soak/
 **/target-soak/

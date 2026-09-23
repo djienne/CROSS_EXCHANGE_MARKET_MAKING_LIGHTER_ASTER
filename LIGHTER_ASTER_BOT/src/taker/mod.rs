@@ -2,19 +2,19 @@
 //! run as `lighter_aster_bot taker ...` with its own CLI and config. Venue code that was
 //! identical on the XEMM side is shared from `crate::lighter` and `crate::livebot::exec`.
 
-mod arb;
+pub(crate) mod arb;
 mod aster;
 mod book;
 mod book_sanity;
 mod cli;
-mod config;
+pub(crate) mod config;
 mod connectors;
 mod decimal;
 mod entry_gate;
 mod lighter;
 mod markets;
-mod pnl;
-mod status;
+pub(crate) mod pnl;
+pub(crate) mod status;
 mod types;
 mod venues;
 
@@ -25,13 +25,16 @@ use clap::Parser;
 
 /// The standalone taker was built with `panic = "abort"`: a panicking task takes the whole
 /// process down instead of dying silently while the scanner keeps trading. The merged binary
-/// must unwind (XEMM catches strategy-thread panics), so the taker restores abort semantics
-/// with a hook that runs before any unwinding.
+/// must unwind (XEMM catches strategy-thread panics), so `taker` and `run` restore abort
+/// semantics with a hook that runs before any unwinding — except on XEMM's strategy thread,
+/// whose `catch_unwind` turns the panic into an orderly, order-cancelling shutdown.
 pub fn abort_on_panic() {
     let report = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         report(info);
-        std::process::abort();
+        if std::thread::current().name() != Some(crate::livebot::STRATEGY_THREAD) {
+            std::process::abort();
+        }
     }));
 }
 

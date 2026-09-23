@@ -14,7 +14,6 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::Config;
 use crate::types::Side;
 
 #[derive(Debug, Clone, Serialize)]
@@ -356,12 +355,8 @@ pub fn inferred_journal_path(db: &Path) -> PathBuf {
     directory.join(format!("{stem}-journal.jsonl"))
 }
 
-pub fn summarize_path(path: &Path, cfg: &Config, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
-    summarize_reader(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?), cfg, market, since_ms)
-}
-
-pub fn summarize_reader<R: BufRead>(reader: R, _cfg: &Config, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
-    summarize(reader, market, since_ms)
+pub fn summarize_path(path: &Path, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {
+    summarize(BufReader::new(File::open(path).with_context(|| format!("opening {}", path.display()))?), market, since_ms)
 }
 
 fn summarize<R: BufRead>(reader: R, market_filter: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {

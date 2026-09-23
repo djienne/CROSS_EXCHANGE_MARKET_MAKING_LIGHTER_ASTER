@@ -7,9 +7,10 @@
 //!   per-market cells resolved at venue construction (never the feed writer's mutex).
 //! * **Sizing and edge prefilters use cached f64 math**; qualifying opportunities use
 //!   Decimal for exact gate thresholds, exchange quantities and accounting.
-//! * **No inline file I/O** — entry-gate samples, reduce-signal files, and execution logs
-//!   go to dedicated writer threads (`taker-history`, `taker-signal`, `taker-journal`) or
-//!   `spawn_blocking`; account state arrives via a `watch` channel from the background refresher.
+//! * **No inline file I/O** — entry-gate samples and execution logs go to dedicated writer
+//!   threads (`taker-history`, `taker-journal`) or `spawn_blocking`; reduce signals and the
+//!   lease are `watch` values shared with the `run` controller; account state arrives via a
+//!   `watch` channel from the background refresher.
 //! * **No inline REST on the iteration** — the lease nonce refresh runs as a spawned task
 //!   with execution gated until it lands; account snapshots refresh on their own task.
 //! Execution itself (sign + submit both legs concurrently, confirm, reconcile, rescue) is
@@ -26,9 +27,9 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use tokio::signal;
+use serde::Serialize;
 use tokio::sync::{watch, Notify};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
 
 use crate::taker::aster::creds::{AsterCreds, LighterCreds};
@@ -44,7 +45,7 @@ use crate::taker::connectors::{rest_book, rest_specs};
 use crate::taker::decimal::{bps_to_rate, common_qty_step};
 use crate::taker::entry_gate::{OpportunityGate, OpportunityGateInput};
 use crate::taker::markets::MarketSpec;
-use crate::taker::pnl::{format_ts, ActiveSession, ColdJournal, ColdLatest, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
+use crate::taker::pnl::{format_ts, ActiveSession, ColdJournal, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
 use crate::taker::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side};
 use crate::taker::venues::lighter::{
     LighterFillConfirmation, LighterVenue, PendingFill, SubmitOutcome as LighterOutcome,
@@ -285,8 +286,11 @@ pub struct RunOptions {
     pub min_size: bool,
     pub observe_only: bool,
     pub exposure_filter: ExposureFilter,
-    pub control_file: Option<PathBuf>,
-    pub signal_file: Option<PathBuf>,
+    /// Reduce-only standby under the `run` controller: execution is allowed only while this
+    /// holds a valid lease (and forces `exposure_filter = reduce`). `None` = full rights.
+    pub lease: Option<watch::Receiver<Option<ExecutionLease>>>,
+    /// Where confirmed reduce bursts are published for the controller.
+    pub reduce_signals: Option<watch::Sender<Option<ReduceSignal>>>,
     pub reduce_cooldown_ms: u64,
     pub reduce_signal_min_samples: usize,
     pub reduce_signal_window_ms: i64,
@@ -300,8 +304,8 @@ impl Default for RunOptions {
             min_size: false,
             observe_only: false,
             exposure_filter: ExposureFilter::Any,
-            control_file: None,
-            signal_file: None,
+            lease: None,
+            reduce_signals: None,
             reduce_cooldown_ms: 5_000,
             reduce_signal_min_samples: 3,
             reduce_signal_window_ms: 2_000,
@@ -309,12 +313,20 @@ impl Default for RunOptions {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct ExecutionLease {
-    market: String,
-    mode: String,
-    lease_id: Option<String>,
-    expires_at: DateTime<Utc>,
+/// Reduce-only execution rights granted by the controller for one market until `expires_at`.
+/// A new `lease_id` re-arms the session (nonce refresh + fresh account snapshot) before any
+/// order; extending keeps the id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLease {
+    pub market: String,
+    pub lease_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl ExecutionLease {
+    fn valid_for(&self, market: &MarketId, now: DateTime<Utc>) -> bool {
+        self.market == market.0 && self.expires_at > now && !self.lease_id.is_empty()
+    }
 }
 
 const LEASE_REREAD_INTERVAL: Duration = Duration::from_millis(250);
@@ -327,7 +339,7 @@ struct ControlSnapshot {
     validated_epoch: Option<u64>,
 }
 
-struct LeaseFileCache {
+struct LeaseCache {
     rx: watch::Receiver<ControlSnapshot>,
     execution_epoch: Arc<AtomicU64>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -357,32 +369,36 @@ fn publish_account(tx: &watch::Sender<AccountSnapshot>, snapshot: AccountSnapsho
 }
 
 fn spawn_control_refresher(
-    path: Option<PathBuf>, spec: MarketSpec, cfg: Config, aster: Arc<AsterRest>,
+    lease_rx: Option<watch::Receiver<Option<ExecutionLease>>>, spec: MarketSpec, cfg: Config, aster: Arc<AsterRest>,
     lighter: Arc<LighterVenue>, execution_epoch: Arc<AtomicU64>,
     account_tx: watch::Sender<AccountSnapshot>, wake: Arc<Notify>, session: ActiveSession,
-) -> LeaseFileCache {
+) -> LeaseCache {
     let (tx, rx) = watch::channel(ControlSnapshot {
         lease: None, observed_at: tokio::time::Instant::now(), validated_epoch: None,
     });
-    let mut result = LeaseFileCache { rx, execution_epoch: execution_epoch.clone(), task: None };
-    let Some(path) = path else { return result; };
+    let mut result = LeaseCache { rx, execution_epoch: execution_epoch.clone(), task: None };
+    let Some(mut lease_rx) = lease_rx else { return result; };
     result.task = Some(tokio::spawn(async move {
         let mut tick = tokio::time::interval(LEASE_REREAD_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut validated_lease: Option<String> = None;
+        let mut grants_open = true;
         loop {
-            tick.tick().await;
+            // A grant or revoke is seen at once; the tick re-validates expiry, account
+            // freshness and open orders while a lease stands.
+            tokio::select! {
+                _ = tick.tick() => {}
+                changed = lease_rx.changed(), if grants_open => { grants_open = changed.is_ok(); }
+            }
             let observed_at = tokio::time::Instant::now();
-            let lease = tokio::fs::read_to_string(&path).await.ok()
-                .and_then(|text| serde_json::from_str::<ExecutionLease>(&text).ok())
-                .filter(|lease| lease.market == spec.market_id.0 && lease.mode == "reduce_only"
-                    && lease.expires_at > Utc::now()
-                    && lease.lease_id.as_deref().is_some_and(|id| !id.is_empty()));
+            // A closed channel (controller gone) reads as no lease.
+            let lease = (if grants_open { lease_rx.borrow_and_update().clone() } else { None })
+                .filter(|lease| lease.valid_for(&spec.market_id, Utc::now()));
             let epoch = execution_epoch.load(Ordering::Acquire);
             let mut state = ControlSnapshot { lease: lease.clone(), observed_at, validated_epoch: None };
             if let Some(lease) = lease {
                 if epoch % 2 == 0 {
-                    let new_lease = validated_lease != lease.lease_id;
+                    let new_lease = validated_lease.as_deref() != Some(lease.lease_id.as_str());
                     if new_lease {
                         let _ = tx.send(state.clone());
                         wake.notify_one();
@@ -396,13 +412,13 @@ fn spawn_control_refresher(
                                 } else { session.arm().await };
                                 if armed.is_ok() {
                                     publish_account(&account_tx, snapshot);
-                                    validated_lease = lease.lease_id.clone();
+                                    validated_lease = Some(lease.lease_id.clone());
                                 }
                             }
                         }
                     }
                     let snapshot = *account_tx.borrow();
-                    if validated_lease == lease.lease_id
+                    if validated_lease.as_deref() == Some(lease.lease_id.as_str())
                         && snapshot.execution_epoch == epoch
                         && execution_epoch.load(Ordering::Acquire) == epoch
                         && !snapshot.is_stale(Duration::from_millis(cfg.live.max_account_snapshot_age_ms as u64))
@@ -436,26 +452,27 @@ struct ReduceSignalSample {
 }
 
 struct ReduceSignalTracker {
-    writer: Option<ColdLatest<ReduceSignalFile>>,
+    tx: Option<watch::Sender<Option<ReduceSignal>>>,
     min_samples: usize,
     window_ms: i64,
     samples: VecDeque<ReduceSignalSample>,
 }
 
-#[derive(Debug, Serialize)]
-struct ReduceSignalFile {
-    timestamp: DateTime<Utc>,
-    market: String,
-    status: &'static str,
-    samples: usize,
-    window_ms: i64,
-    first_seen: DateTime<Utc>,
-    last_seen: DateTime<Utc>,
-    best: ReduceSignalOpportunity,
+/// A confirmed burst: at least `samples` executable reducing opportunities inside `window_ms`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReduceSignal {
+    pub timestamp: DateTime<Utc>,
+    pub market: String,
+    pub status: &'static str,
+    pub samples: usize,
+    pub window_ms: i64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub best: ReduceSignalOpportunity,
 }
 
-#[derive(Debug, Serialize)]
-struct ReduceSignalOpportunity {
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ReduceSignalOpportunity {
     direction: String,
     qty: Decimal,
     gross_edge_bps: Decimal,
@@ -486,13 +503,13 @@ struct ReduceSignalOpportunity {
 }
 
 impl ReduceSignalTracker {
-    fn new(options: &RunOptions) -> Result<Self> {
-        Ok(Self {
-            writer: options.signal_file.clone().map(ColdLatest::new).transpose()?,
+    fn new(options: &RunOptions) -> Self {
+        Self {
+            tx: options.reduce_signals.clone(),
             min_samples: options.reduce_signal_min_samples.max(1),
             window_ms: options.reduce_signal_window_ms.max(1),
             samples: VecDeque::new(),
-        })
+        }
     }
 
     fn observe(
@@ -502,7 +519,7 @@ impl ReduceSignalTracker {
         gate: &crate::taker::entry_gate::GateEvaluation,
         now: DateTime<Utc>,
     ) {
-        if self.writer.is_none() || !gate.allow_execution {
+        if self.tx.is_none() || !gate.allow_execution {
             return;
         }
         self.prune(now);
@@ -531,7 +548,7 @@ impl ReduceSignalTracker {
     }
 
     fn write_confirmed(&self, spec: &MarketSpec, now: DateTime<Utc>) {
-        let Some(writer) = &self.writer else { return; };
+        let Some(tx) = &self.tx else { return; };
         let Some(first) = self.samples.front() else {
             return;
         };
@@ -545,7 +562,7 @@ impl ReduceSignalTracker {
         }) else {
             return;
         };
-        let body = ReduceSignalFile {
+        let body = ReduceSignal {
             timestamp: now,
             market: spec.market_id.0.clone(),
             status: "confirmed",
@@ -583,32 +600,26 @@ impl ReduceSignalTracker {
                 gate_sample_count: best.gate_sample_count,
             },
         };
-        writer.publish(body);
+        tx.send_replace(Some(body));
     }
 
-    fn healthy(&self) -> bool { self.writer.as_ref().is_none_or(ColdLatest::healthy) }
-
-    async fn shutdown(&mut self) -> Result<()> {
-        if let Some(writer) = self.writer.as_mut() { writer.shutdown().await?; }
-        Ok(())
-    }
+    /// A signal nobody can receive must not look like a standby that never fires.
+    fn healthy(&self) -> bool { self.tx.as_ref().is_none_or(|tx| !tx.is_closed()) }
 }
 
 fn valid_execution_lease(
-    cache: &mut LeaseFileCache, options: &RunOptions, spec: &MarketSpec, now: DateTime<Utc>,
+    cache: &mut LeaseCache, options: &RunOptions, spec: &MarketSpec, now: DateTime<Utc>,
 ) -> Option<ExecutionLease> {
-    if options.observe_only || options.control_file.is_none() { return None; }
+    if options.observe_only || options.lease.is_none() { return None; }
     let state = cache.rx.borrow();
     let epoch = cache.execution_epoch.load(Ordering::Acquire);
     if epoch % 2 != 0 || state.observed_at.elapsed() > CONTROL_MAX_AGE
         || state.validated_epoch != Some(epoch) { return None; }
-    state.lease.as_ref().filter(|lease| lease.market == spec.market_id.0
-        && lease.mode == "reduce_only" && lease.expires_at > now
-        && lease.lease_id.as_deref().is_some_and(|id| !id.is_empty())).cloned()
+    state.lease.as_ref().filter(|lease| lease.valid_for(&spec.market_id, now)).cloned()
 }
 
 fn execution_lease_enabled(
-    cache: &mut LeaseFileCache,
+    cache: &mut LeaseCache,
     options: &RunOptions,
     spec: &MarketSpec,
     now: DateTime<Utc>,
@@ -616,7 +627,7 @@ fn execution_lease_enabled(
     if options.observe_only {
         return (false, None);
     }
-    if options.control_file.is_none() {
+    if options.lease.is_none() {
         return (true, None);
     }
     let lease = valid_execution_lease(cache, options, spec, now);
@@ -909,8 +920,11 @@ impl ExecutionError {
     }
 }
 
-pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) -> Result<()> {
-    if options.control_file.is_some() { options.exposure_filter = ExposureFilter::Reduce; }
+/// Run the taker engine until `stop` is cancelled, the duration/trade limit is reached or a
+/// safety stop fires. Stopping never interrupts an execution: the loop checks `stop` only
+/// between iterations, then verifies flat orders/positions before clearing the session.
+pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, stop: CancellationToken) -> Result<()> {
+    if options.lease.is_some() { options.exposure_filter = ExposureFilter::Reduce; }
     if !cfg.live.enabled || !cfg.live.mode.eq_ignore_ascii_case("live") {
         bail!("refusing to run: set [live] enabled = true and mode = \"live\"");
     }
@@ -1042,7 +1056,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         .wait_ready(&spec.market_id, Duration::from_secs(20))
         .await?;
     info!("Lighter websocket state ready: market={}", spec.market_id);
-    let standby_until_lease = options.control_file.is_some();
+    let standby_until_lease = options.lease.is_some();
     ensure_clean_start(
         &cfg,
         &spec,
@@ -1056,7 +1070,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         Duration::from_millis(cfg.live.max_account_snapshot_age_ms as u64);
     let execution_epoch = Arc::new(AtomicU64::new(0));
     let mut account = refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await?;
-    if options.control_file.is_none() && !options.observe_only {
+    if options.lease.is_none() && !options.observe_only {
         if cfg.pnl.enabled {
             session.arm_with_equity(account.margins.total_equity_usd()
                 .context("marked equity unavailable for session arming")?).await?;
@@ -1088,7 +1102,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
     let mut cooldown_until =
         tokio::time::Instant::now() + Duration::from_millis(cfg.arb.startup_warmup_ms);
     let mut trades_executed = 0u64;
-    let mut reduce_signal_tracker = ReduceSignalTracker::new(&options)?;
+    let mut reduce_signal_tracker = ReduceSignalTracker::new(&options);
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
     // Gated/standby decisions can repeat every 10ms scan while an edge stays visible;
@@ -1109,7 +1123,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
     let mut last_full_eval = tokio::time::Instant::now();
     let mut last_flatten_denied_log_at: Option<tokio::time::Instant> = None;
     let mut last_fill_stats_log = tokio::time::Instant::now();
-    let mut lease_cache = spawn_control_refresher(options.control_file.clone(), spec.clone(), cfg.clone(),
+    let mut lease_cache = spawn_control_refresher(options.lease.clone(), spec.clone(), cfg.clone(),
         aster.clone(), lighter.clone(), execution_epoch.clone(), account_tx.clone(), scan_wake.clone(), session.clone());
     let history_changed = entry_gate.changed();
     // Set when the cooldown select below woke on account_rx.changed(): changed()
@@ -1119,7 +1133,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
     let mut woke_for_account_update = false;
 
     info!(
-        "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} control_file={:?} signal_file={:?} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
+        "taker arb running: market={} required_gross_edge={}bps desired_notional=${} min_size={} max_trades={:?} observe_only={} exposure_filter={:?} lease_standby={} reduce_signals={} startup_warmup_ms={} cooldown_ms={} reduce_cooldown_ms={} fees_bps=aster:{} lighter:{} margin_bps={} slippage_bps=aster:{} lighter:{} depth_guard_enabled={} liquidity_multiple={} depth_max_levels={} rescue_breaker=count_per_hour:{} loss_per_hour:${} risk_max_abs_notional=${} risk_mismatch=${} margin_buffer=${}",
         spec.market_id,
         cfg.arb.required_gross_edge_bps(),
         cfg.arb.desired_notional,
@@ -1127,8 +1141,8 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         options.max_trades,
         options.observe_only,
         options.exposure_filter,
-        options.control_file,
-        options.signal_file,
+        options.lease.is_some(),
+        options.reduce_signals.is_some(),
         cfg.arb.startup_warmup_ms,
         cfg.arb.cooldown_ms,
         options.reduce_cooldown_ms,
@@ -1153,14 +1167,10 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         );
     }
 
-    // Register the SIGINT listener ONCE, before the loop. A fresh signal::ctrl_c()
-    // per iteration only listens while the select! below is polling — a SIGINT landing
-    // during any of the loop's plain poll-interval sleeps was silently swallowed
-    // (observed live 2026-07-02: the reduce-only observer survived SIGINT for minutes
-    // and needed SIGTERM). The pinned future buffers a signal from the moment it is
-    // first polled and resolves at the next select.
-    let ctrl_c = signal::ctrl_c();
-    tokio::pin!(ctrl_c);
+    // `stop` is a level, not an edge: a stop requested during any of the loop's plain
+    // poll-interval sleeps (or during an execution) is seen at the next select. (A fresh
+    // signal::ctrl_c() per iteration once swallowed a SIGINT landing in those sleeps —
+    // observed live 2026-07-02.)
     let run_result: Result<()> = async {
     loop {
         if let Some(deadline) = deadline {
@@ -1171,10 +1181,10 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         }
         tokio::select! {
             // biased: cooldown_until is usually already elapsed, and an unbiased
-            // select could keep picking the ready timer over a pending SIGINT.
+            // select could keep picking the ready timer over a pending stop.
             biased;
-            _ = &mut ctrl_c => {
-                info!("ctrl-c; stopping");
+            _ = stop.cancelled() => {
+                info!("stop requested; stopping");
                 break;
             }
             _ = tokio::time::sleep_until(cooldown_until) => {}
@@ -1617,7 +1627,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
                     gate.sample_count,
                     gate.recorded,
                     options.observe_only,
-                    options.control_file.is_some()
+                    options.lease.is_some()
                 );
                 last_standby_log_at = Some(tokio::time::Instant::now());
             }
@@ -1831,11 +1841,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
     }.await;
     if let Some(task) = lease_cache.task.take() { task.abort(); }
     _account_refresh_task.abort();
-    let (history_drained, signals_drained, executions_drained, pnl_drained) = tokio::join!(
-        entry_gate.shutdown(), reduce_signal_tracker.shutdown(), execution_journal.shutdown(),
+    let (history_drained, executions_drained, pnl_drained) = tokio::join!(
+        entry_gate.shutdown(), execution_journal.shutdown(),
         async { if let Some(pnl) = pnl.as_ref() { pnl.shutdown().await } else { Ok(()) } },
     );
-    let drained = history_drained.and(signals_drained).and(executions_drained).and(pnl_drained);
+    let drained = history_drained.and(executions_drained).and(pnl_drained);
     let shutdown = if drained.is_ok() && !session.unresolved() {
         finish_execution(&execution_epoch);
         match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
@@ -2757,7 +2767,7 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
         aster_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
         lighter_fill: zero_fill_summary().with_fee_provenance(FeeProvenance::Unknown),
         lighter_fee_evidence: Vec::new(),
-        // The orchestrator dedups rows on `taker:<aster_order_id>:<lighter_client_order_index>`;
+        // The controller's realized-loss stop dedups rows on `taker:<aster_order_id>:<lighter_client_order_index>`;
         // a constant 0 collapsed every recovery after the first into one key, hiding
         // repeat losses from downstream accounting. The row timestamp keys each recovery.
         aster_order_id: -timestamp.timestamp_micros(),
@@ -4081,12 +4091,12 @@ mod tests {
         let now = Utc::now();
         let epoch = Arc::new(AtomicU64::new(0));
         let state = ControlSnapshot { lease: Some(ExecutionLease { market: "HYPE".to_string(),
-            mode: "reduce_only".to_string(), lease_id: Some("lease-1".to_string()),
-            expires_at: now + chrono::Duration::seconds(60) }),
+            lease_id: "lease-1".to_string(), expires_at: now + chrono::Duration::seconds(60) }),
             observed_at: tokio::time::Instant::now(), validated_epoch: Some(0) };
         let (tx, rx) = watch::channel(state.clone());
-        let mut cache = LeaseFileCache { rx, execution_epoch: epoch.clone(), task: None };
-        let mut options = RunOptions { control_file: Some(PathBuf::from("lease.json")), ..RunOptions::default() };
+        let mut cache = LeaseCache { rx, execution_epoch: epoch.clone(), task: None };
+        let (_grants, lease_rx) = watch::channel(None::<ExecutionLease>);
+        let mut options = RunOptions { lease: Some(lease_rx), ..RunOptions::default() };
         assert!(execution_lease_enabled(&mut cache, &options, &spec, now).0);
         options.observe_only = true;
         assert!(!execution_lease_enabled(&mut cache, &options, &spec, now).0);
@@ -4385,8 +4395,8 @@ mod tests {
             lighter_open_orders: 0,
         };
         let row = recovery_loss_row(&spec, &recovery);
-        // Deterministic given the row's own timestamp, and nonzero — so the
-        // orchestrator dedup key `taker:<unix_ms>:0` is unique per recovery.
+        // Deterministic given the row's own timestamp, and nonzero — so the dedup key
+        // `taker:<aster_order_id>:0` is unique per recovery.
         let mut other = recovery.clone();
         other.execution_id = "test-recovery-2".to_string();
         let second = recovery_loss_row(&spec,&other);

@@ -1,10 +1,15 @@
-//! Aster maker / Lighter taker XEMM bot and its research core. The `livebot` quotes on
-//! Aster and hedges fills on Lighter; `record`/`replay`/`report` simulate the same quotes
-//! offline to measure realized edge under latency, queue position and partial fills.
+//! Aster/Lighter bot and its research core. `run` (`controller`) trades one market with the
+//! taker–taker engine (`taker`) and the XEMM engine (`livebot`: quotes on Aster, hedges
+//! fills on Lighter), switching execution rights between them in memory.
+//! `record`/`replay`/`report` simulate the XEMM quotes offline to measure realized edge under
+//! latency, queue position and partial fills.
 
 pub mod book;
 pub mod cli;
 pub mod config;
+/// The `run` controller: both engines in one process, execution rights handed over in memory.
+#[cfg(feature = "hotpath")]
+pub mod controller;
 pub mod connectors;
 pub mod decimal;
 pub mod edge;
@@ -19,11 +24,11 @@ pub mod hot_types;
 pub mod hotpath;
 pub mod inventory;
 pub mod lighter;
-/// The trading bot (the `livebot` command), with two modes: `paper` (the selected markets,
-/// simulated executor, NO real orders; records the market tape + persists results) and
-/// `live` (one market, real money; hard-gated behind `[live] enabled`, `--mode live` and the
-/// real signers). Requires `hotpath` (lock-free ingest substrate). The deterministic research
-/// core (`record`/`replay`/`report`) does not.
+/// The XEMM engine (the `livebot` command, and `run`'s maker), with two modes: `paper` (the
+/// selected markets, simulated executor, NO real orders; `livebot` also records the market
+/// tape + persists results) and `live` (one market, real money; hard-gated behind `[live]
+/// enabled`, `--mode live` and the real signers). Requires `hotpath` (lock-free ingest
+/// substrate). The deterministic research core (`record`/`replay`/`report`) does not.
 #[cfg(feature = "hotpath")]
 pub mod livebot;
 pub mod markets;

@@ -26,10 +26,13 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read config {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&text).with_context(|| format!("parse config {}", path.display()))?;
+        Self::from_table(crate::config::read_table(path, "taker")?)
+            .with_context(|| format!("config {}", path.display()))
+    }
+
+    /// Checks a file-loaded taker table (`[taker]` of `bot.toml`).
+    pub fn from_table(value: toml::Value) -> Result<Self> {
+        let cfg: Config = crate::config::strict_from_toml(value)?;
         cfg.validate()?;
         Ok(cfg)
     }

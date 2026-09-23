@@ -177,57 +177,6 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T, durable: bool) ->
     result
 }
 
-/// A single cold writer drains only the newest state; intermediate signal updates coalesce.
-pub struct ColdLatest<T> {
-    latest: Arc<arc_swap::ArcSwapOption<T>>,
-    wake: Option<std::sync::mpsc::SyncSender<()>>,
-    done: Option<oneshot::Receiver<std::result::Result<(), String>>>,
-    healthy: Arc<AtomicBool>,
-}
-
-impl<T: Serialize + Send + Sync + 'static> ColdLatest<T> {
-    pub fn new(path: PathBuf) -> Result<Self> {
-        let latest = Arc::new(arc_swap::ArcSwapOption::<T>::empty());
-        let (wake, rx) = std::sync::mpsc::sync_channel(1);
-        let (finished, done) = oneshot::channel();
-        let healthy = Arc::new(AtomicBool::new(true));
-        let values = latest.clone();
-        let health = healthy.clone();
-        std::thread::Builder::new().name("taker-signal".to_string()).spawn(move || {
-            let mut result = Ok(());
-            while rx.recv().is_ok() {
-                if let Some(value) = values.swap(None) {
-                    if let Err(error) = write_json_atomic(&path, value.as_ref(), false) {
-                        health.store(false, Ordering::Release);
-                        result = Err(format!("{}: {error:#}", path.display()));
-                        tracing::error!("signal write failed: {error:#}");
-                    }
-                }
-            }
-            let _ = finished.send(result);
-        })?;
-        Ok(Self { latest, wake: Some(wake), done: Some(done), healthy })
-    }
-
-    pub fn publish(&self, value: T) {
-        self.latest.store(Some(Arc::new(value)));
-        if let Some(wake) = &self.wake { let _ = wake.try_send(()); }
-    }
-
-    pub fn healthy(&self) -> bool { self.healthy.load(Ordering::Acquire) }
-
-    pub async fn shutdown(&mut self) -> Result<()> {
-        self.wake.take();
-        if let Some(done) = self.done.take() {
-            tokio::time::timeout(Duration::from_secs(5), done).await
-                .context("signal drain exceeded five seconds")?
-                .context("signal worker stopped without acknowledgement")?
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(())
-    }
-}
-
 const JOURNAL_QUEUE_CAPACITY: usize = 1024;
 
 /// File locking covers a whole serialized row, including its newline, across bot processes.
@@ -445,7 +394,7 @@ impl PnlTracker {
         fs::create_dir_all(&dir)
             .with_context(|| format!("create pnl persist dir {}", dir.display()))?;
         let component = market_component(market);
-        let ledger_path = dir.join(format!("trades_{component}.jsonl"));
+        let ledger_path = ledger_path(cfg, market);
         let breaker_path = dir.join(format!("circuit_breaker_{component}.json"));
         let (loaded_trades, cumulative_pnl_usdc, last_trade) =
             load_cumulative_pnl(&ledger_path, since)?;
@@ -627,6 +576,11 @@ fn write_breaker(path: &Path, state: &CircuitBreakerState) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("move breaker temp {} to {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+/// The taker's trade ledger (`trades_<M>.jsonl`), also tailed by the `run` loss stop.
+pub fn ledger_path(cfg: &PnlCfg, market: &MarketId) -> PathBuf {
+    PathBuf::from(&cfg.persist_dir).join(format!("trades_{}.jsonl", market_component(market)))
 }
 
 pub fn session_path(cfg: &PnlCfg, market: &MarketId) -> PathBuf {
@@ -853,18 +807,6 @@ mod tests {
             assert!(ids.insert(row["id"].as_str().unwrap().to_string()));
         }
         assert_eq!(ids.len(),64);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn coalesced_signal_writer_drains_the_latest_value() {
-        let dir = tmp_dir("latest");
-        let path = dir.join("signal.json");
-        let mut writer = ColdLatest::new(path.clone()).unwrap();
-        for sequence in 0..1000 { writer.publish(serde_json::json!({"sequence":sequence})); }
-        writer.shutdown().await.unwrap();
-        let row: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(row["sequence"],999);
         let _ = fs::remove_dir_all(dir);
     }
 

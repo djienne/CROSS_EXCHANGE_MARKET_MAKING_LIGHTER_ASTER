@@ -213,7 +213,7 @@ impl Default for BookCheckCfg {
 /// Execution mode for the live bot. Exactly two modes: `Paper` (the selected markets, NO
 /// real orders — the everyday mode) and `Live` (a single market, real funds, hard-gated
 /// behind `enabled = true`, explicit live mode, single-market selection, and a wired signer).
-/// The CLI always passes a mode (`--mode`, default paper), so `[live] mode` is informational.
+/// The mode comes from the command line only (`--mode`); the config has no mode key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveMode {
@@ -268,9 +268,6 @@ pub struct LiveCfg {
     /// Master switch. While false the `livebot` command refuses to start. Default false.
     #[serde(default)]
     pub enabled: bool,
-    /// Execution mode. Default `paper` (no real orders).
-    #[serde(default)]
-    pub mode: LiveMode,
     /// Cooldown after ANY execution event during which no new maker quote may be placed
     /// (risk-reducing cancels/hedges stay allowed). Plan §6. Default 60_000.
     #[serde(default = "default_cooldown_ms")]
@@ -535,7 +532,6 @@ impl Default for LiveCfg {
     fn default() -> Self {
         LiveCfg {
             enabled: false,
-            mode: LiveMode::default(),
             post_trade_cooldown_ms: default_cooldown_ms(),
             cooldown_scope: default_cooldown_scope(),
             startup_cancel_all: true,
@@ -744,13 +740,35 @@ impl MarketCfg {
     }
 }
 
+/// Reads a TOML config file and returns its `section` table: `bot.toml` holds each engine's
+/// config under its own table (`[maker]`, `[taker]`); a single-engine file is used whole.
+pub fn read_table(path: &Path, section: &str) -> Result<toml::Value> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
+    let mut value: toml::Value =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    Ok(value.as_table_mut().and_then(|table| table.remove(section)).unwrap_or(value))
+}
+
+/// Deserializes a config table, rejecting keys the target does not define: a typo or a key in
+/// the wrong table must fail startup, not silently leave a default in force. Recorded run
+/// headers deserialize without this, so a retired key never breaks replay.
+pub fn strict_from_toml<T: serde::de::DeserializeOwned>(value: toml::Value) -> Result<T> {
+    let mut unknown = Vec::new();
+    let parsed = serde_ignored::deserialize(value, |path| unknown.push(path.to_string()))?;
+    if !unknown.is_empty() {
+        bail!("unknown config keys: {}", unknown.join(", "));
+    }
+    Ok(parsed)
+}
+
 impl Config {
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading config {}", path.display()))?;
-        let value: toml::Value = toml::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        Self::from_table(read_table(path, "maker")?).with_context(|| format!("config {}", path.display()))
+    }
+
+    /// Checks a file-loaded XEMM table (`[maker]` of `bot.toml`).
+    pub fn from_table(value: toml::Value) -> Result<Self> {
         for retired in [
             "partials.accumulate_sub_min_fills",
             "partials.mark_pending_inventory_to_market",
@@ -763,7 +781,7 @@ impl Config {
                 bail!("retired no-op setting {retired}; remove it (requote ticks belong in [quote])");
             }
         }
-        let cfg: Config = value.try_into().context("parsing config fields")?;
+        let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
         // File-loaded operational configs may perform I/O. Recorded headers are
         // deserialized directly, so offline replay does not depend on obsolete URLs.
@@ -1007,8 +1025,6 @@ lighter_symbol = "DOGE"
         let cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.validate().unwrap();
         assert!(!cfg.live.enabled);
-        assert_eq!(cfg.live.mode, LiveMode::Paper);
-        assert!(!cfg.live.mode.is_real());
         assert_eq!(cfg.live.post_trade_cooldown_ms, 60_000);
         assert!(cfg.live.cooldown_is_global());
         assert_eq!(cfg.live.partials.policy, PartialPolicy::StrictEveryFillMustBeHedgeable);
@@ -1027,13 +1043,11 @@ lighter_symbol = "DOGE"
     #[test]
     fn live_section_parses_and_validates() {
         let with_live = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\npost_trade_cooldown_ms = 30000\ncooldown_scope = \"per_market\"\nmax_unhedged_notional_usd = \"7\"\n\n[live.partials]\npolicy = \"accumulate_sub_min\"\nmax_pending_notional_usd = \"5\"\nmax_pending_age_ms = 1000\n\n[live.lighter]\nnormal_slippage_bps = \"4\"\nemergency_slippage_bps = \"25\"\n"
+            "{SAMPLE}\n[live]\nenabled = true\npost_trade_cooldown_ms = 30000\ncooldown_scope = \"per_market\"\nmax_unhedged_notional_usd = \"7\"\n\n[live.partials]\npolicy = \"accumulate_sub_min\"\nmax_pending_notional_usd = \"5\"\nmax_pending_age_ms = 1000\n\n[live.lighter]\nnormal_slippage_bps = \"4\"\nemergency_slippage_bps = \"25\"\n"
         );
         let cfg: Config = toml::from_str(&with_live).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.live.enabled);
-        assert_eq!(cfg.live.mode, LiveMode::Live);
-        assert!(cfg.live.mode.is_real());
         assert_eq!(cfg.live.post_trade_cooldown_ms, 30_000);
         assert!(!cfg.live.cooldown_is_global());
         assert_eq!(cfg.live.partials.policy, PartialPolicy::AccumulateSubMin);
@@ -1043,7 +1057,7 @@ lighter_symbol = "DOGE"
     #[test]
     fn live_quote_reduce_position_only_can_be_disabled() {
         let with_live = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.quote]\nreduce_position_only = false\n"
+            "{SAMPLE}\n[live]\nenabled = true\n\n[live.quote]\nreduce_position_only = false\n"
         );
         let cfg: Config = toml::from_str(&with_live).unwrap();
         cfg.validate().unwrap();
@@ -1053,7 +1067,7 @@ lighter_symbol = "DOGE"
     #[test]
     fn live_zero_caps_resolve_to_safe_defaults_not_unlimited() {
         let with_live = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.quote]\nmax_replaces_per_minute_per_symbol = 0\n\n[live.aster]\nmax_rest_requests_per_minute = 0\noptional_rest_reserve_per_minute = 999999\nrate_limit_backoff_ms = 2500\n"
+            "{SAMPLE}\n[live]\nenabled = true\n\n[live.quote]\nmax_replaces_per_minute_per_symbol = 0\n\n[live.aster]\nmax_rest_requests_per_minute = 0\noptional_rest_reserve_per_minute = 999999\nrate_limit_backoff_ms = 2500\n"
         );
         let cfg: Config = toml::from_str(&with_live).unwrap();
         cfg.validate().unwrap();
@@ -1080,7 +1094,7 @@ lighter_symbol = "DOGE"
     fn margin_guard_defaults_enabled_with_25_buffer() {
         // No [live.margin_guard] block => defaults: enabled, $25 buffer. (SAMPLE has leverage=1 +
         // enforce_position_cap=true, so the guard's prerequisites are satisfied.)
-        let with_live = format!("{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n");
+        let with_live = format!("{SAMPLE}\n[live]\nenabled = true\n");
         let cfg: Config = toml::from_str(&with_live).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.live.margin_guard.enabled);
@@ -1088,7 +1102,7 @@ lighter_symbol = "DOGE"
         assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(25));
         // Explicit block parses and overrides the buffer.
         let explicit = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.margin_guard]\nenabled = true\naster_safety_buffer_usd = \"26\"\n"
+            "{SAMPLE}\n[live]\nenabled = true\n\n[live.margin_guard]\nenabled = true\naster_safety_buffer_usd = \"26\"\n"
         );
         let cfg: Config = toml::from_str(&explicit).unwrap();
         cfg.validate().unwrap();
@@ -1107,15 +1121,15 @@ lighter_symbol = "DOGE"
             "[live.hyperliquid]\nexpires_after_ms=1000",
         ] {
             std::fs::write(&path, format!("{SAMPLE}\n{extra}\n")).unwrap();
-            assert!(Config::load(&path).unwrap_err().to_string().contains("retired no-op"));
+            assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("retired no-op"));
         }
         for key in ["accumulate_sub_min_fills", "mark_pending_inventory_to_market"] {
             std::fs::write(&path, SAMPLE.replace("[partials]", &format!("[partials]\n{key}=true"))).unwrap();
-            assert!(Config::load(&path).unwrap_err().to_string().contains("retired no-op"));
+            assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("retired no-op"));
         }
         std::fs::write(&path, format!("{SAMPLE}\n[live.aster]\nbase_url=\"https://example.test\"\n")).unwrap();
-        assert!(Config::load(&path).unwrap_err().to_string().contains("mainnet origins"));
-        std::fs::write(&path, include_str!("../config-live-lighter.toml")).unwrap();
+        assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("mainnet origins"));
+        std::fs::write(&path, include_str!("../bot.toml")).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
         std::fs::remove_file(path).unwrap();
@@ -1124,7 +1138,7 @@ lighter_symbol = "DOGE"
 
     #[test]
     fn margin_guard_requires_leverage_one_and_enforced_cap() {
-        let base = format!("{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n");
+        let base = format!("{SAMPLE}\n[live]\nenabled = true\n");
         // leverage != 1 with the guard enabled => reject (real venue leverage is gated to 1x).
         let lev2 = base.replace("leverage = \"1\"", "leverage = \"2\"");
         assert!(toml::from_str::<Config>(&lev2).unwrap().validate().is_err());
@@ -1133,7 +1147,7 @@ lighter_symbol = "DOGE"
         assert!(toml::from_str::<Config>(&noenforce).unwrap().validate().is_err());
         // ...but with the guard DISABLED, leverage != 1 is allowed again (the guard is inert).
         let lev2_off = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.margin_guard]\nenabled = false\n"
+            "{SAMPLE}\n[live]\nenabled = true\n\n[live.margin_guard]\nenabled = false\n"
         )
         .replace("leverage = \"1\"", "leverage = \"2\"");
         toml::from_str::<Config>(&lev2_off).unwrap().validate().unwrap();
@@ -1142,7 +1156,7 @@ lighter_symbol = "DOGE"
     #[test]
     fn margin_guard_negative_buffer_rejected() {
         let neg = format!(
-            "{SAMPLE}\n[live]\nenabled = true\nmode = \"live\"\n\n[live.margin_guard]\naster_safety_buffer_usd = \"-1\"\n"
+            "{SAMPLE}\n[live]\nenabled = true\n\n[live.margin_guard]\naster_safety_buffer_usd = \"-1\"\n"
         );
         assert!(toml::from_str::<Config>(&neg).unwrap().validate().is_err());
     }

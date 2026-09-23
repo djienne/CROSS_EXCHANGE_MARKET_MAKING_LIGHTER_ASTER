@@ -126,7 +126,7 @@ pub fn check_startup(db_path: &Path) -> Result<()> {
 /// DURING this run (`check_startup` barred any pre-existing latch at startup) — return `Err`
 /// so the process exits NONZERO and the supervisor safe-halts in one step. Without this, a
 /// trip rode the graceful-shutdown path to exit 0, indistinguishable from a clean stop: the
-/// orchestrator restarted the bot, the restart refused via the latch (exit 1), and only then
+/// former orchestrator restarted the bot, the restart refused via the latch (exit 1), and only then
 /// did it halt (observed 2026-07-04).
 pub fn check_shutdown(db_path: &Path) -> Result<()> {
     let path = trip_path(db_path);

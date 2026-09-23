@@ -127,45 +127,60 @@ fn lighter_env_path() -> String {
 
 pub async fn run(cfg: &Config, target: Option<String>, json: bool) -> Result<()> {
     let target = target.unwrap_or_else(|| "HYPE".into());
-    let selected = cfg.select_markets(Some(&target));
-    if selected.is_empty() {
-        bail!("no market '{target}' in config [[markets]]");
-    }
-    if selected.len() != 1 {
-        bail!("status is single-market only; selected {} markets", selected.len());
-    }
-    let specs = rest_specs::build_market_specs_with_bases(
-        &selected,
-        cfg.partials.hyperliquid_min_notional,
-        &cfg.live.aster.base_url,
-        &cfg.live.hyperliquid.base_url,
-    )
-    .await?;
-    let spec = specs.first().context("no resolved market spec")?.clone();
-    let aster = build_aster(cfg, &specs)?;
-    let lighter = build_lighter(cfg, &specs).await?;
-    let reconciler = Reconciler::new(aster, lighter, &specs, cfg.simulation.max_book_staleness_ms);
-    let snapshot = reconciler.snapshot().await?;
-
-    let http = rest_book::client()?;
-    let (aster_book, lighter_book) = tokio::join!(
-        rest_book::fetch_aster_book_from_base(&http, &cfg.live.aster.base_url, &spec.aster_symbol, 20),
-        rest_book::fetch_lighter_book_from_base(
-            &http,
-            &cfg.live.hyperliquid.base_url,
-            spec.lighter_market_id,
-            20
-        ),
-    );
-    let aster_book = aster_book?;
-    let lighter_book = lighter_book?;
-    let report = build_report(cfg, &spec, snapshot, &aster_book, &lighter_book);
+    let report = StatusPoller::new(cfg, &target).await?.report().await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())
+}
+
+/// Read-only status for one market with clients built once, so the `run` controller can
+/// poll it repeatedly. It never places or cancels an order.
+pub struct StatusPoller {
+    cfg: Config,
+    spec: MarketSpec,
+    reconciler: Reconciler,
+    http: reqwest::Client,
+}
+
+impl StatusPoller {
+    pub async fn new(cfg: &Config, target: &str) -> Result<Self> {
+        let selected = cfg.select_markets(Some(target));
+        if selected.is_empty() {
+            bail!("no market '{target}' in config [[markets]]");
+        }
+        if selected.len() != 1 {
+            bail!("status is single-market only; selected {} markets", selected.len());
+        }
+        let specs = rest_specs::build_market_specs_with_bases(
+            &selected,
+            cfg.partials.hyperliquid_min_notional,
+            &cfg.live.aster.base_url,
+            &cfg.live.hyperliquid.base_url,
+        )
+        .await?;
+        let spec = specs.first().context("no resolved market spec")?.clone();
+        let aster = build_aster(cfg, &specs)?;
+        let lighter = build_lighter(cfg, &specs).await?;
+        let reconciler = Reconciler::new(aster, lighter, &specs, cfg.simulation.max_book_staleness_ms);
+        Ok(Self { cfg: cfg.clone(), spec, reconciler, http: rest_book::client()? })
+    }
+
+    pub async fn report(&self) -> Result<StatusReport> {
+        let snapshot = self.reconciler.snapshot().await?;
+        let (aster_book, lighter_book) = tokio::join!(
+            rest_book::fetch_aster_book_from_base(&self.http, &self.cfg.live.aster.base_url, &self.spec.aster_symbol, 20),
+            rest_book::fetch_lighter_book_from_base(
+                &self.http,
+                &self.cfg.live.hyperliquid.base_url,
+                self.spec.lighter_market_id,
+                20
+            ),
+        );
+        Ok(build_report(&self.cfg, &self.spec, snapshot, &aster_book?, &lighter_book?))
+    }
 }
 
 fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {

@@ -47,6 +47,8 @@ futures-util = "0.3"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 toml = "0.8"
+# Unknown-key rejection for file-loaded configs (bot.toml); recorded run headers stay lenient.
+serde_ignored = "0.1"
 rust_decimal = { version = "1", features = ["serde-str"] }
 rust_decimal_macros = "1"
 chrono = { version = "0.4", features = ["clock", "serde"] }

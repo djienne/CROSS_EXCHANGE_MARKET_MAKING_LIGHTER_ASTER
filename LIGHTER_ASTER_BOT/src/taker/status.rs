@@ -163,44 +163,62 @@ impl Direction {
 }
 
 pub async fn run(cfg: &Config, markets: Vec<MarketCfg>, json: bool) -> Result<()> {
-    anyhow::ensure!(
-        markets.len() == 1,
-        "status is single-market only; selected {} markets",
-        markets.len()
-    );
-    let specs = rest_specs::build_market_specs(
-        &markets,
-        &cfg.venues.aster_base_url,
-        &cfg.venues.lighter_base_url,
-    )
-    .await?;
-    let spec = specs.first().context("no resolved market spec")?.clone();
-
-    let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-    let lighter_env =
-        std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-    let acreds = AsterCreds::load(Path::new(&aster_env))?;
-    let lcreds = LighterCreds::load(Path::new(&lighter_env))?;
-    let signer: Arc<dyn AsterSigner> =
-        Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
-    let aster = AsterRest::new(cfg.venues.aster_base_url.clone(), signer, &specs)?;
-    // Read-only venue: no order-capable tx socket, no authed streams, no 20s
-    // wait_ready — a monitoring poll answers from REST in a couple of seconds and can
-    // never place an order. The report's *_ws fields are null by construction.
-    let lighter = LighterVenue::new_read_only(
-        &cfg.venues.lighter_base_url,
-        Path::new(&cfg.venues.signers_dir),
-        lcreds,
-        &specs,
-    )?;
-
-    let report = build_report(cfg, &spec, &aster, &lighter).await?;
+    let report = StatusPoller::new(cfg, markets).await?.report().await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
     Ok(())
+}
+
+/// Read-only status for one market with clients built once, so the `run` controller can
+/// poll it repeatedly. It can never place an order.
+pub struct StatusPoller {
+    cfg: Config,
+    spec: MarketSpec,
+    aster: AsterRest,
+    lighter: LighterVenue,
+}
+
+impl StatusPoller {
+    pub async fn new(cfg: &Config, markets: Vec<MarketCfg>) -> Result<Self> {
+        anyhow::ensure!(
+            markets.len() == 1,
+            "status is single-market only; selected {} markets",
+            markets.len()
+        );
+        let specs = rest_specs::build_market_specs(
+            &markets,
+            &cfg.venues.aster_base_url,
+            &cfg.venues.lighter_base_url,
+        )
+        .await?;
+        let spec = specs.first().context("no resolved market spec")?.clone();
+
+        let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
+        let lighter_env =
+            std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
+        let acreds = AsterCreds::load(Path::new(&aster_env))?;
+        let lcreds = LighterCreds::load(Path::new(&lighter_env))?;
+        let signer: Arc<dyn AsterSigner> =
+            Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
+        let aster = AsterRest::new(cfg.venues.aster_base_url.clone(), signer, &specs)?;
+        // Read-only venue: no order-capable tx socket, no authed streams, no 20s
+        // wait_ready — a monitoring poll answers from REST in a couple of seconds and can
+        // never place an order. The report's *_ws fields are null by construction.
+        let lighter = LighterVenue::new_read_only(
+            &cfg.venues.lighter_base_url,
+            Path::new(&cfg.venues.signers_dir),
+            lcreds,
+            &specs,
+        )?;
+        Ok(Self { cfg: cfg.clone(), spec, aster, lighter })
+    }
+
+    pub async fn report(&self) -> Result<StatusReport> {
+        build_report(&self.cfg, &self.spec, &self.aster, &self.lighter).await
+    }
 }
 
 async fn build_report(
