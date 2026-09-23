@@ -953,7 +953,7 @@ def print_human(stats: list[IngestStats], report: dict[str, Any] | None) -> None
 
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
-    taker_root = stack_root / "LIGHTER_ASTER_TAKER_ARB"
+    bot_root = stack_root / "LIGHTER_ASTER_BOT"
     parser = argparse.ArgumentParser(description="Canonical local trade-history DB and PnL report.")
     parser.add_argument("--mode", choices=["lan", "local"], default="lan", help="lan/local: local artifacts only; no exchange API calls.")
     parser.add_argument("--market", default="HYPE")
@@ -976,7 +976,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.mode = "lan"
     if args.taker_trades is None:
-        args.taker_trades = taker_root / f"runs/trades_{args.market}.jsonl"
+        args.taker_trades = bot_root / f"runs/trades_{args.market}.jsonl"
     if args.orchestrator_trades is None:
         args.orchestrator_trades = stack_root / f"runs/orchestrator_trades_{args.market}.jsonl"
     if args.xemm_journal is None:

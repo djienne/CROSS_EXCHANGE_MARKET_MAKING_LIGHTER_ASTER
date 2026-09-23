@@ -1397,6 +1397,7 @@ class Orchestrator:
         if bot == TAKER_BOT:
             cmd = [
                 str(self.args.taker_bin),
+                "taker",
                 "--config",
                 str(self.args.taker_config),
                 "status",
@@ -1869,6 +1870,7 @@ class Orchestrator:
             else:
                 cmd = [
                     str(self.args.taker_bin),
+                    "taker",
                     "--config",
                     str(self.args.taker_config),
                     "run",
@@ -1904,6 +1906,7 @@ class Orchestrator:
     def reduce_taker_command(self) -> list[str]:
         cmd = [
             str(self.args.taker_bin),
+            "taker",
             "--config",
             str(self.args.taker_config),
             "run",
@@ -1949,18 +1952,10 @@ class Orchestrator:
             if pid == os.getpid() or pid in own_pids or stat.startswith("Z"):
                 continue
             argv = args.split()
-            if not argv:
+            bot = bot_process_kind(argv)
+            if bot is None or not process_matches_market(argv, self.args.market):
                 continue
-            executable = Path(argv[0]).name
-            subcommand_args = f" {' '.join(argv[1:])} "
-            if executable == "lighter_aster_taker_arb" and " run " in subcommand_args:
-                if not process_matches_market(argv, self.args.market):
-                    continue
-                processes.append({"pid": pid, "pgid": pgid, "bot": TAKER_BOT, "args": args})
-            elif executable == "xemm_lighter_aster" and " livebot " in subcommand_args:
-                if not process_matches_market(argv, self.args.market):
-                    continue
-                processes.append({"pid": pid, "pgid": pgid, "bot": XEMM_BOT, "args": args})
+            processes.append({"pid": pid, "pgid": pgid, "bot": bot, "args": args})
         return processes
 
     def external_writers(self) -> list[dict[str, Any]]:
@@ -2094,6 +2089,23 @@ def inferred_xemm_journal(db: Path) -> Path:
     return db.parent / f"{stem}-journal.jsonl"
 
 
+def bot_process_kind(argv: list[str]) -> str | None:
+    """TAKER_BOT for a taker `run`, XEMM_BOT for a `livebot`, else None.
+
+    The merged binary runs the taker as `lighter_aster_bot taker ... run`; the retired
+    standalone binary names still count, so a leftover old writer is never missed.
+    """
+    if not argv:
+        return None
+    executable = Path(argv[0]).name
+    subcommand_args = f" {' '.join(argv[1:])} "
+    if executable == "lighter_aster_taker_arb" or (executable == "lighter_aster_bot" and argv[1:2] == ["taker"]):
+        return TAKER_BOT if " run " in subcommand_args else None
+    if executable in ("xemm_lighter_aster", "lighter_aster_bot") and " livebot " in subcommand_args:
+        return XEMM_BOT
+    return None
+
+
 def process_matches_market(argv: list[str], market: str) -> bool:
     for i, arg in enumerate(argv):
         if arg == "--markets" and i + 1 < len(argv):
@@ -2123,8 +2135,8 @@ def existing_file_or_path(raw: str) -> Path:
 
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
-    taker_root = stack_root / "LIGHTER_ASTER_TAKER_ARB"
-    xemm_root = stack_root / "XEMM_LIGHTER_ASTER"
+    # One crate and binary runs both engines: `lighter_aster_bot taker ...` and `lighter_aster_bot livebot ...`.
+    bot_root = stack_root / "LIGHTER_ASTER_BOT"
     parser = argparse.ArgumentParser(description="Supervise taker-arb and XEMM reduce-only bots.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--live", action="store_true", help="Actually start/stop child trading bots. Default only observes and writes decisions.")
@@ -2210,12 +2222,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backfill-existing-trades", action="store_true")
     parser.add_argument("--state-dir", type=existing_file_or_path, default=stack_root / "runs")
     parser.add_argument("--aster-nonce-dir", type=existing_file_or_path, default=None, help="Shared signer nonce mappings for bot and status processes (default: ASTER_NONCE_DIR or OS temp/lighter-aster-nonces).")
-    parser.add_argument("--taker-repo", type=existing_file_or_path, default=taker_root)
-    parser.add_argument("--xemm-repo", type=existing_file_or_path, default=xemm_root)
-    parser.add_argument("--taker-bin", type=existing_file_or_path, default=taker_root / "target/release/lighter_aster_taker_arb")
-    parser.add_argument("--xemm-bin", type=existing_file_or_path, default=xemm_root / "target/release/xemm_lighter_aster")
-    parser.add_argument("--taker-config", type=existing_file_or_path, default=taker_root / "configs/live-hype.toml")
-    parser.add_argument("--xemm-config", type=existing_file_or_path, default=xemm_root / "config-live-lighter.toml")
+    parser.add_argument("--taker-repo", type=existing_file_or_path, default=bot_root)
+    parser.add_argument("--xemm-repo", type=existing_file_or_path, default=bot_root)
+    parser.add_argument("--taker-bin", type=existing_file_or_path, default=bot_root / "target/release/lighter_aster_bot")
+    parser.add_argument("--xemm-bin", type=existing_file_or_path, default=bot_root / "target/release/lighter_aster_bot")
+    parser.add_argument("--taker-config", type=existing_file_or_path, default=bot_root / "configs/taker-live-hype.toml")
+    parser.add_argument("--xemm-config", type=existing_file_or_path, default=bot_root / "config-live-lighter.toml")
     parser.add_argument("--taker-trades", type=existing_file_or_path, default=None)
     parser.add_argument("--xemm-db", type=existing_file_or_path, default=None)
     parser.add_argument("--xemm-journal", type=existing_file_or_path, default=None)
@@ -2234,7 +2246,7 @@ def parse_args() -> argparse.Namespace:
         baseline_path = args.state_dir / f"orchestrator_baseline_{args.market}.json"
         baseline_path.unlink(missing_ok=True)
     if args.taker_trades is None:
-        args.taker_trades = (taker_root / f"runs/trades_{args.market}.jsonl").resolve()
+        args.taker_trades = (bot_root / f"runs/trades_{args.market}.jsonl").resolve()
     if args.xemm_db is None:
         args.xemm_db = (args.state_dir / f"orchestrator-xemm-{args.market}.sqlite").resolve()
     if args.arb_control_file is None:
@@ -2247,7 +2259,7 @@ def parse_args() -> argparse.Namespace:
 def insecure_env_files(args: argparse.Namespace) -> list[str]:
     """Credential env files that are readable by group/other (mode should be 600)."""
     insecure = []
-    for repo in (args.taker_repo, args.xemm_repo):
+    for repo in dict.fromkeys((args.taker_repo, args.xemm_repo)):
         for name in ("aster.env", "lighter.env"):
             path = Path(repo) / name
             if not path.exists():

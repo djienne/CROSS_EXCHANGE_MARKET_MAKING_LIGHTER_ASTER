@@ -12,7 +12,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from orchestrator import TAKER_OBSERVER, Orchestrator, utc_now  # noqa: E402
+from orchestrator import TAKER_BOT, TAKER_OBSERVER, XEMM_BOT, Orchestrator, bot_process_kind, utc_now  # noqa: E402
 
 
 def make_orch(state_dir: Path) -> Orchestrator:
@@ -123,6 +123,21 @@ class NotePnlSampleTests(unittest.TestCase):
             orch = make_orch(Path(tmp))
             orch.note_pnl_sample({"source_bot": "XEMM"}, status("238.83", "TAKER"), status("237.50", "XEMM"))
             self.assertEqual([], [k for k, _ in orch.recorded_events if k == "equity_calc_divergence"])
+
+
+class BotProcessKindTests(unittest.TestCase):
+    def test_merged_and_retired_binaries_are_classified(self) -> None:
+        cases = {
+            "/opt/lighter_aster_bot taker --config t.toml run --markets HYPE": TAKER_BOT,
+            "lighter_aster_bot taker --config t.toml status --market HYPE": None,
+            "/opt/lighter_aster_bot --config x.toml livebot --mode live --markets HYPE": XEMM_BOT,
+            "lighter_aster_bot --config x.toml status --market HYPE": None,
+            "lighter_aster_taker_arb --config t.toml run --markets HYPE": TAKER_BOT,
+            "xemm_lighter_aster --config x.toml livebot --mode live": XEMM_BOT,
+            "python3 orchestrator.py --live --market HYPE": None,
+        }
+        for args, expected in cases.items():
+            self.assertEqual(expected, bot_process_kind(args.split()), args)
 
 
 if __name__ == "__main__":

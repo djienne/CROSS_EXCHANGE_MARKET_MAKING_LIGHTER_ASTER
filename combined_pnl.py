@@ -487,8 +487,7 @@ def print_human(result: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
-    taker_root = stack_root / "LIGHTER_ASTER_TAKER_ARB"
-    xemm_root = stack_root / "XEMM_LIGHTER_ASTER"
+    bot_root = stack_root / "LIGHTER_ASTER_BOT"
     parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
     parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
@@ -509,13 +508,13 @@ def parse_args() -> argparse.Namespace:
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:
-        args.taker_trades = taker_root / f"runs/trades_{args.market}.jsonl"
+        args.taker_trades = bot_root / f"runs/trades_{args.market}.jsonl"
     if args.xemm_runs_dir is None:
         args.xemm_runs_dir = []
     if not explicit_xemm_journals and not explicit_xemm_runs_dirs:
         args.xemm_journal = [
             stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl",
-            xemm_root / f"runs/live-{args.market.lower()}-lighter-journal.jsonl",
+            bot_root / f"runs/live-{args.market.lower()}-lighter-journal.jsonl",
         ]
         args.xemm_journal_selection = "default_production_journals"
         args.require_xemm_journal_paths = False
