@@ -23,6 +23,17 @@ def optional_decimal(raw: Any) -> Decimal | None:
     except (InvalidOperation, ValueError):
         return None
 
+def parse_timestamp(value: Any) -> datetime | None:
+    """ISO-8601 text as aware UTC. Rust writes nanosecond fractions, which Python < 3.11
+    rejects, so they are trimmed to microseconds; naive times are UTC."""
+    if not isinstance(value, str):
+        return None
+    try:
+        at = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+(?=[+-]\d\d:\d\d$)", r"\1", value.strip().replace("Z", "+00:00")))
+    except ValueError:
+        return None
+    return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+
 def event_time(row: dict[str, Any]) -> datetime | None:
     detail = row.get("detail")
     for obj in ([detail, row] if isinstance(detail, dict) else [row]):
@@ -35,14 +46,9 @@ def event_time(row: dict[str, Any]) -> datetime | None:
                 except (OverflowError, ValueError):
                     pass
         for name in ("timestamp", "ts", "time", "created_at"):
-            value = obj.get(name)
-            if isinstance(value, str):
-                try:
-                    value = re.sub(r"(\.\d{6})\d+(?=[+-]\d\d:\d\d$)", r"\1", value.replace("Z", "+00:00"))
-                    at = datetime.fromisoformat(value)
-                    return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
-                except ValueError:
-                    pass
+            at = parse_timestamp(obj.get(name))
+            if at is not None:
+                return at
     return None
 
 def venue_name(raw: Any) -> str:
@@ -53,7 +59,9 @@ def fill_fee(detail: dict[str, Any], *, trusted: bool) -> Decimal | None:
     notional = optional_decimal(detail.get("notional_usd", detail.get("usd_amount")))
     ticks = optional_decimal(detail.get("fee_ticks"))
     if detail.get("fee_ticks") is not None:
-        if notional is None or ticks is None or not isinstance(detail.get("maker"), bool) or detail.get("fee_complete") is False:
+        # An explicit null fee_usd next to a rate is the bot marking contradictory evidence.
+        if (notional is None or ticks is None or not isinstance(detail.get("maker"), bool)
+                or detail.get("fee_complete") is False or ("fee_usd" in detail and detail["fee_usd"] is None)):
             return None
         # Native selected rate/notional can repair an older derived fee_usd field.
         return abs(notional) * ticks / Decimal(1_000_000)

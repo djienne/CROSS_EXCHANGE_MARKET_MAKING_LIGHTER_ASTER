@@ -1648,7 +1648,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         // No await between this final in-memory validation and starting the execution epoch.
         let final_now = Utc::now();
         let final_account = *account_rx.borrow();
-        let (final_aster, final_lighter) = fetch_books(&spec, &aster_books, &lighter)?;
+        // A feed reset between the two reads is a skip, like the first read, not a process exit.
+        let Ok((final_aster, final_lighter)) = fetch_books(&spec, &aster_books, &lighter) else {
+            wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
+            continue;
+        };
         if !execution_lease_enabled(&mut lease_cache, &options, &spec, final_now).0
             || !lighter.tx_ready() || !entry_gate.healthy() || !execution_journal.healthy() || !reduce_signal_tracker.healthy() || session.unresolved()
             || !Arc::ptr_eq(&final_aster, &aster_book) || !Arc::ptr_eq(&final_lighter, &lighter_book)
@@ -1836,11 +1840,13 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions) 
         finish_execution(&execution_epoch);
         match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
             Ok(snapshot) if snapshot.aster_open_orders == 0 && snapshot.lighter_open_orders == 0 => {
-                let (a_book, l_book) = fetch_books(&spec, &aster_books, &lighter)?;
-                if net_mismatch_notional(snapshot.position, &a_book, &l_book)
-                    .is_some_and(|amount| amount <= cfg.risk.max_position_mismatch_usd) {
-                    session.clear_verified().await
-                } else { Err(anyhow::anyhow!("shutdown position mismatch; session remains armed")) }
+                // Book errors join the shutdown result so they cannot mask `run_result`.
+                match fetch_books(&spec, &aster_books, &lighter) {
+                    Ok((a_book, l_book)) if net_mismatch_notional(snapshot.position, &a_book, &l_book)
+                        .is_some_and(|amount| amount <= cfg.risk.max_position_mismatch_usd) => session.clear_verified().await,
+                    Ok(_) => Err(anyhow::anyhow!("shutdown position mismatch; session remains armed")),
+                    Err(error) => Err(anyhow::anyhow!("shutdown books unavailable ({error:#}); session remains armed")),
+                }
             }
             _ => Err(anyhow::anyhow!("shutdown account/orders unverified; session remains armed")),
         }
@@ -2725,9 +2731,10 @@ async fn execute_opportunity(
 fn zero_fill_summary() -> FillSummary { FillSummary::zero() }
 
 
-/// Ledger row for a recovery/auto-flatten that took action: books the estimated realized
-/// loss into cumulative PnL so the loss breaker cannot develop blind spots (previously
-/// recovery losses only fed the coarse hourly recovered-loss limiter, never the ledger).
+/// Ledger row for a recovery: books the conservative equity-delta estimate into cumulative
+/// PnL so the loss breaker cannot develop blind spots. The rescue path books it even when no
+/// close was needed, because that execution's own economics were unavailable; auto-flatten
+/// books it only after acting. Only acting recoveries feed the hourly recovered-loss limiter.
 fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedgerRow {
     let loss = recovery.estimated_loss_usdc;
     let timestamp = Utc::now();
@@ -3269,10 +3276,9 @@ async fn recover_if_needed(
             let l_mark = l_book.mid().context("recovery Lighter mark unavailable")?;
             anyhow::ensure!(mark > Decimal::ZERO && l_mark > Decimal::ZERO
                 && !a_book.is_crossed() && !l_book.is_crossed(), "invalid recovery books");
+            // Recovery removes the unhedged residual only; the hedged inventory stays open.
             let balanced = position.net_qty().abs() * mark <= cfg.risk.max_position_mismatch_usd;
-            let flat = position.aster_qty.abs() * mark <= cfg.risk.max_position_mismatch_usd
-                && position.lighter_qty.abs() * l_mark <= cfg.risk.max_position_mismatch_usd;
-            if balanced && (!action_taken || flat) {
+            if balanced {
                 let (a_open, l_open, margins) = tokio::join!(aster.open_orders(&spec.market_id),
                     lighter.rest_open_orders_count(&spec.market_id), reconcile_margins(aster, lighter));
                 anyhow::ensure!(a_open?.is_empty() && l_open? == 0, "recovery has unverified/live open orders");
@@ -3282,11 +3288,9 @@ async fn recover_if_needed(
                     margin_after: margins, estimated_loss_usdc: estimated_recovery_loss(margin_before, margins),
                     aster_open_orders: 0, lighter_open_orders: 0 });
             }
-            anyhow::ensure!(attempt < 3, "recovery still nonflat after three close attempts");
-            let a_qty = floor_to_step(position.aster_qty.abs(), spec.step);
-            let l_qty = floor_to_step(position.lighter_qty.abs(), spec.lighter_qty_step);
-            let a_side = if position.aster_qty > Decimal::ZERO { Side::Sell } else { Side::Buy };
-            let l_side = if position.lighter_qty > Decimal::ZERO { Side::Sell } else { Side::Buy };
+            anyhow::ensure!(attempt < 3, "recovery residual remains after three close attempts");
+            let (side, a_qty, l_qty) = residual_close_qtys(position, spec.step, spec.lighter_qty_step);
+            let (a_side, l_side) = (side, side);
             in_flight = true;
             let (a_result, l_result) = tokio::join!(
                 async { if a_qty > Decimal::ZERO {
@@ -3370,6 +3374,24 @@ fn estimated_recovery_loss(before: MarginSnapshot, after: MarginSnapshot) -> Dec
         }
     };
     delta.max(Decimal::ZERO)
+}
+
+/// Reduce-only quantities that close a net cross-venue residual without touching the hedged
+/// inventory. Only a venue holding the residual's sign can reduce it: Aster first (as in the
+/// XEMM correction), Lighter takes any remainder; each is floored to its step, so a sub-step
+/// remainder stays as dust inside the mismatch tolerance. Temporary twin of XEMM's
+/// `dispatch_correction` sizing until the venue layers merge.
+fn residual_close_qtys(position: PositionSnapshot, aster_step: Decimal, lighter_step: Decimal) -> (Side, Decimal, Decimal) {
+    let net = position.net_qty();
+    let side = if net > Decimal::ZERO { Side::Sell } else { Side::Buy };
+    let same_sign = |qty: Decimal| qty != Decimal::ZERO && (qty > Decimal::ZERO) == (net > Decimal::ZERO);
+    let a_qty = if same_sign(position.aster_qty) {
+        floor_to_step(net.abs().min(position.aster_qty.abs()), aster_step)
+    } else { Decimal::ZERO };
+    let l_qty = if same_sign(position.lighter_qty) {
+        floor_to_step((net.abs() - a_qty).min(position.lighter_qty.abs()), lighter_step)
+    } else { Decimal::ZERO };
+    (side, a_qty, l_qty)
 }
 
 /// Marketable IOC price bound for an emergency reduce-only close: cross the spread by
@@ -4329,6 +4351,21 @@ mod tests {
         let before = margin_snapshot(dec!(100), dec!(100), Some(dec!(150)), Some(dec!(150)));
         let after = margin_snapshot(dec!(90), dec!(90), Some(dec!(160)), Some(dec!(150)));
         assert_eq!(estimated_recovery_loss(before, after), Decimal::ZERO);
+    }
+
+    #[test]
+    fn recovery_closes_only_the_residual_and_keeps_hedged_inventory() {
+        let pos = |aster_qty, lighter_qty| PositionSnapshot { aster_qty, lighter_qty };
+        let plan = |aster, lighter| residual_close_qtys(pos(aster, lighter), dec!(0.01), dec!(0.01));
+        // Hedged 4 HYPE plus a naked 0.5 Aster short: buy back 0.5 on Aster only.
+        assert_eq!(plan(dec!(-4.5), dec!(4)), (Side::Buy, dec!(0.5), dec!(0)));
+        // The naked leg is on Lighter: sell 0.5 there; Aster's opposite-sign short is untouched.
+        assert_eq!(plan(dec!(-4), dec!(4.5)), (Side::Sell, dec!(0), dec!(0.5)));
+        // Both venues hold the residual's sign: Aster first, Lighter takes the remainder.
+        assert_eq!(plan(dec!(0.3), dec!(0.2)), (Side::Sell, dec!(0.3), dec!(0.2)));
+        // Sub-step remainders stay as dust instead of rounding up past the residual.
+        assert_eq!(plan(dec!(-4.505), dec!(4)), (Side::Buy, dec!(0.5), dec!(0)));
+        assert_eq!(plan(dec!(1), dec!(-1)), (Side::Buy, dec!(0), dec!(0)));
     }
 
     #[test]

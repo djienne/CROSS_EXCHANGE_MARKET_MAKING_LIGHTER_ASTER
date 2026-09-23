@@ -187,8 +187,10 @@ fn fee(detail: &Value, trusted: bool) -> Option<Decimal> {
     let notional = amount(detail.get("notional_usd").or_else(|| detail.get("usd_amount")));
     let ticks = amount(detail.get("fee_ticks"));
     if detail.get("fee_ticks").is_some_and(|value| !value.is_null()) {
+        // An explicit null fee_usd next to a rate is the bot marking contradictory evidence.
         if !detail.get("maker").is_some_and(Value::is_boolean)
-            || detail.get("fee_complete").and_then(Value::as_bool) == Some(false) { return None; }
+            || detail.get("fee_complete").and_then(Value::as_bool) == Some(false)
+            || detail.get("fee_usd").is_some_and(Value::is_null) { return None; }
         return notional?.abs().checked_mul(ticks?)?.checked_div(Decimal::from(1_000_000));
     }
     if trusted && detail.get("fee_complete").and_then(Value::as_bool).unwrap_or(true) {
@@ -503,7 +505,8 @@ mod tests {
         let native = serde_json::json!({"notional_usd":"1000","fee_ticks":"280","maker":false,"fee_usd":"0.00028"});
         assert_eq!(fee(&native, false), Some("0.28".parse().unwrap()));
         for replacement in [serde_json::json!({"fee_ticks":"NaN"}), serde_json::json!({"maker":null}),
-            serde_json::json!({"notional_usd":null}), serde_json::json!({"fee_complete":false})] {
+            serde_json::json!({"notional_usd":null}), serde_json::json!({"fee_complete":false}),
+            serde_json::json!({"fee_usd":null})] {
             let mut invalid = native.clone();
             invalid.as_object_mut().unwrap().extend(replacement.as_object().unwrap().clone());
             assert_eq!(fee(&invalid, true), None, "{invalid}");

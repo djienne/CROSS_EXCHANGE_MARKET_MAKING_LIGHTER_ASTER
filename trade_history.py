@@ -832,6 +832,11 @@ def report_from_db(conn: sqlite3.Connection, *, market: str, since: datetime, no
     for b in buckets.values():
         for name,value in b.items():
             if name!="strategy": total[name]+=value
+    # Untimestamped rows cannot be placed inside or outside any window: they keep every
+    # window incomplete instead of silently vanishing from it.
+    total["untimestamped_trades"]=conn.execute(
+        "SELECT COUNT(*) FROM strategy_trades WHERE market=? AND timestamp_us IS NULL",(market,)).fetchone()[0]
+    total["incomplete_trades"]+=total["untimestamped_trades"]
     source_errors=[r[0] for r in conn.execute("SELECT last_error FROM sync_state WHERE market=? AND last_error IS NOT NULL",(market,))]
     for b in [*buckets.values(),total]:
         if b["incomplete_trades"] or (b is total and source_errors):

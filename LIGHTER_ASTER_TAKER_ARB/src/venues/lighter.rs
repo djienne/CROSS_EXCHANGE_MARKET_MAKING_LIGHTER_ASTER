@@ -29,6 +29,7 @@ use crate::markets::MarketSpec;
 use crate::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side, TxSendStatus};
 
 const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
+const MAX_ORDER_HISTORY_PAGES: usize = 64;
 static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
 /// Millisecond in which the 7-bit client-order counter last wrapped (see the wrap guard in
 /// `random_client_order_index`).
@@ -717,8 +718,9 @@ impl LighterBook {
             self.asks.clear();
             self.initialized = true;
         }
-        apply_levels(&mut self.bids, &msg.order_book.bids);
-        apply_levels(&mut self.asks, &msg.order_book.asks);
+        if !apply_levels(&mut self.bids, &msg.order_book.bids) || !apply_levels(&mut self.asks, &msg.order_book.asks) {
+            return false; // the caller resets and resubscribes; nothing was published
+        }
         self.updated_at = Some(Utc::now());
         self.source_at = msg.source_time_ms().and_then(DateTime::from_timestamp_millis);
         self.engine_at = msg.engine_time_ms().and_then(DateTime::from_timestamp_millis);
@@ -1321,7 +1323,9 @@ impl LighterVenue {
                 if terminal.is_none() {
                     let mut cursor: Option<String> = None;
                     let mut cursors = HashSet::new();
-                    loop {
+                    // Our IOC is among the newest rows; the cap stops a lagging history from
+                    // walking the shared account's whole past every 250 ms (XEMM uses 64 too).
+                    for _ in 0..MAX_ORDER_HISTORY_PAGES {
                         let page = self.rest.account_inactive_orders(self.account_index, market_index,
                             &auth, cursor.as_deref()).await?;
                         let rows = page.get("orders").and_then(serde_json::Value::as_array)
@@ -1711,13 +1715,12 @@ fn remote_order_filled_qty(order: &RemoteOrder) -> Option<Decimal> {
         .filter(|qty| *qty >= Decimal::ZERO)
 }
 
-fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'_>]) {
+/// `false` when any level is unparseable: skipping it would leave a stale level in the book,
+/// so the frame is a gap (reset + fresh snapshot), as in the XEMM hedge worker.
+fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'_>]) -> bool {
     for level in levels {
-        let Some(px) = level.price.parse::<Decimal>().ok() else {
-            continue;
-        };
-        let Some(qty) = level.size.parse::<Decimal>().ok() else {
-            continue;
+        let (Ok(px), Ok(qty)) = (level.price.parse::<Decimal>(), level.size.parse::<Decimal>()) else {
+            return false;
         };
         if px <= Decimal::ZERO {
             continue;
@@ -1728,6 +1731,7 @@ fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'
             side.insert(px, qty);
         }
     }
+    true
 }
 
 fn signed_position_payload_dec(p: &crate::lighter::messages::PositionPayload) -> Decimal {
@@ -1777,12 +1781,18 @@ fn fill_identity(trade: &TradePayload) -> Option<u128> {
     trade.trade_id.filter(|id| *id >= 0).map(|id| id as u128)
 }
 
+/// A fill's selected fee is a signed rate in millionths of USD notional. Lighter serializes
+/// both fee fields `omitempty`, so omission means zero; explicit null/malformed stays unknown.
+/// Every Lighter order this bot sends is IOC, so its own side is the taker: a missing
+/// `is_maker_ask` selects the taker fee, and a fill flagged maker is contradictory evidence
+/// whose fee stays unknown (the same rule as the XEMM hedge worker).
 fn trade_fee_evidence(trade: &TradePayload, side: Side, client: i64, notional: Decimal, source: &str) -> FeeEvidence {
-    let maker = trade.is_maker_ask.map(|ask| match side { Side::Sell=>ask, Side::Buy=>!ask });
-    let rate = maker.and_then(|maker| value_dec(if maker { trade.maker_fee.as_ref() } else { trade.taker_fee.as_ref() }));
+    let maker = trade.is_maker_ask.map(|ask| match side { Side::Sell=>ask, Side::Buy=>!ask }).unwrap_or(false);
+    let selected = if maker { trade.maker_fee.as_ref() } else { trade.taker_fee.as_ref() };
+    let rate = match selected { None => Some(Decimal::ZERO), Some(value) => value_dec(Some(value)) };
     FeeEvidence { trade_id:trade.trade_id, order_id:match side {Side::Sell=>trade.ask_id,Side::Buy=>trade.bid_id},
-        client_order_index:client,maker,notional_usd:notional,fee_ticks:rate,
-        fee_usd:rate.map(|rate|notional*rate/Decimal::from(1_000_000)),
+        client_order_index:client,maker:Some(maker),notional_usd:notional,fee_ticks:rate,
+        fee_usd:if maker { None } else { rate.map(|rate|notional*rate/Decimal::from(1_000_000)) },
         event_time_ms:trade.event_time_ms(),source:source.to_string() }
 }
 
@@ -1914,6 +1924,24 @@ mod tests {
         let out = book.to_order_book().unwrap();
         assert!(out.best_bid().is_none());
         assert_eq!(out.best_ask().unwrap().px, Decimal::new(1005, 2));
+    }
+
+    #[test]
+    fn lighter_book_treats_unparseable_level_as_gap() {
+        let initial: OrderBookMsgRef<'_> = serde_json::from_str(
+            r#"{"type":"subscribed/order_book","order_book":{"nonce":100,
+                "bids":[{"price":"10.00","size":"2.50"}],"asks":[{"price":"10.10","size":"1.25"}]}}"#,
+        )
+        .unwrap();
+        // Contiguous delta whose removal of the 10.00 bid cannot be parsed.
+        let bad_size: OrderBookMsgRef<'_> = serde_json::from_str(
+            r#"{"type":"update/order_book","order_book":{"begin_nonce":100,"nonce":101,
+                "bids":[{"price":"10.00","size":""}],"asks":[]}}"#,
+        )
+        .unwrap();
+        let mut book = LighterBook::default();
+        assert!(book.apply(&initial));
+        assert!(!book.apply(&bad_size), "a skipped level would leave the stale 10.00 bid live");
     }
 
     #[test]
@@ -2411,18 +2439,26 @@ mod tests {
         let trade = TradePayload { is_maker_ask: Some(true),
             maker_fee: Some(serde_json::json!(-25)), taker_fee: Some(serde_json::json!(200)),
             ..Default::default() };
-        assert_eq!(trade_fee_evidence(&trade, Side::Buy, 11, dec!(1000), "fixture").fee_usd, Some(dec!(0.2)));
-        assert_eq!(trade_fee_evidence(&trade, Side::Buy, 11, dec!(10), "fixture").fee_usd, Some(dec!(0.002)));
-        assert_eq!(trade_fee_evidence(&trade, Side::Sell, 11, dec!(1000), "fixture").fee_usd, Some(dec!(-0.025)));
-        let mut unknown = trade.clone();
-        unknown.taker_fee = None;
-        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
-        unknown.taker_fee = Some(serde_json::Value::Null);
-        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
-        unknown.taker_fee = Some(serde_json::json!(0));
-        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, Some(dec!(0)));
-        unknown.is_maker_ask = None;
-        assert_eq!(trade_fee_evidence(&unknown, Side::Buy, 11, dec!(1000), "fixture").fee_usd, None);
+        let fee = |trade: &TradePayload, side, notional| trade_fee_evidence(trade, side, 11, notional, "fixture").fee_usd;
+        assert_eq!(fee(&trade, Side::Buy, dec!(1000)), Some(dec!(0.2)));
+        assert_eq!(fee(&trade, Side::Buy, dec!(10)), Some(dec!(0.002)));
+        // Our IOC flagged as the maker contradicts its provenance: keep the fill, not the fee.
+        let contradictory = trade_fee_evidence(&trade, Side::Sell, 11, dec!(1000), "fixture");
+        assert_eq!((contradictory.maker, contradictory.fee_usd), (Some(true), None));
+        let mut taker = trade.clone();
+        // Lighter omits a zero fee (`omitempty`): omission is a confirmed zero, not unknown.
+        taker.taker_fee = None;
+        assert_eq!(fee(&taker, Side::Buy, dec!(1000)), Some(dec!(0)));
+        taker.taker_fee = Some(serde_json::Value::Null);
+        assert_eq!(fee(&taker, Side::Buy, dec!(1000)), None);
+        taker.taker_fee = Some(serde_json::json!("bad"));
+        assert_eq!(fee(&taker, Side::Buy, dec!(1000)), None);
+        taker.taker_fee = Some(serde_json::json!(0));
+        assert_eq!(fee(&taker, Side::Buy, dec!(1000)), Some(dec!(0)));
+        // A missing role flag on our own IOC selects the taker fee.
+        taker.is_maker_ask = None;
+        taker.taker_fee = Some(serde_json::json!(40));
+        assert_eq!(fee(&taker, Side::Sell, dec!(1000)), Some(dec!(0.04)));
     }
 
     #[tokio::test(start_paused = true)]

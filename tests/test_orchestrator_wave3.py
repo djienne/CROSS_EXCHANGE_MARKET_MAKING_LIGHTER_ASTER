@@ -404,5 +404,35 @@ class XemmCorrectionTests(unittest.TestCase):
             self.assertEqual(Decimal("0.30"), replayed.net_total)
 
 
+class ReduceSignalConsumptionTests(unittest.TestCase):
+    def test_each_reduce_burst_promotes_at_most_once(self) -> None:
+        import json
+        from datetime import timedelta
+
+        with tempfile.TemporaryDirectory() as tmp:
+            signal = Path(tmp) / "arb_reduce_signal_HYPE.json"
+            orch = make_orch(Path(tmp), live=True, arb_signal_file=signal,
+                             reduce_burst_min_samples=3, reduce_signal_fresh_ms=60_000)
+            orch.check_child_exits = lambda: None
+            promoted = []
+            orch.activate_reduce_arb = lambda row: promoted.append(row["timestamp"])
+
+            def burst(at) -> None:
+                signal.write_text(json.dumps({"status": "confirmed", "market": "HYPE", "samples": 3,
+                                              "timestamp": iso(at)}), encoding="utf-8")
+
+            first = utc_now() - timedelta(seconds=1)  # both bursts in the past: future ones are rejected
+            burst(first)
+            orch.active_bot = XEMM_BOT
+            orch.fast_tick()
+            # The lease capped and XEMM resumed while the file still holds that burst.
+            orch.active_bot = XEMM_BOT
+            orch.fast_tick()
+            self.assertEqual(1, len(promoted))
+            burst(first + timedelta(milliseconds=5))
+            orch.fast_tick()
+            self.assertEqual(2, len(promoted))
+
+
 if __name__ == "__main__":
     unittest.main()

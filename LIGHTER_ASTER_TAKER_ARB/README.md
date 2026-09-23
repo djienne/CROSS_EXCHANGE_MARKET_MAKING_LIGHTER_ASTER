@@ -97,7 +97,8 @@ Version 2 trade rows contain `economic_status`, `execution_id`, `source_event_id
 and fee provenance. Lighter fees are computed per fill as
 `notional_usd * own_role_fee_ticks / 1_000_000`, preserving rebates. Individual
 `lighter_fee_evidence` records retain rate, notional, role, trade/order identity,
-and available event time. Missing/null selected fees remain unknown.
+and available event time. Lighter omits zero fees, so an omitted selected fee is
+zero; an explicit null or malformed fee, or an IOC fill flagged as maker, stays unknown.
 
 Ordinary `actual_net_usd` records matched spread capture minus fees, not realized
 account PnL for open inventory. Recovery rows are labeled conservative equity-delta

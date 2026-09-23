@@ -215,10 +215,21 @@ class EconomicContractTests(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_rust_nanosecond_and_naive_timestamps_parse_as_utc(self):
+        from datetime import datetime, timezone
+        expected=datetime(2026,9,23,12,0,0,123456,tzinfo=timezone.utc)
+        for raw in ["2026-09-23T12:00:00.123456789Z","2026-09-23T14:00:00.123456789+02:00","2026-09-23T12:00:00.123456"]:
+            with self.subTest(raw=raw):
+                self.assertEqual(economics.parse_timestamp(raw),expected)
+        self.assertIsNone(economics.parse_timestamp("not a time"))
+        self.assertIsNone(economics.parse_timestamp(None))
+        with self.assertRaises(ValueError):
+            combined_pnl.parse_dt("not a time")
+
     def test_malformed_rate_or_role_evidence_remains_unknown(self):
         base={"notional_usd":"100","maker":False,"fee_ticks":"280","fee_usd":"0.028"}
         self.assertEqual(economics.fill_fee(base,trusted=True),Decimal("0.028"))
-        for changed in [{"fee_ticks":"bad"},{"maker":"false"},{"fee_complete":False}]:
+        for changed in [{"fee_ticks":"bad"},{"maker":"false"},{"fee_complete":False},{"fee_usd":None}]:
             with self.subTest(changed=changed):
                 self.assertIsNone(economics.fill_fee({**base,**changed},trusted=True))
 

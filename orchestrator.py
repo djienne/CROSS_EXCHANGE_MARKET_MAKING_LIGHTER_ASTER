@@ -17,7 +17,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from economics import optional_decimal, event_time
+from economics import optional_decimal, event_time, parse_timestamp
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -670,15 +670,7 @@ class TradeTracker:
 
     @staticmethod
     def parse_ts(value: Any) -> datetime | None:
-        if not value:
-            return None
-        raw = str(value)
-        if raw.endswith("Z"):
-            raw = raw[:-1] + "+00:00"
-        try:
-            return datetime.fromisoformat(raw).astimezone(timezone.utc)
-        except ValueError:
-            return None
+        return parse_timestamp(value)
 
 
 class PnlTracker:
@@ -1024,8 +1016,10 @@ class Orchestrator:
             return
         signal_row = self.read_reduce_signal()
         if signal_row and self.active_bot == TAKER_BOT and self.active_taker_mode == "reduce":
+            self.last_reduce_signal_at = signal_row["signal_at"]
             self.extend_reduce_lease("fresh_reduce_signal", signal_row)
         if signal_row and self.active_bot == XEMM_BOT:
+            self.last_reduce_signal_at = signal_row["signal_at"]
             self.activate_reduce_arb(signal_row)
 
     def read_reduce_signal(self) -> dict[str, Any] | None:
@@ -1046,10 +1040,15 @@ class Orchestrator:
         ts = TradeTracker.parse_ts(row.get("timestamp"))
         if ts is None:
             return None
+        # Each signal is used once: the file keeps the last burst for up to the freshness
+        # window, and re-reading it after a lease cap would re-promote into a starting XEMM.
+        if self.last_reduce_signal_at is not None and ts <= self.last_reduce_signal_at:
+            return None
         age_ms = int((utc_now() - ts).total_seconds() * 1000)
         if age_ms < 0 or age_ms > self.args.reduce_signal_fresh_ms:
             return None
         row["age_ms"] = age_ms
+        row["signal_at"] = ts
         return row
 
     def activate_reduce_arb(self, signal_row: dict[str, Any]) -> None:

@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from economics import optional_decimal, xemm_journal, taker_economics
+from economics import optional_decimal, parse_timestamp, xemm_journal, taker_economics
 
 
 SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
@@ -24,16 +24,12 @@ def utc_now() -> datetime:
 
 
 def parse_dt(raw: str) -> datetime:
-    raw = raw.strip()
-    if raw.lower() == "now":
+    if raw.strip().lower() == "now":
         return utc_now()
-    if raw.endswith("Z"):
-        raw = raw[:-1] + "+00:00"
-    raw = re.sub(r"\.(\d{6})\d+(\+00:00)$", r".\1\2", raw)
-    parsed = datetime.fromisoformat(raw)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+    parsed = parse_timestamp(raw)
+    if parsed is None:
+        raise ValueError(f"invalid timestamp: {raw!r}")
+    return parsed
 
 
 def iso(dt: datetime) -> str:
@@ -120,11 +116,14 @@ def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> 
     confirmed = [r for r in normalized if r is not None and r["economic_status"] == "confirmed"]
     unknown = len(rows)-len(confirmed)
     net = sum((r["net_pnl_usdc"] for r in confirmed),Decimal(0))
+    # Recovery rows are conservative loss estimates: excluded from known net, shown on their own.
+    estimated = sum((r["net_pnl_usdc"] for r in normalized if r is not None and r["economic_status"] == "estimated"
+                     and r["net_pnl_usdc"] is not None), Decimal(0))
     return {"trades":len(rows),"path":path,
         "gross_pnl_usdc":sum_optional(confirmed,"gross_pnl_usdc") if not unknown else None,
         "fees_usdc":sum_optional(confirmed,"fees_usdc") if not unknown else None,
         "net_pnl_usdc":net if not unknown else None,
-        "known_net_pnl_usdc":net,"incomplete_trades":unknown}
+        "known_net_pnl_usdc":net,"estimated_net_pnl_usdc":estimated,"incomplete_trades":unknown}
 
 
 def parse_xemm_fee_bps(config_path: Path) -> tuple[Decimal, Decimal]:
@@ -346,6 +345,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "trades": taker["trades"] + xemm["trades"],
         "incomplete_trades": taker["incomplete_trades"] + xemm["incomplete_trades"],
         "known_net_pnl_usdc": taker["known_net_pnl_usdc"] + xemm["known_net_pnl_usdc"],
+        "estimated_net_pnl_usdc": taker["estimated_net_pnl_usdc"],
         "gross_pnl_usdc": sum_optional([taker,xemm], "gross_pnl_usdc"),
         "fees_usdc": sum_optional([taker,xemm], "fees_usdc"),
         "net_pnl_usdc": sum_optional([taker,xemm], "net_pnl_usdc"),
@@ -361,6 +361,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     notes = [
         "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
+        "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
         "By default XEMM includes only production live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
     ]
     if xemm["untimestamped_trades"]:
@@ -469,7 +470,9 @@ def print_human(result: dict[str, Any]) -> None:
         right_align={1, 2, 3, 4, 5},
     )
     print()
-    print(f"Known net subtotal: {fmt_money(result['total']['known_net_pnl_usdc'])}; incomplete trades: {result['total']['incomplete_trades']}")
+    print(f"Known net subtotal: {fmt_money(result['total']['known_net_pnl_usdc'])}; "
+          f"estimated recovery net: {fmt_money(result['total']['estimated_net_pnl_usdc'])}; "
+          f"incomplete trades: {result['total']['incomplete_trades']}")
     print_table(
         "Projection",
         ["Metric", "Value"],

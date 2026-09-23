@@ -268,6 +268,26 @@ class TradeHistoryTests(unittest.TestCase):
                 )
             self.assertEqual(report["total"]["trades"], 1)
 
+    def test_untimestamped_rows_keep_every_window_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            taker_path, orch_path, db_path = root / "taker.jsonl", root / "orchestrator.jsonl", root / "history.sqlite"
+            row = {"market": "HYPE", "direction": "SELL_ASTER_BUY_LIGHTER", "qty": "1", "timestamp": "2026-01-02T00:00:00Z",
+                   "aster_order_id": 1, "lighter_client_order_index": 1,
+                   "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0"},
+                   "lighter_fill": {"qty": "1", "vwap": "99", "notional": "99", "fee_usd": "0"}}
+            write_jsonl(taker_path, [row])
+            write_jsonl(orch_path, [])
+            with self.open_db(db_path) as conn:
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                conn.execute("UPDATE strategy_trades SET timestamp_us=NULL")  # a legacy row without a time
+                report = trade_history.report_from_db(
+                    conn, market="HYPE", since=combined_pnl.parse_dt("2026-01-01T00:00:00Z"),
+                    now=combined_pnl.parse_dt("2026-01-03T00:00:00Z"), db_path=db_path)
+            self.assertEqual((report["total"]["trades"], report["total"]["untimestamped_trades"],
+                              report["total"]["incomplete_trades"]), (0, 1, 1))
+            self.assertIsNone(report["total"]["net_pnl_usdc"])
+
     def test_report_time_window_uses_normalized_timestamp_not_text_sort(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

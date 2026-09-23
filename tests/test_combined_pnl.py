@@ -175,6 +175,18 @@ class XemmSummaryTests(unittest.TestCase):
             )
         self.assertEqual(out["trades"], 1)
 
+    def test_estimated_recovery_losses_are_reported_not_hidden(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "taker.jsonl"
+            write_jsonl(path, [{"schema_version": 2, "economic_status": "estimated", "timestamp": "2026-01-02T00:00:00Z",
+                                "market": "HYPE", "direction": "RECOVERY", "aster_order_id": -1, "lighter_client_order_index": 0,
+                                "actual_gross_usd": "-0.40", "actual_fees_usd": "0", "actual_net_usd": "-0.40"}])
+            out = combined_pnl.summarize_taker(path, combined_pnl.parse_dt("2026-01-01T00:00:00Z"),
+                                               combined_pnl.parse_dt("2026-01-03T00:00:00Z"), "HYPE")
+        self.assertEqual((out["known_net_pnl_usdc"], out["estimated_net_pnl_usdc"], out["incomplete_trades"]),
+                         (Decimal("0"), Decimal("-0.40"), 1))
+        self.assertIsNone(out["net_pnl_usdc"])
+
 
 if __name__ == "__main__":
     unittest.main()
