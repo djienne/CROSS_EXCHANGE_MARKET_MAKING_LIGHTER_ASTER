@@ -1,6 +1,6 @@
-//! XEMM dry-run evaluator: simulate an Aster maker quote priced backward from a
-//! Lighter taker hedge, then measure realized edge under latency, queue
-//! position, and partial-fill accumulation. See `docs/DESIGN.md`.
+//! Aster maker / Lighter taker XEMM bot and its research core. The `livebot` quotes on
+//! Aster and hedges fills on Lighter; `record`/`replay`/`report` simulate the same quotes
+//! offline to measure realized edge under latency, queue position and partial fills.
 
 pub mod book;
 pub mod cli;
@@ -13,17 +13,17 @@ pub mod fill_sweep;
 pub mod hedge;
 pub mod hot_types;
 /// Lock-free real-time substrate (latest-book cell, stream watchdog, execution
-/// seam) — the foundation for a future live trading bot. Never on the deterministic
-/// record/replay path. Compiled out under `--no-default-features`.
+/// seam) used by the `livebot`. Never on the deterministic record/replay path.
+/// Compiled out under `--no-default-features`.
 #[cfg(feature = "hotpath")]
 pub mod hotpath;
 pub mod inventory;
 pub mod lighter;
-/// The trading bot (the `livebot` command) — the four-plane execution architecture from
-/// `docs/UPDATE_PLAN.md`, with two modes: `paper` (all pairs, dry-run — records the market
-/// tape + persists results) and `live` (single pair, real money; hard-gated behind explicit
-/// opt-in + a wired/testnet-verified signer). Requires `hotpath` (lock-free ingest
-/// substrate). The deterministic research core (`record`/`replay`/`report`) does not.
+/// The trading bot (the `livebot` command), with two modes: `paper` (the selected markets,
+/// simulated executor, NO real orders; records the market tape + persists results) and
+/// `live` (one market, real money; hard-gated behind `[live] enabled`, `--mode live` and the
+/// real signers). Requires `hotpath` (lock-free ingest substrate). The deterministic research
+/// core (`record`/`replay`/`report`) does not.
 #[cfg(feature = "hotpath")]
 pub mod livebot;
 pub mod markets;

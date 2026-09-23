@@ -5,7 +5,7 @@ edition = "2021"
 # Keep the supported compiler aligned with the container and release checks.
 rust-version = "1.92"
 default-run = "xemm_lighter_aster"
-description = "XEMM Aster<->Lighter maker/taker dry-run evaluator"
+description = "XEMM Aster maker / Lighter taker bot and research tools"
 
 [lib]
 name = "xemm_lighter_aster"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [features]
 # `hotpath` is the lock-free real-time substrate (latest-book cell, stream
-# watchdog, execution seam) used by `live` and a future real bot. It is default-on
+# watchdog, execution seam) used by the `livebot`. It is default-on
 # but `record`/`replay` never touch it, so the deterministic core builds and runs
 # bit-identically under `--no-default-features`.
 default = ["hotpath"]
@@ -73,8 +73,8 @@ arc-swap = { version = "1", optional = true }
 tokio-util = { version = "0.7", optional = true }
 core_affinity = { version = "0.8", optional = true }
 # --- live signing (optional, pulled in by `hotpath`) ---
-# secp256k1 ECDSA with recoverable signatures (EIP-712 'v'); keccak256;
-# msgpack for legacy hedge signing tests/helpers; hex for r/s serialization.
+# secp256k1 ECDSA with recoverable signatures (EIP-712 'v'); keccak256; hex for r/s
+# serialization; fs2 + memmap2 for the cross-process Aster nonce counter.
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 tiny-keccak = { version = "2", features = ["keccak"], optional = true }
 hex = { version = "0.4", optional = true }

@@ -1,11 +1,10 @@
-//! Live primitive probes (plan §8). `xemm_eval probe <check>` exercises one venue action in
+//! Live primitive probes. `xemm_lighter_aster probe <check>` exercises one venue action in
 //! isolation with the REAL signers, printing action / round-trip latency / resulting state and
 //! self-cleaning any order it opens. No-risk checks (balance, far-from-mid post-only place +
 //! cancel) run freely; money-risking checks (`lighter-market`) require `--i-understand-live` and a
 //! `--max-usd` cap they refuse to exceed.
 //!
-//! These are the Phase 2–4 gates: they prove every primitive works live before the integrated
-//! bot wires them together.
+//! Each probe proves one primitive works live in isolation.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -95,7 +94,7 @@ async fn resolve(cfg: &Config, target: &str) -> Result<(Vec<MarketCfg>, Vec<Mark
     Ok((markets, specs))
 }
 
-/// Entry point for `xemm_eval probe <check>`.
+/// Entry point for `xemm_lighter_aster probe <check>`.
 pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand_live: bool, max_usd: Decimal) -> Result<()> {
     let target = target.unwrap_or_else(|| "HYPE".into());
     match check {

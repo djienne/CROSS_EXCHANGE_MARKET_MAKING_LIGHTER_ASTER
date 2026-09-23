@@ -1,4 +1,4 @@
-//! Aster user-data stream (plan §4.1, §6): the low-latency maker-fill signal. Manages the
+//! Aster user-data stream: the low-latency maker-fill signal. Manages the
 //! listenKey lifecycle (POST create / PUT keepalive / DELETE only on graceful shutdown, with
 //! the documented gotchas: no PUT right after POST; reuse-not-recreate on reconnect), connects
 //! the WS, parses `ORDER_TRADE_UPDATE` fills into [`AsterFill`]s, and forwards them to the
@@ -129,7 +129,7 @@ impl Backoff {
 }
 
 /// Shared monotonic timestamp (ns) of the last user-stream message — the strategy/watchdog can
-/// read this to gate quoting on stream liveness (plan §6 `max_user_stream_staleness_ms`).
+/// read this to gate quoting on stream liveness.
 #[derive(Debug, Default)]
 pub struct StreamLiveness {
     last_ns: AtomicI64,

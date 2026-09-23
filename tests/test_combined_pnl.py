@@ -25,8 +25,6 @@ class XemmSummaryTests(unittest.TestCase):
         *,
         since: str = "2026-01-01T00:00:00Z",
         now: str = "2026-01-03T00:00:00Z",
-        aster_fee_rate: Decimal = Decimal("0"),
-        lighter_fee_rate: Decimal = Decimal("0"),
         include_untimestamped: bool = False,
         current_schema: bool = True,
     ) -> dict:
@@ -55,8 +53,6 @@ class XemmSummaryTests(unittest.TestCase):
             return combined_pnl.summarize_xemm_journal(
                 path,
                 "HYPE",
-                aster_fee_rate,
-                lighter_fee_rate,
                 combined_pnl.parse_dt(since),
                 combined_pnl.parse_dt(now),
                 include_untimestamped,
@@ -75,24 +71,13 @@ class XemmSummaryTests(unittest.TestCase):
         self.assertEqual(out["lighter_fees_usdc"], Decimal("0.3"))
         self.assertEqual(out["net_pnl_usdc"], Decimal("1.7"))
 
-    def test_actual_lighter_fee_is_not_double_counted_with_configured_rate(self) -> None:
-        rows = [
-            {"timestamp": "2026-01-02T00:00:00Z", "kind": "fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
-            {"timestamp": "2026-01-02T00:00:01Z", "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "px": "99", "fee_usd": "0.1"}},
-        ]
-        out = self.summarize(rows, lighter_fee_rate=Decimal("0.01"))
-        self.assertEqual(out["lighter_callback_fees_usdc"], Decimal("0.1"))
-        self.assertEqual(out["lighter_config_fallback_fees_usdc"], Decimal("0"))
-        self.assertEqual(out["net_pnl_usdc"], Decimal("0.9"))
-
-    def test_missing_venue_fee_remains_unknown_despite_configured_rate(self) -> None:
+    def test_missing_venue_fee_remains_unknown(self) -> None:
         rows = [
             {"timestamp": "2026-01-02T00:00:00Z", "kind": "fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "avg_aster_px": "100"}},
             {"timestamp": "2026-01-02T00:00:01Z", "kind": "hedge_fill", "market": "HYPE", "detail": {"cloid": "a", "side": "BUY", "qty": "1", "px": "99"}},
         ]
-        out = self.summarize(rows, lighter_fee_rate=Decimal("0.01"))
-        self.assertIsNone(out["lighter_callback_fees_usdc"])
-        self.assertEqual(out["lighter_config_fallback_fees_usdc"], Decimal("0"))
+        out = self.summarize(rows)
+        self.assertIsNone(out["lighter_fees_usdc"])
         self.assertIsNone(out["net_pnl_usdc"])
 
     def test_mismatched_pair_keeps_matched_economics_and_exposes_residual(self) -> None:

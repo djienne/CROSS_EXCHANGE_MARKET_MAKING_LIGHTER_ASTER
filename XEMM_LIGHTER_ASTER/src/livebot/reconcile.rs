@@ -1,4 +1,4 @@
-//! Account/position reconciler (plan §2, §6 clean-start, §10 cold backstop). Reads both venues
+//! Account/position reconciler. Reads both venues
 //! via signed Aster REST + unsigned HL `/info` and assembles an [`AccountSnapshot`] of the REAL
 //! positions. This module only READS + PUBLISHES the truth; the strategy's `recover_orphans`
 //! (on the cold tick) is what ACTS on it — actively hedging or flattening any persistent net
@@ -245,8 +245,9 @@ impl Reconciler {
 
         // TOTAL (mark-to-market) equity per venue for the circuit breaker — NOT the free-margin
         // figures above, which drop by the locked margin when a hedge is open and would false-trip.
-        // Aster: wallet balance + Σ position unrealized PnL. HL: marginSummary.accountValue (already
-        // includes unrealized). For a delta-neutral book the unrealized legs cancel ⇒ stable equity.
+        // Aster: wallet balance + Σ position unrealized PnL. Lighter: portfolio value, which does
+        // NOT move with open-position uPnL; the marked uPnL is added below. For a delta-neutral
+        // book the unrealized legs cancel ⇒ stable equity.
         let (aster_unrealized_usd, aster_net) =
             fold_aster_position_rows(&pos, &self.aster_sym_to_market)?;
         let aster_equity_usd = aster_wallet_usd + aster_unrealized_usd;

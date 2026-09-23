@@ -20,9 +20,8 @@ use super::book_cell::{VenueBook, VenueTag};
 /// thread exits (so `join()` returns) when `shutdown` is cancelled.
 ///
 /// `core_hint` optionally pins the thread to a CPU core (index taken modulo the
-/// available cores) — only honored under the `core-pin` feature (default off); see
-/// [`maybe_pin_core`]. Wired so a future live bot flips the feature on with no code
-/// change.
+/// available cores); pinning is on whenever the default `hotpath` feature is, see
+/// [`maybe_pin_core`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_venue_thread(
     venue: VenueTag,

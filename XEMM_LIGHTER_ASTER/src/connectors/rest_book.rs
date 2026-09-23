@@ -51,7 +51,7 @@ pub async fn fetch_aster_book(
     fetch_aster_book_from_base(client, DEFAULT_ASTER_BASE_URL, symbol_upper, limit).await
 }
 
-/// Same as [`fetch_aster_book`], but against a configured REST base URL (live/testnet/custom).
+/// Same as [`fetch_aster_book`], but against a configured REST base URL.
 pub async fn fetch_aster_book_from_base(
     client: &reqwest::Client,
     base_url: &str,

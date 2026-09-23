@@ -1,5 +1,6 @@
-//! Command-line interface: subcommands `record`, `replay`, `report`, `livebot`,
-//! `live-report`, `fetch-specs`, `verify-books`, `verify-db`. The dispatcher wires each to its module.
+//! Command-line interface: subcommands `record`, `replay`, `report`, `livebot`, `live-report`,
+//! `probe`, `status`, `fetch-specs`, `verify-books`, `verify-db`. The dispatcher wires each to its
+//! module.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -9,7 +10,7 @@ use std::path::PathBuf;
 #[command(
     name = "xemm_lighter_aster",
     version,
-    about = "XEMM Aster<->Lighter maker/taker dry-run evaluator"
+    about = "XEMM Aster maker / Lighter taker bot and research tools"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -61,6 +62,8 @@ pub enum Commands {
     /// Summarize a livebot journal into logical trades and versioned execution economics.
     LiveReport {
         /// Livebot results DB; used to infer `<db-stem>-journal.jsonl` when --journal is omitted.
+        /// The default is a legacy live-run name, not `livebot`'s own `--db` default: pass the
+        /// run's actual `--db` (or `--journal`).
         #[arg(long, default_value = "runs/live-hype-lighter.sqlite")]
         db: PathBuf,
         /// Explicit journal path. Overrides --db inference.
@@ -82,13 +85,13 @@ pub enum Commands {
     },
 
 
-    /// Run the trading bot. `--mode paper` (all pairs, dry-run, NO real orders) records the
-    /// market tape + persists results. `--mode live` (single pair, real funds) is gated behind
+    /// Run the trading bot. `--mode paper` (the selected markets, NO real orders) records the
+    /// market tape + persists results. `--mode live` (one market, real funds) is gated behind
     /// `[live] enabled = true`, explicit live mode, and wired live signers.
     Livebot {
         #[arg(long, default_value = "HYPE")]
         markets: Option<String>,
-        /// Override the config's `[live] mode` (paper | live).
+        /// paper | live. Always set (default paper); the config's `[live] mode` is not used.
         #[arg(long, default_value = "paper")]
         mode: Option<String>,
         /// Optional duration in seconds; runs until Ctrl-C if omitted.
@@ -102,18 +105,18 @@ pub enum Commands {
         db: PathBuf,
     },
 
-    /// Probe a single live venue primitive (plan §8): balance / open-orders / post-only
+    /// Probe a single live venue primitive: balance / open-orders / post-only
     /// place+cancel far from mid / IOC market round-trip. No-risk checks run freely; the
     /// money-risking `lighter-market` needs `--i-understand-live --max-usd <N>`. Uses the real
     /// signers + `aster.env`/`lighter.env`.
     Probe {
-        /// Which check: aster-balance | aster-open-orders | aster-place-cancel | lighter-balance |
-        /// lighter-open-orders | lighter-order-dry-run | lighter-market
+        /// Which check: aster-balance | aster-positions | aster-open-orders | aster-place-cancel |
+        /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market
         check: String,
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
         market: Option<String>,
-        /// Required confirmation for money-risking probes (hl-market).
+        /// Required confirmation for money-risking probes (lighter-market).
         #[arg(long, default_value_t = false)]
         i_understand_live: bool,
         /// USD cap for money-risking probes.

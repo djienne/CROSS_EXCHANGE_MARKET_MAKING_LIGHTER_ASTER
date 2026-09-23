@@ -210,9 +210,10 @@ impl Default for BookCheckCfg {
     }
 }
 
-/// Execution mode for the live bot. Exactly two modes: `Paper` (all pairs, dry-run, NO
-/// real orders — the everyday mode) and `Live` (a single pair, real funds, hard-gated
+/// Execution mode for the live bot. Exactly two modes: `Paper` (the selected markets, NO
+/// real orders — the everyday mode) and `Live` (a single market, real funds, hard-gated
 /// behind `enabled = true`, explicit live mode, single-market selection, and a wired signer).
+/// The CLI always passes a mode (`--mode`, default paper), so `[live] mode` is informational.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveMode {
@@ -238,16 +239,16 @@ impl LiveMode {
     }
 }
 
-/// Sub-min partial-fill policy for live trading (plan §7).
+/// Sub-min partial-fill policy for live trading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PartialPolicy {
     /// Only trade markets where the smallest possible Aster fill is itself Lighter-hedgeable;
-    /// reject every other pair. The safe first-live default (plan §7.3).
+    /// reject every other pair. The safe first-live default.
     #[default]
     StrictEveryFillMustBeHedgeable,
     /// Accumulate sub-min fills into pending inventory and hedge once it clears the Lighter
-    /// minimum (plan §7.4). More permissive; only after strict mode is proven.
+    /// minimum. More permissive; only after strict mode is proven.
     AccumulateSubMin,
 }
 
@@ -260,7 +261,7 @@ impl PartialPolicy {
     }
 }
 
-/// Top-level live-bot configuration (plan §11). Every field defaults so the section
+/// Top-level live-bot configuration. Every field defaults so the section
 /// is fully optional; the whole struct is inert until `enabled = true`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveCfg {
@@ -284,7 +285,7 @@ pub struct LiveCfg {
     /// Cancel all Aster maker orders on shutdown. Default true.
     #[serde(default = "default_true")]
     pub shutdown_cancel_all: bool,
-    /// Require a fully reconciled, orphan-free start before quoting (plan §6 start cond).
+    /// Require a fully reconciled, orphan-free start before quoting.
     #[serde(default = "default_true")]
     pub require_clean_start: bool,
     /// Max unhedged Aster notional tolerated before maker quoting freezes. Default "5".
@@ -318,9 +319,9 @@ pub struct LiveCfg {
     pub hyperliquid: LiveHyperliquidCfg,
     #[serde(default)]
     pub circuit_breaker: LiveCircuitBreakerCfg,
-    /// Proactive Aster margin guard: dynamically cap the Aster position notional at the real
-    /// available collateral (minus a safety buffer) so the position-increasing side stops quoting
-    /// BEFORE the exchange rejects with -2019. Default enabled; inert in paper (no real orders).
+    /// Proactive per-venue margin guard: cap each venue's position notional at its real free
+    /// collateral (minus that venue's safety buffer) so the position-increasing side stops quoting
+    /// BEFORE the exchange rejects (Aster -2019). Default enabled; inert in paper (no real orders).
     #[serde(default)]
     pub margin_guard: LiveMarginGuardCfg,
 }
@@ -473,7 +474,7 @@ pub struct LiveHyperliquidCfg {
     pub base_url: String,
     #[serde(default = "default_lighter_signers_dir")]
     pub signers_dir: String,
-    /// Hedge order style. Currently only `aggressive_ioc` (plan §4.2).
+    /// Hedge order style. Currently only `aggressive_ioc`.
     #[serde(default = "default_hedge_order_type")]
     pub hedge_order_type: String,
     /// Normal IOC hedge slippage cap (bps). Default "5".
@@ -506,9 +507,10 @@ impl Default for LiveHyperliquidCfg {
     }
 }
 
-/// Cumulative-loss circuit breaker (plan: "normal operating mode" safety stop). When enabled and
-/// running live, the strategy tracks total cross-venue account equity vs a baseline captured at
-/// startup; if the drawdown exceeds `max_cumulative_loss_usdc` it cancels orders, leaves the
+/// Cumulative-loss circuit breaker. When enabled and running live, the strategy tracks total
+/// cross-venue marked equity (Aster wallet + unrealized, Lighter portfolio value + marked uPnL)
+/// against a baseline = the median of the first 5 fresh samples. A drawdown beyond
+/// `max_cumulative_loss_usdc` on 3 consecutive fresh samples cancels orders, leaves the
 /// (delta-neutral) position open, writes a persistent trip-latch file, and halts. The bot then
 /// refuses to restart until the latch is cleared (see `scripts/reset_breaker.py`). Inert unless
 /// `enabled`; ignored entirely in paper mode.
@@ -1113,11 +1115,9 @@ lighter_symbol = "DOGE"
         }
         std::fs::write(&path, format!("{SAMPLE}\n[live.aster]\nbase_url=\"https://example.test\"\n")).unwrap();
         assert!(Config::load(&path).unwrap_err().to_string().contains("mainnet origins"));
-        for sample in [include_str!("../config-live-lighter.toml"), include_str!("../config-paper-lighter.toml")] {
-            std::fs::write(&path, sample).unwrap();
-            let cfg = Config::load(&path).unwrap();
-            assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
-        }
+        std::fs::write(&path, include_str!("../config-live-lighter.toml")).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

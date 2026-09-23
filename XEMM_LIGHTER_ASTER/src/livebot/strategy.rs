@@ -1,9 +1,9 @@
-//! Strategy/order hot path (plan §1.1.B, §5). A single-owner loop reprices each market
+//! Strategy/order hot path. A single-owner loop reprices each market
 //! side, places/cancels/replaces the Aster maker order, and reacts to fills. It REUSES the
 //! deterministic, well-tested quote math (`quote_engine::compute_desired_quote` and
 //! `resting_quote_net_edge_bps`) rather than re-deriving the edge stack in integer math —
 //! the integer hot types accelerate the touch/crossed/staleness pre-checks and carry the
-//! order representation, but money math stays exact (plan §5.3).
+//! order representation, but money math stays exact.
 //!
 //! This file holds the **pure decision table** ([`evaluate_side`]) — exhaustively testable —
 //! and the async driver ([`run_strategy`]) that turns decisions into [`ExecCommand`]s and
@@ -58,10 +58,7 @@ const BREAKER_BASELINE_SAMPLES: usize = 5;
 /// Consecutive fresh marked samples that must breach the loss limit before the breaker
 /// trips (~4-6s at the 2s reconcile cadence). One anomalous snapshot must not halt the bot.
 const BREAKER_TRIP_STREAK: u32 = 3;
-/// Orphan cross-check escalation threshold: after this many DISTINCT snapshots where predicted
-/// reads balanced but the reported snapshot shows a net imbalance, stop treating the disagreement
-/// as a transient venue read (the cross-check's defer would otherwise repeat forever, leaving the
-/// exposure unhedged with the maker gate closed) and let the persistence gate confirm + recover.
+/// Rolling window of the Aster REST command budget (the per-minute cap and its safety reserve).
 const ASTER_CMD_WINDOW_NS: i64 = 60_000_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +100,7 @@ pub struct TradePrint {
     pub buyer_is_maker: bool,
 }
 
-/// What to do with one market side this evaluation (plan §5.3 decision table).
+/// What to do with one market side this evaluation.
 #[derive(Debug, Clone)]
 pub enum SideDecision {
     /// Leave the slot as is.
@@ -612,7 +609,7 @@ fn evaluate_side_with_hl_sources(
                     );
                 }
             }
-            // Per-side requote DEADBAND (plan: don't churn on sub-bps moves): if the new desired
+            // Per-side requote DEADBAND (don't churn on sub-bps moves): if the new desired
             // price is within `min_requote_bps` of the current resting price, leave the quote in
             // place only after the profitability recheck above passed. A genuine qty change still
             // requotes.
@@ -1663,8 +1660,8 @@ impl Strategy {
     }
 
     /// The reason new maker quoting is currently closed for `market`, or `None` if it may quote.
-    /// Builds the full [`MakerGateInputs`] and runs the canonical [`evaluate_maker_gate`] (plan §6
-    /// reopen conditions / §8.1 invariants 5–7), then the cooldown. Live-only inputs (account
+    /// Builds the full [`MakerGateInputs`] and runs the canonical [`evaluate_maker_gate`] (reopen
+    /// conditions and orphan-leg invariants), then the cooldown. Live-only inputs (account
     /// freshness, position reconciliation) are vacuously satisfied in paper (there is no exchange
     /// to be stale against), so paper behaviour is unchanged. Risk-reducing actions ignore this.
     /// `Some(reason)` is the human-readable cause (a [`FreezeReason`] string or `"COOLDOWN"`) so a
@@ -1824,7 +1821,7 @@ impl Strategy {
     }
 
     /// True while the total in-flight (not yet hedged) Aster notional and the oldest unhedged
-    /// fill's age are both within the configured limits (plan §6 / P0 max-unhedged). An
+    /// fill's age are both within the configured limits. An
     /// in-flight hedge's outstanding leg is the risk; resolved hedges don't count.
     fn unhedged_within_limits(&self, now_ns: i64) -> bool {
         let max_notional = self.cfg.live.max_unhedged_notional_usd;

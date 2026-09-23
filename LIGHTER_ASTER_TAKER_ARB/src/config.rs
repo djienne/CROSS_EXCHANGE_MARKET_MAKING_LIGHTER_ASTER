@@ -499,8 +499,9 @@ pub struct RiskCfg {
     /// at the emergency slippage bound instead of pausing forever on a naked position.
     #[serde(default = "default_auto_flatten_on_mismatch")]
     pub auto_flatten_on_mismatch: bool,
-    /// Consecutive mismatch detections (at `min_reconcile_interval_ms` cadence) before the
-    /// auto-flatten fires. Filters transient reconcile lag.
+    /// Consecutive fresh account snapshots showing the mismatch before the auto-flatten fires
+    /// (a mismatch requests an immediate re-read instead of waiting for the ~15 s refresh).
+    /// Filters transient reconcile lag.
     #[serde(default = "default_mismatch_flatten_after_checks")]
     pub mismatch_flatten_after_checks: u32,
 }

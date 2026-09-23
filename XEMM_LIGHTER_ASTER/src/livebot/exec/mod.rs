@@ -1,4 +1,4 @@
-//! Execution plane (plan §1.1.C / §3 / §4). Concrete venue workers behind bounded command
+//! Execution plane. Concrete venue workers behind bounded command
 //! queues — NOT an `async` trait invoked per book event. The strategy `try_send`s small
 //! commands; a worker owns the venue client and publishes lifecycle events back.
 //!

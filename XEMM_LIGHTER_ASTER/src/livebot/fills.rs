@@ -1,4 +1,4 @@
-//! Aster fill detection → Hyperliquid hedge state machine (plan §4.1, §8.3).
+//! Aster fill detection → Hyperliquid hedge state machine.
 //!
 //! The single most important live-safety property: **every Aster fill produces exactly one
 //! hedge, even if the fill event is delivered more than once** (invariants 2 & 4). Aster's
@@ -111,7 +111,7 @@ impl AsterFill {
 }
 
 /// The dedup key for a fill. Prefers `(order_id, trade_id)`; when the trade id is absent or
-/// unreliable, falls back to `(order_id, cumulative_filled_qty)` (plan §4.1) — two
+/// unreliable, falls back to `(order_id, cumulative_filled_qty)` — two
 /// different cumulative levels are two distinct fills.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FillKey {
@@ -172,7 +172,7 @@ impl FillDedup {
     }
 }
 
-/// Fill-to-hedge lifecycle (plan §8.3). Forward path:
+/// Fill-to-hedge lifecycle. Forward path:
 /// `Created → Submitted → Acked → Filled → Reconciled`. Any failure transition routes to a
 /// terminal-ish state that freezes maker quoting until resolved (invariant 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

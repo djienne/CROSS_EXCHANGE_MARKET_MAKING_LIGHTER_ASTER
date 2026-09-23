@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 import sys
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -126,23 +125,6 @@ def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> 
         "known_net_pnl_usdc":net,"estimated_net_pnl_usdc":estimated,"incomplete_trades":unknown}
 
 
-def parse_xemm_fee_bps(config_path: Path) -> tuple[Decimal, Decimal]:
-    aster_maker = Decimal("0")
-    lighter_taker = Decimal("0")
-    if not config_path.exists():
-        return aster_maker, lighter_taker
-    pattern = re.compile(r"^\s*(aster_maker_fee_bps|taker_fee_bps)\s*=\s*[\"']?([^\"'#\s]+)")
-    for line in config_path.read_text(encoding="utf-8").splitlines():
-        match = pattern.search(line)
-        if not match:
-            continue
-        if match.group(1) == "aster_maker_fee_bps":
-            aster_maker = dec(match.group(2))
-        elif match.group(1) == "taker_fee_bps":
-            lighter_taker = dec(match.group(2))
-    return aster_maker, lighter_taker
-
-
 def detail_dec(detail: dict[str, Any], key: str) -> Decimal:
     value = detail.get(key)
     if value is None:
@@ -160,10 +142,8 @@ def normalize_side(value: Any) -> str:
 
 
 def summarize_xemm_journal(
-    path: Path, market: str, aster_fee_rate: Decimal, lighter_fee_rate: Decimal,
-    since: datetime, now: datetime, include_untimestamped: bool,
+    path: Path, market: str, since: datetime, now: datetime, include_untimestamped: bool,
 ) -> dict[str, Any]:
-    # Configured fees are estimates, not proof of historical venue commissions.
     parsed = xemm_journal(path, market, now=now)
     trades = []
     missing_time = skipped_time = filtered = 0
@@ -181,13 +161,10 @@ def summarize_xemm_journal(
     incomplete = sum(t["net_pnl_usdc"] is None for t in trades)
     uncertain = incomplete > 0 or parsed["malformed_rows"] > 0
     known_net = sum((t["net_pnl_usdc"] for t in trades if t["net_pnl_usdc"] is not None), Decimal(0))
-    lighter_fees = sum_optional(trades, "lighter_fee_usdc")
     return {"path": path, "trades": len(trades),
         "gross_pnl_usdc": sum_optional(trades,"gross_pnl_usdc"),
         "aster_fees_usdc": sum_optional(trades,"aster_fee_usdc"),
-        "lighter_fees_usdc": lighter_fees,
-        "lighter_callback_fees_usdc": lighter_fees,
-        "lighter_config_fallback_fees_usdc": Decimal(0),
+        "lighter_fees_usdc": sum_optional(trades, "lighter_fee_usdc"),
         "fees_usdc": sum_optional(trades,"fees_usdc"),
         "net_pnl_usdc": None if uncertain else known_net,
         "known_net_pnl_usdc": known_net, "incomplete_trades": incomplete,
@@ -293,9 +270,6 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     since = parse_dt(args.since)
     now = parse_dt(args.now) if args.now else utc_now()
     taker = summarize_taker(args.taker_trades, since, now, args.market)
-    aster_fee_bps, lighter_fee_bps = parse_xemm_fee_bps(args.xemm_config)
-    aster_fee_rate = aster_fee_bps / Decimal(10_000)
-    lighter_fee_rate = lighter_fee_bps / Decimal(10_000)
     journal_paths, skipped_journals = selected_xemm_journals(
         args.xemm_journal,
         args.xemm_runs_dir,
@@ -306,8 +280,6 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         summarize_xemm_journal(
             path,
             args.market,
-            aster_fee_rate,
-            lighter_fee_rate,
             since,
             now,
             args.include_untimestamped_xemm,
@@ -322,8 +294,6 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "aster_fees_usdc": sum_optional(xemm_journals, "aster_fees_usdc"),
         "lighter_fees_usdc": sum_optional(xemm_journals, "lighter_fees_usdc"),
         "fees_usdc": sum_optional(xemm_journals, "fees_usdc"),
-        "lighter_callback_fees_usdc": sum_optional(xemm_journals, "lighter_callback_fees_usdc"),
-        "lighter_config_fallback_fees_usdc": sum_optional(xemm_journals, "lighter_config_fallback_fees_usdc"),
         "net_pnl_usdc": sum_optional(xemm_journals, "net_pnl_usdc"),
         "unmatched_fills": sum(j["unmatched_fills"] for j in xemm_journals),
         "unmatched_hedges": sum(j["unmatched_hedges"] for j in xemm_journals),
@@ -334,10 +304,6 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
         "time_filtered_trades": sum(j["time_filtered_trades"] for j in xemm_journals),
         "journals": xemm_journals,
         "skipped_journals": skipped_journals,
-        "fee_bps": {
-            "aster_maker": aster_fee_bps,
-            "lighter_taker": lighter_fee_bps,
-        },
         "journal_selection": args.xemm_journal_selection,
         "untimestamped_policy": args.xemm_untimestamped,
     }
@@ -456,7 +422,7 @@ def print_human(result: dict[str, Any]) -> None:
                 fmt_money(xemm["gross_pnl_usdc"]),
                 fmt_money(xemm["fees_usdc"], signed=False),
                 fmt_money(xemm["net_pnl_usdc"]),
-                fmt_money(xemm["lighter_callback_fees_usdc"], signed=False),
+                fmt_money(xemm["lighter_fees_usdc"], signed=False),
             ],
             [
                 "TOTAL",
@@ -485,7 +451,6 @@ def print_human(result: dict[str, Any]) -> None:
             ["Window Return", fmt_pct(p["window_return_pct"], 8)],
             ["Simple Annualized", fmt_pct(p["simple_annualized_return_pct"], 4)],
             ["Projected CAGR", fmt_pct(p["projected_cagr_pct"], 4)],
-            ["XEMM Fee Bps", f"aster_maker={xemm['fee_bps']['aster_maker']} lighter_taker={xemm['fee_bps']['lighter_taker']}"],
         ],
     )
     print()
@@ -533,7 +498,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--xemm-runs-dir", type=Path, action="append", default=None, help="Advanced: scan a directory of XEMM journal files by mtime. Repeatable.")
     parser.add_argument("--xemm-journal", type=Path, action="append", default=[], help="Explicit XEMM journal to include. Repeatable. Overrides default journal selection.")
-    parser.add_argument("--xemm-config", type=Path, default=xemm_root / "config-live-lighter.toml")
     parser.add_argument(
         "--xemm-untimestamped",
         choices=["auto", "include", "exclude"],

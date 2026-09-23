@@ -1,4 +1,4 @@
-//! Per-market in-flight Aster maker order state (plan §1.1 single-owner state). One
+//! Per-market in-flight Aster maker order state. One
 //! [`MakerSlot`] per (market, side): the bid and the ask are tracked independently, each
 //! carrying its current order, lifecycle state, a per-side quote-epoch counter (feeds the
 //! deterministic client id), a requote throttle, and a per-symbol replace-rate limiter.

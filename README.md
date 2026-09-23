@@ -1,7 +1,7 @@
 # Aster/Lighter Cross-Exchange Market Making and Arbitrage
 
 A live Aster/Lighter trading stack that coordinates two strategies: a
-takerâ€“taker arbitrage bot and an XEMM maker/taker hedging bot. The top-level
+taker–taker arbitrage bot and an XEMM maker/taker hedging bot. The top-level
 orchestrator supervises switching, risk state, logs, and combined PnL across
 both bots.
 
@@ -22,9 +22,13 @@ modes before any live run.
   reduce-only standby while XEMM is active.
 - `combined_pnl.py` reports combined execution economics across taker-arb trade logs
   and XEMM hedge journals.
-- `LIGHTER_ASTER_TAKER_ARB/` is the standalone takerâ€“taker arbitrage bot. It
+- `LIGHTER_ASTER_TAKER_ARB/` is the standalone taker–taker arbitrage bot. It
   checks both Aster-sell/Lighter-buy and Lighter-sell/Aster-buy directions and
-  only trades when top-of-book edge clears fees and configured margin.
+  trades a clip only when the depth-weighted edge clears both taker fees plus the
+  configured margin, both books hold `liquidity_multiple` times the clip within
+  `max_levels`, and the edge passes the entry gate (the greater of the 90th
+  percentile of recent opportunity samples and the required edge plus
+  `min_extra_bps`).
 - `XEMM_LIGHTER_ASTER/` is the maker/taker XEMM bot. It quotes on Aster and
   hedges on Lighter, with paper, probe, record/replay, and livebot workflows.
 
@@ -32,18 +36,21 @@ modes before any live run.
 
 ```text
 .
-â”œâ”€â”€ orchestrator.py
-â”œâ”€â”€ combined_pnl.py
-â”œâ”€â”€ LIGHTER_ASTER_TAKER_ARB/
-â”‚   â”œâ”€â”€ configs/live-hype.toml
-â”‚   â”œâ”€â”€ src/
-â”‚   â””â”€â”€ README.md
-â””â”€â”€ XEMM_LIGHTER_ASTER/
-    â”œâ”€â”€ config-live-lighter.toml
-    â”œâ”€â”€ config-paper-lighter.toml
-    â”œâ”€â”€ src/
-    â”œâ”€â”€ DOCKER_DEPLOY.md
-    â””â”€â”€ LIVE_RUNBOOK.md
+├── orchestrator.py
+├── combined_pnl.py
+├── trade_history.py
+├── economics.py            shared execution-economics parser for both reports
+├── tests/                  Python tests + shared fixtures (tests/fixtures/)
+├── LIGHTER_ASTER_TAKER_ARB/
+│   ├── configs/live-hype.toml
+│   ├── src/
+│   └── README.md
+└── XEMM_LIGHTER_ASTER/
+    ├── config-live-lighter.toml
+    ├── scripts/            check_hedged_trade.py, reset_breaker.py, deploy_vps.sh
+    ├── src/
+    ├── DOCKER_DEPLOY.md
+    └── LIVE_RUNBOOK.md
 ```
 
 Runtime directories such as `runs/` and Rust build directories such as
@@ -58,12 +65,12 @@ Credentials are local files and must not be committed:
 - `XEMM_LIGHTER_ASTER/aster.env`
 - `XEMM_LIGHTER_ASTER/lighter.env`
 
-Keep these files mode `600` on the machine running the bots â€” the orchestrator
+Keep these files mode `600` on the machine running the bots — the orchestrator
 refuses `--live` if any env file is readable by group/other. The top-level and
 bot-level `.gitignore` files ignore env files, run outputs, sqlite databases,
 logs, jsonl/zst tapes, build outputs, PEM/key files, and local tool state.
 
-The taker-arb `aster.env` must explicitly list the API-wallet (signer) address
+Both bots' `aster.env` must explicitly list the API-wallet (signer) address
 in `wallet_address`/`subaccount_address` and it must match `private_key`'s
 derived address; startup fails otherwise (catches a rotated key against a
 stale env file before anything is signed).
@@ -128,15 +135,19 @@ The orchestrator is the normal top-level entry point for running the stack:
 
 ```bash
 tmux new -s lighter_aster_orchestrator
-python3 -u orchestrator.py --live --market HYPE --preflight-kill-existing
+python3 -u orchestrator.py --live --market HYPE
 ```
+
+`--live` also terminates stray taker/XEMM writers before the first poll.
 
 Useful options:
 
 - `--once` runs one status/decision cycle.
 - `--poll-sec N` controls the normal supervision interval.
-- `--max-loss-usdc N` sets the orchestrator-level realized-loss stop
-  (default 15 â€” deliberately above the bot-level `max_loss_usdc` /
+- `--max-loss-usdc N` sets the orchestrator-level loss stop: it halts when
+  account equity falls N below its persisted baseline or realized trade PnL in
+  the `--pnl-since` window reaches −N
+  (default 15 — deliberately above the bot-level `max_loss_usdc` /
   `max_cumulative_loss_usdc` of 10, so the bot breaker trips first and the
   supervisor stays a genuine backstop).
 - `--pnl-since startup|now|<RFC3339>` controls the PnL window.
@@ -226,7 +237,8 @@ Execution economics combine venue-realized closes and spread on matched opposite
 remaining positions, less actual fees. They exclude funding and the marked value
 of unpaired exposure; use account equity and residual positions to assess those.
 Trade evidence is paired before filtering by economic time. The Rust `live-report`
-and Python `scripts/check_hedged_trade.py` entry points use the same fixture contract.
+and Python `XEMM_LIGHTER_ASTER/scripts/check_hedged_trade.py` entry points use the same
+fixture contract (`tests/fixtures/execution_economics.json`).
 
 Historical repair writes a separate candidate and a before/after JSON comparison:
 
@@ -259,6 +271,24 @@ owns positions, quotes, reserved exposure, consumed liquidity and fees. Reports
 use venue-realized P&L plus fresh marks less fees, and show censored future hedges
 and residuals. The smallest latency is the primary display; old rows are labelled
 unassigned and need tape replay for corrected results.
+
+## Evidence Limits
+
+No production history or representative long market tape exists here; historical
+repair is validated with explicit fixtures. The short public tape establishes
+transport/paper/replay operation, not trading edge. Execution economics exclude
+funding and unpaired account marks; account-equity changes also include transfers.
+Unresolved sessions lacking terminal venue identity remain blocked until primary
+evidence resolves them. The tests do not certify deployed latency, actual
+profitability, live venue acceptance or signer-binary supply-chain integrity.
+
+Protocol evidence: Aster signing follows the
+[documented EIP-712 contract](https://asterdex.github.io/aster-api-website/asterCode/authentication/).
+Lighter fee units, and "an omitted fee means zero", come from the
+[trade circuit](https://github.com/elliottech/lighter-prover/blob/main/circuit/src/apply_trade.rs),
+[fee constants](https://github.com/elliottech/lighter-prover/blob/main/circuit/src/types/constants.rs)
+and the [WebSocket reference](https://apidocs.lighter.xyz/docs/websocket-reference).
+Offline protocol vectors do not establish private venue acceptance.
 
 ## Git Hygiene
 

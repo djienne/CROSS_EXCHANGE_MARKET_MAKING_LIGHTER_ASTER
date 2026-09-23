@@ -3,7 +3,7 @@
 # risk OOM on a Rust LTO release build). Build the image locally, ship it via
 # `docker save | ssh docker load`, and sync the source tree + (once) the secrets.
 #
-# Run from the repo root in Git Bash, with VPS_HOST and KEY set:
+# Run from this crate directory (beside docker-compose.yml) in Git Bash, with VPS_HOST and KEY set:
 #   export VPS_HOST='ubuntu@<host>'
 #   export KEY="$HOME/.ssh/<deploy-key>.pem"
 #   scripts/deploy_vps.sh image      # build locally + ship the image to the VPS

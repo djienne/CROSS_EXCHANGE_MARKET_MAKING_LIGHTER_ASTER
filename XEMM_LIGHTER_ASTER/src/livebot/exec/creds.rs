@@ -1,4 +1,4 @@
-//! Credential loading for live trading (plan §1, §2.2). Reads the `aster.env` / `lighter.env`
+//! Credential loading for live trading. Reads the `aster.env` / `lighter.env`
 //! dotenv files at the repo root, derives the venue ROLE for each address from the **key**, not
 //! from the (user-editable, sometimes mislabeled) field names, and validates the mapping before
 //! a single signed call.
@@ -75,7 +75,7 @@ impl AsterCreds {
                 "aster env wallet_address/subaccount_address does not contain the private key's address {derived_lc}"
             );
         }
-        // The signer field is optional in the file (we can synthesize it from the key); the
+        // `signer` is always set here (the key's address must be listed, checked above); the
         // user (main account) is mandatory and cannot be the signer.
         let signer = signer.unwrap_or_else(|| derived_lc.clone());
         let user = user.ok_or_else(|| {

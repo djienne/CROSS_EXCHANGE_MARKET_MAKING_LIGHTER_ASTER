@@ -774,9 +774,9 @@ class PnlTracker:
         if self.baseline_equity is None:
             if active_bot is None:
                 # Bootstrap tick: the sample comes from whichever bot answered first,
-                # but the two bots' equity calcs differ (the taker's excludes Lighter
-                # uPnL). Anchor only once a bot is active so the baseline matches the
-                # steady-state series instead of seeding a phantom offset.
+                # and the two bots compute equity separately (both add Lighter uPnL to
+                # its collateral-style account value). Anchor only once a bot is active
+                # so the baseline matches the steady-state series.
                 pass
             else:
                 self.baseline_equity = total_equity
@@ -1972,9 +1972,8 @@ class Orchestrator:
             elif process["bot"] == XEMM_BOT and not (
                 "--mode paper" in args or "--mode=paper" in args
             ):
-                # The XEMM livebot falls back to the config's [live] mode when --mode is
-                # absent, and the live config ships mode="live" — so only an explicit
-                # paper flag proves a process is not a live writer.
+                # Conservative: only an explicit paper flag proves a livebot is not a live
+                # writer (an absent --mode means paper today, but that is not proof enough).
                 writers.append(process)
         return writers
 
@@ -2191,9 +2190,10 @@ def parse_args() -> argparse.Namespace:
         "--max-loss-usdc",
         type=strictly_positive_decimal,
         default=Decimal("15"),
-        help="Supervisor-level realized-loss backstop. Deliberately ABOVE the bot-level "
-        "max_loss_usdc (10 in the live configs) so the bot breaker trips first and this "
-        "remains a genuine second line of defense.",
+        help="Supervisor-level loss backstop: halts on an account-equity drawdown OR a "
+        "realized trade loss of this size. Deliberately ABOVE the bot-level max_loss_usdc "
+        "(10 in the live configs) so the bot breaker trips first and this remains a genuine "
+        "second line of defense.",
     )
     parser.add_argument(
         "--baseline-max-gap-hours",

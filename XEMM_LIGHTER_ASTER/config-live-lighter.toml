@@ -69,7 +69,7 @@ depth_limit          = 20
 
 [live]
 enabled                       = true
-mode                          = "live"       # this config is FOR the live run (CLI also passes --mode live)
+mode                          = "live"       # informational: livebot defaults to --mode paper; only --mode live trades
 post_trade_cooldown_ms        = 3000
 cooldown_scope                = "per_market"
 startup_cancel_all            = true
@@ -132,10 +132,11 @@ aster_safety_buffer_usd = "26"
 lighter_safety_buffer_usd = "26"
 
 [live.circuit_breaker]
-# Unattended-run safety stop. Measures TOTAL cross-venue account equity (Aster wallet+unrealized + Lighter
-# accountValue) vs a baseline captured at startup; if the drawdown exceeds the limit the bot cancels
-# orders, LEAVES the delta-neutral position open, writes runs/<db-stem>.trip.json, and halts. It then
-# REFUSES to restart until the latch is cleared:  python scripts/reset_breaker.py
+# Unattended-run safety stop. Measures TOTAL cross-venue marked equity (Aster wallet+unrealized + Lighter
+# portfolio value + marked uPnL) vs a baseline = median of the first 5 fresh samples; if the drawdown
+# exceeds the limit on 3 consecutive fresh samples the bot cancels orders, LEAVES the delta-neutral
+# position open, writes runs/<db-stem>.trip.json, and halts. It then REFUSES to restart until the
+# latch is cleared:  python scripts/reset_breaker.py
 enabled                  = true
 max_cumulative_loss_usdc = "10"
 

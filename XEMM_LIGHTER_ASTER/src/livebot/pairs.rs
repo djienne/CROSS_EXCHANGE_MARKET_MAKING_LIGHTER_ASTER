@@ -1,4 +1,4 @@
-//! Pair eligibility classification (plan §7.2) and the strict-mode filter — one of the
+//! Pair eligibility classification and the strict-mode filter — one of the
 //! most important live risks (§7). The danger: an Aster maker order can partial-fill an
 //! amount BELOW Hyperliquid's minimum hedge notional, leaving a temporary unhedged leg.
 //!
@@ -12,7 +12,7 @@ use crate::decimal::floor_to_step;
 use crate::inventory::{hl_min_hedge_qty, HedgeabilityRules};
 use crate::markets::MarketSpec;
 
-/// Pair classes (plan §7.2), best → worst.
+/// Pair classes, best → worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairClass {
     /// Every possible Aster fill (down to a single lot/step) is HL-hedgeable.
@@ -87,7 +87,7 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
     }
 }
 
-/// Whether a class is eligible for live trading under `policy` (plan §7.3 / §7.4):
+/// Whether a class is eligible for live trading under `policy`:
 /// - **strict**: only Class A (every fill hedgeable).
 /// - **accumulate**: Class A and B (B's sub-min partials flow into pending inventory).
 /// - C and D are never eligible.

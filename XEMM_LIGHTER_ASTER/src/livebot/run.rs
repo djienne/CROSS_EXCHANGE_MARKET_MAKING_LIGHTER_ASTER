@@ -1,4 +1,4 @@
-//! Live bot orchestration (plan §1 / §12). Wires the four planes: ingest threads + watchdog
+//! Live bot orchestration. Wires the four planes: ingest threads + watchdog
 //! (market-data hot path), the strategy loop (strategy/order hot path), the execution
 //! workers behind command queues (execution hot path), and account/journal/book-check (cold
 //! plane). Selects the executor once from the mode.
@@ -242,9 +242,8 @@ pub async fn run(
     // --- cold plane: account state + journal ---
     let account = AccountState::default();
     let (journal, jrx) = Journal::channel();
-    // Journal path is derived from --db so a SEPARATE run (e.g. a live HYPE session alongside the
-    // always-on multi-pair paper dry run) never clobbers the other's journal. db `runs/x.sqlite`
-    // → journal `runs/x-journal.jsonl`.
+    // Journal path is derived from --db so a SEPARATE run (e.g. a paper session beside the live
+    // one) never clobbers the other's journal. db `runs/x.sqlite` → journal `runs/x-journal.jsonl`.
     let journal_path = {
         let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
         let dir = db_path
@@ -710,9 +709,9 @@ fn release_until(
 /// Classify every market's pair eligibility against a REST-fetched HL reference mid.
 ///
 /// The strict Class-A-only filter is a REAL-MONEY orphan-leg safety: it bars pairs where a
-/// sub-minimum partial Aster fill could be un-hedgeable on HL (plan §7). In **paper** mode
-/// there is no real orphan risk — `PaperExec` always fills the hedge — so paper quotes EVERY
-/// non-degenerate pair (the everyday "dry-run on all pairs"). In **live** mode the strict
+/// sub-minimum partial Aster fill could be un-hedgeable on Lighter. In **paper** mode
+/// there is no real orphan risk — `PaperExec` always fills the hedge — so paper quotes every
+/// selected non-degenerate pair. In **live** mode the strict
 /// policy applies (with the `accumulate_sub_min` fallback noted below).
 async fn classify_markets(specs: &[MarketSpec], cfg: &Config, exec_mode: ExecMode) -> HashMap<MarketId, bool> {
     use super::pairs::PairClass;
@@ -801,7 +800,7 @@ async fn run_paper_workers(
     }
 }
 
-/// Build + spawn ALL live planes (plan §2/§4/§6): the venue workers, the account reconciler
+/// Build + spawn ALL live planes: the venue workers, the account reconciler
 /// (initial reconcile for clean-start + a cold backstop loop), and the Aster user (fill) stream.
 /// Real signing is wired from `aster.env`/`lighter.env` — reached ONLY under `mode = "live"`.
 /// Roles are derived from the keys, not the env field names (see [`super::exec::creds`]).
@@ -984,14 +983,13 @@ async fn setup_live_planes(
     Ok((worker_task, true, Some(liveness), Some(shutdown_recon)))
 }
 
-/// Post-drain shutdown verification (live only; F3). Confirms the shutdown cancel actually
-/// landed (re-cancels + polls `openOrders` for bot-prefixed strays) and takes one final
-/// snapshot to report/persist any residual positions — there is no Aster userTrades REST
-/// method, so a late fill is detected as a position. Every step is timeout-bounded and
-/// best-effort: the shutdown path must NEVER hang, so any error/timeout logs "verification
-/// incomplete" and moves on. The exit code is deliberately unchanged — a delta-neutral
-/// residual is documented-normal (positions are left open on graceful shutdown), and a NET
-/// imbalance is adopted + recovered by the next start (F2).
+/// Post-drain shutdown verification (live only). Re-cancels + polls `openOrders` for
+/// bot-prefixed strays (a failure there is only warned), then takes one final snapshot to
+/// report/persist any residual positions — there is no Aster userTrades REST method, so a
+/// late fill is detected as a position. Every step is timeout-bounded so shutdown never hangs.
+/// Returns `true` only when the final snapshot shows no bot order and every market net-flat (a
+/// delta-neutral pair left open is normal). A failed snapshot or report write, a stray order or
+/// a NET imbalance returns `false`: the run exits nonzero and keeps the active-session marker.
 async fn shutdown_verify(
     recon: &super::reconcile::Reconciler,
     journal: &Journal,

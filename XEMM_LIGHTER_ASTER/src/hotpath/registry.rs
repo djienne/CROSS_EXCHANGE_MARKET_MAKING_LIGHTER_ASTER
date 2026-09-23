@@ -27,8 +27,8 @@ impl VenueRegistry {
     }
 
     /// Like [`new`] but every cell publishes into a shared coalescing wakeup `Notify`,
-    /// so a live strategy loop parked on it wakes on the next book change of ANY cell
-    /// (plan §5.2). Used only by the `livebot` driver; the dry-run path uses [`new`].
+    /// so a live strategy loop parked on it wakes on the next book change of ANY cell.
+    /// Used only by the `livebot` driver; the dry-run path uses [`new`].
     pub fn with_wake(markets: &[MarketId], wake: Arc<Notify>) -> Self {
         Self::build(markets, Some(wake), None)
     }

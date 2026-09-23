@@ -8,8 +8,8 @@
 //! * **Sizing and edge prefilters use cached f64 math**; qualifying opportunities use
 //!   Decimal for exact gate thresholds, exchange quantities and accounting.
 //! * **No inline file I/O** — entry-gate samples, reduce-signal files, and execution logs
-//!   go through `spawn_blocking` (see `write_file_atomic_off_path`); account state arrives
-//!   via a `watch` channel from the background refresher.
+//!   go to dedicated writer threads (`taker-history`, `taker-signal`, `taker-journal`) or
+//!   `spawn_blocking`; account state arrives via a `watch` channel from the background refresher.
 //! * **No inline REST on the iteration** — the lease nonce refresh runs as a spawned task
 //!   with execution gated until it lands; account snapshots refresh on their own task.
 //! Execution itself (sign + submit both legs concurrently, confirm, reconcile, rescue) is

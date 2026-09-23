@@ -779,8 +779,9 @@ mod tests {
     }
 
     fn config(latencies: &[i64]) -> Config {
-        let mut c: Config = toml::from_str(include_str!("../../config-paper-lighter.toml")).unwrap();
+        let mut c: Config = toml::from_str(include_str!("../../config-live-lighter.toml")).unwrap();
         c.live.enabled = false;
+        c.quote.price_change_ticks_to_requote = 1;
         c.edge.min_net_profit_bps = Decimal::ZERO;
         c.edge.slippage_buffer_bps = Decimal::ZERO;
         c.edge.latency_buffer_bps = Decimal::ZERO;

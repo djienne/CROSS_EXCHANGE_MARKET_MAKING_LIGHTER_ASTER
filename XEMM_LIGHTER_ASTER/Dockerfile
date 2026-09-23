@@ -56,8 +56,8 @@ COPY config-live-lighter.toml /app/config-live-lighter.toml
 
 # The bot wires ONLY tokio ctrl_c (SIGINT) for graceful drain (cancel resting orders,
 # finalize tape/DB). Docker's default SIGTERM is UNhandled -> SIGKILL with no cancel.
-# Make SIGINT the stop signal so `docker stop` drains cleanly (positions stay open;
-# shutdown never flattens).
+# Make SIGINT the stop signal so `docker stop` drains cleanly (fills are hedged and net
+# residuals corrected; paired positions stay open).
 STOPSIGNAL SIGINT
 
 ENTRYPOINT ["xemm_lighter_aster"]

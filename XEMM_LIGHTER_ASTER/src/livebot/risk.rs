@@ -1,5 +1,5 @@
-//! Live risk gating: the post-trade cooldown (plan §6), predicted-vs-reported position
-//! reconciliation, and the orphan-leg invariant gate (plan §8.1) that decides whether new
+//! Live risk gating: the post-trade cooldown, predicted-vs-reported position
+//! reconciliation, and the orphan-leg invariant gate that decides whether new
 //! maker quoting is allowed.
 //!
 //! The rule that makes the bot safe: **risk-reducing actions (cancel, hedge, flatten,
@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 
 use crate::types::MarketId;
 
-/// Cooldown scope (plan §6). First live version is `Global`; `PerMarket` is the later,
+/// Cooldown scope. First live version is `Global`; `PerMarket` is the later,
 /// measured option.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownScope {
@@ -67,7 +67,7 @@ impl CooldownState {
 
 }
 
-/// Why new maker quoting is currently frozen (plan §6 start-condition / §8 invariants).
+/// Why new maker quoting is currently frozen.
 /// `None` of these means quoting may proceed (subject to cooldown + the feed gate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreezeReason {
@@ -106,8 +106,8 @@ impl FreezeReason {
     }
 }
 
-/// The conditions the maker gate must ALL satisfy to allow new quoting (plan §6/§9.1
-/// reopen conditions, §8.1 invariants). Pure inputs → pure decision, so it is exhaustively
+/// The conditions the maker gate must ALL satisfy to allow new quoting (reopen conditions
+/// and orphan-leg invariants). Pure inputs → pure decision, so it is exhaustively
 /// testable and the reactor just feeds it live values.
 #[derive(Debug, Clone, Copy)]
 pub struct MakerGateInputs {

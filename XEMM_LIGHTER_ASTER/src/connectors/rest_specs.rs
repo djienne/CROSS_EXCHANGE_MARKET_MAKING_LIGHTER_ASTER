@@ -149,7 +149,7 @@ pub async fn build_market_specs(markets: &[MarketCfg], hl_min_notional: Decimal)
     build_market_specs_with_bases(markets, hl_min_notional, DEFAULT_ASTER_BASE_URL, DEFAULT_LIGHTER_BASE_URL).await
 }
 
-/// Resolve `MarketSpec`s against configured REST base URLs (live/testnet/custom).
+/// Resolve `MarketSpec`s against configured REST base URLs.
 pub async fn build_market_specs_with_bases(
     markets: &[MarketCfg],
     hl_min_notional: Decimal,

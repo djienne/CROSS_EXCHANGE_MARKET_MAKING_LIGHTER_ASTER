@@ -101,7 +101,7 @@ pub struct VenueBook {
     content_version: AtomicU64,
     /// Optional coalescing strategy wakeup. When a live strategy loop is attached
     /// ([`VenueBook::with_wake`]) every `publish` calls `notify_one`, so the loop wakes
-    /// on the next book change instead of sleep-polling (plan §5.2). `None` on the
+    /// on the next book change instead of sleep-polling. `None` on the
     /// dry-run `record`/`live` path, so that path is behaviorally unchanged.
     wake: Option<Arc<Notify>>,
     /// When set, each `publish`/`publish_hot` marks this market dirty in the shared

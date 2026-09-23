@@ -38,7 +38,7 @@ class EconomicContractTests(unittest.TestCase):
                     self.assertEqual(trade[key],expected,key)
                 since=combined_pnl.parse_dt("2026-01-01T00:00:00Z")
                 now=combined_pnl.parse_dt("2026-01-03T00:00:00Z")
-                summary=combined_pnl.summarize_xemm_journal(journal,"HYPE",Decimal(0),Decimal(0),since,now,False)
+                summary=combined_pnl.summarize_xemm_journal(journal,"HYPE",since,now,False)
                 expected=case["expected"]["net_pnl_usdc"]
                 expected=None if expected is None else Decimal(expected)
                 self.assertEqual(summary["net_pnl_usdc"],expected)
@@ -62,10 +62,10 @@ class EconomicContractTests(unittest.TestCase):
             rows=CASES[0]["rows"]
             write_rows(path,rows)
             boundary=economics.event_time(rows[1])
-            summary=combined_pnl.summarize_xemm_journal(path,"HYPE",Decimal(0),Decimal(0),boundary,boundary,False)
+            summary=combined_pnl.summarize_xemm_journal(path,"HYPE",boundary,boundary,False)
             self.assertEqual(summary["net_pnl_usdc"],Decimal("0.11"))
             self.assertEqual(summary["trades"],1)
-            before=combined_pnl.summarize_xemm_journal(path,"HYPE",Decimal(0),Decimal(0),economics.event_time(rows[0]),economics.event_time(rows[0]),False)
+            before=combined_pnl.summarize_xemm_journal(path,"HYPE",economics.event_time(rows[0]),economics.event_time(rows[0]),False)
             self.assertEqual(before["unmatched_fills"],1)
             self.assertEqual(before["gross_pnl_usdc"],Decimal(0))
 

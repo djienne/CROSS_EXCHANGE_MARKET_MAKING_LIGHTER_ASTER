@@ -68,7 +68,7 @@ Stop gracefully with `docker kill --signal=SIGINT xemm-hype`. Shutdown quiesces 
 ## Lighter Market Probe
 ```bash
 ./target/release/xemm_lighter_aster --config config-live-lighter.toml \
-  probe lighter-market --market HYPE --i-understand-live --max-usd 6
+  probe lighter-market --market HYPE --i-understand-live --max-usd 12
 ```
 
 That command sends live native market orders and can lose money through spread, fees, and slippage. Do not run it as part of routine validation.

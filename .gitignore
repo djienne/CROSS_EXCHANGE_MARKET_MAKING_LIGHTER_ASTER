@@ -2,6 +2,7 @@
 *.env
 .env
 *.pem
+*.key
 
 # Runtime outputs
 runs/

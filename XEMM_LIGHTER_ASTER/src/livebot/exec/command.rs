@@ -1,4 +1,4 @@
-//! The execution command/event contract (plan §1.1 / §5.4). The strategy and fill reactor
+//! The execution command/event contract. The strategy and fill reactor
 //! talk to the execution workers through **bounded command queues** and a shared **event
 //! channel** — never by calling an `async` trait per book event. This keeps the hot path
 //! single-owner and allocation-light: the strategy `try_send`s a small `Copy`-ish command
@@ -112,7 +112,7 @@ pub enum ExecCommand {
     /// `client_id` is a session-prefixed id (OrderManager::next_flatten_client_id) so the
     /// resulting reduce-only fill passes the strategy's own-order attribution.
     FlattenAster { intent: HedgeIntent, client_id: String },
-    /// Refresh the per-symbol dead-man countdown (plan §3.4).
+    /// Refresh the per-symbol dead-man countdown.
     RefreshDeadman { market: MarketId },
     /// FIFO barrier: all earlier maker commands finished before this timestamp.
     Barrier { completion: Arc<CommandBarrier> },
@@ -140,19 +140,20 @@ pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
     )
 }
 
-/// Fill reactor / strategy → Hyperliquid hedge worker.
+/// Fill reactor / strategy → Lighter hedge worker (the module keeps its historical
+/// `hyperliquid` name; there is no Hyperliquid venue).
 #[derive(Debug, Clone)]
 pub enum HedgeCommand {
     /// Send an aggressive IOC hedge for this intent at `aggressive_px` with `slippage_bps`
     /// as the acceptable cap. `emergency` selects the wider second-attempt slippage ladder.
+    /// Residual corrections reuse this with a `ReduceDelta` intent.
     Hedge {
         intent: HedgeIntent,
         aggressive_px: Decimal,
         slippage_bps: Decimal,
         emergency: bool,
     },
-    /// Reduce-only IOC to flatten an HL position (orphan resolution): `side` closes the leg,
-    /// `qty` base units. `aggressive_px` crosses the book; `slippage_bps` caps it.
+    /// Drain and stop the worker.
     Shutdown,
 }
 

@@ -1,4 +1,4 @@
-//! Deterministic client IDs (plan §8.2). Idempotency and restart recovery are
+//! Deterministic client IDs. Idempotency and restart recovery are
 //! mandatory for a cross-exchange bot: every order carries an id we can recompute and
 //! query by, so a process that dies mid-hedge can ask the venue "did this fill?".
 //!

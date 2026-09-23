@@ -16,8 +16,8 @@
 #   docker compose run --rm xemm --config config-live-lighter.toml livebot \
 #     --mode paper --markets HYPE --secs 30
 #
-# LIVE single-coin test (real money). Leaves the hedged position OPEN & delta-neutral
-# on graceful stop — shutdown only cancels resting ORDERS, never flattens:
+# LIVE single-coin test (real money). Graceful stop cancels resting orders, hedges fills and
+# corrects net residuals during the drain, then leaves the paired position OPEN & delta-neutral:
 #   docker compose run --rm --name xemm-hype xemm \
 #     --config config-live-lighter.toml livebot --mode live --markets HYPE \
 #     --secs 900 \
@@ -43,7 +43,7 @@ services:
       ASTER_NONCE_DIR: /nonce
     volumes:
       # Mount the WHOLE deploy dir read-only at the working dir, so ANY config
-      # (config-live-lighter.toml, config-quick.toml, …), signer binaries, and
+      # (config-live-lighter.toml, …), signer binaries, and
       # the secret env files (aster.env / lighter.env, read from CWD) are present — no
       # per-file mounts to keep in sync. The binary lives in /usr/local/bin, so
       # this never shadows it; secrets are still mount-only (never in the image).
@@ -55,7 +55,9 @@ services:
       - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
     # Graceful drain on SIGINT (the only signal the bot wires). Positions stay OPEN.
     stop_signal: SIGINT
-    stop_grace_period: 90s
+    # Above the worst-case bounded drain + verification (5+70+65+30+5 = 175 s); a shorter
+    # grace SIGKILLs a legitimate drain and leaves fills unhedged.
+    stop_grace_period: 200s
     # The test drives runs manually via `docker compose run`; don't auto-restart.
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.

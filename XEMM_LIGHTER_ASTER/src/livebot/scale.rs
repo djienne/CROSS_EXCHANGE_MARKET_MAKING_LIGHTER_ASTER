@@ -4,8 +4,7 @@
 //! heap-ish and slow). The live quote loop instead works in **scaled integers**:
 //! prices as integer multiples of the venue tick (`px_ticks`) and quantities as
 //! integer multiples of the venue lot/step (`qty_lots`). Comparisons, requote-threshold
-//! checks, and crossed/touch tests are then branch-light `i64` math with no allocation
-//! (plan §1.1 / §5.1).
+//! checks, and crossed/touch tests are then branch-light `i64` math with no allocation.
 //!
 //! `Decimal` is kept for config, edge/PnL math, and cold reconciliation — we convert at
 //! the boundary when building a [`MarketScale`] from a [`MarketSpec`] and when emitting an
@@ -13,8 +12,7 @@
 //! the exact, well-tested money math, and re-deriving it in `i64` for a few microseconds
 //! would be a real-funds correctness hazard. The integers carry the *hot, hot* part
 //! (touch/crossed/staleness/price-move detection + order representation); the proven
-//! `Decimal` quote engine prices the actual quote (plan §5.3 "reuse pure calculation
-//! code where appropriate").
+//! `Decimal` quote engine prices the actual quote.
 
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;

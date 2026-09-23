@@ -366,7 +366,7 @@ impl AsterRest {
     }
 
     /// Cancel a specific order by client id (DELETE `/fapi/v3/order`). A `-2011` "unknown order"
-    /// is treated as already-gone (success), per plan §3.
+    /// is treated as already-gone (success).
     pub(crate) async fn cancel_order(&self, market: &MarketId, client_id: &str) -> Result<CancelOutcome> {
         let w = self.wire(market)?;
         let params = vec![
@@ -375,7 +375,7 @@ impl AsterRest {
         ];
         match self.signed_request(Method::DELETE, ASTER_ORDER_PATH, params).await {
             // Aster returns HTTP 200 even for some venue errors ({code,msg} in the body), so
-            // transport success != cancel success — classify the body (plan: no false CancelAck).
+            // transport success != cancel success — classify the body (no false CancelAck).
             Ok(body) => classify_cancel(&body),
             Err(e) if e.downcast_ref::<VenueFailure>().is_some_and(|e| e.status < 500 && e.code == Some(-2011)) => Ok(CancelOutcome::AlreadyGone),
             Err(e) => Err(e),
