@@ -82,7 +82,9 @@ enabled = true
 mode = "enforce"
 history_window_hours = 72
 sample_interval_ms = 1000
-min_history_samples = 500
+# Samples are recorded only for fee-clearing opportunities (~3/h on calm HYPE, 2026-09-24), so
+# 500 in 72 h was unreachable: 50 still gates at the 90th percentile of recent history.
+min_history_samples = 50
 entry_percentile = "90"
 min_extra_bps = "0.5"
 
