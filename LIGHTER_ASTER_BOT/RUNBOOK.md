@@ -265,8 +265,9 @@ marker holds complete scoped order identities:
 
 `resolve-session` needs an inactive owner, matching terminal orders, positions consistent
 with those fills, and no open orders; it saves `session_resolution_*.json`. It refuses a
-marker from a crash before any receipt, without enough identities: resolve that one from the
-venues' own records, then archive it by hand as above. The loss breaker
+marker from a crash before any receipt, without enough identities, or whose Lighter order has
+left the newest 200 rows of the account's order history: resolve that one from the venues'
+own records, then archive it by hand as above. The loss breaker
 `circuit_breaker_<M>.json` trips when the ledger's PnL since `[taker.pnl] since` reaches
 −`max_loss_usdc` (10), on the same terms. `reset-circuit-breaker` archives it only: it neither
 resolves a session nor rewrites the ledger, so the breaker returns at the next start while

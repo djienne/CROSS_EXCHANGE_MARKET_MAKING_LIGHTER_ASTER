@@ -4,8 +4,8 @@
 //! handles ping/pong + the `subscribed` confirmation, applies liveness/data watchdogs,
 //! and reconnects with exponential backoff. Each decoded application message is handed to a
 //! synchronous callback (the hot-path market-data task runs its book+signal update there;
-//! cold-path account tasks enqueue to channels). A buggy callback never tears down the
-//! socket — it is caught and logged.
+//! cold-path account tasks enqueue to channels). A callback must not panic: a panic outside
+//! the strategy thread aborts the process (`taker::abort_on_panic`).
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};

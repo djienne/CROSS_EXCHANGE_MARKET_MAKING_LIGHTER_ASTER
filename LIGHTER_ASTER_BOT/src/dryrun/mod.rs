@@ -237,7 +237,9 @@ impl SimFiles {
     }
 
     /// Writes the state if it changed, synced before it replaces the last one: a crash leaves
-    /// one whole state or the other, never a torn file the next start refuses.
+    /// one whole state or the other, never a torn file the next start refuses. Ponytail: the
+    /// sync runs on the venues' loop (the state changes about once a minute when idle); if
+    /// `lateness_ms` grows with order flow, move the write to a thread.
     fn save(&mut self, core: &Exchange) -> Result<()> {
         let json = serde_json::to_string(core.state())?;
         if json != self.written {

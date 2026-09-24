@@ -1343,19 +1343,18 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
         if mismatch_notional > cfg.risk.max_position_mismatch_usd {
             if account_fresh {
                 mismatch_consecutive = mismatch_consecutive.saturating_add(1);
+                warn!(
+                    "position mismatch too large: aster={} lighter={} net={}; pausing ({} consecutive of {} needed)",
+                    pos.aster_qty,
+                    pos.lighter_qty,
+                    pos.net_qty(),
+                    mismatch_consecutive,
+                    cfg.risk.mismatch_flatten_after_checks
+                );
             }
-            // Ask the refresher for an immediate re-read so the next check sees a new
-            // generation promptly (~seconds instead of one 15s refresh per count).
+            // Ask the refresher for an early re-read so the next check sees a new generation
+            // sooner than the 15 s refresh (it spaces forced re-reads 5 s apart).
             account_refresh_now.notify_one();
-            warn!(
-                "position mismatch too large: aster={} lighter={} net={}; pausing ({} consecutive of {} needed, snapshot_fresh={})",
-                pos.aster_qty,
-                pos.lighter_qty,
-                pos.net_qty(),
-                mismatch_consecutive,
-                cfg.risk.mismatch_flatten_after_checks,
-                account_fresh
-            );
             // A residual that persists across several reconciles is a real naked position
             // (e.g. an external fill, or an Unknown-outcome leg that landed): act on it
             // with the same reduce-only emergency-bound machinery as the rescue path,
@@ -2592,7 +2591,7 @@ pub(crate) async fn resolve_lighter_evidence(
         || value.fill.as_ref().is_none_or(|fill| fill.fee_provenance != FeeProvenance::Venue));
     if needs_history {
         let remaining = timeout.saturating_sub(start.elapsed());
-        let history = lighter.resolve_order_terminal(&spec.market_id, client, side, qty, remaining);
+        let history = lighter.resolve_order_terminal(&spec.market_id, client, side, remaining);
         tokio::pin!(history);
         if let Some(pending) = pending.as_mut() {
             let stream = pending.observe_confirmed(remaining);
@@ -2831,8 +2830,6 @@ fn recovery_loss_row(spec: &MarketSpec, recovery: &RecoveryReport) -> TradeLedge
     }
 }
 
-/// Record a recovery-loss ledger row (if the PnL tracker is enabled) and enforce the
-/// cumulative-loss breaker, mirroring the normal trade path.
 /// The only completed-execution accounting exit: acknowledge the row before enforcing
 /// either breaker, and retain the session marker if persistence fails.
 async fn commit_accounting(
@@ -2849,6 +2846,8 @@ async fn commit_accounting(
     Ok(update)
 }
 
+/// Record a recovery-loss ledger row (if the PnL tracker is enabled) and enforce the
+/// cumulative-loss breaker, mirroring the normal trade path.
 async fn record_recovery_loss(
     pnl: &mut Option<PnlTracker>, spec: &MarketSpec, recovery: &RecoveryReport,
     session: &ActiveSession, hourly_breaker: Option<String>,
@@ -3378,7 +3377,14 @@ async fn recover_if_needed(
             if !a_evidence.terminal || !l_evidence.terminal {
                 bail!("recovery close terminal evidence unavailable; no further close may be submitted");
             }
-            tokio::time::sleep(Duration::from_millis(cfg.risk.min_reconcile_interval_ms.max(250))).await;
+            // The next attempt sizes from REST positions: wait until they show these closes, or
+            // a lagging read would close the same residual twice.
+            let sign = if side == Side::Buy { Decimal::ONE } else { -Decimal::ONE };
+            let expected = PositionSnapshot {
+                aster_qty: position.aster_qty + sign * a_evidence.qty.unwrap_or(Decimal::ZERO),
+                lighter_qty: position.lighter_qty + sign * l_evidence.qty.unwrap_or(Decimal::ZERO),
+            };
+            wait_position_evidence(cfg, spec, aster, lighter, expected, mark).await?;
         }
         unreachable!()
     }).await;
@@ -3409,16 +3415,16 @@ async fn recover_if_needed(
     }
 }
 
-/// Estimated realized loss across a recovery window. Prefers the total-equity delta:
-/// closing a position RELEASES available margin, so the available-only delta can report
-/// zero (or a gain) while a loss was realized. Falls back to the available-margin delta
-/// when either snapshot lacks equity. Floored at zero — this feeds loss breakers and must
-/// never book phantom gains.
 fn session_marked_loss(baseline: Decimal, current: Decimal, limit: Decimal) -> Option<Decimal> {
     let loss = baseline-current;
     (loss >= limit).then_some(loss)
 }
 
+/// Estimated realized loss across a recovery window. Prefers the total-equity delta:
+/// closing a position RELEASES available margin, so the available-only delta can report
+/// zero (or a gain) while a loss was realized. Falls back to the available-margin delta
+/// when either snapshot lacks equity. Floored at zero — this feeds loss breakers and must
+/// never book phantom gains.
 fn estimated_recovery_loss(before: MarginSnapshot, after: MarginSnapshot) -> Decimal {
     let delta = match (before.total_equity_usd(), after.total_equity_usd()) {
         (Some(before_eq), Some(after_eq)) => before_eq - after_eq,
@@ -3531,17 +3537,21 @@ fn spawn_account_snapshot_refresher(
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(refresh_ms));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = tokio::time::Instant::now();
         loop {
             // A forced refresh (scan loop stuck on a mismatch) skips the wait; the
             // pause check below still applies, so recovery windows also suppress
             // forced refreshes — a stored permit consumed post-unpause is harmless.
+            // The scan asks every 500 ms while a mismatch lasts, so forced reads come at
+            // least 5 s apart: each costs two of the IP's 60 Lighter REST calls a minute.
             tokio::select! {
                 _ = tick.tick() => {}
-                _ = refresh_now.notified() => {}
+                _ = refresh_now.notified() => tokio::time::sleep_until(last + Duration::from_secs(5)).await,
             }
             if execution_epoch.load(Ordering::Acquire) % 2 != 0 {
                 continue;
             }
+            last = tokio::time::Instant::now();
             match refresh_account_snapshot(&market, &aster, &lighter, &execution_epoch).await {
                 Ok(snapshot) => {
                     // Re-check the pause flag before publishing: a refresh already in

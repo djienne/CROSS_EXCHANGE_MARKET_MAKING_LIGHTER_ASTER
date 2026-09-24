@@ -70,10 +70,6 @@ pub struct AsterPositionRow {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsterBalanceRow {
     pub asset: String,
-    #[serde(rename = "availableBalance", default)]
-    pub available_balance: String,
-    #[serde(default)]
-    pub balance: String,
     #[serde(rename = "crossWalletBalance", default)]
     pub cross_wallet_balance: String,
     #[serde(rename = "crossUnPnl", default)]
@@ -83,7 +79,6 @@ pub struct AsterBalanceRow {
 #[derive(Debug, Clone, Copy)]
 pub struct AsterBalanceSnapshot {
     pub available_usd: Decimal,
-    pub wallet_balance_usd: Option<Decimal>,
     pub cross_wallet_balance_usd: Option<Decimal>,
     pub cross_unrealized_pnl_usd: Option<Decimal>,
 }
@@ -95,18 +90,6 @@ impl AsterBalanceSnapshot {
             _ => None,
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AsterOpenOrder {
-    #[serde(rename = "orderId")]
-    pub order_id: i64,
-    #[serde(rename = "clientOrderId", default)]
-    pub client_order_id: String,
-    #[serde(default)]
-    pub symbol: String,
-    #[serde(default)]
-    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -128,8 +111,6 @@ struct AsterOrderResp {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AsterUserTrade {
-    #[serde(default)]
-    pub id: i64,
     #[serde(rename = "orderId")]
     pub order_id: i64,
     pub price: String,
@@ -140,18 +121,11 @@ pub struct AsterUserTrade {
     pub commission: Option<serde_json::Value>,
     #[serde(rename = "commissionAsset", default)]
     pub commission_asset: Option<String>,
-    #[serde(default)]
-    pub time: i64,
-    #[serde(default)]
-    pub buyer: bool,
-    #[serde(default)]
-    pub maker: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct AsterImmediateFill {
     pub qty: Decimal,
-    pub vwap: Decimal,
     pub notional: Decimal,
 }
 
@@ -408,17 +382,10 @@ impl AsterRest {
         if stable_rows.is_empty() {
             return Ok(AsterBalanceSnapshot {
                 available_usd: Decimal::ZERO,
-                wallet_balance_usd: None,
                 cross_wallet_balance_usd: None,
                 cross_unrealized_pnl_usd: None,
             });
         }
-        // SIGNED sum: a negative stablecoin row is debt and must reduce the wallet total
-        // (the old `> 0` filter overstated it by the debt).
-        let wallet_balance_usd: Decimal = stable_rows
-            .iter()
-            .map(|r| r.balance.parse::<Decimal>().context("malformed Aster wallet balance"))
-            .collect::<Result<Vec<_>>>()?.into_iter().sum();
         // SIGNED sums across ALL stable rows for the equity terms: the old
         // positive-only `.max()` picked the USDC collateral row and dropped the negative
         // USDT debt row, so `equity_usd()` overstated equity by the debt — and per-asset
@@ -438,13 +405,13 @@ impl AsterRest {
             (unpnl_vals.len() == stable_rows.len()).then(|| unpnl_vals.into_iter().sum::<Decimal>());
         Ok(AsterBalanceSnapshot {
             available_usd,
-            wallet_balance_usd: Some(wallet_balance_usd),
             cross_wallet_balance_usd,
             cross_unrealized_pnl_usd,
         })
     }
 
-    pub async fn open_orders(&self, market: &MarketId) -> Result<Vec<AsterOpenOrder>> {
+    /// Only the count is read.
+    pub async fn open_orders(&self, market: &MarketId) -> Result<Vec<serde::de::IgnoredAny>> {
         let symbol = self.wire(market)?.symbol.clone();
         let body = self
             .signed_request(
@@ -614,7 +581,7 @@ fn immediate_fill_from_order(r: &AsterOrderResp) -> Result<AsterImmediateFill> {
     let qty = quantity.parse::<Decimal>().context("malformed Aster executed quantity")?;
     if qty < Decimal::ZERO { anyhow::bail!("negative Aster executed quantity"); }
     if qty.is_zero() {
-        return Ok(AsterImmediateFill { qty, vwap: Decimal::ZERO, notional: Decimal::ZERO });
+        return Ok(AsterImmediateFill { qty, notional: Decimal::ZERO });
     }
     let quote = r.cum_quote.as_deref().map(|s| s.parse::<Decimal>()).transpose()
         .context("malformed Aster cumulative quote")?;
@@ -623,7 +590,7 @@ fn immediate_fill_from_order(r: &AsterOrderResp) -> Result<AsterImmediateFill> {
     let notional = quote.filter(|v| *v > Decimal::ZERO)
         .or_else(|| price.filter(|v| *v > Decimal::ZERO).map(|p| qty * p))
         .ok_or_else(|| anyhow!("Aster filled quantity has no positive quote amount or price"))?;
-    Ok(AsterImmediateFill { qty, notional, vwap: notional / qty })
+    Ok(AsterImmediateFill { qty, notional })
 }
 
 fn classify_order_response(client_order_id: &str, body: &str) -> SubmitOutcome {
@@ -778,16 +745,14 @@ mod tests {
         let fill = immediate_fill_from_order_response(body).expect("fill parse");
         assert_eq!(fill.qty, Decimal::ZERO);
         assert_eq!(fill.notional, Decimal::ZERO);
-        assert_eq!(fill.vwap, Decimal::ZERO);
     }
 
     #[test]
-    fn immediate_fill_prefers_cum_quote_for_vwap() {
+    fn immediate_fill_prefers_cum_quote() {
         let body = r#"{"orderId":1,"status":"FILLED","executedQty":"0.21","cumQty":"0.21","cumQuote":"12.931107","avgPrice":"61.5767"}"#;
         let fill = immediate_fill_from_order_response(body).expect("fill parse");
         assert_eq!(fill.qty, dec!(0.21));
         assert_eq!(fill.notional, dec!(12.931107));
-        assert_eq!(fill.vwap, dec!(61.5767));
     }
 
     #[test]
@@ -828,7 +793,6 @@ mod tests {
         let fill = immediate_fill_from_order_response(body).expect("fill parse");
         assert_eq!(fill.qty, dec!(0.07));
         assert_eq!(fill.notional, dec!(4.305));
-        assert_eq!(fill.vwap, dec!(61.5));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -845,7 +809,7 @@ mod tests {
         let outcome = rest.submit_ioc_order(&hype, Side::Buy, dec!(0.1), dec!(101.5), false).await;
         let SubmitOutcome::Accepted { raw, .. } = outcome else { panic!("{outcome:?}") };
         let fill = immediate_fill_from_order_response(&raw).unwrap();
-        assert_eq!((fill.qty, fill.vwap), (dec!(0.1), dec!(101)), "the IOC takes the ask it can reach");
+        assert_eq!((fill.qty, fill.notional), (dec!(0.1), dec!(10.1)), "the IOC takes the ask it can reach");
         assert_eq!(rest.position_qty(&hype).await.unwrap(), dec!(0.1));
     }
 }

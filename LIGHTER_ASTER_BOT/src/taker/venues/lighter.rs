@@ -29,7 +29,6 @@ use crate::taker::markets::MarketSpec;
 use crate::taker::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side, TxSendStatus};
 
 const MAX_CLIENT_ORDER_INDEX: i64 = 281_474_976_710_655; // 2^48 - 1
-const MAX_ORDER_HISTORY_PAGES: usize = 64;
 static CLIENT_ORDER_COUNTER: AtomicI64 = AtomicI64::new(0);
 /// Millisecond in which the 7-bit client-order counter last wrapped (see the wrap guard in
 /// `random_client_order_index`).
@@ -139,9 +138,7 @@ impl LighterFillStatus {
 pub struct LighterFillConfirmation {
     pub fee_evidence: Vec<FeeEvidence>,
     pub fill: Option<FillSummary>,
-    pub status: LighterFillStatus,
     pub terminal_order: Option<RemoteOrder>,
-    pub matched_trades_seen: u64,
     pub filled_qty: Decimal,
 }
 
@@ -355,9 +352,7 @@ impl PendingFill {
             fill: if status == LighterFillStatus::ExpiredNoFill { Some(FillSummary::zero()) }
                 else { FillSummary::from_qty_notional(progress.qty, progress.notional, progress.fee).map(|fill|
                     fill.with_fee_provenance(if progress.fee_known { FeeProvenance::Venue } else { FeeProvenance::Unknown })) },
-            status,
             terminal_order,
-            matched_trades_seen: progress.matched_seen,
             filled_qty: effective_filled_qty,
         }
     }
@@ -380,7 +375,6 @@ struct AccountFeedState {
     account_index: Option<i64>,
     positions: Mutex<HashMap<u32, Decimal>>,
     available_balance: Mutex<Option<Decimal>>,
-    portfolio_value: Mutex<Option<Decimal>>,
     open_orders: Mutex<HashMap<u32, usize>>,
     client_orders: Mutex<HashMap<i64, RemoteOrder>>,
     client_order_markets: Mutex<HashMap<i64, u32>>,
@@ -418,20 +412,12 @@ impl AccountFeedState {
             .copied()
     }
 
-    fn set_user_stats(&self, available_balance: Option<Decimal>, portfolio_value: Option<Decimal>) {
+    fn set_user_stats(&self, available_balance: Option<Decimal>) {
         if let Some(value) = available_balance {
             *self
                 .available_balance
                 .lock()
                 .expect("Lighter available balance poisoned") = Some(value);
-        }
-        if let Some(value) = portfolio_value {
-            *self
-                .portfolio_value
-                .lock()
-                .expect("Lighter portfolio value poisoned") = Some(value);
-        }
-        if available_balance.is_some() || portfolio_value.is_some() {
             self.user_stats_ready.store(true, Ordering::Release);
         }
     }
@@ -444,16 +430,6 @@ impl AccountFeedState {
             .available_balance
             .lock()
             .expect("Lighter available balance poisoned")
-    }
-
-    fn portfolio_value(&self) -> Option<Decimal> {
-        if !self.user_stats_ready.load(Ordering::Acquire) {
-            return None;
-        }
-        *self
-            .portfolio_value
-            .lock()
-            .expect("Lighter portfolio value poisoned")
     }
 
     fn set_open_orders_for_markets(&self, known_markets: &[u32], orders: &serde_json::Value, is_snapshot: bool) {
@@ -1139,11 +1115,9 @@ impl LighterVenue {
                 .await;
             match result.status {
                 TxSendStatus::NotSent => self.nonce.rollback(1),
-                TxSendStatus::Unknown => {}
-                TxSendStatus::Rejected if lighter_nonce_reject(result.code, &result.message) => {
-                    let _ = self.nonce.hard_refresh(&self.rest).await;
-                }
-                TxSendStatus::Ok | TxSendStatus::Rejected => {}
+                TxSendStatus::Unknown | TxSendStatus::Ok => {}
+                // Not every reject uses the nonce (a rate limit does not): re-read it, as XEMM does.
+                TxSendStatus::Rejected => { let _ = self.nonce.hard_refresh(&self.rest).await; }
             }
             (result, tx_hash, nonce)
         };
@@ -1270,22 +1244,6 @@ impl LighterVenue {
             .ok_or_else(|| anyhow!("Lighter user_stats websocket available balance not ready"))
     }
 
-    pub async fn account_value_usdc(&self) -> Result<Option<Decimal>> {
-        self.rest_account_value_usdc().await
-    }
-
-    pub async fn rest_account_value_usdc(&self) -> Result<Option<Decimal>> {
-        let raw = self.rest.account_raw(self.account_index).await?;
-        Ok(account_value_usdc(account_root(&raw)?))
-    }
-
-    pub fn ws_account_value_usdc(&self) -> Result<Option<Decimal>> {
-        if !self.account_feed.user_stats_ready.load(Ordering::Acquire) {
-            bail!("Lighter user_stats websocket not ready")
-        }
-        Ok(self.account_feed.portfolio_value())
-    }
-
     pub async fn open_orders_count(&self, market: &MarketId) -> Result<usize> {
         self.rest_open_orders_count(market).await
     }
@@ -1309,29 +1267,27 @@ impl LighterVenue {
 
     /// Cold, identity-matched resolution. Exhausted/missing history is never no-fill evidence.
     pub async fn resolve_order_terminal(
-        &self, market: &MarketId, client_order_index: i64, side: Side,
-        expected_qty: Decimal, timeout: Duration,
+        &self, market: &MarketId, client_order_index: i64, side: Side, timeout: Duration,
     ) -> Result<LighterFillConfirmation> {
         let market_index = self.wire(market)?.market_index as u32;
         let deadline = tokio::time::Instant::now() + timeout;
         let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;
-        tokio::time::timeout_at(deadline, async {
-            loop {
+        let mut last_error = None;
+        loop {
+            let pass = tokio::time::timeout_at(deadline, async {
                 let cached = self.account_feed.order_by_client(client_order_index)
                     .filter(|order| remote_matches(order, self.account_index, market_index, client_order_index, side));
                 let mut terminal = cached.filter(RemoteOrder::is_terminal);
                 if terminal.is_none() {
                     let mut cursor: Option<String> = None;
                     let mut cursors = HashSet::new();
-                    // Our IOC is among the newest rows; the cap stops a lagging history from
-                    // walking the shared account's whole past every 250 ms (XEMM uses 64 too).
-                    for _ in 0..MAX_ORDER_HISTORY_PAGES {
+                    for _ in 0..crate::lighter::rest::HISTORY_PAGES {
                         let page = self.rest.account_inactive_orders(self.account_index, market_index,
                             &auth, cursor.as_deref()).await?;
                         let rows = page.get("orders").and_then(serde_json::Value::as_array)
                             .context("Lighter inactive-order history has no orders array")?;
                         for row in rows {
-                            let order: RemoteOrder = serde_json::from_value(row.clone())?;
+                            let Ok(order) = serde_json::from_value::<RemoteOrder>(row.clone()) else { continue };
                             if remote_matches(&order, self.account_index, market_index, client_order_index, side)
                                 && order.is_terminal() { terminal = Some(order); break; }
                         }
@@ -1345,9 +1301,8 @@ impl LighterVenue {
                     let filled = remote_order_filled_qty(&order).context("terminal Lighter order lacks filled quantity")?;
                     anyhow::ensure!(filled >= Decimal::ZERO, "negative terminal filled quantity");
                     if filled == Decimal::ZERO {
-                        return Ok(LighterFillConfirmation { fee_evidence:Vec::new(), fill: Some(FillSummary::zero()),
-                            status: LighterFillStatus::ExpiredNoFill, terminal_order: Some(order),
-                            matched_trades_seen: 0, filled_qty: Decimal::ZERO });
+                        return Ok(Some(LighterFillConfirmation { fee_evidence:Vec::new(), fill: Some(FillSummary::zero()),
+                            terminal_order: Some(order), filled_qty: Decimal::ZERO }));
                     }
                     let order_index = order.order_index.context("terminal Lighter order lacks order index")?;
                     let mut cursor: Option<String> = None;
@@ -1356,7 +1311,6 @@ impl LighterVenue {
                     let (mut qty, mut notional, mut fees) = (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
                     let mut known_fee = true;
                     let mut fee_evidence = Vec::new();
-                    let mut rows_seen = 0;
                     loop {
                         let page = self.rest.trades_by_order(self.account_index, order_index, &auth, cursor.as_deref()).await?;
                         let trades = page.get("trades").and_then(serde_json::Value::as_array)
@@ -1382,7 +1336,6 @@ impl LighterVenue {
                             anyhow::ensure!(amount > Decimal::ZERO, "nonpositive Lighter historical notional");
                             qty += q;
                             notional += amount;
-                            rows_seen += 1;
                             let evidence = trade_fee_evidence(&trade,side,client_order_index,amount,"rest_trades");
                             match evidence.fee_usd {
                                 Some(fee) => fees += fee,
@@ -1398,13 +1351,22 @@ impl LighterVenue {
                         FillSummary::from_qty_notional(qty, notional, fees).map(|fill| fill.with_fee_provenance(
                             if known_fee { FeeProvenance::Venue } else { FeeProvenance::Unknown }))
                     } else { None };
-                    return Ok(LighterFillConfirmation { fee_evidence, fill,
-                        status: if filled >= expected_qty { LighterFillStatus::Filled } else { LighterFillStatus::PartialFill },
-                        terminal_order: Some(order), matched_trades_seen: rows_seen, filled_qty: filled });
+                    return Ok(Some(LighterFillConfirmation { fee_evidence, fill,
+                        terminal_order: Some(order), filled_qty: filled }));
                 }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                Ok::<_, anyhow::Error>(None)
+            }).await;
+            // A failed read is "not yet", never evidence: retry until the deadline, once a second
+            // (XEMM polls every 2 s).
+            match pass {
+                Ok(Ok(Some(confirmation))) => return Ok(confirmation),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => return Err(last_error.unwrap_or_else(|| anyhow!("no terminal order in its history"))
+                    .context("Lighter order remains unresolved at confirmation deadline")),
             }
-        }).await.context("Lighter order remains unresolved at confirmation deadline")?
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     pub async fn refresh_nonce(&self) -> Result<()> {
@@ -1598,10 +1560,7 @@ fn spawn_user_stats_stream(
             None,
             move |raw| {
                 if let Ok(msg) = serde_json::from_str::<UserStatsMsg>(raw) {
-                    account_feed.set_user_stats(
-                        value_dec(msg.stats.available_balance.as_ref()),
-                        value_dec(msg.stats.portfolio_value.as_ref()),
-                    );
+                    account_feed.set_user_stats(value_dec(msg.stats.available_balance.as_ref()));
                 }
             },
             || {},

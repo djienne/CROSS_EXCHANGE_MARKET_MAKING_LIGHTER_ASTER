@@ -1460,7 +1460,7 @@ impl HlExchange {
         let auth = generate_ws_auth_token(&self.signer, self.api_key_index)?;
         let index = intent.cloid.to_lighter_client_order_index();
         let mut cursor: Option<String> = None;
-        for _ in 0..64 {
+        for _ in 0..crate::lighter::rest::HISTORY_PAGES {
             let page = self.rest.account_inactive_orders(self.account_index, market_id, &auth, cursor.as_deref()).await?;
             let rows = page.get("orders").and_then(|x| x.as_array()).ok_or_else(|| anyhow!("inactive order response missing orders"))?;
             for row in rows {

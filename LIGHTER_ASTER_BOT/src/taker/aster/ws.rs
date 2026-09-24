@@ -117,11 +117,15 @@ async fn depth_loop(
 ) {
     let mut backoff = RECONNECT_BASE;
     loop {
+        let started = tokio::time::Instant::now();
         match depth_session(&url, &symbol, state.clone(), reconnect.clone()).await {
             Ok(()) => {}
             Err(e) => tracing::warn!("Aster depth websocket disconnected: {e:#}"),
         }
         state.publish(None);
+        if started.elapsed() >= Duration::from_secs(60) {
+            backoff = RECONNECT_BASE; // the session was healthy: retry fast, as the Lighter streams do
+        }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(RECONNECT_MAX);
     }

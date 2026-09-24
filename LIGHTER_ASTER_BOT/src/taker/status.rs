@@ -451,7 +451,7 @@ fn direction_status(
     let l_sign = -a_sign;
     let max_abs_qty = cfg.risk.max_abs_position_notional_usd / ref_px;
     let headroom_qty = max_qty_by_headroom(max_abs_qty, pos, a_sign, l_sign);
-    let margin_room_qty = max_qty_by_available_margin(cfg, ref_px, pos, margins, a_sign, l_sign);
+    let margin_room_qty = max_qty_by_available_margin(cfg.risk.margin_buffer_usd, ref_px, pos, margins, a_sign, l_sign);
 
     let depth_guard_enabled = cfg.arb.depth_guard.enabled;
     let liquidity_multiple = if depth_guard_enabled {
@@ -658,7 +658,7 @@ fn max_qty_by_headroom(
 }
 
 fn max_qty_by_available_margin(
-    cfg: &Config,
+    buffer: Decimal,
     ref_px: Decimal,
     pos: PositionSnapshot,
     margins: MarginSnapshot,
@@ -675,30 +675,18 @@ fn max_qty_by_available_margin(
         let increases_abs = current == Decimal::ZERO
             || (current > Decimal::ZERO && sign > Decimal::ZERO)
             || (current < Decimal::ZERO && sign < Decimal::ZERO);
-        if !increases_abs {
-            return Decimal::MAX;
-        }
         let usable = available - buffer;
-        if usable <= Decimal::ZERO || ref_px <= Decimal::ZERO {
+        let margin_qty = if usable <= Decimal::ZERO || ref_px <= Decimal::ZERO {
             Decimal::ZERO
         } else {
             usable / ref_px
-        }
+        };
+        // As in arb: reducing is margin-free only down to flat; beyond it the trade opens
+        // the other side.
+        if increases_abs { margin_qty } else { current.abs() + margin_qty }
     }
-    leg(
-        ref_px,
-        pos.aster_qty,
-        a_sign,
-        margins.aster_available_usd,
-        cfg.risk.margin_buffer_usd,
-    )
-    .min(leg(
-        ref_px,
-        pos.lighter_qty,
-        l_sign,
-        margins.lighter_available_usd,
-        cfg.risk.margin_buffer_usd,
-    ))
+    leg(ref_px, pos.aster_qty, a_sign, margins.aster_available_usd, buffer)
+        .min(leg(ref_px, pos.lighter_qty, l_sign, margins.lighter_available_usd, buffer))
 }
 
 fn min_trade_qty(
@@ -754,6 +742,15 @@ mod tests {
             exposure_effect(pos, dec!(-1), dec!(1), dec!(0.2)),
             "increase"
         );
+    }
+
+    #[test]
+    fn a_reducing_leg_is_margin_free_only_down_to_flat() {
+        // Short 1 on Aster, long 1 on Lighter, 20 USD usable a venue at price 10: buying on
+        // Aster reduces both legs by 1, then opens up to 2 more.
+        let pos = PositionSnapshot { aster_qty: dec!(-1), lighter_qty: dec!(1) };
+        let margins = MarginSnapshot { aster_available_usd: dec!(70), lighter_available_usd: dec!(70) };
+        assert_eq!(max_qty_by_available_margin(dec!(50), dec!(10), pos, margins, dec!(1), dec!(-1)), dec!(3));
     }
 
     #[test]

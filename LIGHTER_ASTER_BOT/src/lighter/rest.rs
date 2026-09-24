@@ -14,6 +14,11 @@ use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use std::time::Duration;
 
+/// History pages (100 rows each, newest first) one order lookup reads per pass. A just-sent
+/// IOC is among the newest rows; walking a lagging history deeper would spend a Standard
+/// account's 60 REST calls a minute in one pass. An older order is resolved by hand (RUNBOOK).
+pub const HISTORY_PAGES: usize = 2;
+
 #[derive(Clone)]
 pub struct RestClient {
     base: String,
@@ -44,7 +49,6 @@ impl RestClient {
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
     }
-
 
     async fn authenticated_history(
         &self, path: &str, auth: &str, mut params: Vec<(&str, String)>, cursor: Option<&str>,

@@ -459,8 +459,6 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     Some("BUY") => Side::Buy, Some("SELL") => Side::Sell,
                     _ => bail!("session order side unavailable"),
                 };
-                let qty = order.get("qty").and_then(serde_json::Value::as_str)
-                    .context("session order quantity missing")?.parse::<Decimal>()?;
                 match order.get("venue").and_then(serde_json::Value::as_str) {
                     Some("aster") => {
                         let client = order.get("client_order_id").and_then(serde_json::Value::as_str)
@@ -475,7 +473,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     Some("lighter") => {
                         let client = order.get("client_order_index").and_then(serde_json::Value::as_i64)
                             .context("Lighter client identity missing")?;
-                        let result = lighter.resolve_order_terminal(&spec.market_id, client, side, qty, Duration::from_secs(10)).await?;
+                        let result = lighter.resolve_order_terminal(&spec.market_id, client, side, Duration::from_secs(10)).await?;
                         anyhow::ensure!(result.terminal_order.as_ref().is_some_and(|order| order.is_terminal()), "Lighter terminal order unavailable");
                         expected_lighter += if side == Side::Buy { result.filled_qty } else { -result.filled_qty };
                         verified.push(serde_json::json!({"venue":"lighter", "client_order_index":client,
