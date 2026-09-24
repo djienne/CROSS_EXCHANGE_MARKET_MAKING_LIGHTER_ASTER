@@ -43,7 +43,8 @@ pub enum Venue {
 }
 
 impl Venue {
-    fn ix(self) -> usize {
+    /// Its slot in the per-venue pairs (`[Aster, Lighter]`).
+    pub fn ix(self) -> usize {
         self as usize
     }
 }
@@ -164,6 +165,7 @@ impl Order {
 pub struct Fill {
     pub id: u64,
     pub order_id: u64,
+    pub client_id: String,
     pub market: String,
     pub side: Side,
     pub price: Decimal,
@@ -201,6 +203,8 @@ pub enum Request {
     Deadman { market: String, countdown_ms: i64 },
     Account,
     OpenOrders { market: Option<String> },
+    /// Finished orders, newest first.
+    ClosedOrders { market: Option<String> },
     Order { order: OrderRef },
     Fills { market: Option<String> },
     Book { market: String },
@@ -231,7 +235,8 @@ pub enum Reply {
     Orders(Vec<Order>),
     Fills(Vec<Fill>),
     Account(AccountView),
-    Book { bids: Vec<Level>, asks: Vec<Level> },
+    /// The visible book, read at `at_us`.
+    Book { bids: Vec<Level>, asks: Vec<Level>, at_us: i64 },
     Nonce(i64),
     Reject(Reject),
 }
@@ -338,6 +343,9 @@ pub struct VenueState {
     pub deadman: BTreeMap<String, i64>,
     /// Funding rate per market and settlement time (exchange µs); the latest poll wins.
     pub funding: BTreeMap<String, BTreeMap<i64, Decimal>>,
+    /// The last settlement applied per market: a rate reported again is not charged twice.
+    #[serde(default)]
+    pub settled: BTreeMap<String, i64>,
     #[serde(skip)]
     books: BTreeMap<String, Replica>,
     #[serde(skip)]
@@ -359,6 +367,7 @@ impl VenueState {
             nonces: BTreeMap::new(),
             deadman: BTreeMap::new(),
             funding: BTreeMap::new(),
+            settled: BTreeMap::new(),
             books: BTreeMap::new(),
             filters: BTreeMap::new(),
             marks: BTreeMap::new(),
@@ -518,9 +527,14 @@ impl Exchange {
         self.schedule(at, rank, Pending::Feed { venue, market: market.to_string(), exch_us, event });
     }
 
-    /// Records the funding rate a settlement at `exch_us` will use (re-polls update it).
+    /// Records the funding rate a settlement at `exch_us` will use (re-polls update it). A rate
+    /// arriving after its settlement's shifted time is charged on arrival.
     pub fn funding(&mut self, venue: Venue, market: &str, exch_us: i64, rate: Decimal) {
-        let rates = self.venues[venue.ix()].funding.entry(market.to_string()).or_default();
+        let st = &mut self.venues[venue.ix()];
+        if st.settled.get(market).is_some_and(|&last| exch_us <= last) {
+            return;
+        }
+        let rates = st.funding.entry(market.to_string()).or_default();
         if rates.insert(exch_us, rate).is_none() {
             let at = exch_us + self.p.shift_us;
             self.schedule(at, RANK_FUNDING, Pending::Funding { venue, market: market.to_string(), exch_us });
@@ -539,6 +553,12 @@ impl Exchange {
         let ticket = self.tickets;
         self.schedule(gateway, RANK_ACTION, Pending::Gateway { ticket, reply_at, envelope });
         ticket
+    }
+
+    /// The venue's account and open orders as of now, outside any request: what a private
+    /// stream sends on subscription.
+    pub fn peek(&self, venue: Venue) -> (AccountView, Vec<Order>) {
+        (self.account_view(venue), self.venues[venue.ix()].open.values().cloned().collect())
     }
 
     pub fn next_due(&self) -> Option<i64> {
@@ -699,6 +719,12 @@ impl Exchange {
                     .cloned()
                     .collect(),
             ),
+            Request::ClosedOrders { market } => Reply::Orders(
+                self.venues[v].closed.iter().rev()
+                    .filter(|o| market.as_ref().is_none_or(|m| &o.market == m))
+                    .cloned()
+                    .collect(),
+            ),
             Request::Order { order: which } => {
                 let st = &self.venues[v];
                 let matches = |o: &&Order| match &which {
@@ -721,7 +747,7 @@ impl Exchange {
                 let book = self.venues[v].books.get(&market)
                     .map(|b| b.warm().then(|| (b.levels(Side::Buy).collect(), b.levels(Side::Sell).collect())));
                 match book {
-                    Some(Some((bids, asks))) => Reply::Book { bids, asks },
+                    Some(Some((bids, asks))) => Reply::Book { bids, asks, at_us: self.now },
                     Some(None) => self.reject(venue, Reject::Unavailable),
                     None => self.reject(venue, Reject::UnknownMarket),
                 }
@@ -858,6 +884,7 @@ impl Exchange {
         let fill = Fill {
             id: st.next_id(),
             order_id: order.id,
+            client_id: order.client_id.clone(),
             market: order.market.clone(),
             side: order.side,
             price,
@@ -1043,6 +1070,7 @@ impl Exchange {
         let v = venue.ix();
         let st = &mut self.venues[v];
         let Some(rate) = st.funding.get_mut(&market).and_then(|rates| rates.remove(&exch_us)) else { return };
+        st.settled.insert(market.clone(), exch_us);
         let qty = st.account.position(&market).qty;
         let Some(mark) = st.marks.get(&market).copied() else { return };
         if qty.is_zero() {
@@ -1482,6 +1510,9 @@ mod tests {
         sim.ex.funding(Venue::Aster, HYPE, 1_000 * MS, dec!(0.0001));
         sim.ex.funding(Venue::Aster, HYPE, 1_000 * MS, dec!(0.0002));
         sim.at(2_000);
+        // Lighter re-reports its last settlement with every stats frame: charged once.
+        sim.ex.funding(Venue::Aster, HYPE, 1_000 * MS, dec!(0.0002));
+        sim.at(3_000);
         let account = &sim.ex.venues[0].account;
         // Long 2 at mid 100 pays 0.0002 × 200.
         assert_eq!(account.funding, dec!(-0.04));

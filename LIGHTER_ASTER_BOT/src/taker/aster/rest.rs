@@ -830,4 +830,22 @@ mod tests {
         assert_eq!(fill.notional, dec!(4.305));
         assert_eq!(fill.vwap, dec!(61.5));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ioc_takes_from_the_dry_run_venue() {
+        let world = crate::dryrun::tests::World::start().await;
+        let hype = MarketId("HYPE".into());
+        let spec = MarketSpec {
+            market_id: hype.clone(), aster_symbol: "HYPEUSDT".into(), lighter_symbol: "HYPE".into(),
+            lighter_market_id: 24, lighter_price_decimals: 4, lighter_size_decimals: 2, lighter_price_tick: dec!(0.0001),
+            tick: dec!(0.001), step: dec!(0.01), aster_min_qty: dec!(0.01), aster_min_notional: dec!(5),
+            lighter_qty_step: dec!(0.01), lighter_min_notional: dec!(10),
+        };
+        let rest = AsterRest::new(world.aster.clone(), crate::dryrun::tests::aster_signer(), &[spec]).unwrap();
+        let outcome = rest.submit_ioc_order(&hype, Side::Buy, dec!(0.1), dec!(101.5), false).await;
+        let SubmitOutcome::Accepted { raw, .. } = outcome else { panic!("{outcome:?}") };
+        let fill = immediate_fill_from_order_response(&raw).unwrap();
+        assert_eq!((fill.qty, fill.vwap), (dec!(0.1), dec!(101)), "the IOC takes the ask it can reach");
+        assert_eq!(rest.position_qty(&hype).await.unwrap(), dec!(0.1));
+    }
 }

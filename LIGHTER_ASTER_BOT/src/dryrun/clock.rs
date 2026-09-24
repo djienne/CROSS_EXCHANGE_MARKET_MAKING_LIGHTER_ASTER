@@ -8,6 +8,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// This host's wall clock, µs since the Unix epoch: the venues stamp their frames on the same
+/// scale.
+pub fn wall_us() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64)
+}
+
 /// splitmix64: tiny, fast and well mixed; plenty for latency draws.
 #[derive(Debug, Clone)]
 pub struct Rng(u64);

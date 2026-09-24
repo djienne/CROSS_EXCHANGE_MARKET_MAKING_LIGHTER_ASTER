@@ -3,7 +3,7 @@
 //! Offline vectors use eth-account 0.13.7; they do not assert live venue acceptance.
 
 use anyhow::{bail, Result};
-use k256::ecdsa::SigningKey;
+use k256::ecdsa::{RecoveryId, Signature, SigningKey, VerifyingKey};
 use tiny_keccak::{Hasher, Keccak};
 
 pub fn keccak256(data: &[u8]) -> [u8; 32] {
@@ -36,7 +36,11 @@ pub fn address_from_priv(key: &[u8; 32]) -> Result<[u8; 20]> {
 }
 
 pub fn address_from_signing_key(key: &SigningKey) -> [u8; 20] {
-    let point = key.verifying_key().to_encoded_point(false);
+    address_of(key.verifying_key())
+}
+
+fn address_of(key: &VerifyingKey) -> [u8; 20] {
+    let point = key.to_encoded_point(false);
     let hash = keccak256(&point.as_bytes()[1..]);
     let mut address = [0u8; 20];
     address.copy_from_slice(&hash[12..]);
@@ -78,6 +82,22 @@ pub fn aster_sign_v3_with_key(key: &SigningKey, encoded_query: &str) -> Result<S
     Ok(format!("0x{}", hex::encode(bytes)))
 }
 
+/// The address that signed `encoded_query` with `signature` (`0x` r‖s‖v): what the venue
+/// compares with the request's `signer`.
+pub fn aster_recover_signer(encoded_query: &str, signature: &str) -> Result<[u8; 20]> {
+    let bytes = hex::decode(signature.trim().trim_start_matches("0x"))
+        .map_err(|_| anyhow::anyhow!("signature is not hexadecimal"))?;
+    if bytes.len() != 65 {
+        bail!("signature must be 65 bytes, got {}", bytes.len());
+    }
+    let signature = Signature::from_slice(&bytes[..64]).map_err(|e| anyhow::anyhow!("malformed signature: {e}"))?;
+    let recovery_id = RecoveryId::from_byte(bytes[64].wrapping_sub(27))
+        .ok_or_else(|| anyhow::anyhow!("signature recovery byte must be 27 or 28"))?;
+    let key = VerifyingKey::recover_from_prehash(&aster_digest(encoded_query), &signature, recovery_id)
+        .map_err(|e| anyhow::anyhow!("signature does not recover a key: {e}"))?;
+    Ok(address_of(&key))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +120,9 @@ mod tests {
         assert_eq!(aster_sign_v3_with_key(&key, QUERY).unwrap(),
             "0x16fc22851e7ea6821868690c16116d6c50266c0cf681ea9eeaabc5e2c5ca697b2deebb413c9fe24013ff1fabc677f8a7dae0b5a90ae2684b99a8022926c3a3dc1c");
         assert_ne!(aster_digest(QUERY), aster_digest(&QUERY.replace("price=100.25", "price=100.26")));
+        let signature = aster_sign_v3_with_key(&key, QUERY).unwrap();
+        assert_eq!(aster_recover_signer(QUERY, &signature).unwrap(), address_from_signing_key(&key));
+        let tampered = QUERY.replace("price=100.25", "price=100.26");
+        assert_ne!(aster_recover_signer(&tampered, &signature).unwrap(), address_from_signing_key(&key));
     }
 }

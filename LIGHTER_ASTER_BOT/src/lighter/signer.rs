@@ -361,7 +361,12 @@ pub fn chain_id_for_url(url: &str) -> i32 {
     }
 }
 
-fn signer_filename() -> &'static str {
+/// The native library keeps one client per API key for the whole process, so tests that load
+/// it take turns.
+#[cfg(test)]
+pub(crate) static NATIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn signer_filename() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => "lighter-signer-linux-amd64.so",
         ("linux", "aarch64") => "lighter-signer-linux-arm64.so",
@@ -385,6 +390,7 @@ mod tests {
             eprintln!("skipped: no signer library for this platform");
             return;
         }
+        let _native = NATIVE.lock().unwrap_or_else(|e| e.into_inner());
         let creds = LighterCreds::dry_run();
         let (account, key) = (creds.account_index, creds.api_key_index);
         // A venue holding the dry-run public key. CheckClient compares it with the key the
