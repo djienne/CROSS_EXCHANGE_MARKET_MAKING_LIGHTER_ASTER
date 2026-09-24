@@ -162,7 +162,7 @@ taker. Without `--dry-run` that command resets live's breaker.
 | `rtt_ms`, `private_ms` | The latencies drawn. |
 | `requests`, `orders`, `rejects` | Rejects by reason. Each needs an explanation in the bot's log; `RateLimited` means the bot outran a venue limit, which is a finding about the bot. |
 | `maker_fills`, `taker_fills`, `queue_ahead`, `maker_wait_ms` | Fills, the queue ahead of each order that came to rest, and each maker fill's wait since placement. |
-| `prints`, `prints_inside_spread`, `prints_over_visible` | Trades the visible book cannot explain, i.e. hidden liquidity. Their share calibrates `hidden_queue_multiplier`. |
+| `prints`, `prints_inside_spread`, `prints_over_visible` | Trades the visible book cannot explain: hidden orders, or orders placed and taken between two book updates. Their share bounds from above the hidden liquidity `hidden_queue_multiplier` assumes. |
 | `account` | Balance, unrealized, equity, realized, fees, funding, positions, maintenance breach. |
 
 Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simulated` means
