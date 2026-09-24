@@ -6,7 +6,6 @@
 //!
 //! Each probe proves one primitive works live in isolation.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
@@ -24,38 +23,15 @@ use super::exec::aster::AsterRest;
 use super::exec::command::ExecEvent;
 use super::exec::creds::{AsterCreds, LighterCreds};
 use super::exec::hyperliquid::HlExchange;
-use super::exec::sign::EvmAsterSigner;
-use super::scale::MarketScale;
-
-fn aster_env_path() -> String {
-    std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".into())
-}
-fn hl_env_path() -> String {
-    std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".into())
-}
 
 /// Build the live Aster client for the given specs.
 fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
-    let creds = AsterCreds::load(Path::new(&aster_env_path()))?;
-    let signer = std::sync::Arc::new(EvmAsterSigner::new(creds.user, creds.signer, creds.key)?);
-    let mut scales: HashMap<MarketId, (MarketScale, String)> = HashMap::new();
-    for s in specs {
-        scales.insert(s.market_id.clone(), (MarketScale::from_spec(s), s.aster_symbol.clone()));
-    }
-    AsterRest::new(
-        cfg.live.aster.base_url.clone(),
-        signer,
-        scales,
-        cfg.live.aster.deadman_countdown_ms,
-        cfg.live.aster.rate_limit_backoff_ms,
-        cfg.live.aster.effective_max_rest_requests_per_minute(),
-        None,
-    )
+    super::status::build_aster(cfg, specs, AsterCreds::from_env()?)
 }
 
 /// Build the live HL client for the given specs.
 async fn build_hl(cfg: &Config, specs: &[MarketSpec]) -> Result<HlExchange> {
-    let creds = LighterCreds::load(Path::new(&hl_env_path()))?;
+    let creds = LighterCreds::from_env()?;
     HlExchange::new_lighter(
         cfg.live.hyperliquid.base_url.clone(),
         Path::new(&cfg.live.hyperliquid.signers_dir),

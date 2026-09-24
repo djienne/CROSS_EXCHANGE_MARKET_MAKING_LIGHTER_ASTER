@@ -9,7 +9,8 @@
 //!     is held inside the library keyed by (api_key_index, account_index).
 //!   * every returned `char*` is malloc'd by the library and must be freed with libc
 //!     `free` after copying (mirrors Python `decode_and_free`).
-//!   * mainnet `chain_id = 304` (url contains "mainnet" or "api"), testnet = 300.
+//!   * `chain_id` 300 on testnet, else mainnet's 304: the dry-run venue on loopback replays
+//!     mainnet, so its transactions are signed exactly as live ones.
 
 use anyhow::{bail, Context, Result};
 use libloading::{Library, Symbol};
@@ -353,10 +354,10 @@ unsafe impl Send for Signer {}
 unsafe impl Sync for Signer {}
 
 pub fn chain_id_for_url(url: &str) -> i32 {
-    if url.contains("mainnet") || url.contains("api") {
-        304
-    } else {
+    if url.contains("testnet") {
         300
+    } else {
+        304
     }
 }
 
@@ -367,5 +368,67 @@ fn signer_filename() -> &'static str {
         ("macos", "aarch64") => "lighter-signer-darwin-arm64.dylib",
         ("windows", "x86_64") => "lighter-signer-windows-amd64.dll",
         (os, arch) => panic!("unsupported platform for lighter signer: {os}/{arch}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::livebot::exec::creds::LighterCreds;
+    use std::io::{BufRead, BufReader, Write};
+
+    /// Runs where the platform's library ships (the Docker test image carries the linux build).
+    #[test]
+    fn the_dry_run_key_passes_the_venue_check_and_signs_readable_orders() {
+        let dir = Path::new("signers");
+        if !dir.join(signer_filename()).exists() {
+            eprintln!("skipped: no signer library for this platform");
+            return;
+        }
+        let creds = LighterCreds::dry_run();
+        let (account, key) = (creds.account_index, creds.api_key_index);
+        // A venue holding the dry-run public key. CheckClient compares it with the key the
+        // library derives from the private one, so it passes only for a matching pair.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let public = creds.api_public_key.clone();
+        let venue = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap() > 2 {
+                line.clear();
+            }
+            let body = format!(
+                r#"{{"code":200,"api_keys":[{{"account_index":{account},"api_key_index":{key},"nonce":1,"public_key":"{public}"}}]}}"#
+            );
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            request
+        });
+        let signer = Signer::load(dir, &url, &creds.api_private_key, key, account).unwrap();
+        signer.check_client(key).unwrap();
+        let request = venue.join().unwrap();
+        assert!(request.starts_with("GET /api/v1/apikeys?"), "{request}");
+
+        // The fields the dry-run venue reads from a signed order.
+        let tx = signer
+            .sign_create_order(24, 11, 150, 250_000, true, ORDER_TYPE_LIMIT, TIF_POST_ONLY, false,
+                NIL_TRIGGER_PRICE, DEFAULT_28_DAY_ORDER_EXPIRY, 5, key)
+            .unwrap();
+        let info: serde_json::Value = serde_json::from_str(&tx.tx_info).unwrap();
+        for (field, value) in [
+            ("AccountIndex", account), ("ApiKeyIndex", key.into()), ("MarketIndex", 24), ("ClientOrderIndex", 11),
+            ("BaseAmount", 150), ("Price", 250_000), ("IsAsk", 1), ("Type", 0), ("TimeInForce", 2),
+            ("ReduceOnly", 0), ("Nonce", 5),
+        ] {
+            assert_eq!(info[field], value, "{field} in {info}");
+        }
     }
 }

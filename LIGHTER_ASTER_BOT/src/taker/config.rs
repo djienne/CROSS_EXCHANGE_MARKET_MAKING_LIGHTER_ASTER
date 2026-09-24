@@ -480,6 +480,10 @@ pub struct VenueCfg {
     pub aster_base_url: String,
     pub lighter_base_url: String,
     pub signers_dir: String,
+    /// Set only by `run --mode dry-run` after pointing the URLs at the simulated venues: the
+    /// taker then signs with the dry-run identity. No file can set it.
+    #[serde(skip)]
+    pub dry_run: bool,
 }
 
 impl Default for VenueCfg {
@@ -488,6 +492,7 @@ impl Default for VenueCfg {
             aster_base_url: crate::config::default_aster_base_url(),
             lighter_base_url: crate::config::default_hl_base_url(),
             signers_dir: "signers".to_string(),
+            dry_run: false,
         }
     }
 }
@@ -619,6 +624,10 @@ mod tests {
             let err = table(&format!("{venues}lighter_base_url=\"{lighter}\"")).unwrap_err();
             assert!(format!("{err:#}").contains("mainnet origins"), "{lighter}: {err:#}");
         }
+        // Only `run --mode dry-run` may switch the identity, never a file.
+        let err = table(&format!("{venues}lighter_base_url=\"https://mainnet.zklighter.elliot.ai\"\ndry_run=true"))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unknown config keys: venues.dry_run"), "{err:#}");
     }
 
     #[test]

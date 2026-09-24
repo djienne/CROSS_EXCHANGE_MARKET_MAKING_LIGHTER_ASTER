@@ -32,7 +32,7 @@ use tokio::sync::{watch, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Level};
 
-use crate::taker::aster::creds::{AsterCreds, LighterCreds};
+use crate::taker::aster::creds::venue_creds;
 use crate::taker::aster::rest::{
     immediate_fill_from_order_response, order_response_is_terminal, AsterRest,
     SubmitOutcome as AsterOutcome,
@@ -1016,11 +1016,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
         info!("entry gate disabled");
     }
 
-    let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-    let lighter_env =
-        std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-    let acreds = AsterCreds::load(Path::new(&aster_env))?;
-    let lcreds = LighterCreds::load(Path::new(&lighter_env))?;
+    let (acreds, lcreds) = venue_creds(cfg.venues.dry_run)?;
     let aster_account_id = acreds.user.clone();
     let aster_signer: Arc<dyn AsterSigner> =
         Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);

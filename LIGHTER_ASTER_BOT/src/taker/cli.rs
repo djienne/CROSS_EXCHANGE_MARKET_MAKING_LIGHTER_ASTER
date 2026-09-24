@@ -186,12 +186,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .into_iter()
             .next()
             .context("no selected market spec")?;
-            let aster_env =
-                std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-            let lighter_env =
-                std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-            let acreds = AsterCreds::load(std::path::Path::new(&aster_env))?;
-            let lcreds = LighterCreds::load(std::path::Path::new(&lighter_env))?;
+            let acreds = AsterCreds::from_env()?;
+            let lcreds = LighterCreds::from_env()?;
             let signer: Arc<dyn AsterSigner> =
                 Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
             let aster = AsterRest::new(
@@ -247,9 +243,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .into_iter()
             .next()
             .context("no selected market spec")?;
-            let aster_env =
-                std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-            let acreds = AsterCreds::load(std::path::Path::new(&aster_env))?;
+            let acreds = AsterCreds::from_env()?;
             let signer: Arc<dyn AsterSigner> =
                 Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
             let aster_account_id = signer.user_address().to_string();
@@ -342,9 +336,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             .into_iter()
             .next()
             .context("no selected market spec")?;
-            let lighter_env =
-                std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-            let lcreds = LighterCreds::load(std::path::Path::new(&lighter_env))?;
+            let lcreds = LighterCreds::from_env()?;
             let lighter = LighterVenue::new(
                 &cfg.venues.lighter_base_url,
                 std::path::Path::new(&cfg.venues.signers_dir),
@@ -438,10 +430,8 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 "session order identity coverage is incomplete; primary venue evidence is required");
             let orders = evidence.get("orders").and_then(serde_json::Value::as_array).context("session orders missing")?;
             anyhow::ensure!(!orders.is_empty(), "session has no scoped orders to verify");
-            let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-            let lighter_env = std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-            let acreds = AsterCreds::load(std::path::Path::new(&aster_env))?;
-            let lcreds = LighterCreds::load(std::path::Path::new(&lighter_env))?;
+            let acreds = AsterCreds::from_env()?;
+            let lcreds = LighterCreds::from_env()?;
             if let Some(account) = marker.get("aster_account").and_then(serde_json::Value::as_str) {
                 anyhow::ensure!(account.eq_ignore_ascii_case(&acreds.user), "Aster session account mismatch");
             }

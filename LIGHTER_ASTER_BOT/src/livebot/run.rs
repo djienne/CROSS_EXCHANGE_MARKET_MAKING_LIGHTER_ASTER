@@ -548,7 +548,7 @@ async fn setup_live_planes(
     use std::path::Path;
 
     use super::exec::aster::{run_aster_worker, AsterRest};
-    use super::exec::creds::{AsterCreds, LighterCreds};
+    use super::exec::creds::venue_creds;
     use super::exec::hyperliquid::{run_hl_worker, HlExchange};
     use super::exec::sign::{AsterSigner, EvmAsterSigner};
     use super::reconcile::Reconciler;
@@ -556,10 +556,7 @@ async fn setup_live_planes(
     use super::userstream::{run_aster_user_stream, StreamLiveness};
 
     // Load + role-resolve credentials; build the signers once (shared across clients).
-    let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".into());
-    let hl_env = std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".into());
-    let acreds = AsterCreds::load(Path::new(&aster_env))?;
-    let hcreds = LighterCreds::load(Path::new(&hl_env))?;
+    let (acreds, hcreds) = venue_creds(cfg.live.dry_run)?;
     let aster_signer: Arc<dyn AsterSigner> = Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
 
     // Per-market wire data shared by all Aster/HL client instances.

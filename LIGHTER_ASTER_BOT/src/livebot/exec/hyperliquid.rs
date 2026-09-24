@@ -500,6 +500,31 @@ impl HlExchange {
         fill_timeout_ms: i64,
         ws_account_max_age_ms: i64,
     ) -> Result<Self> {
+        let mut ex = Self::new_read_only(base_url, signers_dir, &creds, specs, fill_timeout_ms, ws_account_max_age_ms)?;
+        ex.signer
+            .check_client(creds.api_key_index)
+            .context("Lighter CheckClient")?;
+        ex.nonce =
+            Arc::new(NonceManager::init(&ex.rest, creds.account_index, creds.api_key_index).await?);
+        ex.tx_ws
+            .connect()
+            .await
+            .with_context(|| format!("preconnect Lighter tx websocket {}", ex.ws_url))?;
+        Ok(ex)
+    }
+
+    /// Read-only client for the status poller: REST, the market wire context and the signer (the
+    /// active-orders auth token needs it), but no key check, an offline nonce stub and an
+    /// unconnected tx socket. A poll so spends no Lighter request on a nonce and holds no
+    /// order-capable socket; nothing may be sent through it.
+    pub fn new_read_only(
+        base_url: String,
+        signers_dir: &Path,
+        creds: &LighterCreds,
+        specs: &[MarketSpec],
+        fill_timeout_ms: i64,
+        ws_account_max_age_ms: i64,
+    ) -> Result<Self> {
         let rest = RestClient::new(&base_url, 2)?;
         let signer = Arc::new(Signer::load(
             signers_dir,
@@ -508,17 +533,9 @@ impl HlExchange {
             creds.api_key_index,
             creds.account_index,
         )?);
-        signer
-            .check_client(creds.api_key_index)
-            .context("Lighter CheckClient")?;
-        let nonce =
-            Arc::new(NonceManager::init(&rest, creds.account_index, creds.api_key_index).await?);
+        let nonce = Arc::new(NonceManager::offline(creds.account_index, creds.api_key_index));
         let ws_url = crate::lighter::ws::stream_url(&base_url);
         let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
-        tx_ws
-            .connect()
-            .await
-            .with_context(|| format!("preconnect Lighter tx websocket {ws_url}"))?;
 
         let mut markets = HashMap::new();
         let mut symbol_to_market = HashMap::new();

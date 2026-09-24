@@ -192,12 +192,11 @@ fn refuse_insecure_env_files() -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let mut insecure = Vec::new();
-        for (var, default) in [("ASTER_ENV_PATH", "aster.env"), ("LIGHTER_ENV_PATH", "lighter.env")] {
-            let path = std::env::var(var).unwrap_or_else(|_| default.into());
+        for path in crate::livebot::exec::creds::env_files() {
             if let Ok(meta) = std::fs::metadata(&path) {
                 let mode = meta.permissions().mode() & 0o777;
                 if mode & 0o077 != 0 {
-                    insecure.push(format!("{path} (mode {mode:03o})"));
+                    insecure.push(format!("{} (mode {mode:03o})", path.display()));
                 }
             }
         }

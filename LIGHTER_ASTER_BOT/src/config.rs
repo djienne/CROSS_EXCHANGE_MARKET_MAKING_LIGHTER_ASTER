@@ -241,6 +241,10 @@ pub struct LiveCfg {
     /// BEFORE the exchange rejects (Aster -2019). Default enabled.
     #[serde(default)]
     pub margin_guard: LiveMarginGuardCfg,
+    /// Set only by `run --mode dry-run` after pointing the venue URLs at the simulated venues:
+    /// the engine then signs with the dry-run identity. No file can set it.
+    #[serde(skip)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -475,6 +479,7 @@ impl Default for LiveCfg {
             hyperliquid: LiveHyperliquidCfg::default(),
             circuit_breaker: LiveCircuitBreakerCfg::default(),
             margin_guard: LiveMarginGuardCfg::default(),
+            dry_run: false,
         }
     }
 }

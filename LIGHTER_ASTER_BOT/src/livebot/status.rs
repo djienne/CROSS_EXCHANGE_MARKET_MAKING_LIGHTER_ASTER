@@ -15,7 +15,7 @@ use crate::types::{MarketId, RejectReason, Side};
 
 use super::account::{AccountSnapshot, Venue};
 use super::exec::aster::AsterRest;
-use super::exec::creds::{AsterCreds, LighterCreds};
+use super::exec::creds::{venue_creds, AsterCreds};
 use super::exec::hyperliquid::HlExchange;
 use super::exec::sign::EvmAsterSigner;
 use super::reconcile::Reconciler;
@@ -117,14 +117,6 @@ impl PositionSnapshot {
     }
 }
 
-fn aster_env_path() -> String {
-    std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".into())
-}
-
-fn lighter_env_path() -> String {
-    std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".into())
-}
-
 pub async fn run(cfg: &Config, target: Option<String>, json: bool) -> Result<()> {
     let target = target.unwrap_or_else(|| "HYPE".into());
     let report = StatusPoller::new(cfg, &target).await?.report().await?;
@@ -162,8 +154,16 @@ impl StatusPoller {
         )
         .await?;
         let spec = specs.first().context("no resolved market spec")?.clone();
-        let aster = build_aster(cfg, &specs)?;
-        let lighter = build_lighter(cfg, &specs).await?;
+        let (acreds, lcreds) = venue_creds(cfg.live.dry_run)?;
+        let aster = build_aster(cfg, &specs, acreds)?;
+        let lighter = HlExchange::new_read_only(
+            cfg.live.hyperliquid.base_url.clone(),
+            Path::new(&cfg.live.hyperliquid.signers_dir),
+            &lcreds,
+            &specs,
+            cfg.live.hyperliquid.fill_timeout_ms,
+            cfg.live.hyperliquid.ws_account_max_age_ms,
+        )?;
         let reconciler = Reconciler::new(aster, lighter, &specs, cfg.live.max_book_staleness_ms);
         Ok(Self { cfg: cfg.clone(), spec, reconciler, http: rest_book::client()? })
     }
@@ -183,8 +183,7 @@ impl StatusPoller {
     }
 }
 
-fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
-    let creds = AsterCreds::load(Path::new(&aster_env_path()))?;
+pub(super) fn build_aster(cfg: &Config, specs: &[MarketSpec], creds: AsterCreds) -> Result<AsterRest> {
     let signer = std::sync::Arc::new(EvmAsterSigner::new(creds.user, creds.signer, creds.key)?);
     let mut scales: HashMap<MarketId, (MarketScale, String)> = HashMap::new();
     for s in specs {
@@ -199,19 +198,6 @@ fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
         cfg.live.aster.effective_max_rest_requests_per_minute(),
         None,
     )
-}
-
-async fn build_lighter(cfg: &Config, specs: &[MarketSpec]) -> Result<HlExchange> {
-    let creds = LighterCreds::load(Path::new(&lighter_env_path()))?;
-    HlExchange::new_lighter(
-        cfg.live.hyperliquid.base_url.clone(),
-        Path::new(&cfg.live.hyperliquid.signers_dir),
-        creds,
-        specs,
-        cfg.live.hyperliquid.fill_timeout_ms,
-        cfg.live.hyperliquid.ws_account_max_age_ms,
-    )
-    .await
 }
 
 fn build_report(

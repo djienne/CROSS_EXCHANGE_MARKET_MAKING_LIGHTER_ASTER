@@ -1,18 +1,53 @@
-//! Credential loading for live trading. Reads the `aster.env` / `lighter.env`
-//! dotenv files at the repo root, derives the venue ROLE for each address from the **key**, not
-//! from the (user-editable, sometimes mislabeled) field names, and validates the mapping before
-//! a single signed call.
+//! Credential loading. Live trading reads the `aster.env` / `lighter.env` dotenv files at the
+//! repo root, derives the venue ROLE for each address from the **key**, not from the
+//! (user-editable, sometimes mislabeled) field names, and validates the mapping before a single
+//! signed call. A dry run signs with a fixed identity instead ([`venue_creds`]).
 //!
 //! These files contain real private keys in plaintext — they MUST be gitignored and never
 //! logged. This module logs only public addresses, never key material.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::info;
 
-use super::crypto::{address_from_priv, address_hex, parse_address, parse_priv_key};
+use super::crypto::{address_from_priv, address_hex, keccak256, parse_address, parse_priv_key};
+
+/// The live credential files: `ASTER_ENV_PATH` and `LIGHTER_ENV_PATH`, by default `aster.env`
+/// and `lighter.env` in the working directory.
+pub fn env_files() -> [PathBuf; 2] {
+    [("ASTER_ENV_PATH", "aster.env"), ("LIGHTER_ENV_PATH", "lighter.env")]
+        .map(|(var, default)| std::env::var_os(var).map_or_else(|| PathBuf::from(default), PathBuf::from))
+}
+
+/// What both engines and their status pollers sign with: the live env files, or the dry-run
+/// identity once `run --mode dry-run` has pointed the config at the simulated venues.
+pub fn venue_creds(dry_run: bool) -> Result<(AsterCreds, LighterCreds)> {
+    if dry_run {
+        return Ok((AsterCreds::dry_run(), LighterCreds::dry_run()));
+    }
+    Ok((AsterCreds::from_env()?, LighterCreds::from_env()?))
+}
+
+// The dry-run identity is registered on no venue, so it is public by design: nothing signed with
+// it can move money, yet every request still passes through the live signers unchanged.
+
+/// A dry-run secp256k1 key, derived so the repo holds no key literal.
+fn dry_run_key(role: &str) -> [u8; 32] {
+    keccak256(format!("lighter-aster-bot dry run: {role}").as_bytes())
+}
+
+fn dry_run_owner() -> String {
+    address_hex(&address_from_priv(&dry_run_key("owner")).expect("the fixed dry-run key is valid"))
+}
+
+/// A pair from the signer library's `GenerateAPIKey`, pinned because that generator is not
+/// deterministic in its seed and the dry-run venue must answer `apikeys` with this public key.
+const DRY_RUN_LIGHTER_PRIVATE_KEY: &str =
+    "0xffaaab6ffc4d3379f43ac385ba2be5dc84ffbe279f65e2dcc7f7338206b2c146fcb8981de2e66c12";
+const DRY_RUN_LIGHTER_PUBLIC_KEY: &str =
+    "84b37246a1e5efb5cdbbe31e31bc2d1b1e7d030ed228265bb3ad451e21ca8deec1c76e446b03b8c4";
 
 /// Parse a tiny `key=value` dotenv file (the live env files are a handful of lines).
 fn parse_env_file(path: &Path) -> Result<HashMap<String, String>> {
@@ -47,6 +82,19 @@ pub struct AsterCreds {
 }
 
 impl AsterCreds {
+    /// The live credentials, from the Aster file of [`env_files`].
+    pub fn from_env() -> Result<Self> {
+        let [aster, _] = env_files();
+        Self::load(&aster)
+    }
+
+    /// The dry-run identity: an API wallet trading for the dry-run owner.
+    pub fn dry_run() -> Self {
+        let key = dry_run_key("aster api wallet");
+        let signer = address_hex(&address_from_priv(&key).expect("the fixed dry-run key is valid"));
+        AsterCreds { user: dry_run_owner(), signer, key }
+    }
+
     /// Load + role-resolve from a dotenv file. `signer` = the address derived from `private_key`;
     /// `user` = the address field (`wallet_address`/`subaccount_address`) that ISN'T the signer.
     pub fn load(path: &Path) -> Result<Self> {
@@ -117,6 +165,23 @@ impl std::fmt::Debug for LighterCreds {
 }
 
 impl LighterCreds {
+    /// The live credentials, from the Lighter file of [`env_files`].
+    pub fn from_env() -> Result<Self> {
+        let [_, lighter] = env_files();
+        Self::load(&lighter)
+    }
+
+    /// The dry-run identity: the pinned API key in slot 2 of a made-up account of the owner.
+    pub fn dry_run() -> Self {
+        LighterCreds {
+            api_private_key: DRY_RUN_LIGHTER_PRIVATE_KEY.to_string(),
+            api_public_key: DRY_RUN_LIGHTER_PUBLIC_KEY.to_string(),
+            api_key_index: 2,
+            account_index: 1_000_000_000,
+            wallet_address: dry_run_owner(),
+        }
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let m = parse_env_file(path)?;
         let api_private_key = required(&m, "API_KEY_PRIVATE_KEY")?;
@@ -162,6 +227,18 @@ mod tests {
     const KEY1: &str = "0x0000000000000000000000000000000000000000000000000000000000000001";
     const ADDR1: &str = "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf";
     const USER1: &str = "0x1111111111111111111111111111111111111111";
+
+    #[test]
+    fn the_dry_run_identity_is_fixed_valid_and_needs_no_files() {
+        let (aster, lighter) = venue_creds(true).unwrap();
+        let (again, _) = venue_creds(true).unwrap();
+        assert_eq!((aster.key, &aster.signer, &aster.user), (again.key, &again.signer, &again.user));
+        assert_ne!(aster.user, aster.signer);
+        // The live signer accepts it: the signer address is the key's.
+        super::super::sign::EvmAsterSigner::new(aster.user.clone(), aster.signer, aster.key).unwrap();
+        assert_eq!(lighter.wallet_address, aster.user);
+        assert_eq!((lighter.account_index, lighter.api_key_index), (1_000_000_000, 2));
+    }
 
     #[test]
     fn aster_roles_derived_from_key_not_field_names() {

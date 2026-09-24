@@ -6,7 +6,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
-use crate::taker::aster::creds::{AsterCreds, LighterCreds};
+use crate::taker::aster::creds::venue_creds;
 use crate::taker::aster::rest::AsterRest;
 use crate::taker::aster::sign::{AsterSigner, EvmAsterSigner};
 use crate::taker::book::OrderBook;
@@ -196,11 +196,7 @@ impl StatusPoller {
         .await?;
         let spec = specs.first().context("no resolved market spec")?.clone();
 
-        let aster_env = std::env::var("ASTER_ENV_PATH").unwrap_or_else(|_| "aster.env".to_string());
-        let lighter_env =
-            std::env::var("LIGHTER_ENV_PATH").unwrap_or_else(|_| "lighter.env".to_string());
-        let acreds = AsterCreds::load(Path::new(&aster_env))?;
-        let lcreds = LighterCreds::load(Path::new(&lighter_env))?;
+        let (acreds, lcreds) = venue_creds(cfg.venues.dry_run)?;
         let signer: Arc<dyn AsterSigner> =
             Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
         let aster = AsterRest::new(cfg.venues.aster_base_url.clone(), signer, &specs)?;
