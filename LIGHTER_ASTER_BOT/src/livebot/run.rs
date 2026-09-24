@@ -573,7 +573,6 @@ async fn setup_live_planes(
         }
     }
     let new_aster = || {
-        // STP omitted by default (our bid<ask never self-cross under GTX).
         AsterRest::new(
             cfg.live.aster.base_url.clone(),
             aster_signer.clone(),
@@ -581,7 +580,6 @@ async fn setup_live_planes(
             cfg.live.aster.deadman_countdown_ms,
             cfg.live.aster.rate_limit_backoff_ms,
             cfg.live.aster.effective_max_rest_requests_per_minute(),
-            None,
         )
     };
     let signers_dir = Path::new(&cfg.live.hyperliquid.signers_dir);

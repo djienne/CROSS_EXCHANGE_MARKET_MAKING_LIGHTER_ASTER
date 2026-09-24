@@ -192,7 +192,6 @@ pub(super) fn build_aster(cfg: &Config, specs: &[MarketSpec], creds: AsterCreds)
         cfg.live.aster.deadman_countdown_ms,
         cfg.live.aster.rate_limit_backoff_ms,
         cfg.live.aster.effective_max_rest_requests_per_minute(),
-        None,
     )
 }
 

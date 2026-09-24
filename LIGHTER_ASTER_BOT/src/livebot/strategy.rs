@@ -2443,7 +2443,7 @@ impl Strategy {
     }
 
     /// Cancel BOTH resting maker sides for `market` via TARGETED per-order cancels (§8.4
-    /// cancel-opposite). NOT `CancelMarket` (allOpenOrders) — that emits no per-order ack, so the
+    /// cancel-opposite). NOT a per-symbol cancel-all (allOpenOrders) — that emits no per-order ack, so the
     /// slot tracking would desync; each targeted Cancel emits a CancelAck that closes the
     /// slot via `close_by_client_id`. Called after a fill (the post-fill
     /// cooldown means neither side should rest while we hedge).
@@ -2473,7 +2473,7 @@ impl Strategy {
     /// Fold a worker/venue event back into the order + hedge state.
     pub fn handle_exec_event(&mut self, ev: ExecEvent, now_ns: i64) {
         if matches!(&ev, ExecEvent::MakerOrderProgress { .. } | ExecEvent::ExecutionProgress { .. }
-            | ExecEvent::HedgeFill { .. } | ExecEvent::AsterFlattenAck { .. }) { self.revoke_makers(); }
+            | ExecEvent::AsterFlattenAck { .. }) { self.revoke_makers(); }
         let order_evidence = match &ev {
             ExecEvent::PlaceAck { client_id, venue_order_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: Some(venue_order_id.clone()), state: "accepted" }),
             ExecEvent::CancelAck { client_id } => Some(JournalDetail::Order { client_id: client_id.clone(), venue_order_id: None, state: "cancelled" }),
@@ -2553,7 +2553,7 @@ impl Strategy {
                 self.freeze(now_ns, "cancel_rejected");
                 self.request_safety_sweep(now_ns, "cancel_rejected");
             }
-            ExecEvent::MakerFill(_) | ExecEvent::MakerOrderProgress { .. } => {
+            ExecEvent::MakerOrderProgress { .. } => {
                 // Routed through handle_maker_fill by the driver; nothing here.
             }
             ExecEvent::AsterRateLimited { reason, backoff_ms } => {
@@ -2572,15 +2572,6 @@ impl Strategy {
             ExecEvent::HedgeReject { cloid, reason } => {
                 let retry = super::exec::hyperliquid::hedge_reject_is_definitive_no_fill(&reason);
                 self.handle_definitive_reject(cloid, reason, retry, now_ns);
-            }
-            ExecEvent::HedgeFill { cloid, filled_qty, px, fee_usd } => {
-                // Historical per-fill event: normalize immediately to cumulative evidence.
-                if let Some(h) = self.hedges.get(&cloid.to_hex()) {
-                    let qty = h.filled_qty + filled_qty;
-                    let quote = h.filled_quote_usd.map(|q| q + filled_qty * px);
-                    let fee = h.fee_usd.map(|f| f + fee_usd);
-                    self.apply_execution_progress(cloid, qty, quote, fee, qty == h.qty, None, None, now_ns);
-                }
             }
             ExecEvent::ExecutionProgress { cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms } => {
                 self.apply_execution_progress(cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms, now_ns);
@@ -2977,7 +2968,6 @@ const PRIORITY_DRAIN_LIMIT: usize = 64;
 
 async fn dispatch_execution_event(strat: &mut Strategy, ev: ExecEvent, now_ns: i64) {
     match ev {
-        ExecEvent::MakerFill(fill) => strat.handle_maker_fill(fill, now_ns).await,
         ExecEvent::MakerOrderProgress { market, side, client_id, order_id, cumulative_qty, cumulative_quote_usd, terminal, event_time_ms } => {
             strat.handle_maker_order_progress(market, side, client_id, order_id, cumulative_qty,
                 cumulative_quote_usd, terminal, event_time_ms, now_ns).await;

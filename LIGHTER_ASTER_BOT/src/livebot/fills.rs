@@ -1,10 +1,10 @@
-//! Aster fill detection → Hyperliquid hedge state machine.
+//! Aster fill detection → Lighter hedge state machine.
 //!
-//! The single most important live-safety property: **every Aster fill produces exactly one
-//! hedge, even if the fill event is delivered more than once** (invariants 2 & 4). Aster's
+//! The single most important live-safety property: **every Aster fill is hedged exactly
+//! once, even if the fill event is delivered more than once** (invariants 2 & 4). Aster's
 //! user stream can repeat `ORDER_TRADE_UPDATE`s, so we dedup on `(order_id, trade_id)` —
 //! with a `(order_id, cumulative_filled_qty)` fallback when the trade id is missing — and
-//! key the hedge on a deterministic cloid so a restart can ask Hyperliquid "did this
+//! key the hedge on a deterministic cloid so a restart can ask Lighter "did this
 //! already hedge?" instead of double-hedging.
 
 use std::collections::HashSet;

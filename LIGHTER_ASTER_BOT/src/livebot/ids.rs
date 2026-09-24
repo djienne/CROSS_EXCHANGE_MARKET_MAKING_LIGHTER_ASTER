@@ -6,11 +6,12 @@
 //!   kept inside Aster's `newClientOrderId` charset/length budget (Binance-style
 //!   `^[A-Za-z0-9_:/.\-]{1,36}$`). Maker ids need not survive a restart (startup cancels
 //!   all Aster orders), only be unique within a session.
-//! - **Hyperliquid hedge cloid**: a 128-bit id derived **purely** from the exchange-supplied
-//!   Aster fill identity `(aster_order_id, aster_trade_id, cumulative_filled_qty)` — every
+//! - **Lighter hedge cloid** (a Hyperliquid-era name): a 128-bit id derived **purely** from
+//!   the exchange-supplied Aster fill identity `(aster_order_id, aster_trade_id, cumulative_filled_qty)` — every
 //!   input comes from the venue, NONE from a bot-side session counter — so it is
 //!   **session-independent**: re-processing the same fill after a restart yields the SAME
-//!   cloid; we then query HL `orderStatus` by it and never double-hedge (invariants 3 & 4).
+//!   cloid, whose `client_order_index` finds the order in Lighter's history, so the fill is
+//!   never hedged twice (invariants 3 & 4).
 //!
 //! Hashing is a tiny inline FNV-1a (no new dependency, and stable across toolchains —
 //! `std`'s `DefaultHasher` is explicitly NOT stable, so it must not be used here).
@@ -106,10 +107,8 @@ pub fn aster_client_id(session: &SessionId, market: &MarketId, side: Side, quote
     }
 }
 
-/// A 128-bit Hyperliquid client order id (`cloid`). Hyperliquid requires a 16-byte hex
-/// value (`0x` + 32 hex digits); a human-readable string is NOT accepted, so the
-/// `XEMM-HEDGE-...` mnemonic from the plan is realized as a deterministic hash of the same
-/// fields.
+/// A 128-bit hedge id (`cloid`): a deterministic hash of the `XEMM-HEDGE-...` fields. Lighter
+/// orders carry it as a 48-bit `client_order_index` ([`Cloid::to_lighter_client_order_index`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Cloid([u8; 16]);
 
@@ -192,7 +191,7 @@ impl Cloid {
     }
 
     /// Lighter wire form: a positive integer `client_order_index` in `[1, 2^48 - 1]`.
-    /// The mapping is deterministic from the same 128-bit id used for Hyperliquid cloids; zero
+    /// The mapping is deterministic from the 128-bit id; zero
     /// is remapped to one because several exchange/client paths treat `0` as unset.
     pub fn to_lighter_client_order_index(self) -> i64 {
         let mut lo = [0u8; 8];

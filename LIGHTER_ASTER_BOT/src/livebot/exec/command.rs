@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use crate::livebot::fills::{Admission, AsterFill, HedgeIntent, WireProof};
+use crate::livebot::fills::{Admission, HedgeIntent, WireProof};
 use crate::livebot::account::Venue;
 use crate::livebot::ids::Cloid;
 use crate::types::{MarketId, Side};
@@ -103,8 +103,6 @@ pub enum ExecCommand {
         price_ticks: i64,
         qty_lots: i64,
     },
-    /// Cancel every resting order in one market (safety).
-    CancelMarket { market: MarketId },
     /// Cancel every bot order across all markets (gate close / shutdown).
     CancelAllBot,
     /// Reduce-only taker (MARKET) order to FLATTEN an orphaned Aster position (recovery path):
@@ -128,7 +126,7 @@ pub enum ExecCommand {
 ///   `-2011 → AlreadyGone → slot cleared → ghost order rests` sequence. Un-acked cancels
 ///   (`venue_order_id: None`) stay FIFO.
 /// - `FlattenAster`: reduce-only MARKET with no slot interaction.
-/// - `CancelAllBot`/`CancelMarket` must stay FIFO: sweeping ahead of queued `Place`s
+/// - `CancelAllBot` must stay FIFO: sweeping ahead of queued `Place`s
 ///   would let those places rest AFTER the sweep.
 pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
     matches!(
@@ -179,8 +177,7 @@ pub struct ExecutionTrade {
 }
 
 /// Worker / venue → strategy + risk reactor. Order/hedge lifecycle notifications. Aster
-/// maker fills primarily arrive on the user-data stream (not the exec worker);
-/// `MakerFill` routes one through the same handler.
+/// maker fills arrive on the user-data stream, not here.
 #[derive(Debug, Clone)]
 pub enum ExecEvent {
     PlaceAck { client_id: String, venue_order_id: String },
@@ -196,15 +193,12 @@ pub enum ExecEvent {
     /// A cancel/replace-cancel that FAILED at the venue (or returned a venue error body). The
     /// order may still be resting — the strategy must NOT close the slot; it freezes + reconciles.
     CancelReject { client_id: String, reason: String },
-    /// A maker fill, handled like one from the Aster user stream.
-    MakerFill(AsterFill),
     MakerOrderProgress { market: MarketId, side: Side, client_id: String, order_id: String,
         cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, terminal: bool, event_time_ms: i64 },
     AttemptStarted { cloid: Cloid, proof: WireProof },
     AttemptNotSent { cloid: Cloid, reason: String },
     ExecutionProgress { cloid: Cloid, cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, cumulative_fee_usd: Option<Decimal>, terminal: bool, venue_order_id: Option<String>, event_time_ms: Option<i64> },
     ExecutionTrade(ExecutionTrade),
-    HedgeFill { cloid: Cloid, filled_qty: Decimal, px: Decimal, fee_usd: Decimal },
     HedgeReject { cloid: Cloid, reason: String },
     /// Hedge outcome is ambiguous: the request may have reached Hyperliquid, but
     /// the worker did not receive a definitive response. The strategy must freeze

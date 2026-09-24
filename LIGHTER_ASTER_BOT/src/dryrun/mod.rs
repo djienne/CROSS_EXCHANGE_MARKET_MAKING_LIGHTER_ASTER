@@ -770,7 +770,7 @@ pub(crate) mod tests {
     fn xemm_aster(url: &str) -> AsterRest {
         let scale = MarketScale { tick: dec!(0.001), step: dec!(0.01), hl_qty_step: dec!(0.01) };
         let markets = HashMap::from([(MarketId::from("HYPE"), (scale, "HYPEUSDT".to_string()))]);
-        AsterRest::new(url.to_string(), aster_signer(), markets, 30_000, 1_000, 1_000, None).unwrap()
+        AsterRest::new(url.to_string(), aster_signer(), markets, 30_000, 1_000, 1_000).unwrap()
     }
 
     /// A subscription's frames, taken by type in whatever order they came.

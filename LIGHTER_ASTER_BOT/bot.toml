@@ -200,7 +200,6 @@ base_url             = "https://fapi.asterdex.com"
 deadman_enabled      = true
 deadman_countdown_ms = 10000
 deadman_refresh_ms   = 2000
-prefer_modify_order  = true
 max_rest_requests_per_minute      = 1200
 optional_rest_reserve_per_minute  = 120
 cancel_retry_backoff_ms           = 1000
@@ -210,7 +209,6 @@ rate_limit_backoff_ms             = 5000
 [maker.live.lighter]
 base_url              = "https://mainnet.zklighter.elliot.ai"
 signers_dir           = "signers"
-hedge_order_type      = "aggressive_ioc"
 # IOC limit bounds adverse execution; fresh remaining quantities govern any retry.
 normal_slippage_bps   = "60"
 emergency_slippage_bps = "90"

@@ -334,10 +334,6 @@ pub struct LiveAsterCfg {
     /// Control-plane refresh cadence (ms) of the dead-man countdown. Default 1000.
     #[serde(default = "default_deadman_refresh_ms")]
     pub deadman_refresh_ms: i64,
-    /// Prefer atomic PUT /fapi/v3/order modify over cancel+place. Default true (but the
-    /// strategy still falls back to cancel+place if modify is unreliable). Plan §3.3.
-    #[serde(default = "default_true")]
-    pub prefer_modify_order: bool,
     /// Live Aster REST write budget per minute. Counts real REST request units, not logical
     /// strategy decisions: place=1, targeted cancel=1, cancel+place replace=2, each
     /// CancelAllBot/deadman request=1. `0` resolves to the safe default, not unlimited.
@@ -367,7 +363,6 @@ impl Default for LiveAsterCfg {
             deadman_enabled: true,
             deadman_countdown_ms: default_deadman_countdown_ms(),
             deadman_refresh_ms: default_deadman_refresh_ms(),
-            prefer_modify_order: true,
             max_rest_requests_per_minute: default_aster_max_rest_requests_per_minute(),
             optional_rest_reserve_per_minute: default_aster_optional_rest_reserve_per_minute(),
             cancel_retry_backoff_ms: default_aster_cancel_retry_backoff_ms(),
@@ -402,9 +397,6 @@ pub struct LiveHyperliquidCfg {
     pub base_url: String,
     #[serde(default = "default_lighter_signers_dir")]
     pub signers_dir: String,
-    /// Hedge order style. Currently only `aggressive_ioc`.
-    #[serde(default = "default_hedge_order_type")]
-    pub hedge_order_type: String,
     /// Normal IOC hedge slippage cap (bps). Default "5".
     #[serde(default = "default_normal_slippage_bps")]
     pub normal_slippage_bps: Decimal,
@@ -426,7 +418,6 @@ impl Default for LiveHyperliquidCfg {
         LiveHyperliquidCfg {
             base_url: default_hl_base_url(),
             signers_dir: default_lighter_signers_dir(),
-            hedge_order_type: default_hedge_order_type(),
             normal_slippage_bps: default_normal_slippage_bps(),
             emergency_slippage_bps: default_emergency_slippage_bps(),
             fill_timeout_ms: default_lighter_fill_timeout_ms(),
@@ -639,9 +630,6 @@ fn default_lighter_fill_timeout_ms() -> i64 {
 
 fn default_ws_account_max_age_ms() -> i64 {
     1_500
-}
-fn default_hedge_order_type() -> String {
-    "aggressive_ioc".to_string()
 }
 fn default_normal_slippage_bps() -> Decimal {
     Decimal::from(5)

@@ -18,7 +18,7 @@ use crate::markets::MarketSpec;
 use crate::types::{MarketId, Side};
 
 use super::account::{AccountSnapshot, AccountState, OpenOrderSnapshot, ScaledPosition, Venue};
-use super::exec::aster::{AsterBalanceRow, AsterPositionRow, AsterRest};
+use super::exec::aster::{AsterBalanceRow, AsterOpenOrder, AsterPositionRow, AsterRest};
 use super::exec::hyperliquid::HlExchange;
 
 /// USD-pegged collateral assets counted at face value in the wallet sum.
@@ -216,6 +216,16 @@ impl Reconciler {
         }
     }
 
+    /// Our symbols' open Aster orders, one symbol at a time: weight 1 each, where the
+    /// account-wide read costs 40 (about 1200 of the IP's 2400 a minute at the 2 s cadence).
+    async fn aster_open_orders(&self) -> Result<Vec<AsterOpenOrder>> {
+        let mut out = Vec::new();
+        for market in self.aster_sym_to_market.values() {
+            out.extend(self.aster.open_orders(Some(market)).await?);
+        }
+        Ok(out)
+    }
+
     /// Assemble a fresh snapshot from live reads on both venues.
     pub async fn snapshot(&self) -> Result<AccountSnapshot> {
         // Stamp the read-START before ANY venue read (the orphan backstop's straddle guard requires
@@ -229,7 +239,7 @@ impl Reconciler {
         let (bal, pos, oo, ch, hloo, available) = tokio::join!(
             self.aster.balance(),
             self.aster.position_risk(),
-            self.aster.open_orders(None),
+            self.aster_open_orders(),
             self.hl.clearinghouse_state(),
             self.hl.open_orders_info(),
             self.aster.account_available_balance(),
@@ -400,7 +410,7 @@ impl Reconciler {
             // remaining retries and the `require_clean_start` bail. So on Err we warn, consume the
             // attempt, and retry — the early `return Ok(())` below is reachable ONLY after a
             // SUCCESSFUL read proves the stray set empty.
-            let open = match self.aster.open_orders(None).await {
+            let open = match self.aster_open_orders().await {
                 Ok(o) => o,
                 Err(e) => {
                     warn!("clean-start: openOrders read failed (attempt {attempt}/6): {e:#}");

@@ -923,52 +923,6 @@ impl HlExchange {
         .context("serialize Lighter tx result")
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn cancel_by_oid(&self, market: &MarketId, oid: u64) -> Result<String> {
-        let w = self.wire(market)?;
-        let nonce = self.nonce.next();
-        let signed =
-            self.signer
-                .sign_cancel_order(w.market_index, oid as i64, nonce, self.api_key_index)?;
-        let result = self.send_signed(signed).await;
-        serde_json::to_string(&serde_json::json!({
-            "status": format!("{:?}", result.status),
-            "code": result.code,
-            "message": result.message,
-            "quota_remaining": result.quota_remaining,
-        }))
-        .context("serialize Lighter cancel result")
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn update_leverage(
-        &self,
-        market: &MarketId,
-        leverage: u32,
-        _is_cross: bool,
-    ) -> Result<()> {
-        let w = self.wire(market)?;
-        let nonce = self.nonce.next();
-        let signed = self.signer.sign_update_leverage(
-            w.market_index,
-            leverage as i32,
-            MARGIN_MODE_CROSS,
-            nonce,
-            self.api_key_index,
-        )?;
-        // Lighter rejects update-leverage when it is sent through sendtxbatch
-        // ("unsupported tx type: for batch operation"). Control-plane single txs
-        // use REST sendTx, matching lighter_MM_RUST's startup/cancel-all path.
-        let resp = self.rest.send_tx(signed.tx_type, &signed.tx_info).await?;
-        let code = if resp.code == 200 { 0 } else { resp.code };
-        if code == 0 {
-            Ok(())
-        } else {
-            let _ = self.nonce.hard_refresh(&self.rest).await;
-            bail!("Lighter update_leverage rejected: {}", resp.message)
-        }
-    }
-
     /// Read the current Lighter market leverage from the account payload.
     ///
     /// Lighter exposes `initial_margin_fraction` as a percentage. A 1x market shows
@@ -1327,6 +1281,7 @@ async fn handle_hedge_cmd(ex: &HlExchange, tx: &Sender<ExecEvent>, journal: &Jou
             if refresh_nonce_after_emit {
                 ex.nonce_uncertain.store(true, Ordering::Release);
                 if ex.nonce.hard_refresh(&ex.rest).await.is_ok() { ex.nonce_uncertain.store(false, Ordering::Release); }
+                else { let ex = ex.clone(); waits.spawn(async move { repair_nonce(&ex).await }); }
             }
         }
         HedgeSendOutcome::AwaitFills { token, rx, overflow, requested_qty, proof, ambiguous } => {
@@ -1368,14 +1323,29 @@ async fn resolve_attempt(ex: HlExchange, tx: Sender<ExecEvent>, journal: Journal
     let context = ResolutionContext { market: ex.wire(&intent.market).map(|w| w.market_index as u32).unwrap_or(u32::MAX),
         account: ex.account_index, fill_timeout: ex.fill_timeout, intent: intent.clone(), ambiguous };
     let lookup_exchange = ex.clone();
-    let resolved = resolve_updates(context, tx, journal, rx, overflow, move || {
+    let resolution = resolve_updates(context, tx, journal, rx, overflow, move || {
         let ex = lookup_exchange.clone();
         let intent = intent.clone();
         async move { ex.terminal_order_and_trades(&intent).await }
-    }).await;
-    if resolved && ambiguous && ex.nonce.hard_refresh(&ex.rest).await.is_ok() {
-        ex.nonce_uncertain.store(false, Ordering::Release);
+    });
+    tokio::pin!(resolution);
+    // An ambiguous send leaves the nonce uncertain until it resolves, or until the active
+    // budget is spent: by then the venue's next nonce counts it, landed or not.
+    let resolved = tokio::select! {
+        resolved = &mut resolution => Some(resolved),
+        _ = tokio::time::sleep(RESOLUTION_BUDGET), if ambiguous => None,
+    };
+    if ambiguous && resolved != Some(false) { repair_nonce(&ex).await; }
+    if resolved.is_none() { resolution.await; }
+}
+
+/// Re-reads the venue's nonce until it answers: one failed read must not leave the executor
+/// dark for good (an uncertain nonce stops quoting as well as hedging).
+async fn repair_nonce(ex: &HlExchange) {
+    while ex.nonce.hard_refresh(&ex.rest).await.is_err() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
+    ex.nonce_uncertain.store(false, Ordering::Release);
 }
 
 /// Production observation loop with a cold lookup seam for deterministic local tests.

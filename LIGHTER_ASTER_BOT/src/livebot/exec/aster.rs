@@ -120,8 +120,6 @@ pub struct AsterRest {
     deadman_countdown_ms: i64,
     rate_limit_backoff_ms: i64,
     max_rest_requests_per_minute: u32,
-    /// Self-trade-prevention mode for maker orders (e.g. `EXPIRE_MAKER`); `None` omits it.
-    stp_mode: Option<String>,
 }
 
 impl AsterRest {
@@ -132,7 +130,6 @@ impl AsterRest {
         deadman_countdown_ms: i64,
         rate_limit_backoff_ms: i64,
         max_rest_requests_per_minute: u32,
-        stp_mode: Option<String>,
     ) -> Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5)) // short: a stalled order call must not wedge the worker
@@ -158,7 +155,6 @@ impl AsterRest {
             deadman_countdown_ms: deadman_countdown_ms.max(1000),
             rate_limit_backoff_ms: rate_limit_backoff_ms.max(1000),
             max_rest_requests_per_minute: max_rest_requests_per_minute.max(1),
-            stp_mode,
         })
     }
 
@@ -193,9 +189,6 @@ impl AsterRest {
         ];
         if reduce_only {
             p.push(("reduceOnly".into(), "true".into()));
-        }
-        if let Some(stp) = &self.stp_mode {
-            p.push(("stpMode".into(), stp.clone()));
         }
         Ok(p)
     }
@@ -617,8 +610,7 @@ async fn send_backoff_reject(tx: &Sender<ExecEvent>, cmd: ExecCommand, reason: S
                 let _ = tx.send(ExecEvent::AttemptNotSent { cloid: intent.cloid, reason: reason.clone() }).await;
             }
         }
-        ExecCommand::CancelMarket { .. }
-        | ExecCommand::CancelAllBot
+        ExecCommand::CancelAllBot
         | ExecCommand::RefreshDeadman { .. } => {}
         ExecCommand::Barrier { completion } => {
             completion.complete(crate::hotpath::clock::mono_now_ns());
@@ -844,8 +836,8 @@ async fn process_cmd(
                 let _ = tx.send(ev).await;
             }
             ExecCommand::Replace { old_client_id, new_client_id, market, side, price_ticks, qty_lots, permit, .. } => {
-                // Safe path: cancel-then-place (atomic PUT modify is a [VERIFY] item). NEVER place
-                // the new order unless the old cancel is VERIFIED — else both could rest at once.
+                // Cancel-then-place: NEVER place the new order unless the old cancel is
+                // VERIFIED — else both could rest at once.
                 limiter.record();
                 match rest.cancel_order(&market, &old_client_id).await {
                     Ok(CancelOutcome::Canceled) => {
@@ -887,16 +879,6 @@ async fn process_cmd(
                         reject_unsent_maker(tx, &permit, new_client_id,
                             "replace skipped because old cancel failed".into()).await;
                     }
-                }
-            }
-            ExecCommand::CancelMarket { market } => {
-                limiter.record();
-                if let Err(e) = rest.cancel_all_symbol(&market).await {
-                    let reason = e.to_string();
-                    if is_aster_rate_limit_reason(&reason) {
-                        rate_limit_reason = Some(reason.clone());
-                    }
-                    warn!("aster cancelMarket failed: {e:#}");
                 }
             }
             ExecCommand::CancelAllBot => {
@@ -1043,7 +1025,7 @@ mod tests {
                 reply_http(&mut stream, "200 OK", r#"{"code":200}"#).await;
                 request
             });
-            let rest = AsterRest::new(url, Arc::new(TestSigner::new()), HashMap::new(), 5_000, 10_000, 1_200, None).unwrap();
+            let rest = AsterRest::new(url, Arc::new(TestSigner::new()), HashMap::new(), 5_000, 10_000, 1_200).unwrap();
             rest.signed_request(method.clone(), "/fapi/v3/order", vec![
                 ("newClientOrderId".into(), "order:1/two words".into()),
                 ("symbol".into(), "BTCUSDT".into()),
@@ -1091,7 +1073,7 @@ mod tests {
         let signer = Arc::new(TestSigner::new());
         let mut scales = HashMap::new();
         scales.insert("BTC".into(), (MarketScale::from_spec(&spec()), "BTCUSDT".to_string()));
-        AsterRest::new("https://fapi.asterdex.com".into(), signer, scales, 5000, 10_000, 1_200, None).unwrap()
+        AsterRest::new("https://fapi.asterdex.com".into(), signer, scales, 5000, 10_000, 1_200).unwrap()
     }
 
     #[test]
@@ -1124,7 +1106,7 @@ mod tests {
         let signer = Arc::new(TestSigner::new());
         let mut scales = HashMap::new();
         scales.insert("BTC".into(), (MarketScale::from_spec(&spec()), "BTCUSDT".to_string()));
-        AsterRest::new(base_url.into(), signer, scales, 5000, 10_000, 1_200, None).unwrap()
+        AsterRest::new(base_url.into(), signer, scales, 5000, 10_000, 1_200).unwrap()
     }
 
     #[test]
@@ -1146,7 +1128,6 @@ mod tests {
         }));
         // Sweeps must run behind queued Places or they don't sweep them (I3).
         assert!(!is_priority_cmd(&ExecCommand::CancelAllBot));
-        assert!(!is_priority_cmd(&ExecCommand::CancelMarket { market: m.clone() }));
         assert!(!is_priority_cmd(&ExecCommand::Place {
             market: m.clone(),
             side: Side::Buy,
