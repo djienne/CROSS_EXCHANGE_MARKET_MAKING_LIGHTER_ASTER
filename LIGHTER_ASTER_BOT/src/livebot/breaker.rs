@@ -119,7 +119,7 @@ pub fn check_startup(stem: &Path) -> Result<()> {
     };
     bail!(
         "circuit breaker TRIPPED — refusing to start. reason={reason}, loss={loss} USD, at={ts}. \
-         File: {}. Review, then reset with:  python scripts/reset_breaker.py",
+         File: {}. Review, then reset with:  python scripts/reset_breaker.py --coin <MARKET> --archive",
         path.display()
     );
 }

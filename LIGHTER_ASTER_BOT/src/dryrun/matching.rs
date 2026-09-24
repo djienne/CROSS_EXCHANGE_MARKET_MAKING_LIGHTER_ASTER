@@ -12,12 +12,18 @@
 //! - A post-only order expires only if it crosses the book it arrives at. If the book crosses it
 //!   later, it rests and the crossing size trades against it (the adverse outcome; expiring
 //!   it instead would be the kind one).
-//! - A resting order has visible × (1 + h) ahead of it at its price. A print at its price
-//!   eats that queue, then fills it. A print through its price proves the level emptied
-//!   (hidden orders too), so it fills it at once. A print at a better price is another
-//!   level's business. Our resting orders share each print's size.
+//! - A resting order has the visible size at its price ahead of it, and h × that size of hidden
+//!   orders. A print at its price eats the visible queue, then the hidden one, then fills it; a
+//!   book update only shortens the visible queue, to what is left on the level. A print through
+//!   its price proves the level emptied (hidden orders too), so it fills it at once. A print at
+//!   a better price is another level's business. Our resting orders share each print's size.
 //! - If the book crosses a resting order (the market moved through it, or a feed gap hid the
 //!   prints), the crossing size fills it at its price.
+//! - A venue trades only on a market its feed has shown up to that time. An order, a cancel or
+//!   a deadman that falls due first waits, then runs after the frame that catches up: a host or
+//!   network stall delivers frames late, and running ahead of them would let a cancel beat the
+//!   prints that filled its order. A request still waiting after [`HOLD_US`] is answered as
+//!   unavailable. Reads never wait.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -34,6 +40,11 @@ use crate::types::Side;
 /// How far past an effect time matching looks for the next book state. The shift minus the
 /// feed lag must exceed it for that state to have arrived (the diagnostics report the lag).
 pub const LOOKAHEAD_US: i64 = 250_000;
+
+/// How long an order or cancel may wait for its venue's feed before the venue answers it as
+/// unavailable (the bot's own timeouts are 5 s and more). The feed has then been silent for the
+/// shift minus its lag plus this, which a quiet market does not explain.
+pub const HOLD_US: i64 = 2_000_000;
 
 /// Closed orders and fills kept for queries.
 const KEEP: usize = 1_000;
@@ -150,8 +161,11 @@ pub struct Order {
     pub status: Status,
     pub created_us: i64,
     pub updated_us: i64,
-    /// Queue ahead at our price; `None` while the feed's depth cut hides our level.
+    /// Visible queue ahead at our price; `None` while the feed's depth cut hides our level.
     pub ahead: Option<Decimal>,
+    /// Hidden size assumed ahead of us besides: only prints take it.
+    #[serde(default)]
+    pub hidden: Decimal,
 }
 
 impl Order {
@@ -274,6 +288,8 @@ pub struct Diag {
     pub late_frames: u64,
     pub stale_frames: u64,
     pub gaps: u64,
+    /// Actions that had to wait for the feed to reach their time.
+    pub held: u64,
     /// Arrival minus exchange time per stream (`book`, `top`, `trade`), µs: the feed lag the
     /// shift must cover (clock skew shows here too).
     pub lag_us: BTreeMap<&'static str, Vec<i64>>,
@@ -306,6 +322,7 @@ impl Diag {
             "late_frames": self.late_frames,
             "stale_frames": self.stale_frames,
             "gaps": self.gaps,
+            "held": self.held,
             "lag_ms": lag,
             "requests": self.requests,
             "orders": self.orders,
@@ -454,14 +471,36 @@ impl VenueState {
     }
 }
 
+/// When a pending event is due: `(at, rank, seq)`.
+type Key = (i64, u8, u64);
+
 enum Pending {
     Feed { venue: Venue, market: String, exch_us: i64, event: FeedEvent },
     Funding { venue: Venue, market: String, exch_us: i64 },
-    Gateway { ticket: u64, reply_at: i64, envelope: Envelope },
-    /// A Lighter transaction coming out of the speed bump.
-    Execute { venue: Venue, request: Request },
+    /// A request reaching the venue at `due`.
+    Gateway { ticket: u64, due: i64, reply_at: i64, envelope: Envelope },
+    /// A Lighter transaction coming out of the speed bump at `due`.
+    Execute { venue: Venue, due: i64, request: Request },
     Deadman { venue: Venue, market: String, deadline: i64 },
+    /// The end of a held request's wait, if it is still held.
+    Expire { venue: Venue, key: Key },
     Deliver(Output),
+}
+
+impl Pending {
+    /// The venue whose market a trading action must have seen up to its time, and that time.
+    fn acts_at(&self) -> Option<(Venue, i64)> {
+        match *self {
+            Pending::Gateway { due, ref envelope, .. }
+                if matches!(envelope.request, Request::Place(_) | Request::Cancel { .. } | Request::CancelAll { .. }) =>
+            {
+                Some((envelope.venue, due))
+            }
+            Pending::Execute { venue, due, .. } => Some((venue, due)),
+            Pending::Deadman { venue, deadline, .. } => Some((venue, deadline)),
+            _ => None,
+        }
+    }
 }
 
 // Same-µs order: a print before the book change it causes, market before our actions
@@ -525,7 +564,11 @@ pub struct Exchange {
     now: i64,
     seq: u64,
     tickets: u64,
-    pending: BTreeMap<(i64, u8, u64), Pending>,
+    pending: BTreeMap<Key, Pending>,
+    /// Per venue: how far its feed has shown the market (the latest frame's shifted time), and
+    /// the actions waiting for it to reach their time.
+    known: [i64; 2],
+    held: [BTreeMap<Key, Pending>; 2],
     venues: [VenueState; 2],
     /// Per connection: when its last request reached the venue and when it was answered.
     lanes: HashMap<u64, (i64, i64)>,
@@ -548,6 +591,8 @@ impl Exchange {
             seq: 0,
             tickets: 0,
             pending: BTreeMap::new(),
+            known: [i64::MIN; 2],
+            held: Default::default(),
             venues,
             lanes: HashMap::new(),
             streams: [i64::MIN; 2],
@@ -558,6 +603,12 @@ impl Exchange {
 
     pub fn now(&self) -> i64 {
         self.now
+    }
+
+    /// For scripted feeds, which publish only when told: nothing waits for them.
+    #[cfg(test)]
+    pub fn trust_feed(&mut self) {
+        self.known = [i64::MAX; 2];
     }
 
     /// What a restart must keep, per venue.
@@ -629,6 +680,15 @@ impl Exchange {
             diag.lag_us.entry(stream).or_default().push(self.now - exch_us);
         }
         self.schedule(at, rank, Pending::Feed { venue, market: market.to_string(), exch_us, event });
+        // The feed has shown the market up to `at`: what waited for that runs after this frame.
+        let v = venue.ix();
+        if stream.is_some() && at > self.known[v] {
+            self.known[v] = at;
+            let waiting = self.held[v].split_off(&(at + 1, 0, 0));
+            for ((_, rank, _), action) in std::mem::replace(&mut self.held[v], waiting) {
+                self.schedule(self.now, rank, action);
+            }
+        }
     }
 
     /// Records the funding rate a settlement at `exch_us` will use (re-polls update it). A rate
@@ -651,12 +711,17 @@ impl Exchange {
         let rtt = self.p.rtt[envelope.venue.ix()].sample_us(&mut self.rng);
         self.diag[envelope.venue.ix()].rtt_us.push(rtt);
         let effect = self.now + (rtt as f64 * self.p.effect_fraction).round() as i64;
+        // A lane answered by now holds nothing back: forget closed connections' lanes.
+        if self.lanes.len() > 1_024 {
+            let now = self.now;
+            self.lanes.retain(|_, lane| lane.1 > now);
+        }
         let lane = self.lanes.entry(envelope.lane).or_insert((i64::MIN, i64::MIN));
         let gateway = effect.max(lane.0);
         let reply_at = (self.now + rtt).max(gateway).max(lane.1);
         *lane = (gateway, reply_at);
         let ticket = self.tickets;
-        self.schedule(gateway, RANK_ACTION, Pending::Gateway { ticket, reply_at, envelope });
+        self.schedule(gateway, RANK_ACTION, Pending::Gateway { ticket, due: gateway, reply_at, envelope });
         ticket
     }
 
@@ -676,24 +741,48 @@ impl Exchange {
             if entry.key().0 > to {
                 break;
             }
-            let ((at, ..), pending) = entry.remove_entry();
-            self.lateness_us.push(to - at);
-            self.now = self.now.max(at);
+            let (key, pending) = entry.remove_entry();
+            self.lateness_us.push(to - key.0);
+            self.now = self.now.max(key.0);
+            if let Some((venue, due)) = pending.acts_at() {
+                if due > self.known[venue.ix()] {
+                    self.hold(venue, key, pending);
+                    continue;
+                }
+            }
             match pending {
                 Pending::Feed { venue, market, exch_us, event } => self.on_feed(venue, &market, exch_us, event),
                 Pending::Funding { venue, market, exch_us } => self.on_funding(venue, market, exch_us),
-                Pending::Gateway { ticket, reply_at, envelope } => self.on_gateway(ticket, reply_at, envelope),
-                Pending::Execute { venue, request } => self.execute_tx(venue, request),
+                Pending::Gateway { ticket, reply_at, envelope, .. } => self.on_gateway(ticket, reply_at, envelope),
+                Pending::Execute { venue, request, .. } => self.execute_tx(venue, request),
                 Pending::Deadman { venue, market, deadline } => {
                     if self.venues[venue.ix()].deadman.get(&market) == Some(&deadline) {
                         self.venues[venue.ix()].deadman.remove(&market);
                         self.cancel_all(venue, Some(&market), End::Deadman);
                     }
                 }
+                Pending::Expire { venue, key } => {
+                    // Only requests expire (`hold`).
+                    if let Some(Pending::Gateway { ticket, reply_at, .. }) = self.held[venue.ix()].remove(&key) {
+                        self.diag[venue.ix()].requests += 1;
+                        let reply = self.reject(venue, Reject::Unavailable);
+                        self.schedule(reply_at, RANK_DELIVER, Pending::Deliver(Output::Reply { ticket, reply }));
+                    }
+                }
                 Pending::Deliver(output) => out.push(output),
             }
         }
         self.now = self.now.max(to);
+    }
+
+    /// Parks an action until the venue's feed reaches its time; a request gives up after
+    /// [`HOLD_US`].
+    fn hold(&mut self, venue: Venue, key: Key, action: Pending) {
+        self.diag[venue.ix()].held += 1;
+        if let Pending::Gateway { due, .. } = action {
+            self.schedule(due + HOLD_US, RANK_ACTION, Pending::Expire { venue, key });
+        }
+        self.held[venue.ix()].insert(key, action);
     }
 
     fn schedule(&mut self, at: i64, rank: u8, pending: Pending) {
@@ -740,7 +829,7 @@ impl Exchange {
                 let bumped = matches!(&envelope.request, Request::Place(spec) if spec.tif != Tif::PostOnly);
                 if venue == Venue::Lighter && bumped {
                     let at = self.now + self.p.lighter_taker_delay_us;
-                    self.schedule(at, RANK_ACTION, Pending::Execute { venue, request: envelope.request });
+                    self.schedule(at, RANK_ACTION, Pending::Execute { venue, due: at, request: envelope.request });
                 } else {
                     self.execute_tx(venue, envelope.request);
                 }
@@ -776,6 +865,7 @@ impl Exchange {
                         created_us: self.now,
                         updated_us: self.now,
                         ahead: None,
+                        hidden: Decimal::ZERO,
                     };
                     self.emit(venue, &order, None);
                     self.close(venue, order);
@@ -932,6 +1022,7 @@ impl Exchange {
             created_us: self.now,
             updated_us: self.now,
             ahead: None,
+            hidden: Decimal::ZERO,
         };
         if let (Tif::PostOnly, Some(price)) = (spec.tif, spec.price) {
             if self.venues[v].books[&spec.market].crosses(spec.side, price) {
@@ -957,13 +1048,12 @@ impl Exchange {
                 return Ok(order);
             }
             let price = spec.price.unwrap();
-            let book = &self.venues[v].books[&spec.market];
-            let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
-            order.ahead = book.visible(spec.side, price).map(|size| {
+            if let Some(size) = self.venues[v].books[&spec.market].visible(spec.side, price) {
                 let later = next.as_ref().and_then(|n| n.visible(spec.side, price)).unwrap_or_default();
-                size.max(later) * hidden
-            });
-            self.diag[v].queue_ahead.extend(order.ahead);
+                let visible = size.max(later);
+                (order.ahead, order.hidden) = (Some(visible), visible * self.p.hidden_queue_multiplier);
+                self.diag[v].queue_ahead.push(visible + order.hidden);
+            }
         }
         let snapshot = order.clone();
         self.settle(venue, order);
@@ -1108,19 +1198,21 @@ impl Exchange {
         }
     }
 
-    /// After a book update: re-cap each resting order's queue by what is still visible at its
-    /// price (the only cancel credit), then fill whatever the book now crosses.
+    /// After a book update: cut each resting order's visible queue to what is left on its level
+    /// (the only cancel credit), then fill whatever the book now crosses.
     fn on_book(&mut self, venue: Venue, market: &str) {
         let v = venue.ix();
-        let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
+        let h = self.p.hidden_queue_multiplier;
         for id in self.resting(venue, market, None) {
             // A fill above may have closed it (reduce-only orders die with their position).
             let Some(mut order) = self.venues[v].open.remove(&id) else { continue };
             let price = order.price.expect("resting orders have a price");
             let book = &self.venues[v].books[market];
             if let Some(size) = book.visible(order.side, price) {
-                let cap = size * hidden;
-                order.ahead = Some(order.ahead.map_or(cap, |ahead| ahead.min(cap)));
+                match order.ahead {
+                    Some(ahead) => order.ahead = Some(ahead.min(size)),
+                    None => (order.ahead, order.hidden) = (Some(size), size * h),
+                }
             }
             for (level, free) in book.takeable(None, order.side, Some(price)) {
                 let qty = self.fillable(venue, &order).min(free);
@@ -1145,7 +1237,7 @@ impl Exchange {
         } else if book.visible(passive, price).is_some_and(|size| qty > size) {
             diag.prints_over_visible += 1;
         }
-        let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
+        let h = self.p.hidden_queue_multiplier;
         let mut left = qty;
         for id in self.resting(venue, market, Some(passive)) {
             if left <= Decimal::ZERO {
@@ -1159,14 +1251,18 @@ impl Exchange {
             }
             let mut order = self.venues[v].open.remove(&id).unwrap();
             if price != ours {
-                order.ahead = Some(Decimal::ZERO);
+                (order.ahead, order.hidden) = (Some(Decimal::ZERO), Decimal::ZERO);
             } else if order.ahead.is_none() {
-                order.ahead = self.venues[v].books[market].visible(passive, ours).map(|size| size * hidden);
+                if let Some(size) = self.venues[v].books[market].visible(passive, ours) {
+                    (order.ahead, order.hidden) = (Some(size), size * h);
+                }
             }
             if let Some(ahead) = order.ahead {
-                let eaten = ahead.min(left);
-                order.ahead = Some(ahead - eaten);
-                left -= eaten;
+                // The visible queue goes first: the book update that follows shows it gone.
+                let visible = ahead.min(left);
+                let hidden = order.hidden.min(left - visible);
+                (order.ahead, order.hidden) = (Some(ahead - visible), order.hidden - hidden);
+                left -= visible + hidden;
                 let qty = self.fillable(venue, &order).min(left);
                 if qty > Decimal::ZERO {
                     left -= qty;
@@ -1266,6 +1362,7 @@ mod tests {
             };
             ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
             ex.add_market(Venue::Lighter, HYPE, None, filters);
+            ex.trust_feed();
             Self { ex, shift, out: Vec::new(), nonce: 0 }
         }
 
@@ -1367,7 +1464,8 @@ mod tests {
         let mut sim = Sim::new();
         let ticket = sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99), Tif::PostOnly));
         sim.at(100);
-        assert_eq!(placed(&sim, ticket).ahead, Some(dec!(7.5)));
+        let order = placed(&sim, ticket);
+        assert_eq!((order.ahead, order.hidden), (Some(dec!(5)), dec!(2.5)));
         sim.print(Venue::Aster, 200, dec!(99), dec!(6), Side::Sell);
         sim.print(Venue::Aster, 300, dec!(99), dec!(3), Side::Sell);
         sim.print(Venue::Aster, 400, dec!(99), dec!(1), Side::Sell);
@@ -1383,7 +1481,8 @@ mod tests {
         sim.print(Venue::Aster, 200, dec!(99), dec!(10), Side::Sell);
         sim.print(Venue::Aster, 300, dec!(98), dec!(1), Side::Sell);
         sim.at(400);
-        assert_eq!(sim.open(Venue::Aster)[0].ahead, Some(dec!(6.5)));
+        let order = sim.open(Venue::Aster)[0];
+        assert_eq!((order.ahead, order.hidden), (Some(dec!(4)), dec!(2.5)));
         assert!(sim.fills(Venue::Aster).is_empty());
     }
 
@@ -1438,13 +1537,59 @@ mod tests {
     }
 
     #[test]
-    fn the_queue_is_capped_by_what_stays_visible() {
+    fn the_visible_queue_shrinks_with_its_level_and_the_hidden_one_only_by_prints() {
         let mut sim = Sim::new();
         sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(99), Tif::PostOnly));
         sim.book(Venue::Aster, 200, &[(dec!(99), dec!(2))], &[(dec!(101), dec!(5))]);
         sim.book(Venue::Aster, 300, &[(dec!(99), dec!(9))], &[(dec!(101), dec!(5))]);
         sim.at(400);
-        assert_eq!(sim.open(Venue::Aster)[0].ahead, Some(dec!(3)));
+        let order = sim.open(Venue::Aster)[0];
+        assert_eq!((order.ahead, order.hidden), (Some(dec!(2)), dec!(2.5)));
+        // 4 takes the 2 visible and 2 hidden; of the next 1, half is hidden and half fills us.
+        sim.print(Venue::Aster, 500, dec!(99), dec!(4), Side::Sell);
+        sim.print(Venue::Aster, 600, dec!(99), dec!(1), Side::Sell);
+        sim.at(700);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99), dec!(0.5), true)]);
+    }
+
+    // --- A stalled feed. ---
+
+    #[test]
+    fn a_cancel_waits_for_a_stalled_feed_and_the_prints_it_missed_fill_first() {
+        let mut sim = Sim::new();
+        let place = sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99.5), Tif::PostOnly));
+        sim.at(100);
+        let id = placed(&sim, place).id;
+        // The Aster feed has shown the market up to 100 ms, then stalls; the cancel lands at 190.
+        sim.ex.known[0] = 100 * MS + sim.shift;
+        let cancel = sim.send(Venue::Aster, Request::Cancel { market: HYPE.into(), order: OrderRef::Id(id) });
+        let account = sim.send(Venue::Aster, Request::Account);
+        sim.at(1_000);
+        assert!(sim.reply(cancel).is_none(), "the cancel waits for the market");
+        assert!(matches!(sim.reply(account), Some(Reply::Account(_))), "reads never wait");
+        // The stalled frames arrive late: a print at 150 ms hit the bid before the cancel landed.
+        sim.print(Venue::Aster, 150, dec!(99.5), dec!(1), Side::Sell);
+        sim.print(Venue::Aster, 250, dec!(101), dec!(1), Side::Buy);
+        sim.at(1_100);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99.5), dec!(1), true)]);
+        let canceled = placed(&sim, cancel);
+        assert_eq!((canceled.status, canceled.filled), (Status::Done(End::Canceled), dec!(1)));
+        assert_eq!(sim.ex.diag[0].held, 1);
+    }
+
+    #[test]
+    fn an_order_the_feed_never_catches_up_with_is_refused_as_unavailable() {
+        let mut sim = Sim::new();
+        sim.ex.known[1] = sim.ex.now();
+        let order = sim.tx(limit(Side::Buy, dec!(1), dec!(99), Tif::PostOnly));
+        sim.at(2_000);
+        assert!(sim.reply(order).is_none());
+        sim.at(2_010);
+        assert_eq!(sim.reply(order), Some(&Reply::Reject(Reject::Unavailable)));
+        // The nonce was not used: the next transaction may take it.
+        let next = sim.ex.submit(Envelope { venue: Venue::Lighter, lane: 3, weight: 1, orders: 0, nonce: None, request: Request::NextNonce { key: 9 } });
+        sim.at(2_100);
+        assert_eq!(sim.reply(next), Some(&Reply::Nonce(0)));
     }
 
     // --- Taking liquidity. ---

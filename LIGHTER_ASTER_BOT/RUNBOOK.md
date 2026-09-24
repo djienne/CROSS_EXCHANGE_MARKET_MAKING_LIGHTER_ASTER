@@ -97,15 +97,18 @@ The venues respond as seen from AWS Tokyo, and pessimistically where the data ca
 
 - **Time shift.** The simulated world is the live one `shift_ms` (1000) late, timestamps
   included, so the bot sees books as fresh as a Tokyo host would, by its own clocks. A frame
-  that reaches this host later than that is applied on arrival and counted as late.
+  that reaches this host later than that is applied on arrival and counted as late. Orders,
+  cancels and deadmen wait until the feed has caught up with their time, so a cancel cannot
+  beat prints that were late; one that waits over 2 s is answered as unavailable.
 - **Latency.** Each request draws a lognormal round trip from the benchmarked `[p50, p99]`
   and takes effect at `effect_fraction` (0.9) of it. Lighter taker orders wait a further
   `lighter_taker_delay_ms` (300, the Standard account's delay).
 - **Takers** fill against the worse of the two book states around their effect time, and
   liquidity the bot took stays gone until the feed shows that level smaller.
-- **Makers** wait behind the visible size at their price times `1 + hidden_queue_multiplier`.
-  Prints at their price work through that queue before filling them; a print through their
-  price, or a book that crosses them, fills them outright.
+- **Makers** wait behind the visible size at their price, plus `hidden_queue_multiplier` times
+  it in hidden orders. Prints at their price work through the visible queue, then the hidden
+  one, before filling them; the book shrinking only shortens the visible queue. A print through
+  their price, or a book that crosses them, fills them outright.
 - **Venue rules**: the live filters, reduce-only, the Aster deadman and listen-key expiry,
   Lighter's sequential nonces, and both venues' rate limits (Lighter Standard: 60 REST
   requests and 60 transactions a minute).
@@ -166,7 +169,8 @@ taker. Without `--dry-run` that command resets live's breaker.
 | `late_frames` of `frames` | Frames later than the shift. Keep them under 1 %, or raise `shift_ms`. |
 | `lag_ms` (`book`, `top`, `trade`) | Arrival minus exchange time, clock skew included. The p99 must stay under `shift_ms` − 250 (the lookahead that finds the later book state). |
 | `stale_frames`, `gaps` | Out-of-order book frames, and upstream breaks. A gap closes the bot's streams, as the venue would, and orders are rejected `Unavailable` until the next snapshot. |
-| `lateness_ms` (whole row) | How late the simulator ran its events. Tens of ms mean the container is short of CPU. |
+| `held` | Orders, cancels and deadmen that waited for a late feed. |
+| `lateness_ms` (whole row) | How late the simulator ran its events. Hundreds of ms mean this host starved it of CPU (a Docker build on the same host does); stalls past the shift also make late frames. |
 | `rtt_ms`, `private_ms` | The latencies drawn. |
 | `requests`, `orders`, `rejects` | Rejects by reason. Each needs an explanation in the bot's log; `RateLimited` means the bot outran a venue limit, which is a finding about the bot. |
 | `maker_fills`, `taker_fills`, `queue_ahead`, `maker_wait_ms` | Fills, the queue ahead of each order that came to rest, and each maker fill's wait since placement. |
@@ -193,9 +197,10 @@ bind-mounted files as mode 777, and live refuses env files that others can read.
 4. On the host, the read-only probes pass: `docker compose run --rm bot probe aster-balance`,
    then `probe lighter-balance`, `probe lighter-open-orders` and `taker probe --market HYPE`.
 5. Neither venue has open orders, and positions are flat or paired.
-6. `runs/` holds no latch or session marker from an earlier run (`bot-<M>.breaker.json`,
-   `*.trip.json`, `*.active.json`, `active_session_<M>.json`, `circuit_breaker_<M>.json`). Each
-   engine checks its own only when it first starts, which for XEMM can be hours in.
+6. `runs/` holds no latch from an earlier run (`bot-<M>.breaker.json`, `*.trip.json`,
+   `circuit_breaker_<M>.json`): each engine checks its own only when it first starts, which
+   for XEMM can be hours in. `run` itself refuses to start on an engine's unclean-session
+   marker (`*.active.json`, `active_session_<M>.json`).
 7. Start it as in [Run and stop](#run-and-stop). Its drawdown baseline starts at the first
    sample.
 
@@ -224,7 +229,8 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 `bot-<M>.breaker.json` with the reason, and exits nonzero. The reasons are:
 
 - the cross-engine loss stop (`pnl_breaker`): marked equity at or below the baseline minus
-  `max_loss_usdc` (15), a baseline kept across restarts; or realized trade PnL of both engines
+  `max_loss_usdc` (15), a baseline kept across restarts unless no sample has refreshed it for
+  `baseline_max_gap_hours` (48); or realized trade PnL of both engines
   since this start at or below −15. Unverified gains never count; unverified losses do. The
   engines' own stops (10) normally trip first.
 - a failed or hung engine stop (`*_shutdown_unresolved`);

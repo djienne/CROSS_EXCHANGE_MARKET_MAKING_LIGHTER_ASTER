@@ -2,9 +2,10 @@
 //! shifted by D), plus the liquidity our own simulated trades took out of it.
 //!
 //! Our trades never reach the real market, so the feed keeps showing what we took. Each level
-//! remembers what we consumed from it until the feed shows it smaller than that (the rest went
-//! to someone else) or gone. Nothing refills it: no market maker reacts to our trades
-//! (pessimistic, and the only model of our own impact).
+//! remembers what we consumed from it, cut to the level's size whenever the feed shows it
+//! smaller (what others took counts against ours), and forgets it once the level is gone.
+//! Nothing refills it: no market maker reacts to our trades (pessimistic, and the only model of
+//! our own impact).
 
 use std::collections::BTreeMap;
 

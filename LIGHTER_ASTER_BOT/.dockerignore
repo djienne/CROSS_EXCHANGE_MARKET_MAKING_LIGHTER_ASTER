@@ -11,10 +11,9 @@ target-*
 target_*
 runs
 
-# VCS / generated / tooling
+# VCS / generated / tooling / docs
 .git
 .gitignore
-code_bundle.md
 __pycache__
 *.pyc
 *.sqlite
@@ -22,9 +21,4 @@ __pycache__
 *.sqlite-shm
 *.jsonl
 *.jsonl.zst
-
-# Docs / analysis tooling not needed to build the binary
-docs
-tests
 *.md
-USED_PROMPTS.txt

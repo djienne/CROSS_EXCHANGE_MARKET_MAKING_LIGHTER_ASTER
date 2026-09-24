@@ -117,14 +117,10 @@ impl PositionSnapshot {
     }
 }
 
-pub async fn run(cfg: &Config, target: Option<String>, json: bool) -> Result<()> {
+pub async fn run(cfg: &Config, target: Option<String>) -> Result<()> {
     let target = target.unwrap_or_else(|| "HYPE".into());
     let report = StatusPoller::new(cfg, &target).await?.report().await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 

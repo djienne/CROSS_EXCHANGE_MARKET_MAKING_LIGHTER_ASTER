@@ -1,6 +1,7 @@
-//! Live Aster maker / Lighter hedge execution.
+//! The XEMM engine: Aster maker quotes, Lighter hedges.
 //!
-//! Live submission requires enabled configuration, explicit live mode and one market.
+//! It runs only with `[live] enabled` and one market; a dry run points it at the simulated
+//! venues.
 //!
 //! Book publication and strategy ownership stay in memory; bounded queues connect
 //! venue workers, cold account reconciliation and persistent journal writing.

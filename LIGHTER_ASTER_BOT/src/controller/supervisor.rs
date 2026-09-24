@@ -129,7 +129,11 @@ impl Task {
         self.stop.cancel();
         match tokio::time::timeout(ENGINE_STOP_TIMEOUT, &mut self.handle).await {
             Ok(joined) => flatten(joined),
-            Err(_) => bail!("{} did not stop within {}s", self.role.label(), ENGINE_STOP_TIMEOUT.as_secs()),
+            Err(_) => {
+                // Dropping the handle would leave it running (a parked dry run would trade on).
+                self.handle.abort();
+                bail!("{} did not stop within {}s", self.role.label(), ENGINE_STOP_TIMEOUT.as_secs())
+            }
         }
     }
 
@@ -327,6 +331,9 @@ impl<E: Engines> Supervisor<E> {
         }
         if let Err(status) = self.verify_orders_clear(ORDERS_CLEAR_TIMEOUT).await {
             return self.safe_halt("xemm_orders_not_clear_for_reduce_arb", json!({"xemm_status": status, "signal": signal})).await;
+        }
+        if self.stopping() {
+            return;
         }
         self.grant_lease("reduce_burst_signal", Some(&signal));
         if let Some(dead) = self.observer.take_if(|task| !task.running()) {
@@ -527,6 +534,10 @@ impl<E: Engines> Supervisor<E> {
                 return self.safe_halt("xemm_orders_not_clear_on_resume", json!({"xemm_status": status})).await;
             }
         }
+        // A stop asked for during the drain starts nothing new.
+        if self.stopping() {
+            return;
+        }
         let role = if target == Bot::Xemm { Role::Xemm } else { Role::Taker(mode) };
         let task = self.spawn(role);
         self.events.emit("bot_switched", json!({"bot": target.label(), "role": role.label(), "reason": reason, "details": details}));
@@ -623,10 +634,7 @@ impl<E: Engines> Supervisor<E> {
                 return self.safe_halt("active_bot_exited_nonzero", details).await;
             }
             let uptime = (Utc::now() - started_at).num_seconds();
-            if uptime >= SHORT_UPTIME_SEC {
-                self.active_exit_count = 0;
-            }
-            self.active_exit_count += 1;
+            self.active_exit_count = if uptime >= SHORT_UPTIME_SEC { 0 } else { self.active_exit_count + 1 };
             if self.active_exit_count >= CRASH_LOOP_EXITS {
                 let details = json!({"bot": bot, "consecutive_short_exits": self.active_exit_count, "last_uptime_sec": uptime});
                 return self.safe_halt("active_bot_crash_loop", details).await;
@@ -681,7 +689,12 @@ impl<E: Engines> Supervisor<E> {
         let Some(lease) = self.regime.lease.as_mut() else {
             return self.grant_lease(reason, signal);
         };
-        let desired = (Utc::now() + chrono::Duration::seconds(self.cfg.reduce_lease_sec)).min(lease.max_expires_at);
+        let now = Utc::now();
+        // An expired lease stays expired: the next decision hands the rights back to XEMM.
+        if lease.expires_at <= now {
+            return;
+        }
+        let desired = (now + chrono::Duration::seconds(self.cfg.reduce_lease_sec)).min(lease.max_expires_at);
         if desired <= lease.expires_at + chrono::Duration::seconds(1) {
             return;
         }

@@ -82,14 +82,11 @@ pub enum Commands {
         max_usd: rust_decimal::Decimal,
     },
 
-    /// Read-only account/book/quote status: the XEMM report `run` polls every tick.
+    /// Read-only account/book/quote status, as JSON: the XEMM report `run` polls every tick.
     Status {
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
         market: Option<String>,
-        /// Print a machine-readable JSON report.
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
 
     /// Fetch and print resolved market specs (Aster exchangeInfo + Lighter orderBooks).
@@ -131,9 +128,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             let cfg = crate::config::Config::load(&cli.config)?;
             crate::livebot::probe::run(&cfg, &check, market, i_understand_live, max_usd).await?;
         }
-        Commands::Status { market, json } => {
+        Commands::Status { market } => {
             let cfg = crate::config::Config::load(&cli.config)?;
-            crate::livebot::status::run(&cfg, market, json).await?;
+            crate::livebot::status::run(&cfg, market).await?;
         }
         Commands::FetchSpecs { markets } => {
             let cfg = crate::config::Config::load(&cli.config)?;

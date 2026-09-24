@@ -99,12 +99,11 @@ pub async fn run(
             markets.len()
         );
     }
-    warn!(
-        "livebot mode=LIVE: placing REAL orders on Aster + Lighter with REAL funds. \
-         Signing is wired through Aster EVM signing and Lighter native signer FFI. Gated behind \
-         enabled + mode=live + single-market selection."
-    );
-    info!("livebot starting: mode=live, {} market(s)", markets.len());
+    let mode = if cfg.live.dry_run { "dry-run" } else { "live" };
+    if !cfg.live.dry_run {
+        warn!("livebot mode=LIVE: placing REAL orders on Aster + Lighter with REAL funds.");
+    }
+    info!("livebot starting: mode={mode}, {} market(s)", markets.len());
 
     // --- resolve specs + classify pair eligibility ---
     let specs = rest_specs::build_market_specs_with_bases(

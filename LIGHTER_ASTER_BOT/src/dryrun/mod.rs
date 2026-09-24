@@ -236,11 +236,13 @@ impl SimFiles {
         Ok(Some(saved))
     }
 
-    fn save(&mut self, core: &Exchange, durable: bool) -> Result<()> {
+    /// Writes the state if it changed, synced before it replaces the last one: a crash leaves
+    /// one whole state or the other, never a torn file the next start refuses.
+    fn save(&mut self, core: &Exchange) -> Result<()> {
         let json = serde_json::to_string(core.state())?;
         if json != self.written {
             let raw = serde_json::value::RawValue::from_string(json.clone())?;
-            crate::taker::pnl::write_json_atomic(&self.state, &raw, durable)?;
+            crate::taker::pnl::write_json_atomic(&self.state, &raw, true)?;
             self.written = json;
         }
         Ok(())
@@ -433,13 +435,13 @@ async fn drive(
                     }
                     Command::Resume => core.resume(),
                     Command::Save(reply) => {
-                        let _ = reply.send(files.as_mut().map_or(Ok(()), |files| files.save(&core, true)));
+                        let _ = reply.send(files.as_mut().map_or(Ok(()), |files| files.save(&core)));
                     }
                 }
             }
             _ = tokio::time::sleep(wait.unwrap_or_default()), if wait.is_some() => {}
             _ = save.tick() => {
-                if let Some(Err(error)) = files.as_mut().map(|files| files.save(&core, false)) {
+                if let Some(Err(error)) = files.as_mut().map(|files| files.save(&core)) {
                     tracing::warn!("dry run: saving the simulated venues: {error:#}");
                 }
             }
@@ -535,6 +537,7 @@ pub(crate) mod tests {
                 balances: [dec!(1000), dec!(1000)],
             };
             let mut core = Exchange::new(params, wall_us());
+            core.trust_feed();
             let band = Some((dec!(0.95), dec!(1.05)));
             let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), percent_price: band };
             let lighter = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band };
@@ -685,7 +688,7 @@ pub(crate) mod tests {
         core.add_market(Venue::Aster, "HYPEUSDT", Some(20), Filters::default());
         let top = BookUpdate::Top { bid: (dec!(99), dec!(1)), ask: (dec!(101), dec!(1)) };
         core.ingest(Venue::Aster, "HYPEUSDT", core.now() - 30_000, FeedEvent::Book(top));
-        files.save(&core, true).unwrap();
+        files.save(&core).unwrap();
         let saved = files.load().unwrap().expect("the saved state");
         assert_eq!(serde_json::to_value(&saved).unwrap(), serde_json::to_value(core.state()).unwrap());
         files.report(&mut core).unwrap();
@@ -714,6 +717,10 @@ pub(crate) mod tests {
             let (cfg, stop, stem) = (cfg.maker.clone(), stop.clone(), stem.clone());
             async move { crate::livebot::run(&cfg, maker_markets, stem, stop).await }
         });
+        // `run`'s standby taker observes beside XEMM, on the same account, with no lease.
+        let (_no_lease, lease) = tokio::sync::watch::channel(None);
+        let (observer_stop, options) = (CancellationToken::new(), crate::taker::arb::RunOptions { lease: Some(lease), ..Default::default() });
+        let observer = tokio::spawn(crate::taker::arb::run(cfg.taker.clone(), taker_markets.clone(), options, observer_stop.clone()));
         let journal = crate::live_report::inferred_journal_path(&stem);
         // Sells print through any bid the bot can quote (its edge keeps it under 99) until one fills.
         let trade = tokio::time::timeout(Duration::from_secs(60), async {
@@ -733,6 +740,18 @@ pub(crate) mod tests {
         assert!(trade.aster_px.is_some_and(|px| px < dec!(99)), "the maker fill is at the bot's own bid: {trade:?}");
         assert_eq!(trade.lighter_px, Some(dec!(99)), "the hedge took the Lighter bid: {trade:?}");
         assert!(trade.last_mono_ns - trade.first_mono_ns >= 300_000_000, "the hedge waited out the taker delay: {trade:?}");
+        // A hand-back stops the standby first, while XEMM still quotes: having sent nothing, it
+        // stops cleanly whatever rests on the account.
+        let rest = xemm_aster(&cfg.maker.live.aster.base_url);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rest.open_orders(None).await.unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("XEMM quotes again");
+        observer_stop.cancel();
+        tokio::time::timeout(Duration::from_secs(60), observer).await.expect("the standby hung").unwrap().expect("a clean standby stop");
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), xemm).await.expect("the drain hung").unwrap().expect("a clean stop");
         fresh.abort();
@@ -746,10 +765,10 @@ pub(crate) mod tests {
         Arc::new(EvmAsterSigner::new(creds.user, creds.signer, creds.key).unwrap())
     }
 
-    fn xemm_aster(world: &World) -> AsterRest {
+    fn xemm_aster(url: &str) -> AsterRest {
         let scale = MarketScale { tick: dec!(0.001), step: dec!(0.01), hl_qty_step: dec!(0.01) };
         let markets = HashMap::from([(MarketId::from("HYPE"), (scale, "HYPEUSDT".to_string()))]);
-        AsterRest::new(world.aster.clone(), aster_signer(), markets, 30_000, 1_000, 1_000, None).unwrap()
+        AsterRest::new(url.to_string(), aster_signer(), markets, 30_000, 1_000, 1_000, None).unwrap()
     }
 
     /// A subscription's frames, taken by type in whatever order they came.
@@ -773,7 +792,7 @@ pub(crate) mod tests {
     async fn aster_answers_the_bots_own_clients() {
         let world = World::start().await;
         let hype = MarketId::from("HYPE");
-        let rest = xemm_aster(&world);
+        let rest = xemm_aster(&world.aster);
         // The live startup gates.
         assert!(rest.is_one_way().await.unwrap());
         assert_eq!(rest.get_leverage(&hype).await.unwrap(), 1);
@@ -795,7 +814,7 @@ pub(crate) mod tests {
         let liveness = Arc::new(StreamLiveness::default());
         let shutdown = CancellationToken::new();
         let symbols = HashMap::from([("HYPEUSDT".to_string(), hype.clone())]);
-        tokio::spawn(run_aster_user_stream(xemm_aster(&world), symbols, fills_tx, liveness.clone(), shutdown.clone()));
+        tokio::spawn(run_aster_user_stream(xemm_aster(&world.aster), symbols, fills_tx, liveness.clone(), shutdown.clone()));
         while liveness.age_ms(mono_now_ns()) == i64::MAX {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

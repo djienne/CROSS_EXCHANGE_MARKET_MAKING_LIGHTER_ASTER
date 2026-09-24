@@ -93,10 +93,16 @@ impl Default for ControllerCfg {
 
 impl ControllerCfg {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.poll_sec > 0, "controller.poll_sec must be > 0");
+        // The loss stops run once per poll.
+        ensure!((1..=60).contains(&self.poll_sec), "controller.poll_sec must be within 1..=60");
         let clips = [self.switch_headroom_clips, self.switch_margin_clips, self.near_flat_notional_usd];
         ensure!(clips.iter().chain(self.resume_headroom_clips.iter()).chain(self.resume_margin_clips.iter()).all(|c| !c.is_sign_negative()),
             "controller clip and near-flat thresholds must be >= 0");
+        // Without the hysteresis band the taker reads as blocked and ready at once, and the
+        // engines flip every confirm window, each flip a full XEMM drain.
+        let t = self.thresholds();
+        ensure!(t.resume_headroom_clips > t.switch_headroom_clips && t.resume_margin_clips > t.switch_margin_clips,
+            "controller resume clips must exceed the switch clips");
         ensure!(self.max_loss_usdc > Decimal::ZERO, "controller.max_loss_usdc must be > 0");
         ensure!(self.reduce_signal_fresh_ms > 0 && self.reduce_burst_window_ms > 0 && self.reduce_burst_min_samples > 0,
             "controller reduce-burst settings must be > 0");
@@ -166,6 +172,9 @@ impl BotConfig {
         ensure!(t.aster_symbol.eq_ignore_ascii_case(&m.aster_symbol) && t.lighter_symbol.eq_ignore_ascii_case(&m.hl_coin),
             "taker and maker configs name different instruments for {market}");
         ensure!(self.maker.live.quote.reduce_position_only, "[maker.live.quote] reduce_position_only must be true under `run`");
+        ensure!(self.maker.live.enabled, "[maker.live] enabled must be true under `run`");
+        ensure!(self.taker.pnl.enabled && self.maker.live.circuit_breaker.enabled,
+            "`run` keeps both engines' own loss stops: [taker.pnl] and [maker.live.circuit_breaker] need enabled = true");
         Ok((taker, maker))
     }
 }
@@ -207,9 +216,14 @@ pub(crate) async fn run_with(
     let result = async move {
         let files = supervisor::Files::new(&runs_dir, &market);
         let mut events = EventLog::new(files.events.clone());
+        let taker_session = crate::taker::pnl::session_path(&cfg.taker.pnl, &taker_markets[0].id());
+        let markers = [taker_session, crate::livebot::breaker::active_path(&files.xemm_stem)];
         if !live {
-            let taker_session = crate::taker::pnl::session_path(&cfg.taker.pnl, &taker_markets[0].id());
-            archive_unclean_sessions([taker_session, crate::livebot::breaker::active_path(&files.xemm_stem)], &mut events)?;
+            archive_unclean_sessions(markers, &mut events)?;
+        } else if let Some(marker) = markers.iter().find(|marker| marker.exists()) {
+            // Found now, not when its engine first arms, hours in for a standby taker (whose
+            // arming would fail on it every tick).
+            bail!("{} is an unresolved engine session: resolve it first (RUNBOOK.md, Halts and recovery)", marker.display());
         }
         risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
         if reset_baseline && files.baseline.exists() {

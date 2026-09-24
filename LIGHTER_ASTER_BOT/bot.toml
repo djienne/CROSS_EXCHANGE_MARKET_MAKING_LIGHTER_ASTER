@@ -13,10 +13,11 @@
 [controller]
 poll_sec              = 15
 # Normal taker -> XEMM once the taker has been blocked (below the switch clips of position
-# headroom or free margin, with no executable reducing trade) for blocked_confirm_sec.
+# headroom or free margin, or a profitable trade held back by them, with no executable
+# reducing trade) for blocked_confirm_sec.
 blocked_confirm_sec   = 90
 # XEMM -> normal taker once the taker has been ready (near flat, a reducing trade executable,
-# or above the resume clips) for resume_confirm_sec.
+# or no longer blocked at the resume clips) for resume_confirm_sec.
 resume_confirm_sec    = 45
 switch_headroom_clips = "2"
 switch_margin_clips   = "2"
@@ -228,7 +229,7 @@ lighter_safety_buffer_usd = "26"
 # portfolio value + marked uPnL) vs a baseline = median of the first 5 fresh samples; if the drawdown
 # exceeds the limit on 3 consecutive fresh samples the bot cancels orders, LEAVES the delta-neutral
 # position open, writes runs/bot-<MARKET>.trip.json, and halts. It then REFUSES to restart until the
-# latch is cleared:  python scripts/reset_breaker.py
+# latch is cleared:  python scripts/reset_breaker.py --coin <MARKET> --archive
 enabled                  = true
 max_cumulative_loss_usdc = "10"
 

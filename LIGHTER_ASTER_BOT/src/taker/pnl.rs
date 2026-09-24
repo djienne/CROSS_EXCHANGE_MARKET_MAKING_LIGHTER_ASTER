@@ -42,6 +42,7 @@ impl ActiveSession {
     }
 
     pub fn id(&self) -> &str { self.inner.metadata["session_id"].as_str().unwrap_or("unknown") }
+    pub fn armed(&self) -> bool { self.inner.armed.load(Ordering::Acquire) }
     pub fn unresolved(&self) -> bool { self.inner.unresolved.load(Ordering::Acquire) }
     pub fn baseline_equity(&self) -> Option<Decimal> { self.inner.baseline_equity.load_full().map(|value|*value) }
 

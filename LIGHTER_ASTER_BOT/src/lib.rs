@@ -18,8 +18,8 @@ pub mod hot_types;
 pub mod hotpath;
 pub mod inventory;
 pub mod lighter;
-/// The XEMM engine (`run`'s maker): one market, real money; hard-gated behind `[live]
-/// enabled`, `--mode live` and the real signers.
+/// The XEMM engine (`run`'s maker) for one market, gated behind `[live] enabled`; a dry run
+/// points it at the simulated venues.
 pub mod livebot;
 pub mod markets;
 pub mod metrics;

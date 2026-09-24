@@ -81,11 +81,6 @@ impl Latency {
         let sigma = (self.p99_ms / self.p50_ms).ln() / Z99;
         (self.p50_ms * (sigma * rng.normal()).exp() * 1_000.0).round() as i64
     }
-
-    /// The same distribution with every percentile multiplied by `k` (sensitivity runs).
-    pub fn scaled(&self, k: f64) -> Latency {
-        Latency { p50_ms: self.p50_ms * k, p99_ms: self.p99_ms * k }
-    }
 }
 
 #[cfg(test)]

@@ -1888,7 +1888,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
         async { if let Some(pnl) = pnl.as_ref() { pnl.shutdown().await } else { Ok(()) } },
     );
     let drained = history_drained.and(executions_drained).and(pnl_drained);
-    let shutdown = if drained.is_ok() && !session.unresolved() {
+    // A session that never armed sent no order, so it has nothing to verify; the account's
+    // orders may be another engine's (XEMM quotes while a standby observer stops).
+    let shutdown = if drained.is_ok() && session.armed() && !session.unresolved() {
         finish_execution(&execution_epoch);
         match refresh_account_snapshot(&spec.market_id, &aster, &lighter, &execution_epoch).await {
             Ok(snapshot) if snapshot.aster_open_orders == 0 && snapshot.lighter_open_orders == 0 => {
