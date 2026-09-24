@@ -349,10 +349,11 @@ fn calculate(market: String, logical: String, group: &Group, fills: &[Fill]) -> 
     })
 }
 
-pub fn inferred_journal_path(db: &Path) -> PathBuf {
-    let stem = db.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-    let directory = db.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("runs"));
-    directory.join(format!("{stem}-journal.jsonl"))
+/// The XEMM journal of a run's file stem: `runs/bot-HYPE` → `runs/bot-HYPE-journal.jsonl`.
+pub fn inferred_journal_path(stem: &Path) -> PathBuf {
+    let name = stem.file_name().and_then(|s| s.to_str()).unwrap_or("livebot");
+    let directory = stem.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("runs"));
+    directory.join(format!("{name}-journal.jsonl"))
 }
 
 pub fn summarize_path(path: &Path, market: Option<&str>, since_ms: Option<i64>) -> Result<LiveReportSummary> {

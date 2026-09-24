@@ -7,9 +7,8 @@
 //! staleness atomics (`VenueBook::last_msg_ns` / `last_book_ns`) and the watchdog
 //! scan are stamped from a process-start monotonic `Instant`, NOT `Utc::now()`.
 //!
-//! This is a side-channel for liveness only. It never touches the recorder's
-//! `local_recv_ts` (the tape's deterministic *wall-clock* anchor, intentionally
-//! still `Utc::now()`), so replay stays a pure function of (tape, code).
+//! This is a side-channel for liveness only: `OrderBook::local_recv_ts` stays a
+//! wall-clock `Utc::now()` stamp.
 
 use std::sync::OnceLock;
 use std::time::Instant;

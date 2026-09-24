@@ -103,8 +103,7 @@ impl AsterEffectiveTouchSource {
     }
 }
 
-/// A fully-specified candidate quote with the diagnostics needed to persist an
-/// opportunity row and to seed a [`crate::requoter::LiveQuote`].
+/// A fully-specified candidate quote with its pricing and queue diagnostics.
 #[derive(Debug, Clone)]
 pub struct DesiredQuote {
     pub aster_side: Side,
@@ -127,9 +126,9 @@ pub struct DesiredQuote {
     pub aster_mid: Decimal,
     pub hl_mid: Decimal,
 
-    /// Visible volume at levels strictly better than our price (seeded at placement).
+    /// Visible volume at levels strictly better than our price.
     pub better_levels_qty: Decimal,
-    /// Visible volume resting at our exact price (the queue ahead, before model).
+    /// Visible volume resting at our exact price (the queue ahead).
     pub queue_ahead_qty: Decimal,
 
     /// How far inside the Aster touch (bid for a buy, ask for a sell) our quote
@@ -146,20 +145,12 @@ pub struct DesiredQuote {
     pub aster_depth_levels_used: usize,
 
     /// True when `desired_notional` was below the venue minimum lot and the order
-    /// was clamped UP to the minimum (transparency: the report counts these).
+    /// was clamped UP to the minimum.
     pub size_clamped_up: bool,
 
     /// True when the quote rests beyond Aster's captured `@depth20`, so the queue
-    /// ahead (`better_levels_qty`) is only a lower bound — fills here may be
-    /// optimistic. Surfaced (not rejected by default) so the report can separate
-    /// "queue fully observed" from "queue truncated/estimated".
+    /// ahead (`better_levels_qty`) is only a lower bound. A diagnostic, not a reject.
     pub queue_truncated: bool,
-}
-
-impl DesiredQuote {
-    pub fn total_ahead_qty(&self) -> Decimal {
-        self.better_levels_qty + self.queue_ahead_qty
-    }
 }
 
 /// The current signed position on each leg plus the per-leg capital caps, used to
@@ -488,7 +479,7 @@ pub fn compute_desired_quote_with_aster_touch_source(
     let queue_ahead_qty = aster_depth_book.qty_at_price(side, price);
     // The quote may rest deeper than Aster's captured depth20; if so `better_levels_qty`
     // is only a lower bound on the true queue ahead (the unseen levels between the
-    // captured bottom and our price). Flag it for the report.
+    // captured bottom and our price). Flag it.
     let queue_truncated = aster_depth_book.queue_truncated_at(side, price);
 
     Ok(DesiredQuote {

@@ -1,8 +1,8 @@
-//! Shared hot-path data types — plain `Copy` structs with no feature-gate dependency.
+//! Shared hot-path data types — plain `Copy` structs.
 //!
 //! `HotBook` and `HotLevel` are the scaled-integer order book representation used by
 //! the live strategy loop and the `VenueBook` cell. They live here (outside `hotpath`
-//! and `livebot`) so both modules can import them without circular feature-gate issues.
+//! and `livebot`) so both modules can import them.
 
 use crate::types::Side;
 

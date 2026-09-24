@@ -21,13 +21,11 @@ FROM rust:1.92-bookworm AS builder
 WORKDIR /app
 
 # Only what the crate needs to compile: manifests + lockfile + sources.
-# (No build.rs / workspace; TLS=rustls, SQLite=bundled, all *-sys crates build via
-# the stock image's `cc` toolchain — no extra apt packages required.)
+# (No build.rs / workspace; TLS=rustls, all *-sys crates build via the stock image's
+# `cc` toolchain — no extra apt packages required.)
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-# LIVE requires the DEFAULT features (hotpath -> live signing: k256/keccak/hex).
-# Do NOT pass --no-default-features (livebot hard-bails at runtime without hotpath).
 # BuildKit cache mounts make iterative rebuilds (synced bug fixes) fast; the final
 # binary is copied to a stable, non-cache path so the runtime stage can pull it.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

@@ -10,6 +10,9 @@ use crate::types::Side;
 
 pub const MAX_BOOK_LEVELS: usize = 20;
 
+/// One raw `(px, qty)` depth row as parsed off the wire.
+pub type PriceLevel = (Decimal, Decimal);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Level {
     pub px: Decimal,
@@ -118,9 +121,8 @@ impl OrderBook {
     /// level (below the lowest bid for a buy, above the highest ask for a sell). The
     /// book is a partial-depth snapshot (Aster `@depth20`), so when our quote rests
     /// past the captured bottom, the levels between it and our price are unseen and
-    /// [`qty_better_than`] is only a LOWER bound on the true queue ahead — a fill here
-    /// may be simulated too easily. A measurement flag, not a reject (the report
-    /// separates "queue observed" from "queue truncated"). Note: a genuinely shallow
+    /// [`qty_better_than`] is only a LOWER bound on the true queue ahead. A
+    /// measurement flag, not a reject. Note: a genuinely shallow
     /// book that pushed fewer than its cap of levels can also trip this; the flag
     /// reads as "queue not fully observed from this snapshot."
     pub fn queue_truncated_at(&self, side: Side, px: Decimal) -> bool {

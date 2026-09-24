@@ -173,7 +173,7 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
         refuse_insecure_env_files()?;
         refuse_legacy_stack(&market, &[Path::new(RUNS_DIR), Path::new("../runs")])?;
     }
-    let files = supervisor::Files::new(Path::new(RUNS_DIR), &market, live);
+    let files = supervisor::Files::new(Path::new(RUNS_DIR), &market);
     std::fs::create_dir_all(RUNS_DIR)?;
     let mut events = EventLog::new(files.events.clone());
     risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
@@ -182,7 +182,7 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
         events.emit("baseline_reset", serde_json::json!({"path": files.baseline.display().to_string()}));
     }
     let taker_ledger = crate::taker::pnl::ledger_path(&cfg.taker.pnl, &taker_markets[0].id());
-    let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, mode, files.xemm_db.clone()).await?;
+    let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
     supervisor::Supervisor::new(cfg.controller, market, live, files, taker_ledger, engines, events, stop).run().await
 }
 
@@ -234,11 +234,11 @@ fn refuse_legacy_stack(market: &str, dirs: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// Exclusive per-market lock held by every live writer (`run`, `taker run`, `livebot --mode
-/// live`): two writers on one account and market break client-order-index uniqueness, nonce
-/// sequencing and position accounting. The OS drops the lock with the process, so it never
-/// goes stale. Ponytail: keyed by `runs/` under the working directory, so a writer started
-/// from another directory is not excluded.
+/// Exclusive per-market lock held by every live writer (`run`, `taker run`): two writers on one
+/// account and market break client-order-index uniqueness, nonce sequencing and position
+/// accounting. The OS drops the lock with the process, so it never goes stale. Ponytail: keyed
+/// by `runs/` under the working directory, so a writer started from another directory is not
+/// excluded.
 pub fn lock_market(market: &str) -> Result<File> {
     std::fs::create_dir_all(RUNS_DIR)?;
     let path = Path::new(RUNS_DIR).join(format!("bot-{}.lock", market.to_ascii_uppercase()));

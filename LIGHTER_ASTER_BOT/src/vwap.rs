@@ -1,7 +1,7 @@
 //! Volume-weighted average price for a simulated taker order walking the book.
 //! `vwap_take` requires the full quantity to be fillable (used when pricing a
 //! quote); `vwap_take_partial` resolves against whatever depth exists and flags
-//! exhaustion (used when resolving a hedge against a possibly-thin book).
+//! exhaustion.
 
 use rust_decimal::Decimal;
 

@@ -72,13 +72,6 @@ impl SignedPosition {
             realized
         }
     }
-
-    /// Mark notional `|qty| * ref_px` — the capital this position consumes at
-    /// leverage 1.
-    #[inline]
-    pub fn notional(&self, ref_px: Decimal) -> Decimal {
-        self.qty.abs() * ref_px
-    }
 }
 
 #[cfg(test)]
@@ -140,12 +133,5 @@ mod tests {
         assert_eq!(realized, dec!(2));
         assert_eq!(p.qty, dec!(-1));
         assert_eq!(p.avg_px, dec!(100));
-    }
-
-    #[test]
-    fn notional_is_abs_qty_times_ref() {
-        let mut p = SignedPosition::default();
-        p.apply_fill(dec!(-3), dec!(100));
-        assert_eq!(p.notional(dec!(101)), dec!(303));
     }
 }

@@ -5,10 +5,8 @@
 #
 # Run with (the mode is a command-line choice only):
 #   lighter_aster_bot run --config bot.toml --market HYPE --mode live
-#   lighter_aster_bot run --config bot.toml --market HYPE --mode paper   # no orders
 #
 # The engines' own commands read their table of this file, e.g.
-#   lighter_aster_bot --config bot.toml livebot --mode paper --markets HYPE
 #   lighter_aster_bot taker run --config bot.toml --market HYPE --observe-only
 
 [controller]
@@ -94,7 +92,6 @@ max_loss_usdc = "10"
 
 [taker.live]
 # The taker engine's arming switch: it refuses to start unless enabled and mode = "live".
-# `run --mode paper` keeps it observe-only regardless.
 enabled = true
 mode = "live"
 max_account_snapshot_age_ms = 30000
@@ -147,33 +144,11 @@ clamp_to_min_lot             = true
 # bps of the resting quote (even if marginally unprofitable). Suppresses sub-bps requote churn.
 min_requote_bps              = "2.0"
 
-[maker.simulation]
-simulated_aster_place_latency_ms  = 25
-simulated_aster_cancel_latency_ms = 25
-quote_ttl_ms                      = 500
-hedge_latency_buckets_ms          = [50, 100, 250, 500, 1000]
-max_book_staleness_ms             = 10000
-halt_trading_on_stale_feed        = true
-
-[maker.partials]
-strict_all_partials_must_be_hedgeable = false
-lighter_min_notional              = "10"
-max_pending_inventory_notional        = "25"
-max_pending_inventory_age_ms          = 1000
-
 [maker.capital]
 aster_capital_usd       = "200"
 lighter_capital_usd = "200"
 leverage                = "1"
 enforce_position_cap    = true
-
-[maker.queue_model]
-models                 = ["optimistic", "visible_queue", "conservative"]
-hidden_queue_multiplier = "1.0"
-
-[maker.runtime]
-record_path = "runs"
-db_path     = "runs/eval.sqlite"
 
 [maker.book_check]
 enabled              = true
@@ -194,6 +169,7 @@ max_unhedged_age_ms           = 8000         # generous: a slow-network hedge RT
 max_position_mismatch_usd     = "3"
 max_account_snapshot_age_ms   = 4000
 max_user_stream_staleness_ms  = 15000        # slow dev network
+max_book_staleness_ms         = 10000
 cancel_all_on_gate_close      = true
 cancel_all_on_user_stream_stale = true
 
@@ -215,6 +191,7 @@ max_replaces_per_minute_per_symbol = 100
 policy                  = "accumulate_sub_min"
 max_pending_notional_usd = "15"
 max_pending_age_ms       = 6000
+lighter_min_notional     = "10"
 
 [maker.live.aster]
 base_url             = "https://fapi.asterdex.com"
@@ -249,7 +226,7 @@ lighter_safety_buffer_usd = "26"
 # Unattended-run safety stop. Measures TOTAL cross-venue marked equity (Aster wallet+unrealized + Lighter
 # portfolio value + marked uPnL) vs a baseline = median of the first 5 fresh samples; if the drawdown
 # exceeds the limit on 3 consecutive fresh samples the bot cancels orders, LEAVES the delta-neutral
-# position open, writes runs/<db-stem>.trip.json, and halts. It then REFUSES to restart until the
+# position open, writes runs/bot-<MARKET>.trip.json, and halts. It then REFUSES to restart until the
 # latch is cleared:  python scripts/reset_breaker.py
 enabled                  = true
 max_cumulative_loss_usdc = "10"

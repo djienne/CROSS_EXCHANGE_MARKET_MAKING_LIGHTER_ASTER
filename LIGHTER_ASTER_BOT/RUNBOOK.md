@@ -3,8 +3,8 @@
 `lighter_aster_bot run` trades one market with both engines in one process. The taker–taker
 engine and the reduce-only XEMM engine take turns holding execution rights; the controller
 switches them in memory. Commands run from this directory (`LIGHTER_ASTER_BOT/`) and read
-`bot.toml`. `run --mode live`, `livebot --mode live`, `taker run` without `--observe-only`
-and the `*-market`/`*-roundtrip` probes submit real orders.
+`bot.toml`. `run --mode live`, `taker run` without `--observe-only` and the
+`*-market`/`*-roundtrip` probes submit real orders.
 
 ## How `run` switches
 
@@ -47,7 +47,7 @@ cargo build --release --locked        # Rust 1.92; never `cargo fmt`
   `live.quote.price_change_ticks_to_requote`, `expires_after_ms`, …) and non-mainnet
   `[maker.live]` URLs.
   The mode is a command-line choice only. `[taker.live] enabled = true, mode = "live"` arms
-  the taker engine; `--mode paper` keeps it observe-only regardless.
+  the taker engine.
 
 ## Run and stop
 
@@ -64,9 +64,6 @@ Docker (see [Deploy](#deploy)):
 docker compose run --rm --name bot-hype bot run --market HYPE --mode live
 ```
 
-`--mode paper` runs XEMM on its simulated executor and the taker observe-only. Market data
-and account state are real, so paper still needs the credentials.
-
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
 `docker kill --signal=SIGINT bot-hype`). The active engine drains first, then the observer.
 XEMM quiesces admission, cancels makers, drains fills and execution outcomes, corrects net
@@ -75,9 +72,9 @@ it with a shorter kill: `docker stop` needs `-t 200`, and compose already sets
 `stop_grace_period: 200s`. Paired positions stay open and delta-neutral. Exit 0 means a
 clean stop; nonzero means a halt, an unresolved engine stop or an unwritable event log.
 
-Only one live writer per market runs at a time: `run --mode live`, `livebot --mode live`
-and `taker run` (unless `--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock`
-and name the holder's pid on contention.
+Only one live writer per market runs at a time: `run --mode live` and `taker run` (unless
+`--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock` and name the holder's pid
+on contention.
 
 ## Runtime files (`runs/`)
 
@@ -92,8 +89,8 @@ and name the holder's pid on contention.
 | `trades_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger and entry-gate history |
 | `active_session_<M>.json`, `circuit_breaker_<M>.json` | Taker unclean-session marker and loss breaker |
 
-Paper runs use the controller and XEMM stem `bot-<M>-paper`. The taker's observe-only
-history still feeds `opportunities_<M>.jsonl`, as live history collection does.
+The taker's observe-only history still feeds `opportunities_<M>.jsonl`, as live history
+collection does.
 
 ## Halts and recovery
 
@@ -207,7 +204,7 @@ the nonce dir at `/nonce`. It never restarts the bot: a halt stays halted until 
 
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
   lighter-balance | lighter-open-orders`, `taker probe`, `taker status --json`,
-  `fetch-specs`, `verify-books`.
+  `fetch-specs`.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
 - These submit real orders; run them only with explicit approval: `probe lighter-market
   --i-understand-live --max-usd 12` and `taker aster-market-roundtrip` /
@@ -228,7 +225,8 @@ first `run --mode live` on such a host:
    `orchestrator_breaker_<M>.json`, and XEMM's `orchestrator-xemm-<M>.trip.json` and
    `orchestrator-xemm-<M>.active.json`. `run` refuses to start while any of them exists; an
    `.active.json` is an unresolved session (see [Halts and recovery](#halts-and-recovery)).
-   Check `runs/` for other `*.trip.json` / `*.active.json` files left by direct `livebot` runs.
+   Check `runs/` for other `*.trip.json` / `*.active.json` files left by direct runs of the
+   retired `livebot` command.
 3. The taker's files keep their names. The drawdown baseline starts fresh at the first
    sample. To carry the old one over, copy `runs/orchestrator_baseline_<M>.json` to
    `LIGHTER_ASTER_BOT/runs/bot-<M>.baseline.json`; it is discarded if unrefreshed for 48 h.

@@ -179,8 +179,8 @@ pub struct ExecutionTrade {
 }
 
 /// Worker / venue → strategy + risk reactor. Order/hedge lifecycle notifications. Aster
-/// maker fills primarily arrive on the user-data stream (not the exec worker), but the
-/// paper executor synthesizes them here, and the variant is shared so both paths converge.
+/// maker fills primarily arrive on the user-data stream (not the exec worker);
+/// `MakerFill` routes one through the same handler.
 #[derive(Debug, Clone)]
 pub enum ExecEvent {
     PlaceAck { client_id: String, venue_order_id: String },
@@ -196,11 +196,10 @@ pub enum ExecEvent {
     /// A cancel/replace-cancel that FAILED at the venue (or returned a venue error body). The
     /// order may still be resting — the strategy must NOT close the slot; it freezes + reconciles.
     CancelReject { client_id: String, reason: String },
-    /// A maker fill detected (from the Aster user stream, or synthesized in paper mode).
+    /// A maker fill, handled like one from the Aster user stream.
     MakerFill(AsterFill),
     MakerOrderProgress { market: MarketId, side: Side, client_id: String, order_id: String,
         cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, terminal: bool, event_time_ms: i64 },
-    HedgeAck { cloid: Cloid, hl_oid: String },
     AttemptStarted { cloid: Cloid, proof: WireProof },
     AttemptNotSent { cloid: Cloid, reason: String },
     ExecutionProgress { cloid: Cloid, cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, cumulative_fee_usd: Option<Decimal>, terminal: bool, venue_order_id: Option<String>, event_time_ms: Option<i64> },
@@ -217,5 +216,5 @@ pub enum ExecEvent {
 
 /// Default bounded depth of each command queue. Deep enough to absorb a quoting burst, small
 /// enough that a wedged worker is noticed (a `try_send` failure) rather than growing
-/// unbounded — the live analogue of the recorder's backlog watch.
+/// unbounded.
 pub const CMD_QUEUE_DEPTH: usize = 1024;

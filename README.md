@@ -7,9 +7,9 @@ both engines in one process: it switches execution rights between them in memory
 enforces a cross-engine loss stop.
 
 This is a live trading codebase. `run --mode live`, `taker run` (without
-`--observe-only`), `livebot --mode live` and the live market probes can place real
-orders and can lose money through spread, fees, slippage and execution failures. Use
-read-only probes or paper/observe modes before any live run.
+`--observe-only`) and the live market probes can place real orders and can lose money
+through spread, fees, slippage and execution failures. Use read-only probes or the
+taker's observe-only mode before any live run.
 
 ## Components
 
@@ -24,8 +24,8 @@ read-only probes or paper/observe modes before any live run.
   books hold `liquidity_multiple` times the clip within `max_levels`, and the edge passes
   the entry gate: the greater of the 90th percentile of recent opportunity samples and
   the required edge plus `min_extra_bps`.
-- The XEMM engine (`lighter_aster_bot livebot ...` on its own) quotes on Aster and hedges
-  on Lighter; the same binary also has the probe, record/replay and report commands.
+- The XEMM engine quotes on Aster and hedges on Lighter; it runs inside `run`. The same
+  binary also has the probe, status and `live-report` commands.
 - `combined_pnl.py` and `trade_history.py` report combined execution economics across
   taker trade logs and XEMM hedge journals.
 
@@ -41,7 +41,7 @@ read-only probes or paper/observe modes before any live run.
     ├── bot.toml            config: [controller], [taker], [maker]
     ├── scripts/            check_hedged_trade.py, reset_breaker.py, deploy_vps.sh
     ├── signers/            Lighter signer shared libraries
-    ├── src/                controller/ (run), taker/ (taker engine), livebot/ (XEMM), research
+    ├── src/                controller/ (run), taker/ (taker engine), livebot/ (XEMM)
     └── RUNBOOK.md          operation, deploy, halts and recovery
 ```
 
@@ -59,7 +59,7 @@ Both engines read this one pair from their working directory
 (`LIGHTER_ASTER_BOT/`). Keep the files mode `600` on the machine running the
 bot — `run --mode live` refuses an env file readable by group/other. The
 `.gitignore` files ignore env files, run outputs, sqlite databases, logs,
-jsonl/zst tapes, build outputs, PEM/key files, and local tool state.
+jsonl/zst files, build outputs, PEM/key files, and local tool state.
 
 `aster.env` must explicitly list the API-wallet (signer) address in
 `wallet_address`/`subaccount_address` and it must match `private_key`'s derived
@@ -117,8 +117,6 @@ tmux new -s lighter_aster_bot
 ./target/release/lighter_aster_bot run --market HYPE --mode live
 ```
 
-- `--mode paper` runs XEMM on its simulated executor and the taker observe-only; it
-  reads real market data and account state.
 - `[controller] max_loss_usdc` (default 15) is the cross-engine loss stop: the bot
   halts when marked equity falls 15 below its persisted baseline or realized trade PnL
   of both engines reaches −15. It sits above the engines' own `max_loss_usdc` /
@@ -132,23 +130,15 @@ SIGTERM or SIGHUP). The active engine drains fully, which can take up to 175 s, 
 paired positions stay open. Docker, deploy, the cutover from the retired
 `orchestrator.py` and every latch are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md).
 
-## Engines on Their Own
+## The Taker on Its Own
 
-Useful for diagnostics and controlled tests. A live engine takes the same per-market
-lock as `run`, so it cannot run beside it. Run from `LIGHTER_ASTER_BOT/`. Taker
-observe-only, then live:
+Useful for diagnostics and controlled tests. A live taker takes the same per-market
+lock as `run`, so it cannot run beside it. Run from `LIGHTER_ASTER_BOT/`. Observe-only,
+then live:
 
 ```bash
 ./target/release/lighter_aster_bot taker run --markets HYPE --observe-only
 ./target/release/lighter_aster_bot taker run --markets HYPE
-```
-
-XEMM paper, then live:
-
-```bash
-./target/release/lighter_aster_bot livebot --mode paper --markets HYPE --secs 30
-./target/release/lighter_aster_bot livebot --mode live --markets HYPE \
-  --db runs/live-hype.sqlite --out runs/live-hype.jsonl.zst
 ```
 
 Live roundtrip and market probes require explicit `--i-understand-live` flags in
@@ -220,17 +210,10 @@ halts. A lease permits only reducing taker trades; cold observations expire afte
 500 ms and transmission checks the lease's actual expiry. See the
 [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#halts-and-recovery) for execution recovery.
 
-Replay scenarios are independent per market, queue model and hedge latency. Each
-owns positions, quotes, reserved exposure, consumed liquidity and fees. Reports
-use venue-realized P&L plus fresh marks less fees, and show censored future hedges
-and residuals. The smallest latency is the primary display; old rows are labelled
-unassigned and need tape replay for corrected results.
-
 ## Evidence Limits
 
-No production history or representative long market tape exists here; historical
-repair is validated with explicit fixtures. The short public tape establishes
-transport/paper/replay operation, not trading edge. Execution economics exclude
+No production history exists here; historical repair is validated with explicit
+fixtures. Execution economics exclude
 funding and unpaired account marks; account-equity changes also include transfers.
 Unresolved sessions lacking terminal venue identity remain blocked until primary
 evidence resolves them. The tests do not certify deployed latency, actual

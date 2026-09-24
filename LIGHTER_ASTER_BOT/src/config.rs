@@ -1,8 +1,7 @@
 //! TOML configuration. Decimal-bearing fields are quoted strings (the
 //! `rust_decimal` `serde-str` feature parses them). The pure-config structs from
-//! `edge`/`quote_engine` are reused directly; this module adds the simulation,
-//! partials, queue-model, runtime, and market sections and builds the derived
-//! configs the simulation needs.
+//! `edge`/`quote_engine` are reused directly; this module adds the capital,
+//! book-check, live and market sections.
 
 use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
@@ -11,76 +10,32 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::edge::EdgeConfig;
-use crate::inventory::HedgeabilityRules;
 use crate::quote_engine::QuoteEngineConfig;
-use crate::requoter::RequoteConfig;
-use crate::types::{MarketId, QueueModel};
+use crate::types::MarketId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub edge: EdgeConfig,
     pub quote: QuoteEngineConfig,
-    pub simulation: SimulationCfg,
-    pub partials: PartialsCfg,
     #[serde(default)]
     pub capital: CapitalCfg,
-    pub queue_model: QueueModelCfg,
-    #[serde(default)]
-    pub runtime: RuntimeCfg,
     /// Periodic REST cross-check of the live websocket books. Optional; defaults on.
     #[serde(default)]
     pub book_check: BookCheckCfg,
-    /// Real live-trading bot (`livebot` command) settings. Entirely optional and
-    /// `enabled = false` by default, so an existing dry-run config (and every recorded
-    /// run header) parses unchanged and the deterministic record/replay path never sees
-    /// it. Feature-independent (not behind `hotpath`) so the serialized header is
-    /// identical across feature sets — the bot itself still requires `hotpath`.
+    /// XEMM live-trading settings. Entirely optional and `enabled = false` by default;
+    /// the XEMM engine refuses to start until it is enabled.
     #[serde(default)]
     pub live: LiveCfg,
     pub markets: Vec<MarketCfg>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulationCfg {
-    pub simulated_aster_place_latency_ms: i64,
-    pub simulated_aster_cancel_latency_ms: i64,
-    pub quote_ttl_ms: i64,
-    pub hedge_latency_buckets_ms: Vec<i64>,
-    pub max_book_staleness_ms: i64,
-    /// When a book is stale beyond `max_book_staleness_ms`, pull resting quotes and
-    /// suppress fills on the matched side instead of trading on data we'd not trust
-    /// live. The simulator analogue of the live `TradingGate`. Default true.
-    #[serde(default = "default_true")]
-    pub halt_trading_on_stale_feed: bool,
 }
 
 fn default_true() -> bool {
     true
 }
 
-impl SimulationCfg {
-    pub fn requote_config(&self) -> RequoteConfig {
-        RequoteConfig {
-            simulated_aster_place_latency_ms: self.simulated_aster_place_latency_ms,
-            simulated_aster_cancel_latency_ms: self.simulated_aster_cancel_latency_ms,
-            quote_ttl_ms: self.quote_ttl_ms,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PartialsCfg {
-    pub strict_all_partials_must_be_hedgeable: bool,
-    #[serde(alias = "lighter_min_notional")]
-    pub hyperliquid_min_notional: Decimal,
-    pub max_pending_inventory_notional: Decimal,
-    pub max_pending_inventory_age_ms: i64,
-}
-
 /// Per-exchange capital backing each leg. Both legs are perpetual futures, so at
 /// `leverage` the maximum position notional a leg may carry is `capital * leverage`.
-/// The cap is enforced separately for each simulation scenario: each pair gets
-/// its own capital, and each queue-model world is an independent hypothetical.
+/// The cap is enforced per pair: each pair gets its own capital.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CapitalCfg {
     pub aster_capital_usd: Decimal,
@@ -114,41 +69,9 @@ impl CapitalCfg {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct QueueModelCfg {
-    pub models: Vec<String>,
-    pub hidden_queue_multiplier: Decimal,
-}
-
-impl QueueModelCfg {
-    /// Parse the configured model names, erroring on any unknown entry.
-    pub fn parsed_models(&self) -> Result<Vec<QueueModel>> {
-        self.models
-            .iter()
-            .map(|m| QueueModel::parse(m).with_context(|| format!("unknown queue model: {m:?}")))
-            .collect()
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeCfg {
-    pub record_path: String,
-    pub db_path: String,
-}
-
-impl Default for RuntimeCfg {
-    fn default() -> Self {
-        RuntimeCfg {
-            record_path: "runs".to_string(),
-            db_path: "runs/eval.sqlite".to_string(),
-        }
-    }
-}
-
 /// Tunables for the live REST-vs-websocket order-book cross-check (`hotpath::book_check`).
-/// Slow, off-hot-path reconciliation; only active in `live`. All fields default so an
-/// old config (or a recording's embedded config) without a `[book_check]` section
-/// still parses with the check enabled.
+/// Slow, off-hot-path reconciliation; only active in `live`. All fields default so a
+/// config without a `[book_check]` section still parses with the check enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookCheckCfg {
     /// Run the periodic REST cross-check during `live`. Default true.
@@ -210,18 +133,12 @@ impl Default for BookCheckCfg {
     }
 }
 
-/// Execution mode for the live bot. Exactly two modes: `Paper` (the selected markets, NO
-/// real orders — the everyday mode) and `Live` (a single market, real funds, hard-gated
+/// Execution mode for the bot. One mode: `Live` (a single market, real funds, hard-gated
 /// behind `enabled = true`, explicit live mode, single-market selection, and a wired signer).
 /// The mode comes from the command line only (`--mode`); the config has no mode key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LiveMode {
-    /// Run the full order/fill/hedge state machine against a simulated executor that
-    /// fabricates acks/fills locally, while recording the market tape + persisting results.
-    /// No network order I/O. The default.
-    #[default]
-    Paper,
     /// Real signed orders on Aster + Lighter. Real funds. Hard-gated.
     Live,
 }
@@ -229,7 +146,6 @@ pub enum LiveMode {
 impl LiveMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            LiveMode::Paper => "paper",
             LiveMode::Live => "live",
         }
     }
@@ -265,7 +181,7 @@ impl PartialPolicy {
 /// is fully optional; the whole struct is inert until `enabled = true`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveCfg {
-    /// Master switch. While false the `livebot` command refuses to start. Default false.
+    /// Master switch. While false the XEMM engine (`livebot::run`) refuses to start. Default false.
     #[serde(default)]
     pub enabled: bool,
     /// Cooldown after ANY execution event during which no new maker quote may be placed
@@ -300,6 +216,10 @@ pub struct LiveCfg {
     /// Max user-stream silence (ms) before the gate closes + orders cancel. 5000.
     #[serde(default = "default_max_user_stream_staleness_ms")]
     pub max_user_stream_staleness_ms: i64,
+    /// Max venue book age (ms) before a feed counts as stale: the per-market quote gate,
+    /// hedge-book selection, the feed watchdog and reconciler marks. Default 10000.
+    #[serde(default = "default_max_book_staleness_ms")]
+    pub max_book_staleness_ms: i64,
     /// Cancel all Aster maker orders whenever the trading gate closes. Default true.
     #[serde(default = "default_true")]
     pub cancel_all_on_gate_close: bool,
@@ -318,7 +238,7 @@ pub struct LiveCfg {
     pub circuit_breaker: LiveCircuitBreakerCfg,
     /// Proactive per-venue margin guard: cap each venue's position notional at its real free
     /// collateral (minus that venue's safety buffer) so the position-increasing side stops quoting
-    /// BEFORE the exchange rejects (Aster -2019). Default enabled; inert in paper (no real orders).
+    /// BEFORE the exchange rejects (Aster -2019). Default enabled.
     #[serde(default)]
     pub margin_guard: LiveMarginGuardCfg,
 }
@@ -378,6 +298,9 @@ pub struct LivePartialsCfg {
     /// Accumulation age cap (ms). Default 0 (strict).
     #[serde(default)]
     pub max_pending_age_ms: i64,
+    /// Lighter's minimum order notional (USD): the smallest hedge the pair can send. Default "10".
+    #[serde(default = "default_lighter_min_notional")]
+    pub lighter_min_notional: Decimal,
 }
 
 impl Default for LivePartialsCfg {
@@ -386,6 +309,7 @@ impl Default for LivePartialsCfg {
             policy: PartialPolicy::default(),
             max_pending_notional_usd: Decimal::ZERO,
             max_pending_age_ms: 0,
+            lighter_min_notional: default_lighter_min_notional(),
         }
     }
 }
@@ -510,7 +434,7 @@ impl Default for LiveHyperliquidCfg {
 /// `max_cumulative_loss_usdc` on 3 consecutive fresh samples cancels orders, leaves the
 /// (delta-neutral) position open, writes a persistent trip-latch file, and halts. The bot then
 /// refuses to restart until the latch is cleared (see `scripts/reset_breaker.py`). Inert unless
-/// `enabled`; ignored entirely in paper mode.
+/// `enabled`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveCircuitBreakerCfg {
     /// Arm the breaker. Default false (off unless a live config turns it on).
@@ -542,6 +466,7 @@ impl Default for LiveCfg {
             max_position_mismatch_usd: default_max_position_mismatch(),
             max_account_snapshot_age_ms: default_max_account_snapshot_age_ms(),
             max_user_stream_staleness_ms: default_max_user_stream_staleness_ms(),
+            max_book_staleness_ms: default_max_book_staleness_ms(),
             cancel_all_on_gate_close: true,
             cancel_all_on_user_stream_stale: true,
             quote: LiveQuoteCfg::default(),
@@ -562,7 +487,7 @@ impl LiveCfg {
     }
 
     /// Sanity-check the live section. Only enforced when `enabled` — a disabled (default)
-    /// section is inert and never blocks loading a dry-run config.
+    /// section is inert and never blocks loading the config.
     pub fn validate(&self) -> Result<()> {
         if !self.enabled {
             return Ok(());
@@ -623,7 +548,7 @@ impl LiveCfg {
 /// Per-venue reserve held back from fresh free margin before admitting exposure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveMarginGuardCfg {
-    /// Master switch for the proactive guard. Inert in paper regardless. Default true.
+    /// Master switch for the proactive guard. Default true.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// USD held back from real Aster collateral before the dynamic position-notional cap. Covers an
@@ -668,6 +593,12 @@ fn default_max_account_snapshot_age_ms() -> i64 {
 }
 fn default_max_user_stream_staleness_ms() -> i64 {
     5_000
+}
+fn default_max_book_staleness_ms() -> i64 {
+    10_000
+}
+fn default_lighter_min_notional() -> Decimal {
+    Decimal::from(10)
 }
 fn default_min_requote_interval_ms() -> u64 {
     20
@@ -750,8 +681,7 @@ pub fn read_table(path: &Path, section: &str) -> Result<toml::Value> {
 }
 
 /// Deserializes a config table, rejecting keys the target does not define: a typo or a key in
-/// the wrong table must fail startup, not silently leave a default in force. Recorded run
-/// headers deserialize without this, so a retired key never breaks replay.
+/// the wrong table must fail startup, not silently leave a default in force.
 pub fn strict_from_toml<T: serde::de::DeserializeOwned>(value: toml::Value) -> Result<T> {
     let mut unknown = Vec::new();
     let parsed = serde_ignored::deserialize(value, |path| unknown.push(path.to_string()))?;
@@ -770,8 +700,6 @@ impl Config {
     /// Checks a file-loaded XEMM table (`[maker]` of `bot.toml`).
     pub fn from_table(value: toml::Value) -> Result<Self> {
         for retired in [
-            "partials.accumulate_sub_min_fills",
-            "partials.mark_pending_inventory_to_market",
             "live.partials.max_pending_count",
             "live.quote.price_change_ticks_to_requote",
             "live.lighter.expires_after_ms",
@@ -783,8 +711,7 @@ impl Config {
         }
         let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
-        // File-loaded operational configs may perform I/O. Recorded headers are
-        // deserialized directly, so offline replay does not depend on obsolete URLs.
+        // File-loaded operational configs perform venue I/O: pin the supported origins.
         if cfg.live.aster.base_url.trim_end_matches('/') != default_aster_base_url()
             || cfg.live.hyperliquid.base_url.trim_end_matches('/') != default_hl_base_url()
         {
@@ -814,9 +741,6 @@ impl Config {
                 bail!("duplicate lighter_symbol {hl:?} in [[markets]]");
             }
         }
-        if self.queue_model.models.is_empty() {
-            bail!("config queue_model.models is empty");
-        }
         if self.book_check.enabled {
             if self.book_check.max_concurrent_requests == 0 {
                 bail!("book_check.max_concurrent_requests must be >= 1");
@@ -825,21 +749,8 @@ impl Config {
                 bail!("book_check.max_rest_snapshot_age_ms must be positive");
             }
         }
-        self.queue_model.parsed_models()?;
-        if self.simulation.hedge_latency_buckets_ms.is_empty() {
-            bail!("config simulation.hedge_latency_buckets_ms is empty");
-        }
-        if self.simulation.hedge_latency_buckets_ms.iter().any(|&b| b < 0) {
-            bail!("hedge latency buckets must be non-negative");
-        }
-        if self.simulation.simulated_aster_place_latency_ms < 0
-            || self.simulation.simulated_aster_cancel_latency_ms < 0
-            || self.simulation.quote_ttl_ms <= 0
-            || self.simulation.max_book_staleness_ms < 0
-            || self.partials.max_pending_inventory_age_ms < 0
-            || self.partials.max_pending_inventory_notional < Decimal::ZERO
-        {
-            bail!("simulation latencies and risk bounds must be non-negative, and quote_ttl_ms must be positive");
+        if self.live.max_book_staleness_ms < 0 {
+            bail!("live.max_book_staleness_ms must be non-negative");
         }
         if self.capital.aster_capital_usd <= Decimal::ZERO
             || self.capital.hyperliquid_capital_usd <= Decimal::ZERO
@@ -870,13 +781,6 @@ impl Config {
         }
         self.live.validate()?;
         Ok(())
-    }
-
-    pub fn hedgeability_rules(&self, hyperliquid_qty_step: Decimal) -> HedgeabilityRules {
-        HedgeabilityRules {
-            hyperliquid_min_notional: self.partials.hyperliquid_min_notional,
-            hyperliquid_qty_step,
-        }
     }
 
     /// Filter the configured markets by an optional comma-separated id list.
@@ -923,33 +827,11 @@ min_requote_interval_ms = 20
 price_change_ticks_to_requote = 1
 clamp_to_min_lot = true
 
-[simulation]
-simulated_aster_place_latency_ms = 25
-simulated_aster_cancel_latency_ms = 25
-quote_ttl_ms = 500
-hedge_latency_buckets_ms = [50, 100, 250, 500, 1000]
-max_book_staleness_ms = 750
-halt_trading_on_stale_feed = true
-
-[partials]
-strict_all_partials_must_be_hedgeable = false
-lighter_min_notional = "10"
-max_pending_inventory_notional = "25"
-max_pending_inventory_age_ms = 1000
-
 [capital]
 aster_capital_usd = "1000"
 lighter_capital_usd = "1000"
 leverage = "1"
 enforce_position_cap = true
-
-[queue_model]
-models = ["optimistic", "visible_queue", "conservative"]
-hidden_queue_multiplier = "1.0"
-
-[runtime]
-record_path = "runs"
-db_path = "runs/eval.sqlite"
 
 [[markets]]
 aster_symbol = "BTCUSDT"
@@ -971,7 +853,6 @@ lighter_symbol = "DOGE"
         assert_eq!(cfg.quote.max_aster_touch_hysteresis_ms, 300_000);
         assert_eq!(cfg.quote.depth_liquidity_multiple, dec!(10.0));
         assert!(cfg.quote.clamp_to_min_lot);
-        assert!(cfg.simulation.halt_trading_on_stale_feed);
         // No [book_check] section in SAMPLE => the cross-check defaults on.
         assert!(cfg.book_check.enabled);
         assert_eq!(cfg.book_check.interval_secs, 30);
@@ -979,35 +860,22 @@ lighter_symbol = "DOGE"
         assert_eq!(cfg.book_check.consecutive_breaches, 3);
         assert_eq!(cfg.book_check.max_concurrent_requests, 8);
         assert_eq!(cfg.book_check.max_rest_snapshot_age_ms, 3_000);
-        assert_eq!(cfg.simulation.hedge_latency_buckets_ms, vec![50, 100, 250, 500, 1000]);
-        assert_eq!(cfg.partials.hyperliquid_min_notional, dec!(10));
         assert_eq!(cfg.capital.aster_capital_usd, dec!(1000));
         assert_eq!(cfg.capital.aster_cap_notional(), dec!(1000));
-        assert_eq!(cfg.parsed_models().len(), 3);
         assert_eq!(cfg.markets.len(), 2);
         assert_eq!(cfg.markets[0].id().0, "BTC");
     }
 
     #[test]
     fn new_fields_default_when_absent() {
-        // Old recordings embed a config_json without these fields; replay must still
-        // parse them, defaulting the new behavior ON.
-        let without = SAMPLE
-            .replace("clamp_to_min_lot = true\n", "")
-            .replace("halt_trading_on_stale_feed = true\n", "");
+        // A config without these optional fields still parses, defaulting the behavior ON.
+        let without = SAMPLE.replace("clamp_to_min_lot = true\n", "");
         let cfg: Config = toml::from_str(&without).unwrap();
         assert_eq!(cfg.quote.min_aster_touch_distance_bps, dec!(0));
         assert_eq!(cfg.quote.min_aster_touch_hysteresis_bps, dec!(2));
         assert_eq!(cfg.quote.max_aster_touch_hysteresis_ms, 300_000);
         assert_eq!(cfg.quote.depth_liquidity_multiple, dec!(10));
         assert!(cfg.quote.clamp_to_min_lot);
-        assert!(cfg.simulation.halt_trading_on_stale_feed);
-    }
-
-    impl Config {
-        fn parsed_models(&self) -> Vec<QueueModel> {
-            self.queue_model.parsed_models().unwrap()
-        }
     }
 
     #[test]
@@ -1020,14 +888,15 @@ lighter_symbol = "DOGE"
 
     #[test]
     fn live_section_defaults_when_absent_and_is_inert() {
-        // SAMPLE has no [live] section: it must default to a disabled paper config so
-        // every existing dry-run config (and recorded run header) still parses.
+        // SAMPLE has no [live] section: it must default to a disabled, inert live config.
         let cfg: Config = toml::from_str(SAMPLE).unwrap();
         cfg.validate().unwrap();
         assert!(!cfg.live.enabled);
         assert_eq!(cfg.live.post_trade_cooldown_ms, 60_000);
+        assert_eq!(cfg.live.max_book_staleness_ms, 10_000);
         assert!(cfg.live.cooldown_is_global());
         assert_eq!(cfg.live.partials.policy, PartialPolicy::StrictEveryFillMustBeHedgeable);
+        assert_eq!(cfg.live.partials.lighter_min_notional, dec!(10));
         assert_eq!(cfg.live.aster.base_url, "https://fapi.asterdex.com");
         assert_eq!(cfg.live.hyperliquid.normal_slippage_bps, dec!(5));
         assert!(cfg.live.aster.deadman_refresh_ms < cfg.live.aster.deadman_countdown_ms);
@@ -1043,14 +912,16 @@ lighter_symbol = "DOGE"
     #[test]
     fn live_section_parses_and_validates() {
         let with_live = format!(
-            "{SAMPLE}\n[live]\nenabled = true\npost_trade_cooldown_ms = 30000\ncooldown_scope = \"per_market\"\nmax_unhedged_notional_usd = \"7\"\n\n[live.partials]\npolicy = \"accumulate_sub_min\"\nmax_pending_notional_usd = \"5\"\nmax_pending_age_ms = 1000\n\n[live.lighter]\nnormal_slippage_bps = \"4\"\nemergency_slippage_bps = \"25\"\n"
+            "{SAMPLE}\n[live]\nenabled = true\npost_trade_cooldown_ms = 30000\ncooldown_scope = \"per_market\"\nmax_unhedged_notional_usd = \"7\"\nmax_book_staleness_ms = 750\n\n[live.partials]\npolicy = \"accumulate_sub_min\"\nmax_pending_notional_usd = \"5\"\nmax_pending_age_ms = 1000\nlighter_min_notional = \"12\"\n\n[live.lighter]\nnormal_slippage_bps = \"4\"\nemergency_slippage_bps = \"25\"\n"
         );
         let cfg: Config = toml::from_str(&with_live).unwrap();
         cfg.validate().unwrap();
         assert!(cfg.live.enabled);
         assert_eq!(cfg.live.post_trade_cooldown_ms, 30_000);
+        assert_eq!(cfg.live.max_book_staleness_ms, 750);
         assert!(!cfg.live.cooldown_is_global());
         assert_eq!(cfg.live.partials.policy, PartialPolicy::AccumulateSubMin);
+        assert_eq!(cfg.live.partials.lighter_min_notional, dec!(12));
         assert_eq!(cfg.live.hyperliquid.emergency_slippage_bps, dec!(25));
     }
 
@@ -1123,15 +994,23 @@ lighter_symbol = "DOGE"
             std::fs::write(&path, format!("{SAMPLE}\n{extra}\n")).unwrap();
             assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("retired no-op"));
         }
-        for key in ["accumulate_sub_min_fills", "mark_pending_inventory_to_market"] {
-            std::fs::write(&path, SAMPLE.replace("[partials]", &format!("[partials]\n{key}=true"))).unwrap();
-            assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("retired no-op"));
+        // The research-simulator sections are gone: the strict loader rejects them.
+        for section in [
+            "[simulation]\nmax_book_staleness_ms=750",
+            "[partials]\nlighter_min_notional=\"10\"",
+            "[queue_model]\nmodels=[\"optimistic\"]",
+            "[runtime]\ndb_path=\"runs/eval.sqlite\"",
+        ] {
+            std::fs::write(&path, format!("{SAMPLE}\n{section}\n")).unwrap();
+            assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("unknown config keys"));
         }
         std::fs::write(&path, format!("{SAMPLE}\n[live.aster]\nbase_url=\"https://example.test\"\n")).unwrap();
         assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("mainnet origins"));
         std::fs::write(&path, include_str!("../bot.toml")).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
+        assert_eq!(cfg.live.max_book_staleness_ms, 10_000);
+        assert_eq!(cfg.live.partials.lighter_min_notional, dec!(10));
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

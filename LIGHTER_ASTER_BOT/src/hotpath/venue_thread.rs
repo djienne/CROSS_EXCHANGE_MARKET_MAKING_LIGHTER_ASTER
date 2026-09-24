@@ -1,8 +1,7 @@
 //! Per-venue dedicated ingest thread. Each venue's WS reader gets its own OS thread
 //! hosting a single-threaded tokio runtime, so Aster ingest latency/jitter is
-//! isolated from Hyperliquid's (and from the recorder/sim) instead of sharing the
-//! default multi-thread pool. The reader still feeds BOTH the canonical recorder
-//! channel (`tx`) AND the lock-free [`VenueBook`] (via the connector `Tap`).
+//! isolated from Hyperliquid's instead of sharing the default multi-thread pool.
+//! The reader feeds the lock-free [`VenueBook`] (via the connector `Tap`).
 
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -10,7 +9,7 @@ use std::thread::{self, JoinHandle};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::connectors::{aster, lighter, BookTap, EventSink, Tap};
+use crate::connectors::{aster, lighter, BookTap, Tap};
 use crate::livebot::scale::HotQtyScale;
 use crate::types::MarketId;
 
@@ -20,14 +19,12 @@ use super::book_cell::{VenueBook, VenueTag};
 /// thread exits (so `join()` returns) when `shutdown` is cancelled.
 ///
 /// `core_hint` optionally pins the thread to a CPU core (index taken modulo the
-/// available cores); pinning is on whenever the default `hotpath` feature is, see
-/// [`maybe_pin_core`].
+/// available cores), see [`maybe_pin_core`].
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_venue_thread(
     venue: VenueTag,
     symbol: String,
     market: MarketId,
-    tx: EventSink,
     cell: Arc<VenueBook>,
     reconnect: Arc<Notify>,
     shutdown: CancellationToken,
@@ -53,7 +50,7 @@ pub fn spawn_venue_thread(
                 tokio::select! {
                     // The reader loops forever (reconnecting); it only returns if the
                     // task is dropped. The shutdown arm is what ends the thread cleanly.
-                    _ = run_reader(venue, symbol, market, tx, tap) => {}
+                    _ = run_reader(venue, symbol, market, tap) => {}
                     _ = shutdown.cancelled() => {}
                 }
             });
@@ -65,11 +62,10 @@ async fn run_reader(
     venue: VenueTag,
     symbol: String,
     market: MarketId,
-    tx: EventSink,
     tap: Tap,
 ) {
     match venue {
-        VenueTag::Aster => aster::run_with_tap(symbol, market, tx, tap).await,
+        VenueTag::Aster => aster::run_with_tap(symbol, tap).await,
         VenueTag::Hyperliquid => {
             // Fail LOUDLY on a malformed "market_id:label" symbol: the old fallback of
             // market_id 0 silently subscribed a real (wrong) Lighter market's book, only
@@ -82,13 +78,12 @@ async fn run_reader(
                         "malformed Lighter venue symbol {symbol:?} for market {market}: expected \"<market_id>:<label>\""
                     )
                 });
-            lighter::run_with_tap(market_id, label, market, tx, tap).await
+            lighter::run_with_tap(market_id, label, tap).await
         }
     }
 }
 
-/// Pin the current thread to a core (index modulo available cores). Enabled
-/// whenever the `hotpath` feature is on (which includes `core_affinity`).
+/// Pin the current thread to a core (index modulo available cores) via `core_affinity`.
 pub fn maybe_pin_core(hint: Option<usize>) {
     if let Some(idx) = hint {
         if let Some(ids) = core_affinity::get_core_ids() {

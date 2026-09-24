@@ -1,61 +1,49 @@
 //! Live bot orchestration. Wires the four planes: ingest threads + watchdog
 //! (market-data hot path), the strategy loop (strategy/order hot path), the execution
 //! workers behind command queues (execution hot path), and account/journal/book-check (cold
-//! plane). Selects the executor once from the mode.
+//! plane).
 //!
 //! ## Hard safety gate
 //!
-//! `run` refuses to start unless `[live] enabled = true`. `mode = "live"` additionally
-//! requires a single selected market and live credentials/signers. `paper` never constructs
-//! a live worker at all.
+//! `run` refuses to start unless `[live] enabled = true`, and requires a single selected
+//! market and live credentials/signers.
 
-use std::collections::{HashMap, VecDeque};
-use std::io::Write;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use anyhow::{bail, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::sync::Notify;
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
-use uuid::Uuid;
 
-use crate::config::{Config, LiveMode, MarketCfg};
-use crate::connectors::{rest_book, rest_specs, EventSink};
-use crate::events::{open_log_writer, write_event, write_header, Event, EventKind, RunHeader};
+use crate::config::{Config, MarketCfg};
+use crate::connectors::{rest_book, rest_specs};
 use crate::hotpath::clock::mono_now_ns;
 use crate::hotpath::{
     run_book_check, run_watchdog, spawn_venue_thread, BookCheckParams, BookCheckTarget, ReconnectHandle,
     TradingGate, VenueRegistry, VenueTag,
 };
 use crate::markets::MarketSpec;
-use crate::sim::SimEngine;
-use crate::store::Db;
 use crate::types::MarketId;
 
-use super::account::{AccountSnapshot, AccountState};
+use super::account::AccountState;
 use super::scale;
 use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, CMD_QUEUE_DEPTH};
-use super::exec::paper::PaperExec;
-use super::exec::ExecMode;
 use super::fills::AsterFill;
 use super::ids::SessionId;
 use super::journal::{run_journal_writer, Journal};
 use super::pairs::{classify, is_eligible};
-use super::strategy::{run_strategy, Strategy, TradePrint};
+use super::strategy::{run_strategy, Strategy};
 
-/// Connection-stale threshold for the watchdog (same as dry-run `live`): 60s.
+/// Connection-stale threshold for the watchdog: 60s.
 const WATCHDOG_STALE_MS: i64 = 60_000;
 const WATCHDOG_SCAN: std::time::Duration = std::time::Duration::from_millis(250);
-/// Bounded livebot cold-recorder queue. The websocket hot path always publishes to VenueBook first;
-/// this queue is only the research tape/sim side channel, so dropping cold events under recorder
-/// stalls is safer than unbounded memory growth.
-const COLD_INGEST_QUEUE_DEPTH: usize = 16_384;
 
 async fn send_exec_safety(tx: &mpsc::Sender<ExecCommand>, cmd: ExecCommand, label: &'static str) {
     match tokio::time::timeout(Duration::from_secs(2), tx.send(cmd)).await {
@@ -85,28 +73,17 @@ fn panic_payload_message(panic: &(dyn std::any::Any + Send)) -> String {
 /// abort-on-panic hook of `taker`/`run` lets them unwind.
 pub const STRATEGY_THREAD: &str = "livebot-strategy";
 
-/// Entry point for the `livebot` command and the XEMM engine of `run`.
+/// Entry point for the XEMM engine of `run`.
 ///
-/// With `research`, a cold **research plane** runs alongside the bot: every ingested event is
-/// recorded to a per-run tape AND fed through the deterministic `SimEngine` into a SQLite
-/// results DB (opened in APPEND mode, so it is reused/recovered across stop→restart). So a
-/// paper run gathers ≥ the old research run's information (replay the tape for the identical
-/// report) PLUS the bot's own journal. Without it (the `run` controller), the cold thread only
-/// forwards Aster trade prints to the strategy and records a tape when `out` is given. The
-/// bot's hot planes (strategy/exec) run concurrently off the lock-free `VenueBook` cells; the
-/// research plane never touches them. `db_path` also names the journal, trip latch,
-/// active-session marker and residual report (`<db-stem>*`) in every mode.
+/// The bot's hot planes (strategy/exec) run concurrently off the lock-free `VenueBook` cells.
+/// `stem` (e.g. `runs/bot-HYPE`) names the journal, trip latch, active-session marker and
+/// residual report (`<stem>*`).
 ///
 /// Cancelling `stop` takes the same bounded drain as an internal safety halt.
-#[allow(clippy::too_many_arguments)]
 pub async fn run(
     cfg: &Config,
     markets: Vec<MarketCfg>,
-    secs: Option<u64>,
-    mode: LiveMode,
-    out: Option<PathBuf>,
-    db_path: PathBuf,
-    research: bool,
+    stem: PathBuf,
     stop: CancellationToken,
 ) -> Result<()> {
     if markets.is_empty() {
@@ -116,38 +93,31 @@ pub async fn run(
     if !cfg.live.enabled {
         bail!("livebot is disabled: set [live] enabled = true in the config to run it");
     }
-    let exec_mode = ExecMode::from_cfg(mode);
-    if exec_mode.sends_real_orders() && markets.len() != 1 {
+    if markets.len() != 1 {
         bail!(
             "refusing to run mode=\"live\" with {} markets selected; real-money live mode is single-market only",
             markets.len()
         );
     }
-    if exec_mode.sends_real_orders() {
-        warn!(
-            "livebot mode=LIVE: placing REAL orders on Aster + Lighter with REAL funds. \
-             Signing is wired through Aster EVM signing and Lighter native signer FFI. Gated behind \
-             enabled + mode=live + single-market selection."
-        );
-    }
-    info!("livebot starting: mode={}, {} market(s)", mode.as_str(), markets.len());
+    warn!(
+        "livebot mode=LIVE: placing REAL orders on Aster + Lighter with REAL funds. \
+         Signing is wired through Aster EVM signing and Lighter native signer FFI. Gated behind \
+         enabled + mode=live + single-market selection."
+    );
+    info!("livebot starting: mode=live, {} market(s)", markets.len());
 
     // --- resolve specs + classify pair eligibility ---
     let specs = rest_specs::build_market_specs_with_bases(
         &markets,
-        cfg.partials.hyperliquid_min_notional,
+        cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
         &cfg.live.hyperliquid.base_url,
     )
     .await?;
-    let eligibility = classify_markets(&specs, cfg, exec_mode).await;
+    let eligibility = classify_markets(&specs, cfg).await;
     let market_ids: Vec<MarketId> = specs.iter().map(|s| s.market_id.clone()).collect();
     let eligible_count = eligibility.values().filter(|&&e| e).count();
-    let elig_basis = if exec_mode.sends_real_orders() {
-        cfg.live.partials.policy.as_str()
-    } else {
-        "paper (all non-degenerate pairs)"
-    };
+    let elig_basis = cfg.live.partials.policy.as_str();
     info!("pair eligibility: {eligible_count}/{} markets tradeable — {elig_basis}", specs.len());
     if eligible_count == 0 {
         warn!("no eligible pairs under the partial policy — the bot will quote nothing");
@@ -161,9 +131,6 @@ pub async fn run(
     let shutdown = CancellationToken::new();
     let feeds_shutdown = CancellationToken::new();
 
-    let (ingest_tx, ingest_rx) = mpsc::channel::<(MarketId, EventKind)>(COLD_INGEST_QUEUE_DEPTH);
-    let cold_drop_count = Arc::new(AtomicU64::new(0));
-    let ingest_sink = EventSink::lossy(ingest_tx, cold_drop_count.clone());
     let mut reconnect_map: HashMap<(MarketId, VenueTag), ReconnectHandle> = HashMap::new();
     let mut venue_handles = Vec::new();
     let spec_by_id: HashMap<MarketId, &MarketSpec> = specs.iter().map(|s| (s.market_id.clone(), s)).collect();
@@ -190,19 +157,18 @@ pub async fn run(
             let notify = handle.notify();
             reconnect_map.insert((id.clone(), venue), handle);
             venue_handles.push(spawn_venue_thread(
-                venue, symbol, id.clone(), ingest_sink.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
+                venue, symbol, id.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
                 scale.clone(),
             ));
             core_hint += 1;
         }
     }
-    drop(ingest_sink);
 
     let book_check_reconnect = reconnect_map.clone();
     let watchdog_stop = Arc::new(AtomicBool::new(false));
     let watchdog_handle = {
         let (reg, g, stop) = (registry.clone(), gate.clone(), watchdog_stop.clone());
-        let book_stale_ms = cfg.simulation.max_book_staleness_ms;
+        let book_stale_ms = cfg.live.max_book_staleness_ms;
         thread::Builder::new()
             .name("livebot-watchdog".into())
             .spawn(move || run_watchdog(reg, g, reconnect_map, WATCHDOG_STALE_MS, book_stale_ms, WATCHDOG_SCAN, stop))
@@ -233,7 +199,7 @@ pub async fn run(
             consecutive_breaches: cfg.book_check.consecutive_breaches,
             depth_limit: cfg.book_check.depth_limit,
             interval: std::time::Duration::from_secs(cfg.book_check.interval_secs.max(1)),
-            max_quote_staleness_ms: cfg.simulation.max_book_staleness_ms,
+            max_quote_staleness_ms: cfg.live.max_book_staleness_ms,
             max_concurrent_requests: cfg.book_check.max_concurrent_requests,
             max_rest_snapshot_age_ms: cfg.book_check.max_rest_snapshot_age_ms,
             aster_base_url: cfg.live.aster.base_url.clone(),
@@ -253,18 +219,11 @@ pub async fn run(
     // --- cold plane: account state + journal ---
     let account = AccountState::default();
     let (journal, jrx) = Journal::channel();
-    // Journal path is derived from --db so a SEPARATE run (e.g. a paper session beside the live
-    // one) never clobbers the other's journal. db `runs/x.sqlite` → journal `runs/x-journal.jsonl`.
-    let journal_path = {
-        let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-        let dir = db_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("runs"));
-        std::fs::create_dir_all(&dir).ok();
-        dir.join(format!("{stem}-journal.jsonl"))
-    };
+    // Stem `runs/bot-HYPE` → journal `runs/bot-HYPE-journal.jsonl`.
+    let journal_path = crate::live_report::inferred_journal_path(&stem);
+    if let Some(dir) = journal_path.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
     let journal_file = std::fs::OpenOptions::new().create(true).append(true).open(&journal_path)?;
     let (journal_done_tx, journal_done_rx) = oneshot::channel();
     let journal_thread = thread::Builder::new().name("livebot-journal".into()).spawn(move || {
@@ -284,31 +243,23 @@ pub async fn run(
     let (hedge_tx, hedge_rx) = mpsc::channel::<HedgeCommand>(CMD_QUEUE_DEPTH);
     let (events_tx, events_rx) = mpsc::channel::<ExecEvent>(CMD_QUEUE_DEPTH);
     let (maker_fill_tx, maker_fill_rx) = mpsc::channel::<AsterFill>(256);
-    let (trade_tx, trade_rx) = mpsc::channel::<TradePrint>(1024);
 
     // --- circuit-breaker trip latch (persistent across restarts) ---
-    // If a prior run tripped the cumulative-loss breaker it left a latch file next to this run's DB.
-    // Refuse to start (bail) until an operator clears it (scripts/reset_breaker.py) — checked BEFORE
-    // any live execution setup so a tripped bot can never resume trading. No-op for a fresh db stem.
-    super::breaker::check_startup(&db_path)?;
-    if exec_mode.sends_real_orders() { super::breaker::check_active_session(&db_path)?; }
+    // If a prior run tripped the cumulative-loss breaker it left a latch file named after this
+    // run's stem. Refuse to start (bail) until an operator clears it (scripts/reset_breaker.py) —
+    // checked BEFORE any live execution setup so a tripped bot can never resume trading. No-op for
+    // a fresh stem.
+    super::breaker::check_startup(&stem)?;
+    super::breaker::check_active_session(&stem)?;
 
-    // --- bootstrap + execution/cold planes (mode-specific) ---
-    // paper: synthesize a flat snapshot; the simulated worker fabricates acks/fills.
-    // live: real workers + the account reconciler (clean-start + cold backstop) + the Aster
-    // user (fill) stream feeding the maker-fill channel. The initial reconcile gates clean-start.
+    // --- bootstrap + execution/cold planes ---
+    // Real workers + the account reconciler (clean-start + cold backstop) + the Aster user (fill)
+    // stream feeding the maker-fill channel. The initial reconcile gates clean-start.
     let mut aux_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
-    let (worker_task, clean_start, stream_liveness, shutdown_recon) = if exec_mode.sends_real_orders() {
-        setup_live_planes(
-            cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, feeds_shutdown.clone(), &mut aux_tasks, &journal,
-        )
-        .await?
-    } else {
-        let mut snap = AccountSnapshot::empty();
-        snap.source_ts_ns = mono_now_ns();
-        account.publish(snap);
-        (tokio::spawn(async move { run_paper_workers(exec_rx, exec_prio_rx, hedge_rx, events_tx).await; Ok::<(), anyhow::Error>(()) }), true, None, None)
-    };
+    let (worker_task, stream_liveness, shutdown_recon) = setup_live_planes(
+        cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, feeds_shutdown.clone(), &mut aux_tasks, &journal,
+    )
+    .await?;
     // (Startup cancel-all + clean-start verification now happen inside `setup_live_planes`
     // BEFORE the initial reconcile via `Reconciler::ensure_clean_start`, so the bot can never
     // begin quoting while stray prior-run orders still rest. The old fire-and-forget here was
@@ -316,38 +267,34 @@ pub async fn run(
 
     // --- strategy ---
     let session = SessionId::random();
-    if exec_mode.sends_real_orders() { super::breaker::start_active_session(&db_path, session.as_str(), &market_ids)?; }
+    super::breaker::start_active_session(&stem, session.as_str(), &market_ids)?;
     let drain_control = Arc::new(super::exec::command::DrainControl::default());
     // The global TradingGate stays wired to the watchdog (reconnect nudging + the OPEN/CLOSED
     // gauge log); the strategy gates per-market off each pair's own feed freshness, so one
     // stale feed no longer halts quoting on every pair.
     let mut strat = Strategy::new(
         cfg.clone(), &specs, &eligibility, registry.clone(), account.clone(),
-        journal.clone(), session, exec_tx.clone(), hedge_tx.clone(), exec_mode,
+        journal.clone(), session, exec_tx.clone(), hedge_tx.clone(),
     );
     strat.set_exec_prio_lane(exec_prio_tx.clone());
     strat.set_drain_control(drain_control.clone());
-    if let Some(recon) = &shutdown_recon { strat.set_hedge_readiness(recon.hedge_readiness()); }
-    if clean_start {
-        strat.mark_clean_start();
-    }
+    strat.set_hedge_readiness(shutdown_recon.hedge_readiness());
+    strat.mark_clean_start();
     // Seed predicted positions from the startup snapshot (published by the initial reconcile in
     // setup_live_planes). Without this, a non-neutral restart froze quoting forever with the
     // imbalance unhedged: predicted started empty, so the orphan cross-check treated every
-    // snapshot as a transient venue read. No-op in paper; refuses stale/absent snapshots.
+    // snapshot as a transient venue read. Refuses stale/absent snapshots.
     strat.adopt_reported_positions(mono_now_ns());
     // Arm the cumulative-loss circuit breaker: it halts via this same shutdown token and persists a
-    // trip latch at this run's per-db path (the startup guard above reads the same path). Inert
-    // unless live.circuit_breaker.enabled and running live.
-    strat.arm_circuit_breaker(super::breaker::trip_path(&db_path), shutdown.clone());
+    // trip latch at this run's per-stem path (the startup guard above reads the same path). Inert
+    // unless live.circuit_breaker.enabled.
+    strat.arm_circuit_breaker(super::breaker::trip_path(&stem), shutdown.clone());
     // In-memory trip backstop: guarantees a nonzero exit at shutdown even if the persistent
     // latch write fails (unwritable runs/ dir) — see the shutdown check at the end of run().
     let breaker_tripped_flag = Arc::new(AtomicBool::new(false));
     strat.set_trip_flag(breaker_tripped_flag.clone());
     strat.set_dirty(dirty);
-    if let Some(ls) = stream_liveness {
-        strat.set_user_stream(ls); // freeze quoting if the Aster fill stream silently dies
-    }
+    strat.set_user_stream(stream_liveness); // freeze quoting if the Aster fill stream silently dies
     // --- strategy ---
     // Spawned on a DEDICATED OS thread with its own single-threaded tokio runtime, so the
     // strategy loop's latency-critical wake/reprice/fill→hedge path is isolated from the
@@ -365,78 +312,16 @@ pub async fn run(
                     .enable_all()
                     .build()
                     .expect("strategy runtime");
-                rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, trade_rx, strat_shutdown))
+                rt.block_on(run_strategy(strat, wake.clone(), events_rx, maker_fill_rx, strat_shutdown))
             }))
             .map_err(|panic| panic_payload_message(panic.as_ref()))
             .and_then(|result| result.map_err(|e| e.to_string()));
             let _ = strat_done_tx.send(result);
         })
         .expect("spawn strategy thread");
+    info!("livebot running. Journal/latches: {}.", stem.display());
 
-    // --- cold plane: trade prints -> strategy, plus the optional tape + SimEngine -> SQLite ---
-    // Runs on a DEDICATED OS thread so JSONL/SimEngine I/O cannot steal tokio timeslices
-    // from the strategy loop. Stops when all ingest_tx senders are dropped (venue thread exit).
-    let run_id = Uuid::new_v4().to_string();
-    let started_at = Utc::now();
-    let tape_path = out.or_else(|| research.then(|| {
-        PathBuf::from(format!("runs/livebot-{}.jsonl.zst", started_at.format("%Y%m%dT%H%M%SZ")))
-    }));
-    let mode_tag = format!("livebot-{}", mode.as_str());
-    let writer = match &tape_path {
-        Some(tape_path) => {
-            if let Some(p) = tape_path.parent() {
-                if !p.as_os_str().is_empty() {
-                    std::fs::create_dir_all(p).ok();
-                }
-            }
-            let mut writer = open_log_writer(tape_path)?;
-            let header = RunHeader {
-                run_id: run_id.clone(),
-                started_at,
-                mode: mode_tag.clone(),
-                code_version: env!("CARGO_PKG_VERSION").to_string(),
-                config: cfg.clone(),
-                market_specs: specs.clone(),
-            };
-            write_header(&mut writer, &header)?;
-            Some(writer)
-        }
-        None => None,
-    };
-    let research_plane = if research {
-        let mut db = Db::open(&db_path)?;
-        db.insert_run(&run_id, started_at, &mode_tag, tape_path.as_deref().and_then(|p| p.to_str()), env!("CARGO_PKG_VERSION"), &serde_json::to_string(cfg)?)?;
-        for s in &specs {
-            db.insert_market(s)?;
-        }
-        Some((SimEngine::new(cfg.clone(), specs.clone())?, db))
-    } else {
-        None
-    };
-
-    let tape_label = tape_path.as_ref().map_or_else(|| "none".to_string(), |p| p.display().to_string());
-    if research {
-        info!("livebot running: bot + research recording -> {tape_label} (results db {}). Ctrl-C to stop.", db_path.display());
-    } else {
-        info!("livebot running: bot only (tape {tape_label}, no research DB). Journal/latches: {}.", db_path.display());
-    }
-
-    let cold_cfg = cfg.clone();
-    let cold_tape = tape_label.clone();
-    let cold_db_path = db_path.clone();
-    let cold_run_id = run_id;
-    let cold_handle = thread::Builder::new()
-        .name("cold-recorder".into())
-        .spawn(move || {
-            run_cold_recorder(
-                ingest_rx, trade_tx, writer, research_plane,
-                cold_cfg, cold_tape, cold_db_path, cold_run_id, started_at, cold_drop_count,
-            )
-        })
-        .expect("spawn cold-recorder");
-
-    // --- main loop: wait for a stop request, deadline, or an internal safety halt ---
-    let deadline = secs.map(|s| Instant::now() + Duration::from_secs(s));
+    // --- main loop: wait for a stop request or an internal safety halt ---
     let mut strategy_done_seen = false;
     let mut strategy_error: Option<anyhow::Error> = None;
     tokio::select! {
@@ -463,15 +348,6 @@ pub async fn run(
                     shutdown.cancel();
                 }
             }
-        }
-        _ = async {
-            match deadline {
-                Some(d) => tokio::time::sleep_until(d).await,
-                None => std::future::pending::<()>().await,
-            }
-        } => {
-            info!("duration elapsed: shutting down");
-            shutdown.cancel();
         }
         _ = stop.cancelled() => {
             info!("stop requested: shutting down");
@@ -525,38 +401,15 @@ pub async fn run(
     send_hedge_safety(&hedge_tx, HedgeCommand::Shutdown, "hedge Shutdown").await;
     let workers_ok = matches!(tokio::time::timeout(Duration::from_secs(65), worker_task).await, Ok(Ok(Ok(()))));
     if !workers_ok && strategy_error.is_none() { strategy_error = Some(anyhow::anyhow!("execution worker drain incomplete")); }
-    let mut final_verified = !exec_mode.sends_real_orders();
-    if exec_mode.sends_real_orders() && workers_ok {
-        if let Some(recon) = &shutdown_recon {
-            final_verified = shutdown_verify(recon, &journal, &db_path, &market_ids).await;
-        }
-    }
+    let final_verified = workers_ok && shutdown_verify(&shutdown_recon, &journal, &stem, &market_ids).await;
     feeds_shutdown.cancel();
     watchdog_stop.store(true, Ordering::Release);
-    // Joining venue threads drops their ingest_tx senders → cold recorder's recv() returns
-    // None → cold thread drains, finalizes SimEngine, and writes the report.
     for h in venue_handles {
         let _ = h.join();
     }
     let _ = watchdog_handle.join();
     if let Some(h) = book_check_handle {
         let _ = h.join();
-    }
-    match cold_handle.join() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            warn!("cold recorder error: {e:#}");
-            return Err(e);
-        }
-        Err(panic) => {
-            let msg = panic
-                .downcast_ref::<&str>()
-                .map(|s| s.to_string())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            warn!("cold recorder thread panicked: {msg}");
-            return Err(anyhow::anyhow!("cold recorder panicked: {msg}"));
-        }
     }
     if let Err(panic) = strat_handle.join() {
         let msg = panic_payload_message(panic.as_ref());
@@ -600,8 +453,8 @@ pub async fn run(
         thread::spawn(move || { let _ = done_tx.send(retry_trip.persist_trip_cold()); });
         let _ = tokio::time::timeout(Duration::from_secs(5), done_rx).await;
     }
-    if exec_mode.sends_real_orders() && final_verified && workers_ok && strategy_error.is_none() && journal_ok && journal_healthy {
-        super::breaker::finish_active_session(&db_path)?;
+    if final_verified && workers_ok && strategy_error.is_none() && journal_ok && journal_healthy {
+        super::breaker::finish_active_session(&stem)?;
     }
     if !journal_ok || !journal_healthy { bail!("journal did not drain cleanly; active-session marker retained"); }
     if !final_verified { bail!("final positions/orders could not be verified neutral; active-session marker retained"); }
@@ -613,153 +466,19 @@ pub async fn run(
     // exits 0 — indistinguishable from a clean stop — and the supervisor restarts the bot
     // straight into the startup latch (observed 2026-07-04). The startup guard barred any
     // pre-existing latch, so "latch exists at shutdown" ⇔ "the breaker fired THIS run".
-    if exec_mode.sends_real_orders() {
-        super::breaker::check_shutdown(&db_path)?;
-    }
+    super::breaker::check_shutdown(&stem)?;
     if breaker_tripped_flag.load(Ordering::Acquire) { bail!("circuit breaker tripped during this run"); }
 
-    if research {
-        info!("livebot stopped. research tape -> {tape_label} ; results db -> {}", db_path.display());
-    } else {
-        info!("livebot stopped. tape -> {tape_label}");
-    }
+    info!("livebot stopped.");
     Ok(())
-}
-
-/// Cold recorder: ingest events → Aster trade prints for the strategy, plus the optional
-/// JSONL tape and the optional research plane (SimEngine → SQLite). Runs on a dedicated OS
-/// thread with its own single-threaded tokio runtime, so JSONL writes and SimEngine
-/// processing cannot steal timeslices from the main strategy runtime. Exits when all
-/// `ingest_tx` senders are dropped (venue threads stopped), then drains the buffer,
-/// finalizes the SimEngine, and generates the research report.
-#[allow(clippy::too_many_arguments)]
-fn run_cold_recorder(
-    ingest_rx: mpsc::Receiver<(MarketId, EventKind)>,
-    trade_tx: mpsc::Sender<TradePrint>,
-    mut writer: Option<crate::events::LogWriter>,
-    mut research: Option<(SimEngine, Db)>,
-    cfg: Config,
-    tape_label: String,
-    db_path: PathBuf,
-    run_id: String,
-    started_at: DateTime<Utc>,
-    cold_drop_count: Arc<AtomicU64>,
-) -> Result<()> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    rt.block_on(async {
-        let delay_ms = cfg.simulation.hedge_latency_buckets_ms.iter().copied().max().unwrap_or(1000) + 500;
-        let delay = chrono::Duration::milliseconds(delay_ms);
-        let mut buffer: VecDeque<Event> = VecDeque::new();
-        let mut seq: u64 = 0;
-        let mut last_ts = started_at;
-        let mut released_ts = started_at;
-        let mut tick = tokio::time::interval_at(
-            Instant::now() + Duration::from_millis(100),
-            Duration::from_millis(100),
-        );
-        let mut ingest_rx = ingest_rx;
-        let mut last_drop_log = 0u64;
-
-        loop {
-            tokio::select! {
-                msg = ingest_rx.recv() => {
-                    match msg {
-                        Some((market, kind)) => {
-                            if let EventKind::AsterAggTrade { price, qty, buyer_is_maker, .. } = &kind {
-                                let _ = trade_tx.try_send(TradePrint {
-                                    market: market.clone(), price: *price, qty: *qty, buyer_is_maker: *buyer_is_maker,
-                                });
-                            }
-                            if writer.is_none() && research.is_none() {
-                                continue;
-                            }
-                            let now = Utc::now().max(last_ts);
-                            last_ts = now;
-                            let ev = Event { seq, local_recv_ts: now, market, kind };
-                            seq += 1;
-                            if let Some(writer) = writer.as_mut() {
-                                write_event(writer, &ev)?;
-                            }
-                            if research.is_some() {
-                                buffer.push_back(ev);
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = tick.tick() => {
-                    let dropped = cold_drop_count.load(Ordering::Relaxed);
-                    if dropped != last_drop_log {
-                        warn!(
-                            "cold recorder dropped {} live ingest events (bounded queue depth {})",
-                            dropped - last_drop_log,
-                            COLD_INGEST_QUEUE_DEPTH
-                        );
-                        last_drop_log = dropped;
-                    }
-                    if let Some((engine, db)) = research.as_mut() {
-                        let cutoff = Utc::now() - delay;
-                        released_ts = release_until(&mut buffer, cutoff, engine, db, released_ts)?;
-                    }
-                    if let Some(writer) = writer.as_mut() {
-                        writer.flush().ok();
-                    }
-                }
-            }
-        }
-
-        if let Some(writer) = writer {
-            writer.finish()?;
-        }
-        let dropped = cold_drop_count.load(Ordering::Relaxed);
-        if dropped > 0 {
-            warn!("cold recorder finalized after dropping {dropped} live ingest events");
-        }
-        let Some((mut engine, mut db)) = research else {
-            return Ok(());
-        };
-        let far_future = last_ts + chrono::Duration::seconds(3600);
-        released_ts = release_until(&mut buffer, far_future, &mut engine, &mut db, released_ts)?;
-        engine.finalize(released_ts.max(last_ts), &mut db)?;
-        info!("cold recorder finalized: tape -> {tape_label} ; results db -> {}", db_path.display());
-        let out_dir = db_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| PathBuf::from("."));
-        crate::report::generate(&db_path, Some(run_id), &out_dir)?;
-        Ok(())
-    })
-}
-
-/// Release buffered events with `local_recv_ts <= cutoff` into the SimEngine, in order
-/// (ported from the former `live` command). Returns the timestamp of the last released event.
-fn release_until(
-    buffer: &mut VecDeque<Event>,
-    cutoff: DateTime<Utc>,
-    engine: &mut SimEngine,
-    db: &mut Db,
-    mut released_ts: DateTime<Utc>,
-) -> Result<DateTime<Utc>> {
-    while let Some(front) = buffer.front() {
-        if front.local_recv_ts > cutoff {
-            break;
-        }
-        let ev = buffer.pop_front().unwrap();
-        released_ts = ev.local_recv_ts;
-        engine.on_event(&ev, db)?;
-    }
-    Ok(released_ts)
 }
 
 /// Classify every market's pair eligibility against a REST-fetched HL reference mid.
 ///
 /// The strict Class-A-only filter is a REAL-MONEY orphan-leg safety: it bars pairs where a
-/// sub-minimum partial Aster fill could be un-hedgeable on Lighter. In **paper** mode
-/// there is no real orphan risk — `PaperExec` always fills the hedge — so paper quotes every
-/// selected non-degenerate pair. In **live** mode the strict
-/// policy applies (with the `accumulate_sub_min` fallback noted below).
-async fn classify_markets(specs: &[MarketSpec], cfg: &Config, exec_mode: ExecMode) -> HashMap<MarketId, bool> {
-    use super::pairs::PairClass;
-    let live = exec_mode.sends_real_orders();
+/// sub-minimum partial Aster fill could be un-hedgeable on Lighter. The configured policy
+/// applies (with the `accumulate_sub_min` fallback noted below).
+async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketId, bool> {
     // Sub-min handling IS implemented now (a sub-min Aster partial ACCUMULATES into pending
     // inventory and hedges on HL once the net clears the minimum; a genuinely stuck residual is
     // flattened reduce-only on Aster, and the reconciler backstop neutralizes anything else), so a
@@ -784,8 +503,7 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config, exec_mode: ExecMod
         let eligible = match ref_px {
             Some(px) => {
                 let c = classify(s, px, cfg.quote.desired_notional);
-                // Live: strict orphan-leg safety. Paper: quote anything non-degenerate.
-                let ok = if live { is_eligible(c.class, effective_policy) } else { c.class != PairClass::D };
+                let ok = is_eligible(c.class, effective_policy);
                 info!("  {} class {} (aster_min_fill {}, hl_min_hedge {}) -> {}", s.market_id, c.class.as_str(), c.aster_min_fill_qty, c.hl_min_hedge_qty, if ok { "eligible" } else { "EXCLUDED" });
                 ok
             }
@@ -799,57 +517,13 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config, exec_mode: ExecMod
     out
 }
 
-/// Paper executor task: one loop draining both command queues into the event channel.
-async fn run_paper_workers(
-    mut exec_rx: mpsc::Receiver<ExecCommand>,
-    mut exec_prio_rx: mpsc::Receiver<ExecCommand>,
-    mut hedge_rx: mpsc::Receiver<HedgeCommand>,
-    events_tx: mpsc::Sender<ExecEvent>,
-) {
-    let paper = PaperExec::new();
-    loop {
-        tokio::select! {
-            biased;
-            cmd = exec_prio_rx.recv() => match cmd {
-                Some(c) => {
-                    let stop = matches!(c, ExecCommand::Shutdown);
-                    for ev in paper.on_exec_command(c) {
-                        let _ = events_tx.send(ev).await;
-                    }
-                    if stop { break; }
-                }
-                None => break,
-            },
-            cmd = exec_rx.recv() => match cmd {
-                Some(c) => {
-                    let stop = matches!(c, ExecCommand::Shutdown);
-                    for ev in paper.on_exec_command(c) {
-                        let _ = events_tx.send(ev).await;
-                    }
-                    if stop { break; }
-                }
-                None => break,
-            },
-            cmd = hedge_rx.recv() => match cmd {
-                Some(c) => {
-                    let stop = matches!(c, HedgeCommand::Shutdown);
-                    for ev in paper.on_hedge_command(c) {
-                        let _ = events_tx.send(ev).await;
-                    }
-                    if stop { break; }
-                }
-                None => break,
-            },
-        }
-    }
-}
-
 /// Build + spawn ALL live planes: the venue workers, the account reconciler
 /// (initial reconcile for clean-start + a cold backstop loop), and the Aster user (fill) stream.
 /// Real signing is wired from `aster.env`/`lighter.env` — reached ONLY under `mode = "live"`.
 /// Roles are derived from the keys, not the env field names (see [`super::exec::creds`]).
-/// Returns the worker task and `clean_start = true`
-/// (quoting is then still gated per-market on feed freshness and position reconciliation).
+/// Returns the worker task, the user-stream liveness stamp and the shutdown reconciler. Clean
+/// start is then established (quoting is still gated per-market on feed freshness and position
+/// reconciliation).
 #[allow(clippy::too_many_arguments)]
 async fn setup_live_planes(
     cfg: &Config,
@@ -865,9 +539,8 @@ async fn setup_live_planes(
     journal: &Journal,
 ) -> Result<(
     tokio::task::JoinHandle<Result<()>>,
-    bool,
-    Option<Arc<super::userstream::StreamLiveness>>,
-    Option<super::reconcile::Reconciler>,
+    Arc<super::userstream::StreamLiveness>,
+    super::reconcile::Reconciler,
 )> {
     use std::path::Path;
 
@@ -927,11 +600,11 @@ async fn setup_live_planes(
     // writes (worker), reads (reconciler), listenKey+WS (user stream).
     let worker_aster = new_aster()?;
     let worker_hl = hedge.clone();
-    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.simulation.max_book_staleness_ms);
+    let recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.live.max_book_staleness_ms);
     // A second reconciler instance reserved for SHUTDOWN verification (cheap: a reqwest client +
     // the shared signer Arc). The main one is consumed by its cold loop task and dies with the
     // shutdown token; this one performs the post-drain cancel-confirmation + residual sweep.
-    let shutdown_recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.simulation.max_book_staleness_ms);
+    let shutdown_recon = Reconciler::new(new_aster()?, hedge.clone(), specs, cfg.live.max_book_staleness_ms);
     let stream_aster = new_aster()?;
     let mut sym_to_market: HashMap<String, MarketId> = HashMap::new();
     for s in specs {
@@ -1024,10 +697,10 @@ async fn setup_live_planes(
     let liveness = Arc::new(StreamLiveness::default());
     aux.push(tokio::spawn(run_aster_user_stream(stream_aster, sym_to_market, maker_fill_tx, liveness.clone(), shutdown.clone())));
 
-    Ok((worker_task, true, Some(liveness), Some(shutdown_recon)))
+    Ok((worker_task, liveness, shutdown_recon))
 }
 
-/// Post-drain shutdown verification (live only). Re-cancels + polls `openOrders` for
+/// Post-drain shutdown verification. Re-cancels + polls `openOrders` for
 /// bot-prefixed strays (a failure there is only warned), then takes one final snapshot to
 /// report/persist any residual positions — there is no Aster userTrades REST method, so a
 /// late fill is detected as a position. Every step is timeout-bounded so shutdown never hangs.
@@ -1037,7 +710,7 @@ async fn setup_live_planes(
 async fn shutdown_verify(
     recon: &super::reconcile::Reconciler,
     journal: &Journal,
-    db_path: &std::path::Path,
+    stem: &std::path::Path,
     markets: &[MarketId],
 ) -> bool {
     // 1. Re-cancel + poll for bot-prefixed strays. require_clean_start=false keeps it non-fatal
@@ -1097,7 +770,7 @@ async fn shutdown_verify(
         orders_verified_empty,
         residuals,
     };
-    let path = super::breaker::residual_path(db_path);
+    let path = super::breaker::residual_path(stem);
     if let Err(e) = super::breaker::write_residual(&path, &rec) {
         warn!("failed to write shutdown residual report to {}: {e:#}", path.display());
         return false;

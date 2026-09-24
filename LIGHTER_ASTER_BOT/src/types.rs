@@ -1,5 +1,5 @@
-//! Small shared value types: `Side`, `MarketId`, `QueueModel`, and the
-//! `RejectReason` enumeration (core reasons plus extra gates).
+//! Small shared value types: `Side`, `MarketId`, and the `RejectReason`
+//! enumeration (core reasons plus extra gates).
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -101,47 +101,8 @@ impl From<String> for MarketId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MarketIdx(pub u16);
 
-/// Queue-position assumption used when seeding a resting quote's "ahead" volume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum QueueModel {
-    Optimistic,
-    VisibleQueue,
-    Conservative,
-}
-
-impl QueueModel {
-    pub const ALL: [QueueModel; 3] = [
-        QueueModel::Optimistic,
-        QueueModel::VisibleQueue,
-        QueueModel::Conservative,
-    ];
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            QueueModel::Optimistic => "optimistic",
-            QueueModel::VisibleQueue => "visible_queue",
-            QueueModel::Conservative => "conservative",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "optimistic" => Some(QueueModel::Optimistic),
-            "visible_queue" | "visible" => Some(QueueModel::VisibleQueue),
-            "conservative" => Some(QueueModel::Conservative),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for QueueModel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Why a candidate quote (or a fill's hedge) was not acted upon. Persisted on
-/// rejected opportunities so the reject distribution is inspectable.
+/// Why a candidate quote was not placed. `status` and the strategy's per-side
+/// decision note report it via [`RejectReason::as_str`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectReason {
     // --- core reject reasons ---
@@ -153,12 +114,6 @@ pub enum RejectReason {
     HlHedgeVwapUnavailable,
     HlHedgeSlippageTooHigh,
     AsterPostOnlyPriceInvalid,
-    AsterQuoteStalePendingCancel,
-    FillBelowHlMinHedge,
-    PartialFillAccumulated,
-    PendingInventoryTooOld,
-    PendingInventoryTooLarge,
-    StrictPartialHedgeabilityFailed,
     // --- added gates ---
     AsterBookStale,
     HlBookStale,
@@ -166,7 +121,6 @@ pub enum RejectReason {
     MissingAsterBook,
     MissingHlBook,
     MissingMid,
-    InsufficientLighterDepth,
     /// Lighter BBO was fresh but too small for the hedge, and the slower L2
     /// depth snapshot was stale/missing, so neither quote source is safe.
     HlBboThinAndL2Stale,
@@ -182,9 +136,6 @@ pub enum RejectReason {
     /// Live inventory-unwind mode is enabled and this candidate would not reduce the paired
     /// Aster/Lighter absolute position.
     PositionReduceOnly,
-    /// A post-only (GTX) quote would have crossed the book by the time placement
-    /// latency elapsed; Aster would have rejected it.
-    PostOnlyRejectedOnPlacement,
     /// `clamp_to_min_lot` is on but the venue minimum lot exceeds the remaining
     /// capital headroom (or won't clear min-notional at the quoted price), so even
     /// the smallest valid order cannot be placed.
@@ -203,26 +154,18 @@ impl RejectReason {
             HlHedgeVwapUnavailable => "HL_HEDGE_VWAP_UNAVAILABLE",
             HlHedgeSlippageTooHigh => "HL_HEDGE_SLIPPAGE_TOO_HIGH",
             AsterPostOnlyPriceInvalid => "ASTER_POST_ONLY_PRICE_INVALID",
-            AsterQuoteStalePendingCancel => "ASTER_QUOTE_STALE_PENDING_CANCEL",
-            FillBelowHlMinHedge => "FILL_BELOW_HL_MIN_HEDGE",
-            PartialFillAccumulated => "PARTIAL_FILL_ACCUMULATED",
-            PendingInventoryTooOld => "PENDING_INVENTORY_TOO_OLD",
-            PendingInventoryTooLarge => "PENDING_INVENTORY_TOO_LARGE",
-            StrictPartialHedgeabilityFailed => "STRICT_PARTIAL_HEDGEABILITY_FAILED",
             AsterBookStale => "ASTER_BOOK_STALE",
             HlBookStale => "HL_BOOK_STALE",
             BookCrossed => "BOOK_CROSSED",
             MissingAsterBook => "MISSING_ASTER_BOOK",
             MissingHlBook => "MISSING_HL_BOOK",
             MissingMid => "MISSING_MID",
-            InsufficientLighterDepth => "INSUFFICIENT_LIGHTER_DEPTH",
             HlBboThinAndL2Stale => "HL_BBO_THIN_AND_L2_STALE",
             AsterEffectiveTouchUnavailable => "ASTER_EFFECTIVE_TOUCH_UNAVAILABLE",
             QuantityBelowMinimum => "QUANTITY_BELOW_MINIMUM",
             AsterPositionCapReached => "ASTER_POSITION_CAP_REACHED",
             LighterPositionCapReached => "LIGHTER_POSITION_CAP_REACHED",
             PositionReduceOnly => "POSITION_REDUCE_ONLY",
-            PostOnlyRejectedOnPlacement => "POST_ONLY_REJECTED_ON_PLACEMENT",
             MinLotExceedsHeadroom => "MIN_LOT_EXCEEDS_HEADROOM",
         }
     }
@@ -242,13 +185,5 @@ mod tests {
     fn side_opposite() {
         assert_eq!(Side::Buy.opposite(), Side::Sell);
         assert_eq!(Side::Sell.opposite(), Side::Buy);
-    }
-
-    #[test]
-    fn queue_model_roundtrip() {
-        for m in QueueModel::ALL {
-            assert_eq!(QueueModel::parse(m.as_str()), Some(m));
-        }
-        assert_eq!(QueueModel::parse("nope"), None);
     }
 }

@@ -23,8 +23,7 @@ use super::registry::VenueRegistry;
 /// logs OPEN↔CLOSED transitions as an observability *gauge*. It is NOT the livebot's quoting
 /// enforcement input: the strategy gates each market off ITS OWN feed freshness
 /// ([`crate::livebot`]'s `Strategy::market_feeds_fresh`), so one stale low-liquidity feed
-/// can't halt quoting on every pair. In dry-run `live` it is likewise a gauge only, never an
-/// input to the deterministic `SimEngine`.
+/// can't halt quoting on every pair.
 pub struct TradingGate(AtomicBool);
 
 impl Default for TradingGate {
@@ -80,7 +79,7 @@ impl ReconnectHandle {
         self.notify.clone()
     }
     /// Await a reconnect request — a `select!` arm in the reader. A `ReconnectHandle`
-    /// that nobody calls `request()` on (e.g. in `record` mode) simply never fires.
+    /// that nobody calls `request()` on simply never fires.
     pub async fn requested(&self) {
         self.notify.notified().await;
     }

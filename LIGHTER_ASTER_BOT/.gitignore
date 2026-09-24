@@ -6,7 +6,7 @@ lighter.env
 # Rust build output
 /target
 
-# Runtime outputs: sqlite DBs, journals, tapes, reports, trip latches
+# Runtime outputs: journals, ledgers, controller state, trip latches
 /runs
 
 # Python caches

@@ -12,9 +12,6 @@
 #   docker compose run --rm bot probe lighter-open-orders
 #   docker compose run --rm bot taker probe --market HYPE
 #
-# Paper (live market data and account reads, NO orders):
-#   docker compose run --rm --name bot-hype-paper bot run --market HYPE --mode paper
-#
 # LIVE (real money):
 #   docker compose run --rm --name bot-hype bot run --market HYPE --mode live
 #

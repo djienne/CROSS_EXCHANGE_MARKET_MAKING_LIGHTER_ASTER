@@ -443,7 +443,7 @@ impl OrderManager {
     ///
     /// `cum_filled_lots` is cumulative for the venue order, not the last-fill increment.
     /// We store it separately from the original `qty_lots`, so duplicate/out-of-order partial
-    /// updates cannot double-subtract and paper mode cannot repeatedly fill the full clip.
+    /// updates cannot double-subtract.
     pub fn on_maker_fill_progress(
         &mut self,
         market: &MarketId,
@@ -462,7 +462,7 @@ impl OrderManager {
             if slot.client_id.as_deref() == Some(client_id) {
                 // Venue/user-stream updates carry cumulative filled quantity for the order. Accept
                 // duplicate/out-of-order partials without moving backwards, and expose the residual
-                // size to paper fills + exact quote decisions.
+                // size to exact quote decisions.
                 slot.filled_lots = slot.filled_lots.max(cum_filled_lots).min(slot.qty_lots);
                 if slot.filled_lots >= slot.qty_lots {
                     if slot.state == OrderLifecycle::PendingReplace && slot.pending_replace_client_id.is_some() {

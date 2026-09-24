@@ -2,7 +2,7 @@
 """Reset the XEMM livebot circuit-breaker trip latch.
 
 When the cumulative-loss circuit breaker fires, the bot writes a trip-latch file
-(`runs/<db-stem>.trip.json`), halts, and then REFUSES to restart while that file exists. This
+(`runs/bot-<MARKET>.trip.json`), halts, and then REFUSES to restart while that file exists. This
 script clears the latch so the next run can start. It is a pure host-side file operation — it works
 through the Docker bind mount (`./runs:/app/runs`), so there is no need to `docker exec` into the
 container, and it works whether or not the container is running.
@@ -13,7 +13,6 @@ stack-level runs/ beside the crate (the retired orchestrator's runs).
 Usage (run from the deploy dir, e.g. ~/LIGHTER_ASTER_BOT on the VPS, or the repo root locally):
     python scripts/reset_breaker.py                 # clear ALL *.trip.json latches
     python scripts/reset_breaker.py --coin HYPE     # clear only runs/bot-HYPE.trip.json (`run`)
-    python scripts/reset_breaker.py --db runs/live-eth.sqlite   # clear the latch of that livebot --db
     python scripts/reset_breaker.py --archive       # rename instead of delete (keeps an audit copy)
     python scripts/reset_breaker.py --runs-dir /path/to/runs    # override the runs directory
 
@@ -31,10 +30,6 @@ def _runs_dirs_default() -> list[Path]:
     # Robust to the cwd: <crate>/runs for `run`, <stack>/runs for the retired orchestrator's runs.
     crate = Path(__file__).resolve().parent.parent
     return [d for d in (crate / "runs", crate.parent / "runs") if d.exists()]
-
-
-def _latch_for_db(db: str) -> str:
-    return Path(db).stem + ".trip.json"
 
 
 def _describe(path: Path) -> None:
@@ -56,9 +51,7 @@ def main() -> int:
     ap.add_argument("--runs-dir", type=Path, default=None,
                     help="runs directory holding the *.trip.json latch(es) "
                          "(default: <crate>/runs and the stack-level runs/)")
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument("--coin", help="clear only this market's latch, e.g. HYPE -> runs/bot-HYPE.trip.json")
-    g.add_argument("--db", help="clear the latch for this run DB, e.g. runs/live-eth.sqlite")
+    ap.add_argument("--coin", help="clear only this market's latch, e.g. HYPE -> runs/bot-HYPE.trip.json")
     ap.add_argument("--archive", action="store_true",
                     help="rename the latch to <name>.cleared.<ts> instead of deleting it")
     args = ap.parse_args()
@@ -71,10 +64,8 @@ def main() -> int:
 
     targets = []
     for runs_dir in runs_dirs:
-        if args.db:
-            targets.append(runs_dir / _latch_for_db(args.db))
-        elif args.coin:
-            # Mirror `run`: its XEMM db runs/bot-<MARKET>.sqlite -> bot-<MARKET>.trip.json
+        if args.coin:
+            # Mirror `run`: its XEMM stem runs/bot-<MARKET> -> bot-<MARKET>.trip.json
             targets.append(runs_dir / f"bot-{args.coin.upper()}.trip.json")
         else:
             targets.extend(sorted(runs_dir.glob("*.trip.json")))

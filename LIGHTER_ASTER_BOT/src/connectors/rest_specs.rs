@@ -1,7 +1,6 @@
 //! One-shot REST fetch of market specifications: Aster `exchangeInfo` (tick /
-//! step / min-qty / min-notional) and Lighter `orderBooks` metadata. Combined
-//! into `MarketSpec`s that are written into the run-log header so replay is
-//! fully offline.
+//! step / min-qty / min-notional) and Lighter `orderBooks` metadata, combined
+//! into `MarketSpec`s.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -13,8 +12,6 @@ use serde::Deserialize;
 use crate::config::MarketCfg;
 use crate::decimal::parse_dec;
 use crate::markets::MarketSpec;
-
-use super::rest_book::{DEFAULT_ASTER_BASE_URL, DEFAULT_LIGHTER_BASE_URL};
 
 fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
@@ -40,13 +37,6 @@ fn client() -> Result<reqwest::Client> {
 }
 
 /// Map of Aster symbol -> (tick, step, min_qty, min_notional).
-pub async fn fetch_aster_exchange_info(
-    client: &reqwest::Client,
-) -> Result<HashMap<String, (Decimal, Decimal, Decimal, Decimal)>> {
-    fetch_aster_exchange_info_from_base(client, DEFAULT_ASTER_BASE_URL).await
-}
-
-/// Same as [`fetch_aster_exchange_info`], but against a configured REST base URL.
 pub async fn fetch_aster_exchange_info_from_base(
     client: &reqwest::Client,
     base_url: &str,
@@ -109,11 +99,6 @@ pub struct LighterMarketMeta {
 }
 
 /// Map of Lighter symbol -> market metadata.
-pub async fn fetch_lighter_meta(client: &reqwest::Client) -> Result<HashMap<String, LighterMarketMeta>> {
-    fetch_lighter_meta_from_base(client, DEFAULT_LIGHTER_BASE_URL).await
-}
-
-/// Same as [`fetch_lighter_meta`], but against a configured REST base URL.
 pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &str) -> Result<HashMap<String, LighterMarketMeta>> {
     let url = endpoint(base_url, "/api/v1/orderBooks");
     let resp: crate::lighter::messages::OrderBooksResponse = client
@@ -144,12 +129,7 @@ pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &s
     Ok(out)
 }
 
-/// Resolve `MarketSpec`s for the configured markets from both venues.
-pub async fn build_market_specs(markets: &[MarketCfg], hl_min_notional: Decimal) -> Result<Vec<MarketSpec>> {
-    build_market_specs_with_bases(markets, hl_min_notional, DEFAULT_ASTER_BASE_URL, DEFAULT_LIGHTER_BASE_URL).await
-}
-
-/// Resolve `MarketSpec`s against configured REST base URLs.
+/// Resolve `MarketSpec`s for the configured markets from both venues' REST base URLs.
 pub async fn build_market_specs_with_bases(
     markets: &[MarketCfg],
     hl_min_notional: Decimal,

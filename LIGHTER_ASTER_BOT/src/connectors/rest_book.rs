@@ -16,9 +16,6 @@ use crate::decimal::parse_dec;
 use crate::types::Side;
 use crate::vwap::vwap_take;
 
-pub const DEFAULT_ASTER_BASE_URL: &str = "https://fapi.asterdex.com";
-pub const DEFAULT_LIGHTER_BASE_URL: &str = "https://mainnet.zklighter.elliot.ai";
-
 fn endpoint(base_url: &str, path: &str) -> String {
     format!("{}{}", base_url.trim_end_matches('/'), path)
 }
@@ -43,15 +40,6 @@ struct AsterDepthResp {
 }
 
 /// Fetch the Aster partial-depth snapshot via REST (mirrors the `@depth20` WS feed).
-pub async fn fetch_aster_book(
-    client: &reqwest::Client,
-    symbol_upper: &str,
-    limit: u32,
-) -> Result<OrderBook> {
-    fetch_aster_book_from_base(client, DEFAULT_ASTER_BASE_URL, symbol_upper, limit).await
-}
-
-/// Same as [`fetch_aster_book`], but against a configured REST base URL.
 pub async fn fetch_aster_book_from_base(
     client: &reqwest::Client,
     base_url: &str,
@@ -80,11 +68,6 @@ pub async fn fetch_aster_book_from_base(
 }
 
 /// Fetch the Lighter book snapshot via REST.
-pub async fn fetch_lighter_book(client: &reqwest::Client, market_id: u32, limit: u32) -> Result<OrderBook> {
-    fetch_lighter_book_from_base(client, DEFAULT_LIGHTER_BASE_URL, market_id, limit).await
-}
-
-/// Same as [`fetch_lighter_book`], but against a configured REST base URL.
 pub async fn fetch_lighter_book_from_base(client: &reqwest::Client, base_url: &str, market_id: u32, limit: u32) -> Result<OrderBook> {
     let url = endpoint(base_url, "/api/v1/orderBookOrders");
     let resp: serde_json::Value = client

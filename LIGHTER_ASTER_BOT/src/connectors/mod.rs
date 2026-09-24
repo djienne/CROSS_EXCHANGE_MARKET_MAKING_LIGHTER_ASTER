@@ -1,17 +1,13 @@
 //! Live market-data connectors (Aster + Lighter) and one-shot REST spec fetch.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{Sink, SinkExt};
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
-use crate::book::OrderBook;
-use crate::events::{EventKind, PriceLevel};
-use crate::types::MarketId;
+use crate::book::{OrderBook, PriceLevel};
 use chrono::{DateTime, Utc};
 
 pub mod aster;
@@ -20,59 +16,8 @@ pub mod rest_book;
 pub mod rest_specs;
 
 
-/// Cold/canonical market-data event sink used by websocket readers.
-///
-/// `record` and `verify-books` use the lossless unbounded variant so their tapes remain complete.
-/// `livebot` uses the bounded lossy variant: hot-path `VenueBook` publication happens independently,
-/// and a stalled cold recorder increments an explicit drop counter instead of growing memory without
-/// bound or backpressuring websocket keepalives.
-#[derive(Clone)]
-pub enum EventSink {
-    Lossless(mpsc::UnboundedSender<(MarketId, EventKind)>),
-    Lossy {
-        tx: mpsc::Sender<(MarketId, EventKind)>,
-        dropped: Arc<AtomicU64>,
-    },
-}
-
-impl EventSink {
-    pub fn lossless(tx: mpsc::UnboundedSender<(MarketId, EventKind)>) -> Self {
-        EventSink::Lossless(tx)
-    }
-
-    pub fn lossy(tx: mpsc::Sender<(MarketId, EventKind)>, dropped: Arc<AtomicU64>) -> Self {
-        EventSink::Lossy { tx, dropped }
-    }
-
-    /// Non-blocking send from a websocket reader. Lossless mode preserves the old unbounded
-    /// recorder behavior; lossy mode drops when the cold channel is full/closed and records it.
-    #[inline]
-    pub fn send(&self, market: MarketId, kind: EventKind) {
-        match self {
-            EventSink::Lossless(tx) => {
-                let _ = tx.send((market, kind));
-            }
-            EventSink::Lossy { tx, dropped } => {
-                if tx.try_send((market, kind)).is_err() {
-                    dropped.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-
-    #[inline]
-    pub fn dropped(&self) -> u64 {
-        match self {
-            EventSink::Lossless(_) => 0,
-            EventSink::Lossy { dropped, .. } => dropped.load(Ordering::Relaxed),
-        }
-    }
-}
-
 /// A sink for the freshest book on the live hot path. Implemented by
-/// `hotpath::VenueBook`, but defined here (core, hotpath-agnostic) so the connectors
-/// can fan out a copy of each book without ever depending on the `hotpath` module —
-/// keeping `record` buildable with `--no-default-features`.
+/// `hotpath::VenueBook`; the connectors publish through this trait, never the concrete cell.
 ///
 /// `publish` is called on each book snapshot; `touch` on every other inbound frame
 /// (trades, pongs) so a quiet-but-alive stream still reads as fresh.
@@ -80,7 +25,7 @@ pub trait BookTap: Send + Sync {
     fn publish(&self, book: OrderBook);
     fn touch(&self);
     /// Publish both the raw `OrderBook` and the integer `HotBook`. Default
-    /// implementation ignores the hot book (backward compat for record mode).
+    /// implementation ignores the hot book.
     fn publish_hot(&self, book: OrderBook, _hot: crate::hot_types::HotBook) {
         self.publish(book);
     }
@@ -89,8 +34,8 @@ pub trait BookTap: Send + Sync {
     fn publish_hot_only(&self, _hot: crate::hot_types::HotBook, _exch_ts: DateTime<Utc>) {
         self.touch();
     }
-    /// Publish a fast one-level best bid/ask assist. Default no-op keeps record mode
-    /// and venues without a BBO assist unchanged.
+    /// Publish a fast one-level best bid/ask assist. Default no-op for taps without a
+    /// BBO assist.
     fn publish_bbo(&self, _book: OrderBook) {}
     /// Publish a fast BBO assist plus its integer projection.
     fn publish_bbo_hot(&self, book: OrderBook, _hot: crate::hot_types::HotBook) {
@@ -109,13 +54,12 @@ pub trait BookTap: Send + Sync {
         self.publish_bbo_price_wake(book);
     }
     /// Notify the cell that the venue stream is KNOWN down (disconnect/error/gap-resync),
-    /// so the stored book must not be trusted until a full snapshot lands. Default no-op
-    /// keeps record mode unchanged.
+    /// so the stored book must not be trusted until a full snapshot lands. Default no-op.
     fn mark_stream_down(&self) {}
 }
 
-/// The optional hot-path side outputs threaded into a connector reader. Both are
-/// `None` in `record` mode, so the reader is behaviorally identical to before.
+/// The hot-path side outputs threaded into a connector reader. The ingest threads set
+/// both the cell and the reconnect signal; connector unit tests may leave either `None`.
 #[derive(Clone)]
 pub struct Tap {
     /// Lock-free latest-book cell to publish into (the live strategy reads it).
@@ -124,35 +68,20 @@ pub struct Tap {
     pub reconnect: Option<Arc<Notify>>,
     /// When set, `publish` builds a `HotBook` alongside the raw `OrderBook` and calls
     /// `BookTap::publish_hot` for wait-free integer reads on the strategy loop.
-    #[cfg(feature = "hotpath")]
     pub scale: Option<crate::livebot::scale::MarketScale>,
-    #[cfg(feature = "hotpath")]
     pub qty_scale: crate::livebot::scale::HotQtyScale,
 }
 
-impl Default for Tap {
-    fn default() -> Self {
-        Tap {
-            book: None,
-            reconnect: None,
-            #[cfg(feature = "hotpath")]
-            scale: None,
-            #[cfg(feature = "hotpath")]
-            qty_scale: crate::livebot::scale::HotQtyScale::Aster,
-        }
-    }
-}
-
 impl Tap {
-    /// No hot-path outputs — the `record` path.
+    /// No hot-path outputs (connector unit tests).
+    #[cfg(test)]
     pub fn none() -> Self {
-        Tap::default()
+        Tap { book: None, reconnect: None, scale: None, qty_scale: crate::livebot::scale::HotQtyScale::Aster }
     }
 
     /// Build the integer hot book directly from exchange decimal strings. This avoids
     /// converting websocket levels to `rust_decimal::Decimal` just to convert them back
     /// into ticks/lots for the strategy precheck.
-    #[cfg(feature = "hotpath")]
     #[inline]
     pub(crate) fn hot_book_from_raw<'a, I, J>(
         &self,
@@ -186,7 +115,6 @@ impl Tap {
     /// Build the integer hot book from already-parsed Decimal levels (best-first) — the
     /// numeric sibling of [`Tap::hot_book_from_raw`] for connectors that no longer
     /// format levels as strings. Same stamps and metric.
-    #[cfg(feature = "hotpath")]
     #[inline]
     pub(crate) fn hot_book_from_levels(
         &self,
@@ -215,7 +143,6 @@ impl Tap {
 
     /// Publish only a prebuilt integer L2 snapshot before the raw Decimal book is built.
     /// The hot cell marks this as cancel-only until the subsequent full publish clears it.
-    #[cfg(feature = "hotpath")]
     #[inline]
     pub(crate) fn publish_hot_only(&self, hot: crate::hot_types::HotBook, exch_ts: DateTime<Utc>) {
         if let Some(cell) = &self.book {
@@ -231,23 +158,18 @@ impl Tap {
         bids: &[PriceLevel],
         asks: &[PriceLevel],
         exch_ts: DateTime<Utc>,
-        #[cfg(feature = "hotpath")] prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
-        #[cfg(not(feature = "hotpath"))] _prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
+        prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
     ) {
         if let Some(cell) = &self.book {
-            #[cfg(feature = "hotpath")]
             let t0 = crate::hotpath::clock::mono_now_ns();
             let book = OrderBook::from_levels(bids.iter().copied(), asks.iter().copied(), exch_ts, Utc::now());
-            #[cfg(feature = "hotpath")]
             let recv_ns = prebuilt_hot
                 .as_ref()
                 .map(|(_, ns)| *ns)
                 .unwrap_or_else(crate::hotpath::clock::mono_now_ns);
-            #[cfg(feature = "hotpath")]
             if prebuilt_hot.is_none() {
                 crate::metrics::BOOK_BUILD.record((recv_ns - t0).max(0) as u64);
             }
-            #[cfg(feature = "hotpath")]
             if let Some(scale) = &self.scale {
                 let hot = prebuilt_hot
                     .map(|(hot, _)| hot)
@@ -268,7 +190,6 @@ impl Tap {
     }
 
     /// Publish only a prebuilt integer BBO before the raw Decimal BBO is built.
-    #[cfg(feature = "hotpath")]
     #[inline]
     pub(crate) fn publish_bbo_hot_only(&self, hot: crate::hot_types::HotBook, exch_ts: DateTime<Utc>) {
         if let Some(cell) = &self.book {
@@ -283,23 +204,18 @@ impl Tap {
         bid: PriceLevel,
         ask: PriceLevel,
         exch_ts: DateTime<Utc>,
-        #[cfg(feature = "hotpath")] prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
-        #[cfg(not(feature = "hotpath"))] _prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
+        prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
     ) {
         if let Some(cell) = &self.book {
-            #[cfg(feature = "hotpath")]
             let t0 = crate::hotpath::clock::mono_now_ns();
             let book = OrderBook::from_levels([bid], [ask], exch_ts, Utc::now());
-            #[cfg(feature = "hotpath")]
             let recv_ns = prebuilt_hot
                 .as_ref()
                 .map(|(_, ns)| *ns)
                 .unwrap_or_else(crate::hotpath::clock::mono_now_ns);
-            #[cfg(feature = "hotpath")]
             if prebuilt_hot.is_none() {
                 crate::metrics::BOOK_BUILD.record((recv_ns - t0).max(0) as u64);
             }
-            #[cfg(feature = "hotpath")]
             if let Some(scale) = &self.scale {
                 let hot = prebuilt_hot
                     .map(|(hot, _)| hot)
@@ -329,12 +245,10 @@ impl Tap {
         bid: PriceLevel,
         ask: PriceLevel,
         exch_ts: DateTime<Utc>,
-        #[cfg(feature = "hotpath")] prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
-        #[cfg(not(feature = "hotpath"))] _prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
+        prebuilt_hot: Option<(crate::hot_types::HotBook, i64)>,
     ) {
         if let Some(cell) = &self.book {
             let book = OrderBook::from_levels([bid], [ask], exch_ts, Utc::now());
-            #[cfg(feature = "hotpath")]
             if let Some(scale) = &self.scale {
                 let recv_ns = prebuilt_hot
                     .as_ref()
@@ -364,7 +278,7 @@ impl Tap {
         }
     }
 
-    /// Flag the attached book cell as stream-down (no-op without a cell, e.g. record mode).
+    /// Flag the attached book cell as stream-down (no-op without a cell).
     #[inline]
     pub(crate) fn mark_stream_down(&self) {
         if let Some(cell) = &self.book {
@@ -372,8 +286,8 @@ impl Tap {
         }
     }
 
-    /// Await a watchdog reconnect request. When no signal is attached (`record`
-    /// mode) the returned future never resolves, so its `select!` arm never fires.
+    /// Await a watchdog reconnect request. When no signal is attached the returned
+    /// future never resolves, so its `select!` arm never fires.
     async fn wait_reconnect(&self) {
         match &self.reconnect {
             Some(n) => n.notified().await,

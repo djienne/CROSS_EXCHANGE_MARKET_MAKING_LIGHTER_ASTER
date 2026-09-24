@@ -9,7 +9,6 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
 use crate::decimal::ceil_to_step;
-use crate::fill_sweep::SimulatedAsterFill;
 use crate::types::Side;
 
 #[derive(Debug, Clone)]
@@ -110,32 +109,10 @@ pub fn hedge_side_for_signed(signed_qty: Decimal) -> Option<Side> {
     }
 }
 
-/// Fold a fill into pending inventory, returning what to book / hedge / keep.
-pub fn handle_fill(
-    fill: &SimulatedAsterFill,
-    pending: Option<PendingInventory>,
-    rules: &HedgeabilityRules,
-    ref_px: Decimal,
-    aster_maker_fee_rate: Decimal,
-) -> FillOutcome {
-    handle_fill_parts(
-        fill.aster_side,
-        fill.fill_qty,
-        fill.fill_px,
-        fill.local_recv_ts,
-        pending,
-        rules,
-        ref_px,
-        aster_maker_fee_rate,
-    )
-}
-
-/// The core accumulation logic, in primitive params so BOTH the dry-run sim (via
-/// [`handle_fill`]) and the LIVE strategy (which has a venue [`AsterFill`](crate::livebot::fills::AsterFill),
-/// not a `SimulatedAsterFill`) share one exact implementation. A same-direction fill accumulates
-/// with a size-weighted average; an opposite fill nets down and books realized PnL; the result
-/// carries a [`HedgeOrder`] the MOMENT the net clears the HL minimum (primary fast-hedge path),
-/// else keeps the sub-min residual pending — never per-partial flattening.
+/// Fold a fill into pending inventory, returning what to book / hedge / keep. A same-direction
+/// fill accumulates with a size-weighted average; an opposite fill nets down and books realized
+/// PnL; the result carries a [`HedgeOrder`] the MOMENT the net clears the HL minimum (primary
+/// fast-hedge path), else keeps the sub-min residual pending — never per-partial flattening.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_fill_parts(
     aster_side: Side,
@@ -276,9 +253,7 @@ pub fn check_pending_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::MarketId;
     use rust_decimal_macros::dec;
-    use uuid::Uuid;
 
     fn ts() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
@@ -291,27 +266,6 @@ mod tests {
         }
     }
 
-    fn fill(side: Side, px: Decimal, qty: Decimal) -> SimulatedAsterFill {
-        SimulatedAsterFill {
-            id: Uuid::new_v4(),
-            quote_id: Uuid::new_v4(),
-            market: MarketId("BTC".into()),
-            aster_side: side,
-            fill_px: px,
-            fill_qty: qty,
-            sweep_print_px: px,
-            quoted_edge_bps: dec!(0),
-            quoted_distance_bps: dec!(0),
-            remaining_quote_qty_after_fill: dec!(0),
-            was_trade_through: false,
-            was_partial: false,
-            feed_stale_at_fill: false,
-            queue_truncated: false,
-            exch_ts: ts(),
-            local_recv_ts: ts(),
-        }
-    }
-
     #[test]
     fn min_hedge_qty_from_notional() {
         // ref 100, min $10 => 0.1 base, step 0.001.
@@ -321,12 +275,12 @@ mod tests {
     #[test]
     fn sub_min_accumulates_then_hedges() {
         // ref 100 => min hedge 0.1.
-        let o1 = handle_fill(&fill(Side::Buy, dec!(100), dec!(0.05)), None, &rules(), dec!(100), dec!(0));
+        let o1 = handle_fill_parts(Side::Buy, dec!(0.05), dec!(100), ts(), None, &rules(), dec!(100), dec!(0));
         assert!(o1.hedge.is_none());
         let inv = o1.pending.unwrap();
         assert_eq!(inv.signed_qty, dec!(0.05));
 
-        let o2 = handle_fill(&fill(Side::Buy, dec!(100), dec!(0.06)), Some(inv), &rules(), dec!(100), dec!(0));
+        let o2 = handle_fill_parts(Side::Buy, dec!(0.06), dec!(100), ts(), Some(inv), &rules(), dec!(100), dec!(0));
         let h = o2.hedge.unwrap();
         assert_eq!(h.hedge_side, Side::Sell); // long Aster => sell HL
         assert_eq!(h.qty, dec!(0.11));
@@ -336,11 +290,11 @@ mod tests {
     #[test]
     fn opposite_fill_books_pnl_and_keeps_residual() {
         // Pending long 0.08 @ 100 (sub-min).
-        let inv = handle_fill(&fill(Side::Buy, dec!(100), dec!(0.08)), None, &rules(), dec!(100), dec!(0))
+        let inv = handle_fill_parts(Side::Buy, dec!(0.08), dec!(100), ts(), None, &rules(), dec!(100), dec!(0))
             .pending
             .unwrap();
         // Opposite sell 0.05 @ 101 closes 0.05 for +0.05 gross.
-        let o = handle_fill(&fill(Side::Sell, dec!(101), dec!(0.05)), Some(inv), &rules(), dec!(100), dec!(0));
+        let o = handle_fill_parts(Side::Sell, dec!(0.05), dec!(101), ts(), Some(inv), &rules(), dec!(100), dec!(0));
         let n = o.netted.unwrap();
         assert_eq!(n.closed_qty, dec!(0.05));
         assert_eq!(n.realized_pnl, dec!(0.05));
@@ -351,11 +305,11 @@ mod tests {
 
     #[test]
     fn opposite_fill_flips_and_hedges() {
-        let inv = handle_fill(&fill(Side::Buy, dec!(100), dec!(0.08)), None, &rules(), dec!(100), dec!(0))
+        let inv = handle_fill_parts(Side::Buy, dec!(0.08), dec!(100), ts(), None, &rules(), dec!(100), dec!(0))
             .pending
             .unwrap();
         // Big opposite sell 0.2 @ 101: closes 0.08 (+0.08), flips to short 0.12 @ 101.
-        let o = handle_fill(&fill(Side::Sell, dec!(101), dec!(0.2)), Some(inv), &rules(), dec!(100), dec!(0));
+        let o = handle_fill_parts(Side::Sell, dec!(0.2), dec!(101), ts(), Some(inv), &rules(), dec!(100), dec!(0));
         assert_eq!(o.netted.unwrap().realized_pnl, dec!(0.08));
         let h = o.hedge.unwrap();
         assert_eq!(h.hedge_side, Side::Buy); // short Aster => buy HL

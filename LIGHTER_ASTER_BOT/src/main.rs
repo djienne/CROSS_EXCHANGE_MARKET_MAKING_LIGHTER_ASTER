@@ -1,5 +1,5 @@
 //! Binary entry point: initialize tracing, parse the CLI, and dispatch. `taker ...` runs the
-//! taker-taker arbitrage engine with its own CLI; everything else is the XEMM/research CLI.
+//! taker-taker arbitrage engine with its own CLI; everything else is the bot/XEMM CLI.
 
 use std::ffi::OsString;
 
@@ -26,17 +26,7 @@ async fn main() -> Result<()> {
     let mut args: Vec<OsString> = std::env::args_os().collect();
     if args.get(1).is_some_and(|arg| arg == "taker") {
         args.remove(0);
-        return run_taker(args).await;
+        return lighter_aster_bot::taker::run(args).await;
     }
     dispatch(Cli::parse()).await
-}
-
-#[cfg(feature = "hotpath")]
-async fn run_taker(args: Vec<OsString>) -> Result<()> {
-    lighter_aster_bot::taker::run(args).await
-}
-
-#[cfg(not(feature = "hotpath"))]
-async fn run_taker(_args: Vec<OsString>) -> Result<()> {
-    anyhow::bail!("`taker` requires the 'hotpath' feature (default); rebuild without --no-default-features")
 }

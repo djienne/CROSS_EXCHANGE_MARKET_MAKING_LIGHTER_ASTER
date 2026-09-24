@@ -14,8 +14,6 @@ use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use std::time::Duration;
 
-pub const BASE_URL: &str = "https://mainnet.zklighter.elliot.ai";
-
 #[derive(Clone)]
 pub struct RestClient {
     base: String,
@@ -222,21 +220,6 @@ impl RestClient {
             bail!("Lighter account query has no account row");
         }
         Ok(value)
-    }
-
-    /// GET /api/v1/getMakerOnlyApiKeys (maker-only restriction detection).
-    pub async fn maker_only_api_keys(&self, account_index: i64) -> Result<serde_json::Value> {
-        let v: serde_json::Value = self
-            .http
-            .get(self.url("/api/v1/getMakerOnlyApiKeys"))
-            .query(&[("account_index", account_index.to_string())])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("parse getMakerOnlyApiKeys")?;
-        Ok(v)
     }
 
     /// Parse a sendTx[Batch] response body even when the HTTP status is an error

@@ -86,7 +86,7 @@ async fn resolve(cfg: &Config, target: &str) -> Result<(Vec<MarketCfg>, Vec<Mark
     }
     let specs = rest_specs::build_market_specs_with_bases(
         &markets,
-        cfg.partials.hyperliquid_min_notional,
+        cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
         &cfg.live.hyperliquid.base_url,
     )
@@ -119,7 +119,7 @@ async fn probe_aster_balance(cfg: &Config) -> Result<()> {
     let markets = cfg.select_markets(None);
     let specs = rest_specs::build_market_specs_with_bases(
         &markets[..1.min(markets.len())],
-        cfg.partials.hyperliquid_min_notional,
+        cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
         &cfg.live.hyperliquid.base_url,
     )
@@ -143,7 +143,7 @@ async fn probe_aster_positions(cfg: &Config) -> Result<()> {
     let markets = cfg.select_markets(None);
     let specs = rest_specs::build_market_specs_with_bases(
         &markets[..1.min(markets.len())],
-        cfg.partials.hyperliquid_min_notional,
+        cfg.live.partials.lighter_min_notional,
         &cfg.live.aster.base_url,
         &cfg.live.hyperliquid.base_url,
     )

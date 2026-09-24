@@ -1,7 +1,6 @@
 //! Live Aster maker / Lighter hedge execution.
 //!
 //! Live submission requires enabled configuration, explicit live mode and one market.
-//! Paper mode uses the same strategy with a simulated executor and public feeds.
 //!
 //! Book publication and strategy ownership stay in memory; bounded queues connect
 //! venue workers, cold account reconciliation and persistent journal writing.

@@ -32,12 +32,10 @@ use crate::quote_engine::{
     PositionContext, QuoteEngineConfig,
 };
 use crate::position::SignedPosition;
-use crate::requoter::ReplaceReason;
 use crate::types::{MarketId, RejectReason, Side};
 
 use super::account::{AccountState, Venue};
 use super::exec::command::{ExecCommand, ExecEvent, HedgeCommand, MakerPermit};
-use super::exec::ExecMode;
 use super::fills::{AsterFill, FillDedup, HedgeIntent, HedgeState, IntentPurpose};
 use super::ids::{SessionId, Cloid};
 use super::journal::{Journal, JournalDetail, QuoteRecord, DiagnosticRecord};
@@ -89,15 +87,43 @@ pub struct CurrentOrder {
     pub qty: Decimal,
 }
 
-/// An Aster trade print forwarded to the strategy (paper maker-fill detection).
-#[derive(Debug, Clone)]
-pub struct TradePrint {
-    pub market: MarketId,
-    pub price: Decimal,
-    pub qty: Decimal,
-    /// Aster `aggTrade` `m`: true ⇒ the buyer was the maker (a SELL-aggressor print, which
-    /// can fill our resting BID); false ⇒ buyer was the taker (can fill our resting ASK).
-    pub buyer_is_maker: bool,
+/// Why a resting quote is pulled or replaced (journaled via [`ReplaceReason::as_str`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceReason {
+    PriceChanged,
+    QuantityChanged,
+    QuoteTooCloseToTouch,
+    NoLongerProfitable,
+    /// The market-data feed went stale; pull the quote (we can't trust the hedge price).
+    FeedStale,
+}
+
+impl ReplaceReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplaceReason::PriceChanged => "PRICE_CHANGED",
+            ReplaceReason::QuantityChanged => "QUANTITY_CHANGED",
+            ReplaceReason::QuoteTooCloseToTouch => "QUOTE_TOO_CLOSE_TO_TOUCH",
+            ReplaceReason::NoLongerProfitable => "NO_LONGER_PROFITABLE",
+            ReplaceReason::FeedStale => "FEED_STALE",
+        }
+    }
+
+    /// Map a quote-rejection cause into the reason we tag the cancel of a now-invalid
+    /// standing quote. Feed-state failures — a stale or absent book on either venue —
+    /// surface as `FeedStale`; every other cause (no profitable edge, crossed book,
+    /// position cap, insufficient depth, …) collapses to `NoLongerProfitable`. The full
+    /// `RejectReason` is still what the per-side decision note records.
+    pub fn from_reject(reason: RejectReason) -> ReplaceReason {
+        use RejectReason::*;
+        match reason {
+            AsterBookStale | HlBookStale | MissingAsterBook | MissingHlBook | HlBboThinAndL2Stale | AsterEffectiveTouchUnavailable => {
+                ReplaceReason::FeedStale
+            }
+            QuoteTooCloseToTouch => ReplaceReason::QuoteTooCloseToTouch,
+            _ => ReplaceReason::NoLongerProfitable,
+        }
+    }
 }
 
 /// What to do with one market side this evaluation.
@@ -570,7 +596,7 @@ fn evaluate_side_with_hl_sources(
         Ok(d) => d,
         Err(reason) => {
             // No acceptable quote right now. Pull a resting order with an honest reason
-            // (stale feed vs no-longer-profitable), consistent with the simulator.
+            // (stale feed vs no-longer-profitable).
             return (
                 match current {
                     Some(_) => SideDecision::Cancel { reason: ReplaceReason::from_reject(reason) },
@@ -702,9 +728,6 @@ pub struct Strategy {
     exec_prio_tx: Option<Sender<ExecCommand>>,
     hedge_tx: Sender<HedgeCommand>,
     cooldown_ns: i64,
-    exec_mode: ExecMode,
-    /// Synthetic trade-id counter for paper maker fills (no venue trade id).
-    synthetic_trade_seq: u64,
     /// Startup reconciliation done (invariant 7) — no quoting before this.
     clean_start: bool,
     /// Latched freeze after an orphan-leg danger (hedge reject / timeout); cleared only by
@@ -737,8 +760,8 @@ pub struct Strategy {
     /// clears only once that condition holds again in a STRICTLY NEWER snapshot, so a transient
     /// snapshot lag can't unfreeze on a phantom-clean reading. Mirrors the `orphan_seen` gate.
     heal_confirm: Option<i64>,
-    /// Aster user-stream liveness (live only): gates quoting on stream freshness (§6). `None`
-    /// in paper (no real stream).
+    /// Aster user-stream liveness: gates quoting on stream freshness (§6). `None` until
+    /// wired (tests without a stream).
     aster_stream: Option<Arc<super::userstream::StreamLiveness>>,
     /// Cumulative-loss circuit breaker (live only). Cloned shutdown token used to halt the whole
     /// process when the breaker trips; set via [`Strategy::arm_circuit_breaker`].
@@ -803,7 +826,6 @@ impl Strategy {
         session: SessionId,
         exec_tx: Sender<ExecCommand>,
         hedge_tx: Sender<HedgeCommand>,
-        exec_mode: ExecMode,
     ) -> Self {
         let markets: Vec<MarketId> = specs.iter().map(|s| s.market_id.clone()).collect();
         let ctx: HashMap<MarketId, MarketCtx> = specs
@@ -830,7 +852,7 @@ impl Strategy {
         let orders = OrderManager::new(session, &markets);
         let num_markets = registry.num_markets();
         let precheck_cfg = super::precheck::HotPrecheckConfig {
-            max_book_stale_ns: cfg.simulation.max_book_staleness_ms * 1_000_000,
+            max_book_stale_ns: cfg.live.max_book_staleness_ms * 1_000_000,
         };
         Strategy {
             cfg,
@@ -859,8 +881,6 @@ impl Strategy {
             exec_prio_tx: None,
             hedge_tx,
             cooldown_ns,
-            exec_mode,
-            synthetic_trade_seq: 0,
             clean_start: false,
             frozen: false,
             sweep_pending: None,
@@ -951,9 +971,6 @@ impl Strategy {
     /// (with all its confirmation gates) take over. Requires a FRESH snapshot: if it is absent
     /// or stale we adopt nothing, which degrades to the old freeze — never trusts stale data.
     pub fn adopt_reported_positions(&mut self, now_ns: i64) {
-        if !self.exec_mode.sends_real_orders() {
-            return; // paper/record: no real prior-session positions to adopt
-        }
         let snap = self.account.load();
         let max_age_ns = self.cfg.live.max_account_snapshot_age_ms.saturating_mul(1_000_000);
         if snap.source_ts_ns == 0 || now_ns.saturating_sub(snap.source_ts_ns) > max_age_ns {
@@ -1132,14 +1149,12 @@ impl Strategy {
 
     fn freeze_and_sweep(&mut self, now_ns: i64, cause: &'static str) {
         self.freeze(now_ns, cause);
-        if self.exec_mode.sends_real_orders() {
-            self.request_safety_sweep(now_ns, cause);
-        }
+        self.request_safety_sweep(now_ns, cause);
     }
 
     #[inline]
     fn exec_queue_low_for_optional_work(&self) -> bool {
-        self.exec_mode.sends_real_orders() && self.exec_tx.capacity() <= EXEC_CANCEL_RESERVE
+        self.exec_tx.capacity() <= EXEC_CANCEL_RESERVE
     }
 
     #[inline]
@@ -1169,7 +1184,7 @@ impl Strategy {
     }
 
     fn aster_budget_allows(&mut self, priority: AsterCommandPriority, cost: u32, now_ns: i64) -> bool {
-        if !self.exec_mode.sends_real_orders() || cost == 0 {
+        if cost == 0 {
             return true;
         }
         if now_ns < self.aster_rate_limited_until_ns {
@@ -1190,7 +1205,7 @@ impl Strategy {
     }
 
     fn record_aster_command_dispatch(&mut self, cost: u32, now_ns: i64) {
-        if !self.exec_mode.sends_real_orders() || cost == 0 {
+        if cost == 0 {
             return;
         }
         self.prune_aster_cmd_budget(now_ns);
@@ -1268,7 +1283,7 @@ impl Strategy {
 
     fn cancel_target(&mut self, market: &MarketId, side: Side, now_ns: i64) -> CancelTarget {
         self.orders.revoke_queued(market, side);
-        if self.exec_mode.sends_real_orders() && self.sweep_pending.is_some() {
+        if self.sweep_pending.is_some() {
             return CancelTarget::Suppressed;
         }
         self.orders
@@ -1294,7 +1309,7 @@ impl Strategy {
     fn fresh_hl_quote_book(&self, market: &MarketId, now_ns: i64) -> Option<SelectedHlBook> {
         let cell = self.cell(market, VenueTag::Hyperliquid)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
-        let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale_ms = self.cfg.live.max_book_staleness_ms;
 
         // Read age before the ArcSwap pointer so a concurrent publish cannot pair an
         // old book Arc with a newer freshness stamp. A false negative is safe; a false
@@ -1325,7 +1340,7 @@ impl Strategy {
     ) -> Option<SelectedHlBook> {
         let cell = self.cell(market, VenueTag::Hyperliquid)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
-        let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale_ms = self.cfg.live.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
 
         let l2_age_ms = cell.book_age_ms(now_ns);
@@ -1372,7 +1387,7 @@ impl Strategy {
         let cell = self.cell(market, VenueTag::Hyperliquid)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let ctx = self.ctx.get(market)?;
-        let max_stale_ns = self.cfg.simulation.max_book_staleness_ms * 1_000_000;
+        let max_stale_ns = self.cfg.live.max_book_staleness_ms * 1_000_000;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
 
         let l2_age_ms = cell.book_age_ms(now_ns);
@@ -1423,7 +1438,7 @@ impl Strategy {
         let cell = self.cell(market, VenueTag::Hyperliquid)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
         let ctx = self.ctx.get(market)?;
-        let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale_ms = self.cfg.live.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
 
         let l2_age_ms = cell.book_age_ms(now_ns);
@@ -1493,7 +1508,7 @@ impl Strategy {
     fn fresh_aster_touch_book(&self, market: &MarketId, now_ns: i64) -> Option<SelectedAsterTouch> {
         let cell = self.cell(market, VenueTag::Aster)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
-        let max_stale_ms = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale_ms = self.cfg.live.max_book_staleness_ms;
 
         let l2_age_ms = cell.book_age_ms(now_ns);
         let l2 = cell.load();
@@ -1584,7 +1599,7 @@ impl Strategy {
     /// dead socket implies a stale book, which the tighter book-staleness test already catches.
     /// Uses the monotonic `now_ns` (same clock `publish` stamps), matching the watchdog scan.
     fn market_feeds_fresh(&self, market: &MarketId, now_ns: i64) -> bool {
-        let max_stale = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale = self.cfg.live.max_book_staleness_ms;
         let aster_fresh = self
             .cell(market, VenueTag::Aster)
             // Aster depth is still the queue/depth source, but a fresh bookTicker/BBO is
@@ -1603,7 +1618,7 @@ impl Strategy {
         let h = self.hl_pos.get(market).copied().unwrap_or_default();
         let mut a_cap = self.cfg.capital.aster_cap_notional();
         let mut h_cap = self.cfg.capital.hyperliquid_cap_notional();
-        if self.exec_mode.sends_real_orders() && self.cfg.live.margin_guard.enabled {
+        if self.cfg.live.margin_guard.enabled {
             let snap = self.account.load();
             let mark = self.book(market, VenueTag::Hyperliquid).and_then(|b| b.mid()).unwrap_or(Decimal::ZERO);
             let fresh = |origin: i64| origin > 0 && now_ns.saturating_sub(origin) / 1_000_000 <= self.cfg.live.max_account_snapshot_age_ms;
@@ -1618,13 +1633,13 @@ impl Strategy {
         }
         PositionContext { aster_pos_qty: a.qty, hl_pos_qty: h.qty, aster_cap_notional: a_cap,
             hl_cap_notional: h_cap, enforce: self.cfg.capital.enforce_position_cap,
-            reduce_position_only: self.exec_mode.sends_real_orders() && self.cfg.live.quote.reduce_position_only }
+            reduce_position_only: self.cfg.live.quote.reduce_position_only }
     }
 
     /// Reserve the full interval of still-possible positions, including resting
     /// makers' future hedges. Free margin already excludes reported-position margin.
     fn margin_allows(&self, market: &MarketId, maker_side: Side, qty: Decimal, price: Decimal, now_ns: i64) -> bool {
-        if !self.exec_mode.sends_real_orders() || !self.cfg.live.margin_guard.enabled { return true; }
+        if !self.cfg.live.margin_guard.enabled { return true; }
         let Some(ctx) = self.ctx.get(market) else { return false };
         let snap = self.account.load();
         let a = self.aster_pos.get(market).map(|p| p.qty).unwrap_or_default();
@@ -1661,21 +1676,18 @@ impl Strategy {
 
     /// The reason new maker quoting is currently closed for `market`, or `None` if it may quote.
     /// Builds the full [`MakerGateInputs`] and runs the canonical [`evaluate_maker_gate`] (reopen
-    /// conditions and orphan-leg invariants), then the cooldown. Live-only inputs (account
-    /// freshness, position reconciliation) are vacuously satisfied in paper (there is no exchange
-    /// to be stale against), so paper behaviour is unchanged. Risk-reducing actions ignore this.
+    /// conditions and orphan-leg invariants), then the cooldown. Risk-reducing actions ignore this.
     /// `Some(reason)` is the human-readable cause (a [`FreezeReason`] string or `"COOLDOWN"`) so a
     /// closure can be surfaced instead of silently stopping quotes — see
     /// [`note_quote_gate`](Self::note_quote_gate).
     fn maker_gate_reason(&self, market: &MarketId, now_ns: i64) -> Option<&'static str> {
-        let live = self.exec_mode.sends_real_orders();
         if self.draining { return Some("QUIESCING"); }
         if !self.uncertain_makers.is_empty() { return Some("MAKER_EXECUTION_UNCERTAIN"); }
         if !self.journal.healthy() { return Some("JOURNAL_UNHEALTHY"); }
         if self.correction_needed.contains(market) { return Some("RESIDUAL_CORRECTION"); }
-        if live && self.hedge_readiness.as_ref().is_some_and(|r| !r.is_ready()) { return Some("HEDGE_TRANSPORT_NOT_READY"); }
-        if live && (self.exec_tx.is_closed() || self.hedge_tx.is_closed()) { return Some("EXECUTION_WORKER_UNAVAILABLE"); }
-        if live && self.sweep_pending.is_some() {
+        if self.hedge_readiness.as_ref().is_some_and(|r| !r.is_ready()) { return Some("HEDGE_TRANSPORT_NOT_READY"); }
+        if self.exec_tx.is_closed() || self.hedge_tx.is_closed() { return Some("EXECUTION_WORKER_UNAVAILABLE"); }
+        if self.sweep_pending.is_some() {
             return Some("SAFETY_SWEEP_PENDING");
         }
         if self.frozen && self.clean_start {
@@ -1687,20 +1699,18 @@ impl Strategy {
             // freshness gates it, so one stale low-liquidity pair no longer pulls resting
             // quotes on every other pair. The global gate stays a logged gauge in the watchdog.
             feed_gate_open: self.market_feeds_fresh(market, now_ns),
-            // No exchange account/user stream in paper ⇒ freshness is vacuous there.
-            account_fresh: !live || self.account.age_ms(now_ns) <= self.cfg.live.max_account_snapshot_age_ms,
-            // Aster fill stream liveness (live): a silently-dead stream stops us SEEING fills, so
+            account_fresh: self.account.age_ms(now_ns) <= self.cfg.live.max_account_snapshot_age_ms,
+            // Aster fill stream liveness: a silently-dead stream stops us SEEING fills, so
             // freeze new quoting (the reconciler backstop still recovers any orphan meanwhile). If
             // the stream isn't wired, default fresh to avoid a startup deadlock.
-            aster_stream_fresh: !live
-                || self
-                    .aster_stream
-                    .as_ref()
-                    .is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms),
+            aster_stream_fresh: self
+                .aster_stream
+                .as_ref()
+                .is_none_or(|s| s.age_ms(now_ns) <= self.cfg.live.max_user_stream_staleness_ms),
             // HL maker fills are not sourced from a separate user stream today (hedge acks come on
             // the exec event channel), so this is vacuously fresh.
             hl_stream_fresh: true,
-            positions_reconciled: !live || self.positions_reconciled(),
+            positions_reconciled: self.positions_reconciled(),
             no_orphan_hedge: !self.has_orphan_hedge(),
             unhedged_within_limits: self.unhedged_within_limits(now_ns),
         };
@@ -1757,8 +1767,7 @@ impl Strategy {
                     }
                 }
                 let user_stream_stale = r == "ASTER_USER_STREAM_STALE";
-                let should_sweep = self.exec_mode.sends_real_orders()
-                    && r != "COOLDOWN"
+                let should_sweep = r != "COOLDOWN"
                     && r != "SAFETY_SWEEP_PENDING"
                     && r != MAKER_GATE_FROZEN
                     && (self.cfg.live.cancel_all_on_gate_close
@@ -1800,7 +1809,7 @@ impl Strategy {
 
     /// True when every market's predicted position agrees with the exchange-reported snapshot
     /// within `max_position_mismatch_usd` (invariant 6). A single mismatch ⇒ freeze (returns
-    /// false). Only meaningful in live mode (paper has no exchange snapshot).
+    /// false).
     fn positions_reconciled(&self) -> bool {
         let snap = self.account.load();
         let tol = self.cfg.live.max_position_mismatch_usd;
@@ -1962,7 +1971,7 @@ impl Strategy {
             return;
         }
 
-        let max_stale = self.cfg.simulation.max_book_staleness_ms;
+        let max_stale = self.cfg.live.max_book_staleness_ms;
 
         // Read freshness before the ArcSwap pointers so a concurrent publish cannot
         // pair an older book Arc with a newer stamp. At worst we skip one fresh update
@@ -2044,15 +2053,13 @@ impl Strategy {
         if versions.is_none() { return MakerPermit::for_test(); }
         let (a_version, h_version) = versions.expect("production quotes carry book versions");
         let ctx = &self.ctx[market];
-        let max_ms = self.cfg.simulation.max_book_staleness_ms;
+        let max_ms = self.cfg.live.max_book_staleness_ms;
         let mut remaining_ms = max_ms;
         for age in [ctx.aster_cell.book_age_ms(now_ns), ctx.aster_cell.bbo_age_ms(now_ns),
             ctx.hedge_cell.book_age_ms(now_ns), ctx.hedge_cell.bbo_age_ms(now_ns)] {
             if age <= max_ms { remaining_ms = remaining_ms.min(max_ms.saturating_sub(age)); }
         }
-        if self.exec_mode.sends_real_orders() {
-            remaining_ms = remaining_ms.min(self.cfg.live.max_account_snapshot_age_ms.saturating_sub(self.account.age_ms(now_ns)));
-        }
+        remaining_ms = remaining_ms.min(self.cfg.live.max_account_snapshot_age_ms.saturating_sub(self.account.age_ms(now_ns)));
         MakerPermit::new([(ctx.aster_cell.clone(), a_version), (ctx.hedge_cell.clone(), h_version)],
             self.maker_epoch.clone(), now_ns.saturating_add(remaining_ms.max(0).saturating_mul(1_000_000)), self.hedge_readiness.clone())
     }
@@ -2152,10 +2159,7 @@ impl Strategy {
                     self.margin_suppressed.remove(&(market.clone(), side));
                     info!("margin suppression expired for {market} {side:?}");
                 }
-                if self.exec_mode.sends_real_orders()
-                    && self.cfg.live.quote.reduce_position_only
-                    && reason == ReplaceReason::NoLongerProfitable
-                {
+                if self.cfg.live.quote.reduce_position_only && reason == ReplaceReason::NoLongerProfitable {
                     let target = self.cancel_target(market, side, now_ns);
                     let CancelTarget::Send { client_id, venue_order_id } = target else {
                         return;
@@ -2183,7 +2187,7 @@ impl Strategy {
                     return;
                 }
                 // Requote pacing (T1.4): honor `min_requote_interval_ms` for NON-URGENT requotes
-                // (price/qty drift). Outside live reduce-only cancel-only mode above, an urgent
+                // (price/qty drift). Outside reduce-only cancel-only mode above, an urgent
                 // `NoLongerProfitable` replace BYPASSES this small per-side throttle, but it still
                 // obeys the global Aster command budget/backoff below.
                 // The fix is deliberate: urgent no-longer-profitable work must be risk-reducing, not
@@ -2211,7 +2215,7 @@ impl Strategy {
                     Some(_) => return,
                 };
                 let Some(old_cid) = old_cid else { return };
-                if self.exec_mode.sends_real_orders() && self.sweep_pending.is_some() {
+                if self.sweep_pending.is_some() {
                     return;
                 }
                 let full_replace_budget_ok = self.aster_budget_allows(AsterCommandPriority::Optional, 2, now_ns);
@@ -2298,11 +2302,11 @@ impl Strategy {
         }
     }
 
-    /// Handle an Aster maker fill (live: from the user stream; paper: synthesized).
+    /// Handle an Aster maker fill from the user stream.
     /// Exactly-once hedging (invariant 4): a deduped repeat is ignored. Triggers the
     /// post-trade cooldown and cancels the residual on that side (§4.1, §8.4).
     pub async fn handle_maker_fill(&mut self, fill: AsterFill, now_ns: i64) {
-        if self.exec_mode.sends_real_orders() && !self.orders.is_own_client_id(&fill.client_id) { return; }
+        if !self.orders.is_own_client_id(&fill.client_id) { return; }
         if !self.dedup.observe(&fill) { return; }
         self.revoke_makers();
         if self.uncertain_makers.contains(&fill.client_id) {
@@ -2440,8 +2444,8 @@ impl Strategy {
 
     /// Cancel BOTH resting maker sides for `market` via TARGETED per-order cancels (§8.4
     /// cancel-opposite). NOT `CancelMarket` (allOpenOrders) — that emits no per-order ack, so the
-    /// slot tracking would desync in live; each targeted Cancel emits a CancelAck that closes the
-    /// slot via `close_by_client_id` in BOTH paper and live. Called after a fill (the post-fill
+    /// slot tracking would desync; each targeted Cancel emits a CancelAck that closes the
+    /// slot via `close_by_client_id`. Called after a fill (the post-fill
     /// cooldown means neither side should rest while we hedge).
     fn cancel_both_sides(&mut self, market: &MarketId, now_ns: i64) {
         for side in [Side::Buy, Side::Sell] {
@@ -2463,59 +2467,6 @@ impl Strategy {
                     self.freeze_and_sweep(now_ns, "exec_queue_send_failed");
                 }
             }
-        }
-    }
-
-    /// Paper/shadow maker-fill detection from an Aster trade print. An OPTIMISTIC model
-    /// (ignores queue position — the research-grade fill sim is the dry-run `SimEngine`): our
-    /// resting BID fills when a sell-aggressor (`buyer_is_maker`) print lands at/below it; our
-    /// resting ASK fills when a buy-aggressor print lands at/above it. In live mode this is a
-    /// no-op — real fills arrive on the Aster user stream.
-    pub async fn handle_trade_print(&mut self, t: TradePrint, now_ns: i64) {
-        if self.exec_mode.sends_real_orders() {
-            return; // live: user stream owns fills
-        }
-        let Some(scale) = self.ctx.get(&t.market).map(|c| c.scale.clone()) else { return };
-        for side in [Side::Buy, Side::Sell] {
-            let Some(slot) = self.orders.slot(&t.market, side) else { continue };
-            if !slot.is_live() || slot.client_id.is_none() {
-                continue;
-            }
-            let our_px = scale.ticks_to_price(slot.price_ticks);
-            let remaining_lots = slot.remaining_lots();
-            if remaining_lots <= 0 {
-                continue;
-            }
-            let prior_cum_qty = scale.lots_to_qty(slot.filled_lots);
-            let our_qty = scale.lots_to_qty(remaining_lots);
-            let crosses = match side {
-                Side::Buy => t.buyer_is_maker && t.price <= our_px, // sell aggressor hits our bid
-                Side::Sell => !t.buyer_is_maker && t.price >= our_px, // buy aggressor lifts our ask
-            };
-            if !crosses {
-                continue;
-            }
-            let fill_qty = t.qty.min(our_qty);
-            if fill_qty <= Decimal::ZERO {
-                continue;
-            }
-            self.synthetic_trade_seq += 1;
-            let fill = AsterFill {
-                market: t.market.clone(),
-                aster_side: side,
-                order_id: slot.client_id.clone().unwrap_or_default(),
-                trade_id: format!("paper-{}", self.synthetic_trade_seq),
-                client_id: slot.client_id.clone().unwrap_or_default(),
-                last_fill_qty: fill_qty,
-                last_fill_px: our_px,
-                cum_filled_qty: prior_cum_qty + fill_qty,
-                event_time_ms: 0,
-                reduce_only: false,
-            commission: None,
-            commission_asset: None,
-            };
-            self.handle_maker_fill(fill, now_ns).await;
-            return; // one fill per print is enough for the paper model
         }
     }
 
@@ -2608,9 +2559,6 @@ impl Strategy {
             ExecEvent::AsterRateLimited { reason, backoff_ms } => {
                 self.on_aster_rate_limited(now_ns, reason, backoff_ms);
             }
-            ExecEvent::HedgeAck { cloid, hl_oid } => {
-                if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) { h.mark_acked(hl_oid); }
-            }
             ExecEvent::AttemptStarted { cloid, proof } => {
                 if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
                     self.last_hot_action_ns.entry(h.market.clone()).and_modify(|v| *v = (*v).max(proof.sent_ns)).or_insert(proof.sent_ns);
@@ -2626,7 +2574,7 @@ impl Strategy {
                 self.handle_definitive_reject(cloid, reason, retry, now_ns);
             }
             ExecEvent::HedgeFill { cloid, filled_qty, px, fee_usd } => {
-                // Historical test/paper event: normalize immediately to cumulative evidence.
+                // Historical per-fill event: normalize immediately to cumulative evidence.
                 if let Some(h) = self.hedges.get(&cloid.to_hex()) {
                     let qty = h.filled_qty + filled_qty;
                     let quote = h.filled_quote_usd.map(|q| q + filled_qty * px);
@@ -2681,7 +2629,6 @@ impl Strategy {
             }
         }
         if terminal && h.remaining_qty() > Decimal::ZERO { self.correction_needed.insert(h.market.clone()); }
-        if !self.exec_mode.sends_real_orders() && terminal && h.remaining_qty() == Decimal::ZERO { h.mark_reconciled(); }
         self.journal.progress(now_ns, h);
     }
 
@@ -2776,10 +2723,7 @@ impl Strategy {
     /// published snapshot generation at most once. NEVER trips on untrusted data (no
     /// snapshot yet, stale snapshot, unmarked Lighter uPnL, or non-positive equity).
     fn check_circuit_breaker(&mut self, now_ns: i64) {
-        if !self.cfg.live.circuit_breaker.enabled
-            || !self.exec_mode.sends_real_orders()
-            || self.breaker_tripped
-        {
+        if !self.cfg.live.circuit_breaker.enabled || self.breaker_tripped {
             return;
         }
         let limit = self.cfg.live.circuit_breaker.max_cumulative_loss_usdc;
@@ -2871,21 +2815,19 @@ impl Strategy {
             }
         }
         if overdue { self.freeze_and_sweep(now_ns, "execution_deadline"); }
-        if self.exec_mode.sends_real_orders() {
-            let mut expired = Vec::new();
-            for (m, inv) in &self.pending {
-                let mark = self.book(m, VenueTag::Aster).and_then(|b| b.mid()).unwrap_or(inv.avg_aster_px);
-                if inventory::check_pending_limits(inv, self.cfg.live.partials.max_pending_notional_usd,
-                    self.cfg.live.partials.max_pending_age_ms, mark, Utc::now()).is_some() {
-                    expired.push(m.clone());
-                }
+        let mut expired = Vec::new();
+        for (m, inv) in &self.pending {
+            let mark = self.book(m, VenueTag::Aster).and_then(|b| b.mid()).unwrap_or(inv.avg_aster_px);
+            if inventory::check_pending_limits(inv, self.cfg.live.partials.max_pending_notional_usd,
+                self.cfg.live.partials.max_pending_age_ms, mark, Utc::now()).is_some() {
+                expired.push(m.clone());
             }
-            for m in expired {
-                if self.correction_needed.insert(m.clone()) {
-                    self.journal.reason(now_ns, "pending_limit", Some(m.0), "pending age/notional limit");
-                }
-                self.freeze_and_sweep(now_ns, "pending_limit");
+        }
+        for m in expired {
+            if self.correction_needed.insert(m.clone()) {
+                self.journal.reason(now_ns, "pending_limit", Some(m.0), "pending age/notional limit");
             }
+            self.freeze_and_sweep(now_ns, "pending_limit");
         }
         self.recover_orphans(now_ns);
         self.publish_execution_queries();
@@ -2901,10 +2843,6 @@ impl Strategy {
     }
 
     fn recover_orphans(&mut self, now_ns: i64) {
-        if !self.exec_mode.sends_real_orders() {
-            self.hedges.retain(|_, h| !h.state.is_resolved());
-            return;
-        }
         let snap = self.account.load();
         if snap.source_ts_ns == 0 || now_ns.saturating_sub(snap.source_ts_ns) / 1_000_000 > self.cfg.live.max_account_snapshot_age_ms { return; }
         let mut need_maker_backfill = !self.uncertain_makers.is_empty();
@@ -3054,7 +2992,6 @@ async fn drain_priority_events(
     strat: &mut Strategy,
     exec_events: &mut Receiver<ExecEvent>,
     maker_fills: &mut Receiver<AsterFill>,
-    trade_prints: &mut Receiver<TradePrint>,
 ) {
     for _ in 0..PRIORITY_DRAIN_LIMIT {
         let now_ns = crate::hotpath::clock::mono_now_ns();
@@ -3069,24 +3006,17 @@ async fn drain_priority_events(
             continue;
         }
 
-        if let Ok(print) = trade_prints.try_recv() {
-            strat.handle_trade_print(print, now_ns).await;
-            continue;
-        }
-
         break;
     }
 }
 
 /// Drive the strategy: wake on a book change (the coalescing registry `Notify`) or a
 /// periodic tick, and consume worker events. Runs until `shutdown` resolves.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_strategy(
     mut strat: Strategy,
     wake: Arc<Notify>,
     mut exec_events: Receiver<ExecEvent>,
     mut maker_fills: Receiver<AsterFill>,
-    mut trade_prints: Receiver<TradePrint>,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     use crate::hotpath::clock::mono_now_ns;
@@ -3101,7 +3031,7 @@ pub async fn run_strategy(
         // BIASED: the latency-critical fill->hedge and hedge-event arms are polled FIRST, so a
         // pending maker fill deterministically preempts the reprice-all-markets (`wake`) and cold
         // `on_tick` work instead of waiting behind it (random select could schedule them first).
-        // Order: shutdown > maker fills > exec events > paper trade prints > tick > wake. `tick`
+        // Order: shutdown > maker fills > exec events > tick > wake. `tick`
         // precedes `wake` so the recovery/deadman tick is never starved by a continuously-ready
         // book `wake`. This is a tie-break change only (same handlers); on a fast VPS it removes
         // head-of-line jitter from the hot path.
@@ -3113,9 +3043,6 @@ pub async fn run_strategy(
             }
             Some(ev) = exec_events.recv() => {
                 dispatch_execution_event(&mut strat, ev, mono_now_ns()).await;
-            }
-            Some(print) = trade_prints.recv() => {
-                strat.handle_trade_print(print, mono_now_ns()).await;
             }
             _ = tick.tick() => {
                 let now_ns = mono_now_ns();
@@ -3159,7 +3086,7 @@ pub async fn run_strategy(
                 for i in 0..n_markets {
                     let m = strat.markets[i].clone();
                     strat.reprice_market(&m, now, now_ns, force).await;
-                    drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+                    drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
                 }
                 crate::metrics::TICK_REPRICE.record((mono_now_ns() - t0_tick) as u64);
             }
@@ -3174,7 +3101,7 @@ pub async fn run_strategy(
                             for i in 0..n_markets {
                                 let m = strat.markets[i].clone();
                                 strat.reprice_market(&m, now, now_ns, false).await;
-                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
                             }
                         } else {
                             dirty.take_into(&mut dirty_idx_buf);
@@ -3186,7 +3113,7 @@ pub async fn run_strategy(
                             );
                             for m in &dirty_market_buf {
                                 strat.reprice_market(m, now, now_ns, false).await;
-                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
                             }
                         }
                     }
@@ -3195,7 +3122,7 @@ pub async fn run_strategy(
                         for i in 0..n_markets {
                             let m = strat.markets[i].clone();
                             strat.reprice_market(&m, now, now_ns, false).await;
-                            drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+                            drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
                         }
                     }
                 }
@@ -3212,13 +3139,11 @@ pub async fn run_strategy(
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(65);
     let mut drain_tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
     loop {
-        drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills, &mut trade_prints).await;
+        drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
         let now_ns = mono_now_ns();
         let barrier_ns = strat.drain_control.as_ref().map(|c| c.maker_barrier.completed_ns()).unwrap_or(1);
         let snap = strat.account.load();
-        let maker_clear = if strat.exec_mode.sends_real_orders() {
-            barrier_ns > 0 && snap.read_start_ns > barrier_ns && !strat.has_open_aster_bot_orders_in(&snap)
-        } else { true };
+        let maker_clear = barrier_ns > 0 && snap.read_start_ns > barrier_ns && !strat.has_open_aster_bot_orders_in(&snap);
         if maker_clear && strat.uncertain_makers.is_empty() && strat.hedges.is_empty() && strat.pending.is_empty() && strat.correction_needed.is_empty()
             && maker_fills.is_empty() && exec_events.is_empty() && strat.orders.live_slots().is_empty() {
             info!("strategy quiesced with all execution evidence reconciled");
@@ -3380,7 +3305,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         strat
             .registry
@@ -3399,7 +3324,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let crossed = OrderBook::from_levels(
             vec![(dec!(100.10), dec!(2))],
@@ -3423,7 +3348,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         strat
             .registry
@@ -3446,7 +3371,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         strat
             .registry
@@ -3469,7 +3394,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         publish_hl_l2_hot(&strat, books().1, 1_000_000);
         publish_hl_bbo_hot(&strat, hl_bbo_at(dec!(2.1), dec!(2.1), ts()), 1_000_000);
@@ -3491,7 +3416,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         publish_hl_l2_hot(&strat, books().1, 1_000_000);
         // Bid is too thin for a SELL hedge, ask is deep enough for a BUY hedge.
@@ -3517,7 +3442,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let newer = ts() + chrono::Duration::milliseconds(10);
         let l2 = OrderBook::from_levels(
@@ -3542,7 +3467,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         publish_hl_l2_hot(&strat, books().1, 1_000_000);
         publish_hl_bbo_hot(&strat, hl_bbo_at(dec!(2.1), dec!(2.1), ts()), 1_000_000);
@@ -3552,7 +3477,7 @@ mod tests {
             aster_side: Side::Buy,
             order_id: "oid-fill-hot".into(),
             trade_id: "trade-fill-hot".into(),
-            client_id: "cid-fill-hot".into(),
+            client_id: strat.orders.next_client_id(&m, Side::Buy).unwrap(),
             last_fill_qty: dec!(0.2),
             last_fill_px: dec!(100),
             cum_filled_qty: dec!(0.2),
@@ -3582,7 +3507,7 @@ mod tests {
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(8);
         let (htx, _hrx) = tokio::sync::mpsc::channel(8);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let (ptx, mut prx) = tokio::sync::mpsc::channel(1); // depth 1: makes "full" testable
         strat.set_exec_prio_lane(ptx);
         let m: MarketId = "BTC".into();
@@ -3632,14 +3557,14 @@ mod tests {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let mut strat = live_strat(etx, htx, account.clone());
         publish_hl_l2_hot(&strat, books().1, 1_000_000);
         publish_hl_bbo_hot(&strat, hl_bbo_at(dec!(2.1), dec!(2.1), ts()), 1_000_000);
+        let client_id = strat.orders.next_client_id(&"BTC".into(), Side::Buy).unwrap();
 
         let wake = Arc::new(tokio::sync::Notify::new());
         let (ev_tx, ev_rx) = tokio::sync::mpsc::channel(16);
         let (fill_tx, fill_rx) = tokio::sync::mpsc::channel(16);
-        let (_tp_tx, tp_rx) = tokio::sync::mpsc::channel(16);
         let shutdown = tokio_util::sync::CancellationToken::new();
         shutdown.cancel();
         fill_tx
@@ -3648,7 +3573,7 @@ mod tests {
                 aster_side: Side::Buy,
                 order_id: "oid-drain".into(),
                 trade_id: "trade-drain".into(),
-                client_id: "cid-drain".into(),
+                client_id,
                 last_fill_qty: dec!(0.2),
                 last_fill_px: dec!(100),
                 cum_filled_qty: dec!(0.2),
@@ -3661,11 +3586,22 @@ mod tests {
             .unwrap();
         drop(fill_tx); // mirrors the userstream's shutdown arm dropping its sender
 
-        let task = tokio::spawn(run_strategy(strat, wake, ev_rx, fill_rx, tp_rx, shutdown));
+        let task = tokio::spawn(run_strategy(strat, wake, ev_rx, fill_rx, shutdown));
         let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), hrx.recv()).await.unwrap().unwrap();
-        assert!(matches!(cmd, HedgeCommand::Hedge { .. }));
-        for event in super::super::exec::PaperExec::new().on_hedge_command(cmd) { ev_tx.send(event).await.unwrap(); }
-        tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+        let HedgeCommand::Hedge { intent, aggressive_px, .. } = cmd else { panic!("hedge expected") };
+        // The Lighter worker reports the IOC fully filled...
+        ev_tx.send(ExecEvent::ExecutionProgress { cloid: intent.cloid, cumulative_qty: intent.qty,
+            cumulative_quote_usd: Some(intent.qty * aggressive_px), cumulative_fee_usd: Some(Decimal::ZERO),
+            terminal: true, venue_order_id: None, event_time_ms: None }).await.unwrap();
+        // ...and the reconciler's later snapshots confirm both legs, which ends the drain.
+        let drained = async {
+            while !task.is_finished() {
+                account.publish(funded_snapshot(crate::hotpath::clock::mono_now_ns(), dec!(0.2), dec!(-0.2)));
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            task.await
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), drained).await.unwrap().unwrap().unwrap();
     }
 
 
@@ -3980,6 +3916,15 @@ mod tests {
     }
 
     #[test]
+    fn quote_too_close_maps_to_specific_cancel_reason() {
+        assert_eq!(
+            ReplaceReason::from_reject(RejectReason::QuoteTooCloseToTouch),
+            ReplaceReason::QuoteTooCloseToTouch
+        );
+        assert_eq!(ReplaceReason::QuoteTooCloseToTouch.as_str(), "QUOTE_TOO_CLOSE_TO_TOUCH");
+    }
+
+    #[test]
     fn requote_deadband_holds_within_min_bps_but_replaces_beyond() {
         let (a, h) = books();
         let pos = PositionContext::unconstrained();
@@ -4034,22 +3979,8 @@ max_hedge_slippage_bps = "50.0"
 min_requote_interval_ms = 20
 price_change_ticks_to_requote = 1
 clamp_to_min_lot = true
-[simulation]
-simulated_aster_place_latency_ms = 25
-simulated_aster_cancel_latency_ms = 25
-quote_ttl_ms = 500
-hedge_latency_buckets_ms = [50]
+[live]
 max_book_staleness_ms = 5000
-[partials]
-strict_all_partials_must_be_hedgeable = false
-accumulate_sub_min_fills = true
-lighter_min_notional = "10"
-max_pending_inventory_notional = "25"
-max_pending_inventory_age_ms = 1000
-mark_pending_inventory_to_market = true
-[queue_model]
-models = ["optimistic"]
-hidden_queue_multiplier = "1.0"
 [[markets]]
 aster_symbol = "BTCUSDT"
 lighter_symbol = "BTC"
@@ -4072,14 +4003,15 @@ lighter_symbol = "BTC"
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
-            full_cfg(), &specs, &elig, reg.clone(), account, Journal::null(),
-            SessionId::from_tag("t"), etx, htx, ExecMode::Paper,
+            full_cfg(), &specs, &elig, reg.clone(), account.clone(), Journal::null(),
+            SessionId::from_tag("t"), etx, htx,
         );
         let now = mono_now_ns();
+        account.publish(funded_snapshot(now, Decimal::ZERO, Decimal::ZERO));
         // Before clean-start: no quoting (invariant 7).
         assert!(!strat.may_quote(&"BTC".into(), now));
-        // After clean-start + fresh per-market feeds: quoting allowed (paper: account/position
-        // checks are vacuous, no hedges in flight).
+        // After clean-start + fresh per-market feeds: quoting allowed (fresh flat account
+        // snapshot, positions reconciled, no hedges in flight).
         strat.mark_clean_start();
         assert!(strat.may_quote(&"BTC".into(), now));
         // A REST-divergent feed on THIS market closes quoting for it (per-market, not global).
@@ -4087,8 +4019,10 @@ lighter_symbol = "BTC"
         assert!(!strat.may_quote(&"BTC".into(), now));
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().mark_divergent(false);
         assert!(strat.may_quote(&"BTC".into(), now));
-        // A stale book also closes quoting (evaluated >max_book_staleness_ms past the publish).
+        // A stale book also closes quoting (evaluated >max_book_staleness_ms past the publish),
+        // even with a fresh account snapshot.
         let stale_now = now + 10_000_000_000; // +10s
+        account.publish(funded_snapshot(stale_now, Decimal::ZERO, Decimal::ZERO));
         assert!(!strat.may_quote(&"BTC".into(), stale_now));
         // A latched freeze (e.g. hedge reject) stops quoting even with everything else green.
         strat.freeze(now, "test");
@@ -4108,9 +4042,10 @@ lighter_symbol = "BTC"
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
-            full_cfg(), &specs, &elig, reg.clone(), account, Journal::null(),
-            SessionId::from_tag("t"), etx, htx, ExecMode::Paper,
+            full_cfg(), &specs, &elig, reg.clone(), account.clone(), Journal::null(),
+            SessionId::from_tag("t"), etx, htx,
         );
+        account.publish(funded_snapshot(mono_now_ns(), Decimal::ZERO, Decimal::ZERO));
         strat.mark_clean_start();
         assert!(strat.may_quote(&"BTC".into(), mono_now_ns()));
         // A KNOWN disconnect closes the gate immediately, even though the book is still young.
@@ -4133,7 +4068,7 @@ lighter_symbol = "BTC"
     #[test]
     fn correction_waits_for_its_venue_and_reduces_only_the_net_delta() {
         let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account,ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
         strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().mark_stream_down(); strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),now);
         assert!(hrx.try_recv().is_err() && erx.try_recv().is_err()); let (_,book)=books(); strat.registry.cell(&m,VenueTag::Hyperliquid).unwrap().publish(book);
         strat.dispatch_correction(&m,dec!(0.05),dec!(-0.95),dec!(1),crate::hotpath::clock::mono_now_ns());
@@ -4145,7 +4080,7 @@ lighter_symbol = "BTC"
     #[test]
     fn terminal_partial_keeps_one_executable_lot_as_a_residual() {
         let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account,ExecMode::Paper); let m:MarketId="BTC".into(); let id=strat.orders.next_attempt_id(&m);
+        let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let id=strat.orders.next_attempt_id(&m);
         strat.hedges.insert(id.to_hex(),HedgeIntent::with_qty(id,m.clone(),Side::Sell,dec!(0.5),dec!(100),1));
         strat.apply_execution_progress(id,dec!(0.499),Some(dec!(49.9)),Some(dec!(0)),true,None,Some(1700000000000),2);
         assert_eq!(strat.hedges[&id.to_hex()].remaining_qty(),dec!(0.001)); assert!(!strat.hedges[&id.to_hex()].state.is_resolved()); assert!(strat.correction_needed.contains(&m));
@@ -4161,11 +4096,11 @@ lighter_symbol = "BTC"
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
         reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
         let account = AccountState::default();
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
+        let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
         let mut strat = Strategy::new(
             full_cfg(), &specs, &elig, reg, account, Journal::null(),
-            SessionId::from_tag("t"), etx, htx, ExecMode::Paper,
+            SessionId::from_tag("t"), etx, htx,
         );
         strat.mark_clean_start();
         let now = mono_now_ns();
@@ -4179,7 +4114,10 @@ lighter_symbol = "BTC"
         let h = strat.hedges.get(&cloid.to_hex()).unwrap();
         assert_eq!(h.state, crate::livebot::fills::HedgeState::Unknown);
         assert!(h.state.is_dangerous());
-        assert_eq!(strat.maker_gate_reason(&"BTC".into(), now), Some("FROZEN"));
+        assert!(strat.frozen);
+        // The freeze also requests a safety sweep, which gates quoting until it clears.
+        assert!(matches!(erx.try_recv(), Ok(ExecCommand::CancelAllBot)));
+        assert_eq!(strat.maker_gate_reason(&"BTC".into(), now), Some("SAFETY_SWEEP_PENDING"));
     }
 
     #[test]
@@ -4231,7 +4169,6 @@ lighter_symbol = "BTC"
         etx: tokio::sync::mpsc::Sender<ExecCommand>,
         htx: tokio::sync::mpsc::Sender<HedgeCommand>,
         account: AccountState,
-        mode: ExecMode,
     ) -> Strategy {
         let specs = vec![spec()];
         let elig: HashMap<MarketId, bool> = [("BTC".into(), true)].into_iter().collect();
@@ -4239,7 +4176,7 @@ lighter_symbol = "BTC"
         let (ab, hb) = books();
         reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().publish(ab);
         reg.cell(&"BTC".into(), VenueTag::Hyperliquid).unwrap().publish(hb);
-        Strategy::new(full_cfg(), &specs, &elig, reg, account, Journal::null(), SessionId::from_tag("t"), etx, htx, mode)
+        Strategy::new(full_cfg(), &specs, &elig, reg, account, Journal::null(), SessionId::from_tag("t"), etx, htx)
     }
 
     #[test]
@@ -4247,7 +4184,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         strat.cfg.quote.min_aster_touch_distance_bps = dec!(24.0);
         strat.cfg.quote.min_aster_touch_hysteresis_bps = dec!(1.0);
         strat.cfg.quote.max_aster_touch_hysteresis_ms = 300_000;
@@ -4275,7 +4212,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         strat.cfg.quote.min_aster_touch_distance_bps = dec!(24.0);
         strat.cfg.quote.min_aster_touch_hysteresis_bps = dec!(1.0);
         strat.cfg.quote.max_aster_touch_hysteresis_ms = 0;
@@ -4292,11 +4229,14 @@ lighter_symbol = "BTC"
     #[tokio::test]
     async fn queued_maker_is_not_sent_after_freeze_cancel_or_book_change() {
         for cause in ["freeze", "targeted_cancel", "book_update"] {
-            let (etx, mut erx) = tokio::sync::mpsc::channel(64);
+            // Above EXEC_CANCEL_RESERVE, so the optional place is not held back.
+            let (etx, mut erx) = tokio::sync::mpsc::channel(128);
             let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-            let mut strat = live_strat(etx, htx, AccountState::default(), ExecMode::Paper);
+            let account = AccountState::default();
+            let mut strat = live_strat(etx, htx, account.clone());
             let market: MarketId = "BTC".into();
             let now = crate::hotpath::clock::mono_now_ns();
+            account.publish(funded_snapshot(now, Decimal::ZERO, Decimal::ZERO));
             let versions = (strat.ctx[&market].aster_cell.content_version(), strat.ctx[&market].hedge_cell.content_version());
             let decision = evaluate_side(&edge(), &qcfg(), &books().0, &books().1, Side::Buy,
                 &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true);
@@ -4307,9 +4247,11 @@ lighter_symbol = "BTC"
                 "targeted_cancel" => { strat.cancel_target(&market, Side::Buy, now); }
                 _ => strat.ctx[&market].hedge_cell.publish(books().1),
             }
-            let events = crate::livebot::exec::paper::PaperExec::new().on_exec_command(command);
-            assert!(matches!(events.as_slice(), [ExecEvent::PlaceReject { .. }]), "{cause}: revoked quote must never ack");
-            for event in events { strat.handle_exec_event(event, now); }
+            // The Aster worker's send-time check: a revoked permit is never claimed, only rejected.
+            let ExecCommand::Place { client_id, permit, .. } = command else { panic!("{cause}: place expected") };
+            assert!(!permit.try_claim(crate::hotpath::clock::mono_now_ns()), "{cause}: revoked quote must never be sent");
+            assert!(permit.is_cancelled(), "{cause}: revoked quote must be rejected, not left ambiguous");
+            strat.handle_exec_event(ExecEvent::PlaceReject { client_id, reason: "revoked".into() }, now);
             assert!(!strat.orders.slot(&market, Side::Buy).unwrap().is_live());
         }
     }
@@ -4318,11 +4260,12 @@ lighter_symbol = "BTC"
     async fn min_requote_interval_throttles_nonurgent_replace_only() {
         // T1.4: the live path now honors `min_requote_interval_ms`. NON-URGENT replaces (price/qty
         // drift) are throttled; an urgent `NoLongerProfitable` replace BYPASSES. (`Place`/`Cancel`
-        // are never gated.) Mirrors the SimEngine.
+        // are never gated.) Reduce-only mode would turn that urgent replace into a cancel-only.
         let account = AccountState::default();
-        let (etx, mut erx) = tokio::sync::mpsc::channel(64);
+        let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Paper);
+        let mut strat = live_strat(etx, htx, account.clone());
+        strat.cfg.live.quote.reduce_position_only = false;
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
         let desired = match evaluate_side(&edge(), &qcfg(), &books().0, &books().1, Side::Buy, &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true) {
@@ -4331,6 +4274,7 @@ lighter_symbol = "BTC"
         };
         let min_ms = full_cfg().live.quote.min_requote_interval_ms as i64; // 20 (default)
         let t0 = 1_000_000_000_i64;
+        account.publish(funded_snapshot(t0, Decimal::ZERO, Decimal::ZERO)); // fresh margin for the guard
         // Seed a resting order (records last_requote_ns = t0 + a client id).
         strat.apply_decision(&m, Side::Buy, SideDecision::Place(Box::new(desired.clone())), &scale, t0).await;
         let place_cid = match erx.try_recv() {
@@ -4363,7 +4307,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         strat.cfg.live.quote.reduce_position_only = true;
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
@@ -4399,7 +4343,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.freeze(0, "test");
         assert!(strat.frozen);
         let now = 1_000_000_000_i64;
@@ -4437,7 +4381,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         strat.mark_clean_start();
         strat.freeze(0, "exec_queue_send_failed");
@@ -4454,7 +4398,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         let m: MarketId = "BTC".into();
         strat.mark_clean_start();
         strat.freeze(0, "exec_queue_send_failed");
@@ -4495,7 +4439,7 @@ lighter_symbol = "BTC"
         let (etx, _erx) = tokio::sync::mpsc::channel(1);
         let etx_fill = etx.clone();
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
         let t0 = 1_000_000_000_i64;
@@ -4518,7 +4462,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
         let t0 = 1_000_000_000_i64;
@@ -4543,7 +4487,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
         let t0 = 1_000_000_000_i64;
@@ -4569,7 +4513,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(128);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         strat.cfg.live.aster.max_rest_requests_per_minute = 1;
         strat.cfg.live.aster.optional_rest_reserve_per_minute = 0;
         let m: MarketId = "BTC".into();
@@ -4607,7 +4551,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account, ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account);
         let m: MarketId = "BTC".into();
         let scale = MarketScale::from_spec(&spec());
         let desired = match evaluate_side(&edge(), &qcfg(), &books().0, &books().1, Side::Buy, &spec(), 5000, ts(), &PositionContext::unconstrained(), true, None, true) {
@@ -4639,7 +4583,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         let m: MarketId = "BTC".into();
         let t_action = 1_000_000_000_i64;
         strat.last_hot_action_ns.insert(m.clone(), t_action);
@@ -4703,7 +4647,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, mut hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         let m: MarketId = "BTC".into();
         strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
         let cloid = crate::livebot::ids::Cloid::recovery(&m, crate::livebot::fills::cum_scaled(dec!(0.5)));
@@ -4729,7 +4673,7 @@ lighter_symbol = "BTC"
     #[test]
     fn claimed_timeout_never_redispatches_from_position_snapshots() {
         let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
         strat.aster_pos.insert(m.clone(),SignedPosition { qty:dec!(0.5),avg_px:dec!(100) });
         let id=strat.orders.next_attempt_id(&m); let mut h=HedgeIntent::with_qty(id,m.clone(),Side::Sell,dec!(0.5),dec!(100),now-9_000_000_000);
         h.arm_admission(8000); h.mark_submitted(h.created_ns); assert!(h.admission.try_claim(h.created_ns+1)); h.check_timeout(now,8_000_000_000);
@@ -4772,7 +4716,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         let m: MarketId = "BTC".into();
         let src = 10_000_000_000_i64;
         account.publish(adopt_snapshot_for(&m, (dec!(0.5), dec!(101)), (dec!(-0.3), dec!(102)), src));
@@ -4788,7 +4732,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         let m: MarketId = "BTC".into();
         // No snapshot at all: refuse.
         strat.adopt_reported_positions(1_000_000_000);
@@ -4802,22 +4746,9 @@ lighter_symbol = "BTC"
     }
 
     #[test]
-    fn adopt_is_noop_in_paper() {
-        let account = AccountState::default();
-        let (etx, _erx) = tokio::sync::mpsc::channel(16);
-        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Paper);
-        let m: MarketId = "BTC".into();
-        let src = 10_000_000_000_i64;
-        account.publish(adopt_snapshot_for(&m, (dec!(0.5), dec!(101)), (dec!(-0.5), dec!(102)), src));
-        strat.adopt_reported_positions(src + 1_000_000);
-        assert!(strat.aster_pos.is_empty() && strat.hl_pos.is_empty(), "paper must not adopt");
-    }
-
-    #[test]
     fn confirmed_restart_imbalance_reduces_the_excess_leg() {
         let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let now=crate::hotpath::clock::mono_now_ns();
+        let mut strat=live_strat(etx,htx,account.clone()); let now=crate::hotpath::clock::mono_now_ns();
         account.publish(funded_snapshot(now,dec!(0.5),dec!(0))); strat.adopt_reported_positions(now+1); strat.recover_orphans(now+2);
         account.publish(funded_snapshot(now+3,dec!(0.5),dec!(0))); strat.recover_orphans(now+4);
         assert!(std::iter::from_fn(||erx.try_recv().ok()).any(|cmd| matches!(cmd,ExecCommand::FlattenAster { intent,.. } if intent.qty==dec!(0.5) && intent.hedge_side==Side::Sell && intent.purpose==IntentPurpose::ReduceDelta)));
@@ -4827,7 +4758,7 @@ lighter_symbol = "BTC"
     #[tokio::test]
     async fn maker_backfill_then_late_private_fill_hedges_quantity_once() {
         let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(16); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
         let client=strat.orders.next_client_id(&m,Side::Buy).unwrap(); strat.orders.on_place_sent(&m,Side::Buy,client.clone(),10000,500,now);
         strat.orders.on_acked(&m,Side::Buy,"17".into()); account.publish(funded_snapshot(now+1,dec!(0.5),dec!(0))); strat.recover_orphans(now+2);
         assert!(!account.maker_queries().is_empty()); assert!(hrx.try_recv().is_err());
@@ -4860,7 +4791,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, mut erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.cfg.live.circuit_breaker.enabled = true;
         strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
         let tok = CancellationToken::new();
@@ -4931,7 +4862,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.cfg.live.circuit_breaker.enabled = true;
         strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
         let tok = CancellationToken::new();
@@ -4966,43 +4897,24 @@ lighter_symbol = "BTC"
     }
 
     #[test]
-    fn circuit_breaker_inert_in_paper_and_never_trips_on_stale_or_zero() {
+    fn circuit_breaker_never_trips_on_stale_snapshot() {
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(16);
         let (htx, _hrx) = tokio::sync::mpsc::channel(16);
-        // Paper mode: breaker is gated off entirely even with a huge drawdown.
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Paper);
+        // A STALE snapshot (age > max_account_snapshot_age_ms) must never trip.
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.cfg.live.circuit_breaker.enabled = true;
         strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
         let tok = CancellationToken::new();
-        strat.arm_circuit_breaker(tmp_trip_path("paper"), tok.clone());
+        strat.arm_circuit_breaker(tmp_trip_path("stale"), tok.clone());
         let now = 2_000_000_000_i64;
-        account.publish(equity_snap(dec!(100), now));
-        strat.check_circuit_breaker(now);
-        account.publish(equity_snap(dec!(10), now + 1_000_000));
-        strat.check_circuit_breaker(now + 1_000_000);
-        assert!(!strat.breaker_tripped, "paper mode must never trip");
-        assert!(!tok.is_cancelled());
-        assert!(strat.breaker_baseline_equity.is_none(), "paper mode must not even arm a baseline");
-
-        // Live, but a STALE snapshot (age > max_account_snapshot_age_ms) must never trip.
-        let mut strat2 = live_strat(
-            tokio::sync::mpsc::channel(16).0,
-            tokio::sync::mpsc::channel(16).0,
-            account.clone(),
-            ExecMode::Live,
-        );
-        strat2.cfg.live.circuit_breaker.enabled = true;
-        strat2.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
-        let tok2 = CancellationToken::new();
-        strat2.arm_circuit_breaker(tmp_trip_path("stale"), tok2.clone());
         account.publish(equity_snap(dec!(100), now));
         // now_ns is far ahead of the snapshot's source_ts_ns => age >> max age => skip (no baseline).
         let way_later = now + 10_000 * 1_000_000;
-        strat2.check_circuit_breaker(way_later);
-        assert!(strat2.breaker_baseline_equity.is_none(), "stale snapshot must not arm/trip");
-        assert_eq!(strat2.breaker_breach_streak, 0, "stale sample must reset the breach streak");
-        assert!(!tok2.is_cancelled());
+        strat.check_circuit_breaker(way_later);
+        assert!(strat.breaker_baseline_equity.is_none(), "stale snapshot must not arm/trip");
+        assert_eq!(strat.breaker_breach_streak, 0, "stale sample must reset the breach streak");
+        assert!(!tok.is_cancelled());
     }
 
     /// A live strategy with the breaker enabled (limit 5) and an armed baseline of 100,
@@ -5014,7 +4926,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.cfg.live.circuit_breaker.enabled = true;
         strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
         let tok = CancellationToken::new();
@@ -5090,7 +5002,7 @@ lighter_symbol = "BTC"
         let account = AccountState::default();
         let (etx, _erx) = tokio::sync::mpsc::channel(64);
         let (htx, _hrx) = tokio::sync::mpsc::channel(64);
-        let mut strat = live_strat(etx, htx, account.clone(), ExecMode::Live);
+        let mut strat = live_strat(etx, htx, account.clone());
         strat.cfg.live.circuit_breaker.enabled = true;
         strat.cfg.live.circuit_breaker.max_cumulative_loss_usdc = dec!(5);
         let tok = CancellationToken::new();
@@ -5146,7 +5058,7 @@ lighter_symbol = "BTC"
     fn real_margin_reserves_resting_hedges_but_allows_reduction() {
         let account=AccountState::default();
         let (etx,_erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account.clone(),ExecMode::Live); let m:MarketId="BTC".into();
+        let mut strat=live_strat(etx,htx,account.clone()); let m:MarketId="BTC".into();
         let now=crate::hotpath::clock::mono_now_ns();
         let mut snap=funded_snapshot(now,dec!(0),dec!(0)); snap.hl_withdrawable_usd=dec!(1); account.publish(snap);
         assert!(!strat.margin_allows(&m,Side::Buy,dec!(0.13),dec!(100),now));
@@ -5164,7 +5076,7 @@ lighter_symbol = "BTC"
     #[test]
     fn correction_dispatch_has_two_attempt_incident_limit() {
         let account=AccountState::default(); let (etx,mut erx)=tokio::sync::mpsc::channel(128); let (htx,_hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account,ExecMode::Live); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
+        let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into(); let now=crate::hotpath::clock::mono_now_ns();
         for attempt in 0..2 {
             strat.dispatch_correction(&m,dec!(0.05),dec!(0.05),dec!(0),now+attempt);
             let command=erx.try_recv().unwrap();
@@ -5180,15 +5092,16 @@ lighter_symbol = "BTC"
     #[tokio::test]
     async fn partials_netting_and_retry_share_one_economic_logical_id() {
         let account=AccountState::default(); let (etx,_erx)=tokio::sync::mpsc::channel(128); let (htx,mut hrx)=tokio::sync::mpsc::channel(16);
-        let mut strat=live_strat(etx,htx,account,ExecMode::Paper); let m:MarketId="BTC".into();
+        let mut strat=live_strat(etx,htx,account); let m:MarketId="BTC".into();
         let (journal,rx)=Journal::channel(); strat.journal=journal.clone();
         let fill=|client:&str,side:Side,id:&str,last:Decimal,cum:Decimal| AsterFill { market:m.clone(),aster_side:side,order_id:client.into(),trade_id:id.into(),client_id:client.into(),last_fill_qty:last,last_fill_px:dec!(100),cum_filled_qty:cum,event_time_ms:1700000000000,reduce_only:false,commission:Some(dec!(0)),commission_asset:Some("USDT".into()) };
         let now=crate::hotpath::clock::mono_now_ns();
-        strat.handle_maker_fill(fill("buy",Side::Buy,"1",dec!(0.03),dec!(0.03)),now).await;
+        let buy=strat.orders.next_client_id(&m,Side::Buy).unwrap(); let sell=strat.orders.next_client_id(&m,Side::Sell).unwrap();
+        strat.handle_maker_fill(fill(&buy,Side::Buy,"1",dec!(0.03),dec!(0.03)),now).await;
         let logical=strat.logical_ids[&m]; assert!(hrx.try_recv().is_err());
-        strat.handle_maker_fill(fill("sell",Side::Sell,"2",dec!(0.01),dec!(0.01)),now+1).await;
+        strat.handle_maker_fill(fill(&sell,Side::Sell,"2",dec!(0.01),dec!(0.01)),now+1).await;
         assert_eq!(strat.pending[&m].signed_qty,dec!(0.02));
-        strat.handle_maker_fill(fill("buy",Side::Buy,"3",dec!(0.03),dec!(0.06)),now+2).await;
+        strat.handle_maker_fill(fill(&buy,Side::Buy,"3",dec!(0.03),dec!(0.06)),now+2).await;
         let HedgeCommand::Hedge { intent,.. }=hrx.try_recv().unwrap() else {panic!("hedge expected")};
         assert_eq!(intent.qty,dec!(0.05)); assert_eq!(intent.logical_id,logical);
         strat.handle_exec_event(ExecEvent::AttemptNotSent { cloid:intent.cloid,reason:"not sent".into() },now+3);

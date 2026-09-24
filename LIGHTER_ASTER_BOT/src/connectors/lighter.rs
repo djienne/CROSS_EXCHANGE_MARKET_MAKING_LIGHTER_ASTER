@@ -7,14 +7,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 use tracing::warn;
 
-use super::{EventSink, Tap};
+use super::Tap;
 use crate::decimal::parse_dec;
 use rust_decimal::Decimal;
-use crate::events::{EventKind, PriceLevel};
+use crate::book::PriceLevel;
 use crate::lighter::local_book::LocalBook;
 use crate::lighter::messages::{BookUpdateContiguity, OrderBookMsgRef, PriceLevelRef};
 use crate::lighter::ws::{subscribe_loop, SubscribeOptions};
-use crate::types::MarketId;
 
 const PUBLISH_LEVELS: usize = 20;
 
@@ -35,27 +34,9 @@ impl StreamState {
 
 }
 
-pub async fn run(
-    market_id: u32,
-    label: String,
-    market: MarketId,
-    tx: tokio::sync::mpsc::UnboundedSender<(MarketId, EventKind)>,
-) {
-    run_with_tap(
-        market_id,
-        label,
-        market,
-        EventSink::lossless(tx),
-        Tap::none(),
-    )
-    .await
-}
-
 pub async fn run_with_tap(
     market_id: u32,
     label: String,
-    market: MarketId,
-    tx: EventSink,
     tap: Tap,
 ) {
     let channel = format!("order_book/{market_id}");
@@ -81,7 +62,7 @@ pub async fn run_with_tap(
         Some(reconnect),
         move |frame| {
             let mut state = state.lock().expect("Lighter stream book state poisoned");
-            if !handle_raw(frame.raw, &market, &tx, &tap, &mut state) {
+            if !handle_raw(frame.raw, &tap, &mut state) {
                 state.gap_resyncs += 1;
                 warn!(
                     "Lighter order_book sequence gap for market {} (resync #{}); reconnecting for fresh snapshot",
@@ -110,8 +91,6 @@ pub async fn run_with_tap(
 #[cfg(test)]
 fn handle_value(
     data: &serde_json::Value,
-    market: &MarketId,
-    tx: &EventSink,
     tap: &Tap,
     state: &mut StreamState,
 ) -> bool {
@@ -121,13 +100,11 @@ fn handle_value(
     if data.get("timestamp").is_none() {
         data["timestamp"] = serde_json::json!(Utc::now().timestamp_millis());
     }
-    handle_raw(&data.to_string(), market, tx, tap, state)
+    handle_raw(&data.to_string(), tap, state)
 }
 
 fn handle_raw(
     raw: &str,
-    market: &MarketId,
-    tx: &EventSink,
     tap: &Tap,
     state: &mut StreamState,
 ) -> bool {
@@ -190,16 +167,12 @@ fn handle_raw(
         .asks
         .top_ascending(PUBLISH_LEVELS)
         .collect();
-    #[cfg(feature = "hotpath")]
     let prebuilt_hot = tap.hot_book_from_levels(&bid_levels, &ask_levels, exch_ts);
-    #[cfg(feature = "hotpath")]
     if let Some((hot, _)) = prebuilt_hot.as_ref() {
         // Integer projection first (mirrors the Aster connector): fast-cancel
         // prechecks see the move before the raw Decimal book is installed.
         tap.publish_hot_only(*hot, exch_ts);
     }
-    #[cfg(not(feature = "hotpath"))]
-    let prebuilt_hot = None;
     tap.publish_prebuilt(&bid_levels, &ask_levels, exch_ts, prebuilt_hot);
     // Lighter has no separate bookTicker stream (Aster does), so mirror the L2
     // top-of-book into the optional BBO fast-path slot. Without this the slot is
@@ -211,24 +184,13 @@ fn handle_raw(
     // No hot-only pre-publish either — that half of the pair exists for Aster's
     // independent bookTicker stream, not for a mirror of the frame just published.
     if let (Some(&bid_top), Some(&ask_top)) = (bid_levels.first(), ask_levels.first()) {
-        #[cfg(feature = "hotpath")]
         let bbo_hot = tap.hot_book_from_levels(
             std::slice::from_ref(&bid_top),
             std::slice::from_ref(&ask_top),
             exch_ts,
         );
-        #[cfg(not(feature = "hotpath"))]
-        let bbo_hot = None;
         tap.publish_bbo_price_wake_prebuilt(bid_top, ask_top, exch_ts, bbo_hot);
     }
-    tx.send(
-        market.clone(),
-        EventKind::HlL2Book {
-            bids: bid_levels,
-            asks: ask_levels,
-            exch_ts,
-        },
-    );
     tap.touch();
     true
 }
@@ -252,14 +214,36 @@ fn parse_lighter_levels(levels: &[PriceLevelRef<'_>]) -> Option<Vec<(Decimal, De
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use crate::book::OrderBook;
+    use crate::connectors::BookTap;
+
+    /// Records each full-book publish, standing in for the hot-path cell.
+    #[derive(Default)]
+    struct Published(Mutex<Vec<OrderBook>>);
+
+    impl BookTap for Published {
+        fn publish(&self, book: OrderBook) {
+            self.0.lock().unwrap().push(book);
+        }
+        fn touch(&self) {}
+    }
+
+    impl Published {
+        /// The books published since the last call.
+        fn take(&self) -> Vec<OrderBook> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    fn recording_tap() -> (Arc<Published>, Tap) {
+        let published = Arc::new(Published::default());
+        let tap = Tap { book: Some(published.clone() as Arc<dyn BookTap>), ..Tap::none() };
+        (published, tap)
+    }
 
     #[test]
     fn published_levels_preserve_exchange_tick_values() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
         let snapshot = serde_json::json!({
             "type": "subscribed/order_book",
@@ -273,37 +257,28 @@ mod tests {
                 "offset": 1
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
-        let (_, kind) = rx.try_recv().expect("book published");
-        let EventKind::HlL2Book { bids, asks, .. } = kind else {
-            panic!("expected HlL2Book event");
-        };
+        assert!(handle_value(&snapshot, &tap, &mut state));
+        let book = published.take().pop().expect("book published");
         // Bids best-first (highest price), asks best-first (lowest price).
-        assert_eq!(bids.len(), 2);
-        assert_eq!(bids[0].0.to_string(), "64820.2");
-        assert_eq!(bids[0].1.to_string(), "0.00051");
-        assert_eq!(bids[1].0.to_string(), "0.30000000000000004");
-        assert_eq!(bids[1].1.to_string(), "1");
-        assert_eq!(asks[0].0.to_string(), "64820.3");
-        assert_eq!(asks[0].1.to_string(), "0.19283");
+        assert_eq!(book.bids.len(), 2);
+        assert_eq!(book.bids[0].px.to_string(), "64820.2");
+        assert_eq!(book.bids[0].qty.to_string(), "0.00051");
+        assert_eq!(book.bids[1].px.to_string(), "0.30000000000000004");
+        assert_eq!(book.bids[1].qty.to_string(), "1");
+        assert_eq!(book.asks[0].px.to_string(), "64820.3");
+        assert_eq!(book.asks[0].qty.to_string(), "0.19283");
     }
 
     #[test]
-    #[cfg(feature = "hotpath")]
     fn handle_value_mirrors_l2_top_into_bbo_slot() {
         // Lighter has no bookTicker stream; the connector mirrors the L2 top-of-book
         // into the BBO slot so the hedge fast path can engage and qdiag stops showing
         // hl_bbo=none. Regression guard: the slot must be populated with exactly the
         // top level of each side.
-        use crate::connectors::BookTap;
         use crate::hotpath::book_cell::VenueBook;
-        use std::sync::Arc;
 
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
         let cell = Arc::new(VenueBook::new());
         let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
-        let market = MarketId("BTC".to_string());
         let mut state = StreamState::default();
         // Decimal prices and quantities retain the exact wire values.
         // yields clean strings.
@@ -316,7 +291,7 @@ mod tests {
                 "offset": 1
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&snapshot, &tap, &mut state));
 
         let bbo = cell.load_bbo().expect("BBO slot populated from L2 top");
         let bid = bbo.best_bid().expect("bbo bid");
@@ -331,10 +306,7 @@ mod tests {
 
     #[test]
     fn handle_value_detects_orderbook_nonce_gap() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -345,9 +317,9 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&snapshot, &tap, &mut state));
         assert_eq!(state.last_nonce, Some(10));
-        assert!(rx.try_recv().is_ok());
+        assert_eq!(published.take().len(), 1);
 
         // begin_nonce ahead of our position => updates were missed => resync.
         let gap = serde_json::json!({
@@ -359,15 +331,12 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(!handle_value(&gap, &market, &sink, &tap, &mut state));
+        assert!(!handle_value(&gap, &tap, &mut state));
     }
 
     #[test]
     fn handle_value_applies_forward_extending_nonce_overlap() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -378,8 +347,8 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
-        let _ = rx.try_recv();
+        assert!(handle_value(&snapshot, &tap, &mut state));
+        published.take();
 
         // Levels carry absolute sizes, so an overlap that extends forward is safe to apply.
         let overlap = serde_json::json!({
@@ -391,17 +360,14 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(handle_value(&overlap, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&overlap, &tap, &mut state));
         assert_eq!(state.last_nonce, Some(11));
-        assert!(rx.try_recv().is_ok(), "applied overlap must publish");
+        assert_eq!(published.take().len(), 1, "applied overlap must publish");
     }
 
     #[test]
     fn handle_value_skips_stale_nonce_replay_without_resync() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -412,8 +378,8 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
-        let _ = rx.try_recv();
+        assert!(handle_value(&snapshot, &tap, &mut state));
+        published.take();
 
         // Ends at-or-before our position: a replay. Dropped, book kept, no resync.
         let stale = serde_json::json!({
@@ -425,17 +391,14 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(handle_value(&stale, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&stale, &tap, &mut state));
         assert_eq!(state.last_nonce, Some(10), "stale replay must not move the position");
-        assert!(rx.try_recv().is_err(), "stale replay must not publish");
+        assert!(published.take().is_empty(), "stale replay must not publish");
     }
 
     #[test]
     fn handle_value_detects_orderbook_offset_gap_without_nonce() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
         let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -446,7 +409,7 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&snapshot, &tap, &mut state));
         assert_eq!(state.book.last_offset, Some(10));
 
         let gap = serde_json::json!({
@@ -457,15 +420,12 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(!handle_value(&gap, &market, &sink, &tap, &mut state));
+        assert!(!handle_value(&gap, &tap, &mut state));
     }
 
     #[test]
     fn handle_value_skips_duplicate_offset_without_resync() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -476,8 +436,8 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
-        let _ = rx.try_recv();
+        assert!(handle_value(&snapshot, &tap, &mut state));
+        published.take();
 
         // Same offset re-delivered: a duplicate, not a gap — no reconnect churn.
         let dup = serde_json::json!({
@@ -488,9 +448,9 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(handle_value(&dup, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&dup, &tap, &mut state));
         assert_eq!(state.book.last_offset, Some(10));
-        assert!(rx.try_recv().is_err(), "duplicate must not publish");
+        assert!(published.take().is_empty(), "duplicate must not publish");
 
         // The next contiguous delta still applies and preserves a known offset even if
         // the message itself omits one elsewhere in the pipeline.
@@ -502,16 +462,13 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(handle_value(&next, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&next, &tap, &mut state));
         assert_eq!(state.book.last_offset, Some(11));
     }
 
     #[test]
     fn handle_value_resyncs_on_delta_before_snapshot() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
         let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
         let mut state = StreamState::default();
 
         // A delta with no snapshot to apply it to must never seed the book.
@@ -523,16 +480,13 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(!handle_value(&delta, &market, &sink, &tap, &mut state));
+        assert!(!handle_value(&delta, &tap, &mut state));
         assert!(!state.book.initialized);
     }
 
     #[test]
     fn handle_value_rejects_delta_without_sequence_metadata() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
         let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -542,7 +496,7 @@ mod tests {
                 "asks": [{"price": "101", "size": "2"}]
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
+        assert!(handle_value(&snapshot, &tap, &mut state));
 
         let unsequenced = serde_json::json!({
             "type": "update/order_book",
@@ -551,15 +505,12 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(!handle_value(&unsequenced, &market, &sink, &tap, &mut state));
+        assert!(!handle_value(&unsequenced, &tap, &mut state));
     }
 
     #[test]
     fn handle_value_resyncs_on_malformed_level_and_keeps_zero_size_deletes() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let tap = Tap::none();
-        let market = MarketId("BTC".to_string());
+        let (published, tap) = recording_tap();
         let mut state = StreamState::default();
 
         let snapshot = serde_json::json!({
@@ -571,8 +522,8 @@ mod tests {
                 "offset": 10
             }
         });
-        assert!(handle_value(&snapshot, &market, &sink, &tap, &mut state));
-        let _ = rx.try_recv();
+        assert!(handle_value(&snapshot, &tap, &mut state));
+        published.take();
 
         // Regression pin: an explicit "0" size is a deletion, not a resync.
         let delete = serde_json::json!({
@@ -583,12 +534,9 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(handle_value(&delete, &market, &sink, &tap, &mut state));
-        let (_, kind) = rx.try_recv().expect("delete delta published");
-        let EventKind::HlL2Book { bids, .. } = kind else {
-            panic!("expected HlL2Book event");
-        };
-        assert_eq!(bids.len(), 1, "size=0 must delete the 99 level");
+        assert!(handle_value(&delete, &tap, &mut state));
+        let book = published.take().pop().expect("delete delta published");
+        assert_eq!(book.bids.len(), 1, "size=0 must delete the 99 level");
 
         // A malformed size must resync (return false), never coerce to 0.0 — that
         // would silently DELETE the level. And nothing may be published.
@@ -600,16 +548,13 @@ mod tests {
                 "asks": []
             }
         });
-        assert!(!handle_value(&malformed, &market, &sink, &tap, &mut state));
-        assert!(rx.try_recv().is_err(), "malformed delta must not publish");
+        assert!(!handle_value(&malformed, &tap, &mut state));
+        assert!(published.take().is_empty(), "malformed delta must not publish");
     }
 
     #[test]
     fn preserves_source_time_and_rejects_missing_or_future_source() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
-        let market = MarketId("BTC".into());
-        let tap = Tap::none();
+        let (published, tap) = recording_tap();
         let source = Utc::now().timestamp_millis() - 10_000;
         let mut frame = serde_json::json!({
             "type":"subscribed/order_book","timestamp":source,"order_book":{
@@ -617,12 +562,12 @@ mod tests {
             }
         });
         let mut state = StreamState::default();
-        assert!(handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
-        let (_, EventKind::HlL2Book { exch_ts, .. }) = rx.try_recv().unwrap() else { panic!("book expected"); };
-        assert_eq!(exch_ts.timestamp_millis(), source);
+        assert!(handle_raw(&frame.to_string(), &tap, &mut state));
+        let book = published.take().pop().expect("book expected");
+        assert_eq!(book.exch_ts.timestamp_millis(), source);
         frame.as_object_mut().unwrap().remove("timestamp");
-        assert!(!handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
+        assert!(!handle_raw(&frame.to_string(), &tap, &mut state));
         frame["timestamp"] = serde_json::json!(Utc::now().timestamp_millis() + 2_000);
-        assert!(!handle_raw(&frame.to_string(), &market, &sink, &tap, &mut state));
+        assert!(!handle_raw(&frame.to_string(), &tap, &mut state));
     }
 }

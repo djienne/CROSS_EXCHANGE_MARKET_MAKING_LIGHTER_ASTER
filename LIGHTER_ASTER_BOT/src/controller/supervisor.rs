@@ -85,21 +85,20 @@ pub trait Engines {
     fn status(&self, bot: Bot) -> impl Future<Output = Result<Value>>;
 }
 
-/// Controller files: `bot-<M>.*`, or `bot-<M>-paper.*` so a paper run never touches the live
-/// latches. The XEMM db path names XEMM's own journal, trip latch and unclean-session marker
-/// (`bot-<M>-journal.jsonl`, `bot-<M>.trip.json`, `bot-<M>.active.json`).
+/// Controller files: `bot-<M>.*`. The XEMM stem `bot-<M>` names XEMM's own journal, trip latch
+/// and unclean-session marker (`bot-<M>-journal.jsonl`, `bot-<M>.trip.json`, `bot-<M>.active.json`).
 pub struct Files {
     pub events: PathBuf,
     pub state: PathBuf,
     pub breaker: PathBuf,
     pub baseline: PathBuf,
     pub equity: PathBuf,
-    pub xemm_db: PathBuf,
+    pub xemm_stem: PathBuf,
 }
 
 impl Files {
-    pub fn new(dir: &Path, market: &str, live: bool) -> Self {
-        let stem = if live { format!("bot-{market}") } else { format!("bot-{market}-paper") };
+    pub fn new(dir: &Path, market: &str) -> Self {
+        let stem = format!("bot-{market}");
         let path = |suffix: &str| dir.join(format!("{stem}{suffix}"));
         Self {
             events: path(".events.jsonl"),
@@ -107,7 +106,7 @@ impl Files {
             breaker: path(".breaker.json"),
             baseline: path(".baseline.json"),
             equity: path(".equity.jsonl"),
-            xemm_db: path(".sqlite"),
+            xemm_stem: path(""),
         }
     }
 }
@@ -211,7 +210,7 @@ impl<E: Engines> Supervisor<E> {
             now,
             &mut events,
         );
-        let trades = RealizedTrades::new(&market, now, taker_ledger, crate::live_report::inferred_journal_path(&files.xemm_db));
+        let trades = RealizedTrades::new(&market, now, taker_ledger, crate::live_report::inferred_journal_path(&files.xemm_stem));
         Self {
             regime: Regime::new(cfg.thresholds()),
             cfg,
@@ -865,7 +864,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let shared = Shared::default();
         let fake = Fake { shared: shared.clone(), on_stop: on_stop.iter().copied().collect(), exit_at_once };
-        let files = Files::new(&dir, "HYPE", true);
+        let files = Files::new(&dir, "HYPE");
         let events = EventLog::new(files.events.clone());
         let sup = Supervisor::new(ControllerCfg::default(), "HYPE".into(), true, files, dir.join("trades_HYPE.jsonl"), fake, events, CancellationToken::new());
         (sup, shared, dir)

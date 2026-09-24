@@ -156,7 +156,7 @@ impl StatusPoller {
         }
         let specs = rest_specs::build_market_specs_with_bases(
             &selected,
-            cfg.partials.hyperliquid_min_notional,
+            cfg.live.partials.lighter_min_notional,
             &cfg.live.aster.base_url,
             &cfg.live.hyperliquid.base_url,
         )
@@ -164,7 +164,7 @@ impl StatusPoller {
         let spec = specs.first().context("no resolved market spec")?.clone();
         let aster = build_aster(cfg, &specs)?;
         let lighter = build_lighter(cfg, &specs).await?;
-        let reconciler = Reconciler::new(aster, lighter, &specs, cfg.simulation.max_book_staleness_ms);
+        let reconciler = Reconciler::new(aster, lighter, &specs, cfg.live.max_book_staleness_ms);
         Ok(Self { cfg: cfg.clone(), spec, reconciler, http: rest_book::client()? })
     }
 
@@ -328,7 +328,7 @@ fn quote_status(
         spec.aster_min_qty,
         spec.aster_min_notional,
         spec.hl_min_notional,
-        cfg.simulation.max_book_staleness_ms,
+        cfg.live.max_book_staleness_ms,
         Utc::now(),
         &pos_ctx,
     ) {

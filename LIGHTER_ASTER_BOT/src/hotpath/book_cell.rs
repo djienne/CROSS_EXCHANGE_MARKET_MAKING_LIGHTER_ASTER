@@ -2,10 +2,6 @@
 //! venue ingest thread) publishes the freshest [`OrderBook`] via an atomic pointer
 //! swap; many readers (the stream watchdog, a future strategy hot loop) read it
 //! wait-free. A separate atomic stamps the last-message time for staleness checks.
-//!
-//! This is a *side output* of the ingest path: it never feeds the deterministic
-//! recorder channel, the JSONL log, or `SimEngine`. See `hotpath::mod` for the
-//! determinism contract.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,8 +41,8 @@ pub struct VenueBook {
     /// `l2Book` depth used as a VWAP fallback.
     bbo: ArcSwapOption<OrderBook>,
     /// The integer-scaled hot book, published alongside the raw `OrderBook` when a
-    /// `MarketScale` is available (live mode). `None` until the first hot publish, or
-    /// always `None` in record mode (no scale available).
+    /// `MarketScale` is available. `None` until the first hot publish, or always
+    /// `None` when the publisher has no `MarketScale`.
     hot: ArcSwapOption<HotBook>,
     /// Integer projection of `bbo`, used by the fast cancel precheck.
     bbo_hot: ArcSwapOption<HotBook>,
@@ -101,8 +97,8 @@ pub struct VenueBook {
     content_version: AtomicU64,
     /// Optional coalescing strategy wakeup. When a live strategy loop is attached
     /// ([`VenueBook::with_wake`]) every `publish` calls `notify_one`, so the loop wakes
-    /// on the next book change instead of sleep-polling. `None` on the
-    /// dry-run `record`/`live` path, so that path is behaviorally unchanged.
+    /// on the next book change instead of sleep-polling. `None` for a cell built with
+    /// [`VenueBook::new`].
     wake: Option<Arc<Notify>>,
     /// When set, each `publish`/`publish_hot` marks this market dirty in the shared
     /// bitset so the strategy loop can reprice only changed markets on wake.
@@ -449,7 +445,7 @@ impl VenueBook {
     }
 
     /// Wait-free read of the latest hot book. `None` until the first hot publish, or
-    /// always `None` if the publisher doesn't have a `MarketScale` (record mode).
+    /// always `None` if the publisher doesn't have a `MarketScale`.
     #[inline]
     pub fn load_hot(&self) -> Option<Arc<HotBook>> {
         self.hot.load_full()

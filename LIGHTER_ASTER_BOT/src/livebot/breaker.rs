@@ -1,7 +1,8 @@
 //! Circuit-breaker trip latch (persistent across restarts).
 //!
-//! When the strategy's cumulative-loss circuit breaker fires it writes a small JSON marker next to
-//! the run's DB (`<runs_dir>/<db_stem>.trip.json`) and halts. On every subsequent startup, [`run`]
+//! When the strategy's cumulative-loss circuit breaker fires it writes a small JSON marker named
+//! after the run's file stem (`<runs_dir>/<stem>.trip.json`, e.g. `runs/bot-HYPE.trip.json`) and
+//! halts. On every subsequent startup, [`run`]
 //! checks for that marker BEFORE any live execution setup and refuses to start while it exists. The
 //! operator clears it (after reviewing what happened) with `scripts/reset_breaker.py`, which simply
 //! deletes the file — it works through the Docker bind mount (`./runs:/app/runs`), no `docker exec`.
@@ -56,23 +57,23 @@ impl TripSnapshot {
     }
 }
 
-pub fn active_path(db_path: &Path) -> PathBuf {
-    let mut path = trip_path(db_path);
-    let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-    path.set_file_name(format!("{stem}.active.json"));
+pub fn active_path(stem: &Path) -> PathBuf {
+    let mut path = trip_path(stem);
+    let name = stem.file_name().and_then(|s| s.to_str()).unwrap_or("livebot");
+    path.set_file_name(format!("{name}.active.json"));
     path
 }
 
-pub fn check_active_session(db_path: &Path) -> Result<()> {
-    let path = active_path(db_path);
+pub fn check_active_session(stem: &Path) -> Result<()> {
+    let path = active_path(stem);
     if path.exists() {
         bail!("previous session was not verified clean ({}); resolve outstanding execution from venue records before clearing this marker", path.display());
     }
     Ok(())
 }
 
-pub fn start_active_session(db_path: &Path, session: &str, markets: &[crate::types::MarketId]) -> Result<()> {
-    let path = active_path(db_path);
+pub fn start_active_session(stem: &Path, session: &str, markets: &[crate::types::MarketId]) -> Result<()> {
+    let path = active_path(stem);
     if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
     let mut file = std::fs::OpenOptions::new().create_new(true).write(true).open(&path)
         .with_context(|| format!("create active-session marker {}", path.display()))?;
@@ -82,28 +83,29 @@ pub fn start_active_session(db_path: &Path, session: &str, markets: &[crate::typ
     Ok(())
 }
 
-pub fn finish_active_session(db_path: &Path) -> Result<()> {
-    std::fs::remove_file(active_path(db_path)).context("clear verified active-session marker")
+pub fn finish_active_session(stem: &Path) -> Result<()> {
+    std::fs::remove_file(active_path(stem)).context("clear verified active-session marker")
 }
 
-/// The trip-latch path for a given run DB path: `<runs_dir>/<db_stem>.trip.json`.
+/// The trip-latch path for a run's file stem: `<runs_dir>/<stem>.trip.json`.
 ///
-/// Mirrors the journal-path derivation in `run.rs` so the latch lands in the same `runs/` directory
-/// the rest of the run's artifacts do. Per-DB-stem ⇒ a HYPE trip blocks HYPE restarts, not ETH.
-pub fn trip_path(db_path: &Path) -> PathBuf {
-    let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-    let dir = db_path
+/// Mirrors the journal-path derivation (`live_report::inferred_journal_path`) so the latch lands in
+/// the same `runs/` directory the rest of the run's artifacts do. Per-stem ⇒ a HYPE trip blocks HYPE
+/// restarts, not ETH.
+pub fn trip_path(stem: &Path) -> PathBuf {
+    let name = stem.file_name().and_then(|s| s.to_str()).unwrap_or("livebot");
+    let dir = stem
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("runs"));
-    dir.join(format!("{stem}.trip.json"))
+    dir.join(format!("{name}.trip.json"))
 }
 
-/// Startup guard: bail loudly if the trip latch for this run DB exists. Called BEFORE any live
+/// Startup guard: bail loudly if the trip latch for this run's stem exists. Called BEFORE any live
 /// execution setup so a tripped bot can never resume trading until the operator clears the latch.
-pub fn check_startup(db_path: &Path) -> Result<()> {
-    let path = trip_path(db_path);
+pub fn check_startup(stem: &Path) -> Result<()> {
+    let path = trip_path(stem);
     if !path.exists() {
         return Ok(());
     }
@@ -128,8 +130,8 @@ pub fn check_startup(db_path: &Path) -> Result<()> {
 /// trip rode the graceful-shutdown path to exit 0, indistinguishable from a clean stop: the
 /// former orchestrator restarted the bot, the restart refused via the latch (exit 1), and only then
 /// did it halt (observed 2026-07-04).
-pub fn check_shutdown(db_path: &Path) -> Result<()> {
-    let path = trip_path(db_path);
+pub fn check_shutdown(stem: &Path) -> Result<()> {
+    let path = trip_path(stem);
     if path.exists() {
         bail!(
             "circuit breaker tripped during this run (latch: {}); exiting nonzero so the supervisor halts",
@@ -145,7 +147,7 @@ pub fn write_trip(path: &Path, rec: &TripRecord) -> Result<()> {
         std::fs::create_dir_all(dir).ok();
     }
     let json = serde_json::to_string_pretty(rec).context("serialize trip record")?;
-    // `runs/live-eth.trip.json` -> `runs/live-eth.trip.json.tmp` (extension is the final `.json`).
+    // `runs/bot-ETH.trip.json` -> `runs/bot-ETH.trip.json.<pid>.tmp` (extension is the final `.json`).
     let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let mut file = std::fs::File::create(&tmp).with_context(|| format!("write {}", tmp.display()))?;
     file.write_all(json.as_bytes())?;
@@ -169,7 +171,7 @@ pub struct ResidualLine {
     pub net_qty: Decimal,
 }
 
-/// The on-disk shutdown residual report (`<runs_dir>/<db_stem>.residual.json`), overwritten on
+/// The on-disk shutdown residual report (`<runs_dir>/<stem>.residual.json`), overwritten on
 /// each shutdown. Informational only — never a startup latch.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResidualRecord {
@@ -181,15 +183,15 @@ pub struct ResidualRecord {
     pub residuals: Vec<ResidualLine>,
 }
 
-/// The residual-report path for a given run DB path (mirrors [`trip_path`]).
-pub fn residual_path(db_path: &Path) -> PathBuf {
-    let stem = db_path.file_stem().and_then(|s| s.to_str()).unwrap_or("livebot");
-    let dir = db_path
+/// The residual-report path for a run's file stem (mirrors [`trip_path`]).
+pub fn residual_path(stem: &Path) -> PathBuf {
+    let name = stem.file_name().and_then(|s| s.to_str()).unwrap_or("livebot");
+    let dir = stem
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("runs"));
-    dir.join(format!("{stem}.residual.json"))
+    dir.join(format!("{name}.residual.json"))
 }
 
 /// PURE: extract per-market leftover position legs from a snapshot. Only markets in `markets`
@@ -232,17 +234,20 @@ mod tests {
 
     #[test]
     fn trip_path_is_stem_based_in_runs_dir() {
-        let p = trip_path(Path::new("runs/live-eth.sqlite"));
-        assert_eq!(p, PathBuf::from("runs/live-eth.trip.json"));
+        let p = trip_path(Path::new("runs/bot-ETH"));
+        assert_eq!(p, PathBuf::from("runs/bot-ETH.trip.json"));
+        assert_eq!(active_path(Path::new("runs/bot-ETH")), PathBuf::from("runs/bot-ETH.active.json"));
+        // The whole file name is the stem: a dotted market id is kept, not cut as an extension.
+        assert_eq!(trip_path(Path::new("runs/bot-1000.X")), PathBuf::from("runs/bot-1000.X.trip.json"));
         // No parent dir → defaults to runs/.
-        assert_eq!(trip_path(Path::new("foo.sqlite")), PathBuf::from("runs/foo.trip.json"));
+        assert_eq!(trip_path(Path::new("foo")), PathBuf::from("runs/foo.trip.json"));
     }
 
     #[test]
     fn check_startup_ok_when_absent_bails_when_present() {
         let dir = std::env::temp_dir().join(format!("xemm_breaker_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("live-eth.sqlite");
+        let db = dir.join("bot-ETH");
         // Absent → Ok.
         let _ = std::fs::remove_file(trip_path(&db));
         assert!(check_startup(&db).is_ok());
@@ -269,7 +274,7 @@ mod tests {
     fn check_shutdown_errs_when_latch_present() {
         let dir = std::env::temp_dir().join(format!("xemm_breaker_shutdown_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("live-eth.sqlite");
+        let db = dir.join("bot-ETH");
         let _ = std::fs::remove_file(trip_path(&db));
         assert!(check_shutdown(&db).is_ok());
         let rec = TripRecord {
@@ -339,9 +344,9 @@ mod tests {
     fn residual_record_write_and_read_round_trip() {
         let dir = std::env::temp_dir().join(format!("xemm_residual_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let db = dir.join("live-eth.sqlite");
+        let db = dir.join("bot-ETH");
         let path = residual_path(&db);
-        assert_eq!(path, dir.join("live-eth.residual.json"));
+        assert_eq!(path, dir.join("bot-ETH.residual.json"));
         let rec = ResidualRecord {
             ts_utc: "2026-07-19T00:00:00Z".into(),
             orders_verified_empty: true,

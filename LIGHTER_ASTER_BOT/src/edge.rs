@@ -31,10 +31,7 @@ impl EdgeConfig {
     }
 
     /// Just the safety buffers (slippage + latency + basis + funding), excluding
-    /// `min_net_profit_bps`. `instant_edge_bps` is net of fees *and* these buffers;
-    /// `realized_edge_bps` is net of fees only — so `realized ≈ instant + this` by
-    /// construction. The report adds this back to put instant on the same basis as
-    /// realized (see `report.rs`).
+    /// `min_net_profit_bps`.
     pub fn total_buffer_bps(&self) -> Decimal {
         self.slippage_buffer_bps
             + self.latency_buffer_bps
@@ -113,41 +110,6 @@ pub fn net_edge_bps_after_fees_and_buffers(
         - cfg.funding_buffer_bps
 }
 
-/// Realized two-leg PnL of a fill + hedge. Quantities are in
-/// base units; fees are charged on each leg's notional.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PnlBreakdown {
-    pub gross: Decimal,
-    pub aster_fee: Decimal,
-    pub lighter_fee: Decimal,
-    pub net: Decimal,
-}
-
-pub fn pnl_breakdown(
-    aster_side: Side,
-    qty: Decimal,
-    aster_fill_px: Decimal,
-    lighter_vwap: Decimal,
-    cfg: &EdgeConfig,
-) -> PnlBreakdown {
-    let f_a = cfg.aster_maker_fee_rate();
-    let f_l = cfg.taker_fee_rate();
-    let gross = match aster_side {
-        // Buy Aster, sell Lighter.
-        Side::Buy => qty * (lighter_vwap - aster_fill_px),
-        // Sell Aster, buy Lighter.
-        Side::Sell => qty * (aster_fill_px - lighter_vwap),
-    };
-    let aster_fee = qty * aster_fill_px * f_a;
-    let lighter_fee = qty * lighter_vwap * f_l;
-    PnlBreakdown {
-        gross,
-        aster_fee,
-        lighter_fee,
-        net: gross - aster_fee - lighter_fee,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,42 +159,6 @@ mod tests {
         let cheaper = bound - dec!(0.01);
         let net = net_edge_bps_after_fees_and_buffers(Side::Buy, cheaper, hl, refp, &cfg);
         assert!(net > cfg.min_net_profit_bps);
-    }
-
-    #[test]
-    fn pnl_signs() {
-        let cfg = cfg();
-        // Bought Aster at 100, hedge sold Lighter at 100.2 => positive gross.
-        let p = pnl_breakdown(Side::Buy, dec!(1), dec!(100.0), dec!(100.2), &cfg);
-        assert_eq!(p.gross, dec!(0.2));
-        assert!(p.net < p.gross); // fees reduce it
-        assert!(p.net > dec!(0));
-        // Sold Aster at 100.2, hedge bought Lighter at 100.0 => positive gross.
-        let s = pnl_breakdown(Side::Sell, dec!(1), dec!(100.2), dec!(100.0), &cfg);
-        assert_eq!(s.gross, dec!(0.2));
-    }
-
-    /// Finding 1 guardrail: `realized_edge` (net of fees only) sits *exactly*
-    /// `total_buffer_bps` above `instant_edge` (net of fees + buffers) on an
-    /// unchanged book — so the report's `instant_gross = instant + buffers` is the
-    /// basis directly comparable to realized, and realized > instant is expected.
-    #[test]
-    fn realized_equals_instant_plus_buffers_on_unchanged_book() {
-        let cfg = cfg();
-        let (px, hv, refp) = (dec!(99.95), dec!(100.0), dec!(100.0));
-        for side in [Side::Buy, Side::Sell] {
-            let instant = net_edge_bps_after_fees_and_buffers(side, px, hv, refp, &cfg);
-            // Mirrors hedge.rs: realized_edge_bps = rate_to_bps(pnl.net / (qty*ref)).
-            let pnl = pnl_breakdown(side, dec!(1), px, hv, &cfg);
-            let realized = rate_to_bps(pnl.net / (dec!(1) * refp));
-            let offset = realized - instant;
-            assert!(
-                (offset - cfg.total_buffer_bps()).abs() < dec!(0.0001),
-                "side={side:?}: realized {realized} - instant {instant} = {offset}, \
-                 expected buffers {}",
-                cfg.total_buffer_bps()
-            );
-        }
     }
 
     #[test]

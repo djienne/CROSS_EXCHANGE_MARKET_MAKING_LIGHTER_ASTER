@@ -1,23 +1,21 @@
 //! Aster (asterdex) futures market-data WebSocket connector: subscribes to the
 //! `<sym>@depth20@100ms` partial-depth snapshot, `<sym>@bookTicker` top-of-book
 //! assist, and `<sym>@aggTrade` streams via a combined-stream connection, and
-//! emits venue-agnostic `EventKind`s. Using partial-depth snapshots avoids
-//! diff/sequence (U/u/pu) maintenance entirely.
+//! publishes each book into the hot-path [`Tap`]. Trades only count as liveness.
+//! Using partial-depth snapshots avoids diff/sequence (U/u/pu) maintenance entirely.
 //! Responds to server pings; reconnects with capped backoff (24h server cap).
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{sleep, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{debug, info, warn};
 
-use super::{EventSink, Tap};
+use super::Tap;
+use crate::book::PriceLevel;
 use crate::decimal::parse_dec;
-use crate::events::{EventKind, PriceLevel};
-use crate::types::MarketId;
 
 const WS_BASE: &str = "wss://fstream.asterdex.com";
 
@@ -36,18 +34,6 @@ struct DepthMsg<'a> {
     bids: Vec<[&'a str; 2]>,
     #[serde(rename = "a", alias = "asks", borrow, default)]
     asks: Vec<[&'a str; 2]>,
-}
-
-#[derive(Deserialize)]
-struct AggTradeMsg<'a> {
-    #[serde(rename = "T")]
-    trade_time: i64,
-    #[serde(rename = "p")]
-    price: &'a str,
-    #[serde(rename = "q")]
-    qty: &'a str,
-    #[serde(rename = "m")]
-    buyer_is_maker: bool,
 }
 
 #[derive(Deserialize)]
@@ -85,25 +71,16 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(360);
 /// after it so a single long session isn't punished by a grown backoff.
 const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 
-/// Run forever (until aborted), reconnecting on error. The `record` path (no hot
-/// tap); delegates to [`run_with_tap`].
-pub async fn run(symbol_lower: String, market: MarketId, tx: UnboundedSender<(MarketId, EventKind)>) {
-    run_with_tap(symbol_lower, market, EventSink::lossless(tx), Tap::none()).await
-}
-
-/// Like [`run`] but also fans each book out to a lock-free [`Tap`] and honors the
-/// watchdog's reconnect signal — the `live`/strategy hot path. With `Tap::none()`
-/// it is behaviorally identical to `run`.
+/// Run forever (until aborted), reconnecting on error: fans each book out to the
+/// lock-free [`Tap`] and honors the watchdog's reconnect signal.
 pub async fn run_with_tap(
     symbol_lower: String,
-    market: MarketId,
-    tx: EventSink,
     tap: Tap,
 ) {
     let mut backoff = 1u64;
     loop {
         let started = std::time::Instant::now();
-        match stream_once(&symbol_lower, &market, &tx, &tap).await {
+        match stream_once(&symbol_lower, &tap).await {
             Ok(()) => info!("[ASTER {}] stream closed", symbol_lower),
             Err(e) => warn!("[ASTER {}] error: {e:#}", symbol_lower),
         }
@@ -120,8 +97,6 @@ pub async fn run_with_tap(
 
 async fn stream_once(
     symbol: &str,
-    market: &MarketId,
-    tx: &EventSink,
     tap: &Tap,
 ) -> Result<()> {
     let url = format!("{WS_BASE}/stream?streams={symbol}@depth20@100ms/{symbol}@bookTicker/{symbol}@aggTrade");
@@ -137,7 +112,7 @@ async fn stream_once(
             msg = read.next() => {
                 let Some(msg) = msg else { break };
                 match msg? {
-                    Message::Text(text) => handle(&text, market, tx, tap).await,
+                    Message::Text(text) => handle(&text, tap).await,
                     Message::Ping(p) => super::send_guarded(&mut write, Message::Pong(p)).await?,
                     Message::Close(_) => break,
                     _ => {}
@@ -155,27 +130,14 @@ async fn stream_once(
     Ok(())
 }
 
-async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
+async fn handle(text: &str, tap: &Tap) {
     let Combined { stream, data } = match serde_json::from_str::<Combined<'_>>(text) {
         Ok(c) => c,
         Err(_) => return,
     };
     if stream.contains("@aggTrade") {
-        if let Ok(t) = serde_json::from_str::<AggTradeMsg<'_>>(data.get()) {
-            let (price, qty) = match (parse_dec(t.price), parse_dec(t.qty)) {
-                (Ok(p), Ok(q)) if p > Decimal::ZERO && q > Decimal::ZERO => (p, q),
-                _ => return,
-            };
-            tx.send(
-                market.clone(),
-                EventKind::AsterAggTrade {
-                    price,
-                    qty,
-                    buyer_is_maker: t.buyer_is_maker,
-                    exch_ts: ms_to_dt(t.trade_time),
-                },
-            );
-        }
+        // Trades are not consumed: every frame already refreshed liveness
+        // (`tap.touch()` in `stream_once`), which keeps a quiet book's feed fresh.
     } else if stream.contains("@bookTicker") {
         if let Ok(t) = serde_json::from_str::<BookTickerMsg<'_>>(data.get()) {
             // Validate BEFORE any publish. The hot-only publish below sets the
@@ -199,18 +161,14 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
                 tap.mark_stream_down();
                 return;
             }
-            #[cfg(feature = "hotpath")]
             let prebuilt_hot = tap.hot_book_from_raw(
                 std::iter::once((t.bid_px, t.bid_qty)),
                 std::iter::once((t.ask_px, t.ask_qty)),
                 exch_ts,
             );
-            #[cfg(feature = "hotpath")]
             if let Some((hot, _)) = prebuilt_hot.as_ref() {
                 tap.publish_bbo_hot_only(*hot, exch_ts);
             }
-            #[cfg(not(feature = "hotpath"))]
-            let prebuilt_hot = None;
             // Aster BBO *size* influences quote safety: the quote engine only trusts a
             // bookTicker touch as the effective touch when its visible quantity covers
             // the candidate order. Therefore size-only updates must wake the strategy
@@ -225,23 +183,17 @@ async fn handle(text: &str, market: &MarketId, tx: &EventSink, tap: &Tap) {
                 tap.mark_stream_down();
                 return;
             }
-            #[cfg(feature = "hotpath")]
             let prebuilt_hot = tap.hot_book_from_raw(
                 d.bids.iter().map(|r| (r[0], r[1])),
                 d.asks.iter().map(|r| (r[0], r[1])),
                 exch_ts,
             );
-            #[cfg(feature = "hotpath")]
             if let Some((hot, _)) = prebuilt_hot.as_ref() {
                 tap.publish_hot_only(*hot, exch_ts);
             }
-            #[cfg(not(feature = "hotpath"))]
-            let prebuilt_hot = None;
             let bids = to_levels(&d.bids);
             let asks = to_levels(&d.asks);
-            // Hot tap FIRST (strategy latency), then canonical consumer (recording).
             tap.publish_prebuilt(&bids, &asks, exch_ts, prebuilt_hot);
-            tx.send(market.clone(), EventKind::AsterDepth { bids, asks, exch_ts });
         }
     } else {
         debug!("[ASTER] unhandled stream {stream}");
@@ -266,7 +218,6 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    #[cfg(feature = "hotpath")]
     async fn invalid_book_ticker_never_latches_the_hot_only_guard() {
         // A crossed/zero-qty bookTicker frame must be a complete no-op. Before the
         // validate-first reorder, the hot-only publish fired before validation and the
@@ -276,13 +227,9 @@ mod tests {
         use crate::connectors::BookTap;
         use crate::hotpath::book_cell::VenueBook;
         use std::sync::Arc;
-        use tokio::sync::mpsc;
 
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let sink = EventSink::lossless(tx);
         let cell = Arc::new(VenueBook::new());
         let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
-        let market = MarketId("HYPE".to_string());
         let frame = |b: &str, bq: &str, a: &str, aq: &str| {
             format!(
                 r#"{{"stream":"hypeusdt@bookTicker","data":{{"e":"bookTicker","u":1,"s":"HYPEUSDT","b":"{b}","B":"{bq}","a":"{a}","A":"{aq}","T":1,"E":2}}}}"#
@@ -290,18 +237,18 @@ mod tests {
         };
 
         // Valid frame: BBO populated and the pending guard is cleared by the raw publish.
-        handle(&frame("70.5", "10", "70.6", "12"), &market, &sink, &tap).await;
+        handle(&frame("70.5", "10", "70.6", "12"), &tap).await;
         let before = cell.load_bbo().expect("valid frame populates the BBO slot");
         assert!(!cell.has_hot_only_update());
 
         // Crossed frame (bid >= ask): no publish at all, guard must stay clear.
-        handle(&frame("70.7", "10", "70.6", "12"), &market, &sink, &tap).await;
+        handle(&frame("70.7", "10", "70.6", "12"), &tap).await;
         assert!(
             !cell.has_hot_only_update(),
             "crossed bookTicker latched the hot-only guard"
         );
         // Zero-qty frame likewise.
-        handle(&frame("70.5", "0", "70.6", "12"), &market, &sink, &tap).await;
+        handle(&frame("70.5", "0", "70.6", "12"), &tap).await;
         assert!(
             !cell.has_hot_only_update(),
             "zero-qty bookTicker latched the hot-only guard"

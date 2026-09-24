@@ -11,8 +11,7 @@
 //! only sustained disagreement does — so normal REST/WS timing skew never trips it.
 //!
 //! This is cold-path reconciliation: slow, off the quote hot loop, and the only
-//! thing it mutates is the per-cell divergence flag + reconnect nudges. It never
-//! touches the recorder channel, JSONL, or `SimEngine`, so determinism is preserved.
+//! thing it mutates is the per-cell divergence flag + reconnect nudges.
 
 use std::collections::HashMap;
 use std::sync::Arc;
