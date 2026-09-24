@@ -8,7 +8,7 @@
 #   lighter_aster_bot run --config bot.toml --market HYPE --mode dry-run   # see [dry_run]
 #
 # The engines' own commands read their table of this file, e.g.
-#   lighter_aster_bot taker run --config bot.toml --market HYPE --observe-only
+#   lighter_aster_bot taker run --config bot.toml --markets HYPE --observe-only
 
 [controller]
 poll_sec              = 15

@@ -1,8 +1,9 @@
 # Aster/Lighter bot: `run` holds the taker-taker engine and the reduce-only XEMM engine for
-# one market and switches execution rights between them in memory. One binary, one image.
+# one market and switches execution rights between them in memory.
 #
-# ONE image, supplied a command per run. Secrets are MOUNTED read-only (never baked).
-# The runs/ dir (journals, ledgers, latches, controller state) is a persistent bind mount.
+# One Dockerfile, two tags: lighter_aster_bot:live and :dryrun. Secrets are mounted read-only,
+# never baked. The runs/ dir (journals, ledgers, latches, controller state) is a persistent
+# bind mount.
 #
 # `docker compose build` / `up -d` touch only `dryrun`, the same bot against simulated venues
 # (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun). The real-money
@@ -14,23 +15,12 @@
 #   docker compose logs -f dryrun
 #   docker compose restart dryrun     # after a halt: the restart is the review
 #
-# ---- Typical live commands (run from this dir on the VPS; config = bot.toml) -------
-#
-# Build the live image (scripts/deploy_vps.sh image does this and ships it):
-#   docker compose build bot
-#
-# No-risk credential / connectivity check (signed reads, places NO orders):
-#   docker compose run --rm bot probe aster-balance
-#   docker compose run --rm bot probe lighter-balance
-#   docker compose run --rm bot probe lighter-open-orders
-#   docker compose run --rm bot taker probe --market HYPE
-#
-# LIVE (real money):
-#   docker compose run --rm --name bot-hype bot run --market HYPE --mode live
-#
-# Stop gracefully: the active engine cancels resting orders, hedges fills and corrects
-# residuals, then paired positions stay OPEN and delta-neutral:
-#   docker kill --signal=SIGINT bot-hype
+# ---- Live, on the Linux host (RUNBOOK.md: going live, run and stop, probes) --------
+#   docker compose build bot                          # deploy_vps.sh image builds and ships it
+#   docker compose run --rm bot probe aster-balance   # signed reads, no orders
+#   # REAL MONEY; the tee keeps the log that --rm would delete:
+#   docker compose run --rm -T --name bot-hype bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
+#   docker kill --signal=SIGINT bot-hype              # graceful drain; paired positions stay open
 # -----------------------------------------------------------------------------------
 
 services:
@@ -53,7 +43,7 @@ services:
       # Persistent + WRITABLE outputs; this nested mount overrides the read-only parent
       # for the runs/ subtree only.
       - ./runs:/app/runs
-      # Shared with any host-side signer (probes, reports) on the Linux deployment.
+      # Shared with any host-side Aster signer (native probes) on the Linux host.
       - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
     # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
@@ -84,8 +74,8 @@ services:
       - ./bot.toml:/app/bot.toml:ro
       - ./signers:/app/signers:ro
       - ./runs/dry-run:/app/runs/dry-run
-    # A halted dry run parks until stopped, so this policy never resumes one unreviewed; a
-    # deliberate restart acknowledges the halt.
+    # A halted dry run parks instead of exiting, so this policy cannot loop on a halt. Every
+    # start acknowledges the halt, a reboot's too; it stays in the event log (RUNBOOK.md).
     command: ["run", "--market", "HYPE", "--mode", "dry-run", "--ack-breaker"]
     restart: unless-stopped
     stop_signal: SIGINT

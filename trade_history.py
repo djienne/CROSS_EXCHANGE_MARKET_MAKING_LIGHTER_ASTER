@@ -959,7 +959,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
-    parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite (a dry run's in its own directory).")
+    parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite in the repository root (with --dry-run, in LIGHTER_ASTER_BOT/runs/dry-run/).")
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--orchestrator-trades", type=Path, default=None, help="The retired orchestrator's normalized trade ledger (historical XEMM rows).")
     parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: the retired orchestrator's journal, then `run`'s.")

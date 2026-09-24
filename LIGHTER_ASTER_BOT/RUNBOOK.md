@@ -5,7 +5,8 @@ engine and the reduce-only XEMM engine take turns holding execution rights; the 
 switches them in memory. `--mode live` trades real money; `--mode dry-run` runs the same bot
 against simulated venues fed by live market data ([Dry run](#dry-run)). Commands run from
 this directory (`LIGHTER_ASTER_BOT/`) and read `bot.toml`. `run --mode live`, `taker run`
-without `--observe-only` and the `*-market`/`*-roundtrip` probes submit real orders.
+without `--observe-only`, `probe aster-place-cancel` and the `*-market`/`*-roundtrip` probes
+submit real orders.
 
 ## How `run` switches
 
@@ -33,22 +34,22 @@ not stop within 185 s halts the bot instead of switching. The `[controller]` tab
 ## Build, secrets, configuration
 
 ```bash
-cargo build --release --locked        # Rust 1.92; never `cargo fmt`
+cargo build --release --locked        # Rust 1.92; the Lighter signers exist for Linux and macOS only
 ```
 
 - `aster.env` and `lighter.env` sit in the working directory (or at `ASTER_ENV_PATH` /
   `LIGHTER_ENV_PATH`), mode `600`; `run --mode live` refuses them if group/other can read
   them. `aster.env` must list the signer address in `wallet_address`/`subaccount_address`,
   and that address must match the private key.
-- Every Aster signer process shares `ASTER_NONCE_DIR`, a memory-mapped counter per signer that
-  survives restarts. The default is the OS temp dir's `lighter-aster-nonces`. Keep it
-  persistent, writable by the bot user, and never delete it while any signer runs.
-- `bot.toml` has `[controller]`, `[taker]`, `[maker]` and `[dry_run]`. Unknown or misplaced
-  keys fail the load, and so do the retired XEMM switches (`live.partials.max_pending_count`,
-  `live.quote.price_change_ticks_to_requote`, `expires_after_ms`, …) and non-mainnet
-  `[maker.live]` URLs.
-  The mode is a command-line choice only. `[taker.live] enabled = true, mode = "live"` arms
-  the taker engine.
+- Every process that signs for the same Aster API wallet must see the same `ASTER_NONCE_DIR`
+  (default: the OS temp dir's `lighter-aster-nonces`), writable by the bot user. The nonces
+  are clock-based and strictly increasing, so losing the directory at a reboot is safe; never
+  delete it while a signer runs.
+- `bot.toml` has `[controller]`, `[taker]`, `[maker]` and `[dry_run]`. Unknown, misplaced or
+  retired keys fail the load, and so do venue URLs other than the mainnet origins
+  (`[maker.live]`, `[taker.venues]`). The mode is a command-line choice only: in either mode,
+  `[taker.live] enabled = true, mode = "live"` and `[maker.live] enabled = true` arm the
+  engines.
 
 ## Run and stop
 
@@ -56,14 +57,18 @@ Native, in tmux:
 
 ```bash
 tmux new -s lighter_aster_bot
-./target/release/lighter_aster_bot run --market HYPE --mode live
+./target/release/lighter_aster_bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
 ```
 
 Docker (see [Deploy](#deploy)):
 
 ```bash
-docker compose run --rm --name bot-hype bot run --market HYPE --mode live
+docker compose run --rm -T --name bot-hype bot run --market HYPE --mode live 2>&1 | tee -ai runs/bot-HYPE.log
 ```
+
+The bot logs to stdout only; `runs/` holds its journals, ledgers, latches and state. The `tee`
+keeps the log for reviews (`--rm` deletes the container's copy), and `-i` leaves Ctrl-C to the
+bot, so the drain is still logged.
 
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
 `docker kill --signal=SIGINT bot-hype`). The active engine drains first, then the observer.
@@ -71,7 +76,8 @@ XEMM quiesces admission, cancels makers, drains fills and execution outcomes, co
 residuals, reconciles and flushes persistence; this can take up to 175 s. Never stop
 it with a shorter kill: `docker stop` needs `-t 200`, and compose already sets
 `stop_grace_period: 200s`. Paired positions stay open and delta-neutral. Exit 0 means a
-clean stop; nonzero means a halt, an unresolved engine stop or an unwritable event log.
+clean stop; nonzero means a halt, an unresolved engine stop or an unwritable event log. A
+panic outside XEMM's strategy thread aborts the process at once, with no drain, like a kill.
 
 Only one live writer per market runs at a time: `run --mode live` and `taker run` (unless
 `--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock` and name the holder's pid
@@ -115,7 +121,7 @@ docker compose up -d --build dryrun
 docker compose logs -f dryrun
 ```
 
-Natively: `./target/release/lighter_aster_bot run --market HYPE --mode dry-run`.
+Natively (Linux or macOS): `./target/release/lighter_aster_bot run --market HYPE --mode dry-run`.
 
 It stops like live (SIGINT, a drain, positions stay open) and saves the simulated venues;
 the next start takes up their accounts, positions and resting orders. The market moved
@@ -133,9 +139,11 @@ resolved the session against the venues' records; here the simulated venues' own
 the only record, and the engines reconcile to it at start. Docker treats `docker kill` as a
 deliberate stop and does not restart the container; `docker compose up -d dryrun` does.
 
-**Halts.** A halted dry run parks: the process and the simulated venues keep running, the
-diagnostics too, until it is stopped, so the restart policy never resumes it unreviewed. The
-service passes `--ack-breaker`, so `docker compose restart dryrun` is the review. An
+**Halts.** A halted dry run parks: the process, the simulated venues and the diagnostics keep
+running until it is stopped, so the restart policy cannot loop on a halt. Every start passes
+`--ack-breaker`, so any restart resumes it: `docker compose restart dryrun` after a review, but
+also a host reboot, or `start_all.bat` recreating it on a new image. The halt stays in
+`bot-<M>.events.jsonl` and the archived breaker, so check them after an unplanned restart. An
 equity-drawdown halt parks again, asking for `--reset-breaker-baseline`:
 
 ```bash
@@ -167,26 +175,29 @@ taker. Without `--dry-run` that command resets live's breaker.
 
 Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simulated` means
 the bot used something the simulator does not serve, so the dry run no longer matches live:
-treat it as a bug. The reports take `--dry-run` (`python3 combined_pnl.py --dry-run`;
-`python3 trade_history.py --dry-run` keeps its own database in `runs/dry-run/`).
+treat it as a bug. The reports take `--dry-run` (`python3 ../combined_pnl.py --dry-run`;
+`python3 ../trade_history.py --dry-run` keeps its own database in `runs/dry-run/`).
 
 What the dry run cannot tell: whether the fee keys are right; the bot's market impact beyond
 the liquidity it takes; how Aster's ~100 ms splits around matching, and how Lighter treats an
 IOC it cannot fill (both assumed pessimistically until live acks calibrate them); anything
 about liquidation. Lighter signatures are not verified.
 
-**Going live.**
+**Going live.** Live runs on a Linux host ([Deploy](#deploy)). Docker Desktop on Windows shows
+bind-mounted files as mode 777, and live refuses env files that others can read.
 
 1. The dry run has run for days with no unexplained reject, halt or `no route` warning, and
    its reports agree with the simulated equity net of funding and open-position marks.
-2. `aster.env` and `lighter.env` are in place ([Build, secrets, configuration](#build-secrets-configuration)).
-3. Build the live image: `docker compose build bot` (the dry run's image is separate).
-4. The read-only probes pass: `docker compose run --rm bot probe aster-balance`, then
-   `probe lighter-balance`, `probe lighter-open-orders` and `taker probe --market HYPE`.
-5. The fee keys in `bot.toml` match both accounts' actual tiers.
-6. Neither venue has open orders, and positions are flat or paired.
-7. `docker compose run --rm --name bot-hype bot run --market HYPE --mode live`. Its files are
-   in `runs/`, and its drawdown baseline starts at the first sample.
+2. The fee keys in `bot.toml` match both accounts' actual tiers.
+3. Ship the sources, the secrets and the live image with `scripts/deploy_vps.sh` ([Deploy](#deploy)).
+4. On the host, the read-only probes pass: `docker compose run --rm bot probe aster-balance`,
+   then `probe lighter-balance`, `probe lighter-open-orders` and `taker probe --market HYPE`.
+5. Neither venue has open orders, and positions are flat or paired.
+6. `runs/` holds no latch or session marker from an earlier run (`bot-<M>.breaker.json`,
+   `*.trip.json`, `*.active.json`, `active_session_<M>.json`, `circuit_breaker_<M>.json`). Each
+   engine checks its own only when it first starts, which for XEMM can be hours in.
+7. Start it as in [Run and stop](#run-and-stop). Its drawdown baseline starts at the first
+   sample.
 
 ## Runtime files (`runs/`)
 
@@ -198,21 +209,24 @@ about liquidation. Lighter signatures are not verified.
 | `bot-<M>.baseline.json`, `bot-<M>.equity.jsonl` | Equity-drawdown baseline and samples |
 | `bot-<M>-journal.jsonl` | XEMM execution journal |
 | `bot-<M>.trip.json`, `bot-<M>.active.json` | XEMM loss latch and unclean-session marker |
+| `bot-<M>.residual.json` | Legs XEMM left open at its last stop (a report, not a latch) |
 | `trades_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger and entry-gate history |
 | `active_session_<M>.json`, `circuit_breaker_<M>.json` | Taker unclean-session marker and loss breaker |
 
 The taker's observe-only history still feeds `opportunities_<M>.jsonl`, as live history
-collection does. A dry run writes the same files in `runs/dry-run/`, plus the simulated
-venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
+collection does. An archived latch keeps its name plus a timestamp (`.acked.`, `.cleared.`,
+`.resolved.`, `.unclean.`) and no longer blocks. A dry run writes the same files in `runs/dry-run/`, plus
+the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 
 ## Halts and recovery
 
 **Controller halt.** The bot stops both engines (writer first), writes
 `bot-<M>.breaker.json` with the reason, and exits nonzero. The reasons are:
 
-- the cross-engine loss stop (`pnl_breaker`): marked equity at or below the persisted
-  baseline minus `max_loss_usdc` (15), or realized trade PnL of both engines at or below −15.
-  Unverified gains never count; unverified losses do.
+- the cross-engine loss stop (`pnl_breaker`): marked equity at or below the baseline minus
+  `max_loss_usdc` (15), a baseline kept across restarts; or realized trade PnL of both engines
+  since this start at or below −15. Unverified gains never count; unverified losses do. The
+  engines' own stops (10) normally trip first.
 - a failed or hung engine stop (`*_shutdown_unresolved`);
 - resting orders when rights should move (`*_orders_not_clear*`, `startup_orders_not_clear`);
 - an engine error (`active_bot_exited_nonzero`), or three clean exits each under 10 minutes
@@ -225,16 +239,18 @@ archives it as `.acked.<stamp>`. An equity-drawdown breaker also needs
 `--reset-breaker-baseline`, which re-arms the drawdown stop on the next sample. The
 engines' own latches below are separate and each blocks its engine on its own.
 
-**XEMM.** `bot-<M>.active.json` remains after an unclean or unresolved session. Keep it
-until cold venue records resolve every attempted order in the journal and orders and
-positions are reconciled; an empty orders snapshot alone is not enough. The loss latch
-`bot-<M>.trip.json` trips when marked equity falls below the median of the first 5 fresh
-samples by `max_cumulative_loss_usdc` (10) on 3 consecutive samples. Clear it after review
-with `python scripts/reset_breaker.py --coin <M>`; that does not clear an unresolved session.
+**XEMM.** `bot-<M>.active.json` remains after an unclean or unresolved session, and no tool
+resolves it. Once the venues' own records resolve every attempted order in the journal, and
+orders and positions are reconciled (an empty orders snapshot alone is not enough), archive it
+by hand: `mv bot-<M>.active.json bot-<M>.active.json.resolved.<stamp>`. The loss latch
+`bot-<M>.trip.json` trips when marked equity falls `max_cumulative_loss_usdc` (10) below the
+median of the first 5 fresh samples, on 3 consecutive samples; that baseline re-arms at every
+XEMM start. After review, clear the latch (not an unresolved session) with:
+`python scripts/reset_breaker.py --coin <M> --archive`.
 
-**Taker.** The session marker is armed before execution rights are granted, and only a
-verified, drained shutdown retires it. After an unclean exit, when the marker holds complete
-scoped order identities:
+**Taker.** The session marker `active_session_<M>.json` is armed before execution rights are
+granted, and only a verified, drained shutdown retires it. After an unclean exit, when the
+marker holds complete scoped order identities:
 
 ```bash
 ./target/release/lighter_aster_bot taker resolve-session --market HYPE
@@ -242,53 +258,36 @@ scoped order identities:
 ```
 
 `resolve-session` needs an inactive owner, matching terminal orders, positions consistent
-with those fills, and no open orders; it saves a resolution artifact. A marker from a crash
-before any receipt, without enough identities, stays blocked pending primary venue evidence.
-`reset-circuit-breaker` archives the loss breaker only. It neither resolves a session nor
-rewrites the ledger, and an unchanged loss window can recreate the breaker at startup.
+with those fills, and no open orders; it saves `session_resolution_*.json`. It refuses a
+marker from a crash before any receipt, without enough identities: resolve that one from the
+venues' own records, then archive it by hand as above. The loss breaker
+`circuit_breaker_<M>.json` trips when the ledger's PnL since `[taker.pnl] since` reaches
+−`max_loss_usdc` (10), on the same terms. `reset-circuit-breaker` archives it only: it neither
+resolves a session nor rewrites the ledger, so the breaker returns at the next start while
+that PnL is still at or below the limit.
 
 ## Engines
 
 **Taker.** It prices configured depth in both directions (Aster sell/Lighter buy and the
 reverse). A clip trades only when the depth-weighted edge clears both taker fees plus the
-margin, both books hold `liquidity_multiple` times the clip within `max_levels`, and the
-edge passes the entry gate. The gate uses the greater of the 90th percentile of recent
-samples and the required edge plus `min_extra_bps`, and it blocks during history warmup.
-Aster orders are bounded IOC limits; Lighter uses its native market/IOC path.
+margin, both books hold `liquidity_multiple` times the clip within `max_levels` and are
+fresher than `max_book_staleness_ms`, and the edge passes the entry gate: the greater of the
+90th percentile of recent samples and the required edge plus `min_extra_bps`, blocking during
+history warmup. Aster orders are bounded IOC limits; Lighter uses its native market/IOC path.
+Under a lease, execution is reduce-only and capped at both existing positions.
 
-Book updates wake the scanner. Receipt and source age must pass `max_book_staleness_ms`.
-Account and order queries, lease validation, nonce refresh, percentile maintenance and
-journal writes run on cold paths. Final admission rechecks book identity and freshness,
-account epoch and age, clear orders, execution rights, transport readiness and risk limits
-before either leg is submitted.
+An unknown submission outcome keeps its order and client ids: a missing order row or a flat
+position does not prove no fill. A known missing hedge gets one retry within
+`hedge_retry_timeout_ms`; recovery then closes only the same-sign net residual, and an
+unresolved retry or close stops further submissions. The ledger's `actual_net_usd` is
+matched spread capture minus fees, and recovery rows are conservative equity-delta estimates.
 
-Under a lease, execution is reduce-only whatever the exposure filter, and quantities are
-capped at both existing positions. A new lease id refreshes the Lighter nonce and requires
-a fresh verified account/order snapshot first.
-
-Unknown submission outcomes keep order and client ids, native transaction identity and fill
-tracking; a missing order row or a flat position does not prove no fill. A known missing
-hedge gets one retry within `hedge_retry_timeout_ms`. Recovery then closes only the
-same-sign net residual, and an unresolved retry or close stops further submissions.
-
-**XEMM.** Maker transmission rechecks the admission ticket, quote deadline and book versions
-after rate limiting; missing or stale source time blocks new exposure. Logical obligations
-keep separate transmission attempts. Cancellation can revoke an unclaimed attempt; claimed
-or ambiguous attempts stay reserved until matching terminal evidence arrives. A timeout, a
-balanced position snapshot or an empty open-order list cannot prove nonexecution. After 60 s
-without resolution, new exposure stays frozen while late evidence is still accepted.
-Corrections use the smallest rounded-down quantity that removes the residual, at most two
-attempts per incident. The margin guard reserves directional margin for resting makers and
-hedge obligations above the per-venue buffers ($26 shipped); reductions stay possible.
-
-**Accounting.** Version 2 taker rows carry `economic_status`, `execution_id`,
-`source_event_id` and fee provenance. Lighter fees are per fill,
-`notional_usd * own_role_fee_ticks / 1_000_000`, so rebates keep their sign. Lighter omits
-zero fees, so an omitted fee is zero; an explicit null or malformed fee, or an IOC fill
-flagged as maker, stays unknown. `actual_net_usd` is matched spread capture minus fees, not
-account PnL of open inventory, and recovery rows are conservative equity-delta estimates.
-Legacy, incomplete or unknown-fee gains never offset losses in the taker's or the
-controller's realized-loss stop.
+**XEMM.** Stale books block new exposure. A timeout, a balanced position snapshot or an empty
+open-order list never proves that an order did not execute: an unresolved attempt stays
+reserved, and after 60 s new exposure freezes while late evidence is still accepted. A net
+residual is corrected with the smallest rounded-down quantity that removes it, at most twice
+per incident. The margin guard reserves margin for resting makers and hedge obligations above
+the per-venue buffers ($26 shipped); reductions stay possible.
 
 ## Deploy
 
@@ -317,31 +316,22 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
   lighter-balance | lighter-open-orders`, `taker probe`, `taker status --json`,
-  `fetch-specs`.
+  `fetch-specs`. `taker run --markets HYPE --observe-only` scans and records entry-gate
+  history without orders.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
-- These submit real orders; run them only with explicit approval: `probe lighter-market
-  --i-understand-live --max-usd 12` and `taker aster-market-roundtrip` /
-  `taker lighter-market-roundtrip --i-understand-live --max-usd <N>`. The roundtrips need a
-  flat start and no open orders. They clean up reduce-only (at most three closes in 30 s)
-  and stay blocked without terminal-order and flat-position evidence.
+- These submit real orders; run them only with explicit approval, and never beside a live
+  `run`: `probe aster-place-cancel` (two post-only Aster orders 1.8 % from the book, then
+  cancelled; it needs no flag), `probe lighter-market --i-understand-live --max-usd 12`, and
+  `taker aster-market-roundtrip` / `taker lighter-market-roundtrip --i-understand-live
+  --max-usd <N>`. The roundtrips need a flat start and no open orders. They clean up
+  reduce-only (at most three closes in 30 s) and stay blocked without terminal-order and
+  flat-position evidence.
 
-## Moving from the orchestrator
+## Orchestrator leftovers
 
-The stack used to run `orchestrator.py` with the engines as child processes. Before the
-first `run --mode live` on such a host:
-
-1. Stop the orchestrator (Ctrl-C in its tmux), then confirm that no writer is left:
-   `pgrep -af 'orchestrator.py|lighter_aster_bot|lighter_aster_taker_arb|xemm_lighter_aster'`.
-   `run` refuses to start while the orchestrator still holds `runs/orchestrator_<M>.lock`.
-   Children orphaned by a killed orchestrator hold no lock, so only `pgrep` finds them.
-2. Review, resolve and then archive its latches in the stack root's `runs/`:
-   `orchestrator_breaker_<M>.json`, and XEMM's `orchestrator-xemm-<M>.trip.json` and
-   `orchestrator-xemm-<M>.active.json`. `run` refuses to start while any of them exists; an
-   `.active.json` is an unresolved session (see [Halts and recovery](#halts-and-recovery)).
-   Check `runs/` for other `*.trip.json` / `*.active.json` files left by direct runs of the
-   retired `livebot` command.
-3. The taker's files keep their names. The drawdown baseline starts fresh at the first
-   sample. To carry the old one over, copy `runs/orchestrator_baseline_<M>.json` to
-   `LIGHTER_ASTER_BOT/runs/bot-<M>.baseline.json`; it is discarded if unrefreshed for 48 h.
-4. Start `run --mode live` and watch the first switches in `bot-<M>.events.jsonl`. The
-   reports read both the old and the new journal and state files.
+The stack used to run `orchestrator.py` with the engines as child processes. `run --mode live`
+refuses to start while it still runs (its lock `runs/orchestrator_<M>.lock` is held) or while
+its latches exist in the stack root's `runs/`: `orchestrator_breaker_<M>.json`,
+`orchestrator-xemm-<M>.trip.json` and `orchestrator-xemm-<M>.active.json`, the last an
+unresolved session. Review and archive them like the latches above. The reports still read its
+journals and state.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reset the XEMM livebot circuit-breaker trip latch.
+"""Reset the XEMM circuit-breaker trip latch.
 
 When the cumulative-loss circuit breaker fires, the bot writes a trip-latch file
 (`runs/bot-<MARKET>.trip.json`), halts, and then REFUSES to restart while that file exists. This
@@ -7,10 +7,10 @@ script clears the latch so the next run can start. It is a pure host-side file o
 through the Docker bind mount (`./runs:/app/runs`), so there is no need to `docker exec` into the
 container, and it works whether or not the container is running.
 
-Without --runs-dir it searches both latch locations: <crate>/runs (Docker deploys) and the
+Without --runs-dir it searches both latch locations: <crate>/runs (`run`'s) and the
 stack-level runs/ beside the crate (the retired orchestrator's runs).
 
-Usage (run from the deploy dir, e.g. ~/LIGHTER_ASTER_BOT on the VPS, or the repo root locally):
+Usage (from LIGHTER_ASTER_BOT/, the deploy dir; the default runs dirs do not depend on the cwd):
     python scripts/reset_breaker.py                 # clear ALL *.trip.json latches
     python scripts/reset_breaker.py --coin HYPE     # clear only runs/bot-HYPE.trip.json (`run`)
     python scripts/reset_breaker.py --archive       # rename instead of delete (keeps an audit copy)
@@ -47,7 +47,7 @@ def _describe(path: Path) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Reset the livebot circuit-breaker trip latch")
+    ap = argparse.ArgumentParser(description="Reset the XEMM circuit-breaker trip latch")
     ap.add_argument("--runs-dir", type=Path, default=None,
                     help="runs directory holding the *.trip.json latch(es) "
                          "(default: <crate>/runs and the stack-level runs/)")

@@ -61,8 +61,8 @@ zstd = "0.13"
 
 # NOTE: no `panic = "abort"` here: livebot/run.rs relies on catch_unwind to report a
 # strategy-thread panic through the supervision channel and shut down through the
-# order-cancelling cleanup path. Abort would skip that. The `taker` subcommand keeps its
-# abort-on-panic behaviour through a panic hook instead (`taker::abort_on_panic`).
+# order-cancelling cleanup path. Abort would skip that. `taker` and `run` restore
+# abort-on-panic for every other thread through a panic hook (`taker::abort_on_panic`).
 [profile.release]
 opt-level = 3
 lto = "thin"
