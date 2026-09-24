@@ -4,12 +4,14 @@ A live Aster/Lighter trading bot with two engines: a taker–taker arbitrage eng
 an XEMM maker/taker hedging engine. Both are built into one Rust binary,
 `lighter_aster_bot` in `LIGHTER_ASTER_BOT/`. Its `run` command trades one market with
 both engines in one process: it switches execution rights between them in memory and
-enforces a cross-engine loss stop.
+enforces a cross-engine loss stop. `run --mode dry-run` runs the same bot against
+simulated Aster and Lighter venues fed by live market data, with no credentials and no
+real orders.
 
 This is a live trading codebase. `run --mode live`, `taker run` (without
 `--observe-only`) and the live market probes can place real orders and can lose money
-through spread, fees, slippage and execution failures. Use read-only probes or the
-taker's observe-only mode before any live run.
+through spread, fees, slippage and execution failures. Use the dry run, read-only probes
+or the taker's observe-only mode before any live run.
 
 ## Components
 
@@ -38,10 +40,11 @@ taker's observe-only mode before any live run.
 ├── economics.py            shared execution-economics parser for both reports
 ├── tests/                  Python tests + shared fixtures (tests/fixtures/)
 └── LIGHTER_ASTER_BOT/
-    ├── bot.toml            config: [controller], [taker], [maker]
+    ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
     ├── scripts/            check_hedged_trade.py, reset_breaker.py, deploy_vps.sh
     ├── signers/            Lighter signer shared libraries
-    ├── src/                controller/ (run), taker/ (taker engine), livebot/ (XEMM)
+    ├── src/                controller/ (run), taker/ (taker engine), livebot/ (XEMM),
+    │                       dryrun/ (the simulated venues)
     └── RUNBOOK.md          operation, deploy, halts and recovery
 ```
 
@@ -109,6 +112,24 @@ XEMM engine:
 ./target/release/lighter_aster_bot probe lighter-open-orders --market HYPE
 ```
 
+## Dry Run
+
+The whole bot against simulated venues that follow the live public market data as seen
+from AWS Tokyo, pessimistic where the data cannot decide (queue position, taker fills). It
+needs no credentials and places no real order. It runs in Docker in the background, and
+the fleet's `start_all.bat` starts it too:
+
+```bash
+cd LIGHTER_ASTER_BOT
+docker compose up -d --build dryrun
+docker compose logs -f dryrun
+```
+
+Natively: `./target/release/lighter_aster_bot run --market HYPE --mode dry-run`. Its files,
+including the simulated venues' state and a diagnostics row per minute, are in
+`LIGHTER_ASTER_BOT/runs/dry-run/`. The model, halts, diagnostics and the checklist for going
+live are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run).
+
 ## Live Run
 
 ```bash
@@ -166,7 +187,14 @@ python3 trade_history.py --mode lan --market HYPE --json
 
 Both reports read `run`'s files (`LIGHTER_ASTER_BOT/runs/bot-<MARKET>-journal.jsonl`,
 `bot-<MARKET>.state.json`, `trades_<MARKET>.jsonl`) and still read the retired
-orchestrator's journal, ledger and state in the stack root's `runs/`.
+orchestrator's journal, ledger and state in the stack root's `runs/`. With `--dry-run`
+they read only `LIGHTER_ASTER_BOT/runs/dry-run/`, and `trade_history.py` keeps its
+database there:
+
+```bash
+python3 combined_pnl.py --market HYPE --dry-run
+python3 trade_history.py --market HYPE --dry-run
+```
 
 LAN mode reads local artifacts and preserves actual fee evidence. Version 2 records
 carry logical/attempt identities, executed quantities, matched quantity, residual

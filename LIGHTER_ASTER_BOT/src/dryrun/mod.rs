@@ -33,7 +33,7 @@ use self::account::AccountView;
 use self::clock::{wall_us, Latency};
 use self::feed::{Follower, Hub, Input};
 use self::matching::{
-    quantiles, Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, Request, SimParams, Venue, VenueState, LOOKAHEAD_US,
+    quantiles, Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, SimParams, Venue, VenueState, LOOKAHEAD_US,
 };
 use crate::controller::BotConfig;
 use crate::decimal::parse_dec;
@@ -197,7 +197,9 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
 }
 
 /// How often the simulated venues' state is saved, and the diagnostics reported.
-const SAVE_EVERY: Duration = Duration::from_secs(5);
+/// A kill loses at most this much of the venues' history (the state is written only when it
+/// changed, and it is small).
+const SAVE_EVERY: Duration = Duration::from_secs(1);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 
 /// A dry run's own files in its runs directory: the simulated venues' state, which the next
@@ -301,6 +303,7 @@ async fn serve<H: server::Handler>(port: u16, handler: H) -> Result<String> {
 enum Command {
     Call(Envelope, oneshot::Sender<Reply>),
     Peek(Venue, oneshot::Sender<(AccountView, Vec<Order>)>),
+    Warm(Venue, String, oneshot::Sender<bool>),
     Resume,
     Save(oneshot::Sender<Result<()>>),
 }
@@ -374,11 +377,16 @@ impl Venues {
     }
 
     /// Waits until each market's replica holds a book (the feed and the requests reach the core
-    /// on separate channels).
+    /// on separate channels). Asks the core directly: a simulated request would count in the
+    /// diagnostics as the bot's.
     pub async fn warm(&self, markets: &[(Venue, &str)]) {
         for &(venue, market) in markets {
-            let book = || Envelope { venue, lane: 0, weight: 0, orders: 0, nonce: None, request: Request::Book { market: market.into() } };
-            while matches!(self.call(book()).await, Reply::Reject(_)) {
+            loop {
+                let (tx, rx) = oneshot::channel();
+                let _ = self.commands.send(Command::Warm(venue, market.to_string(), tx));
+                if rx.await.unwrap_or(false) {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -419,6 +427,9 @@ async fn drive(
                     }
                     Command::Peek(venue, reply) => {
                         let _ = reply.send(core.peek(venue));
+                    }
+                    Command::Warm(venue, market, reply) => {
+                        let _ = reply.send(core.replica(venue, &market).is_some_and(|book| book.warm()));
                     }
                     Command::Resume => core.resume(),
                     Command::Save(reply) => {

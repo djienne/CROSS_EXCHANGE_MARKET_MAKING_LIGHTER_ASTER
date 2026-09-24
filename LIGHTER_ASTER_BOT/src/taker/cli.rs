@@ -101,6 +101,9 @@ pub enum Commands {
     ResetCircuitBreaker {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
+        /// The dry run's breaker (runs/dry-run/) instead of live's.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     /// Read-only account/book/opportunity status: the taker report `run` polls every tick.
     Status {
@@ -112,7 +115,7 @@ pub enum Commands {
 }
 
 pub async fn dispatch(cli: Cli) -> Result<()> {
-    let cfg = Config::load(&cli.config)?;
+    let mut cfg = Config::load(&cli.config)?;
     match cli.command {
         Commands::Run {
             markets,
@@ -503,7 +506,11 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             println!("session_resolved artifact={}", artifact.display());
             Ok(())
         }
-        Commands::ResetCircuitBreaker { market } => {
+        Commands::ResetCircuitBreaker { market, dry_run } => {
+            if dry_run {
+                // Where `run --mode dry-run` keeps the taker's files.
+                cfg.pnl.persist_dir = format!("{}/dry-run", crate::controller::RUNS_DIR);
+            }
             let selected = cfg.select_markets(market.as_deref());
             let market_id = selected
                 .into_iter()

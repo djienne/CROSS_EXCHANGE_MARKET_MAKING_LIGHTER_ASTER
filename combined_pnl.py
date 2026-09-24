@@ -219,10 +219,19 @@ def selected_xemm_journals(
     return included, skipped
 
 
-def default_state_path(stack_root: Path, market: str) -> Path:
+def report_roots(stack_root: Path, dry_run: bool = False) -> tuple[Path, Path]:
+    """The `runs/` directories the reports read by default: the retired stacks' and `run`'s.
+    A dry run keeps every file in `LIGHTER_ASTER_BOT/runs/dry-run/`, which live never shares,
+    so both resolve there."""
+    bot_runs = stack_root / "LIGHTER_ASTER_BOT" / "runs"
+    return (bot_runs / "dry-run", bot_runs / "dry-run") if dry_run else (stack_root / "runs", bot_runs)
+
+
+def default_state_path(roots: tuple[Path, Path], market: str) -> Path:
     """`run`'s controller state, else the retired orchestrator's (same keys)."""
-    current = stack_root / f"LIGHTER_ASTER_BOT/runs/bot-{market}.state.json"
-    legacy = stack_root / f"runs/orchestrator_state_{market}.json"
+    legacy_runs, bot_runs = roots
+    current = bot_runs / f"bot-{market}.state.json"
+    legacy = legacy_runs / f"orchestrator_state_{market}.json"
     return current if current.exists() or not legacy.exists() else legacy
 
 
@@ -494,8 +503,8 @@ def print_human(result: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
-    bot_root = stack_root / "LIGHTER_ASTER_BOT"
     parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
+    parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
     parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--market", default="HYPE")
@@ -512,17 +521,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file. Default: `run`'s, else the retired orchestrator's.")
     args = parser.parse_args()
+    roots = report_roots(stack_root, args.dry_run)
+    legacy_runs, bot_runs = roots
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:
-        args.taker_trades = bot_root / f"runs/trades_{args.market}.jsonl"
+        args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
     if args.xemm_runs_dir is None:
         args.xemm_runs_dir = []
     if not explicit_xemm_journals and not explicit_xemm_runs_dirs:
         args.xemm_journal = [
-            stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl",
-            bot_root / f"runs/live-{args.market.lower()}-lighter-journal.jsonl",
-            bot_root / f"runs/bot-{args.market}-journal.jsonl",
+            legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
+            bot_runs / f"live-{args.market.lower()}-lighter-journal.jsonl",
+            bot_runs / f"bot-{args.market}-journal.jsonl",
         ]
         args.xemm_journal_selection = "default_production_journals"
         args.require_xemm_journal_paths = False
@@ -533,7 +544,7 @@ def parse_args() -> argparse.Namespace:
         args.xemm_journal_selection = "runs_dir_mtime_since"
         args.require_xemm_journal_paths = False
     if args.orchestrator_state is None:
-        args.orchestrator_state = default_state_path(stack_root, args.market)
+        args.orchestrator_state = default_state_path(roots, args.market)
     if args.xemm_untimestamped == "include":
         args.include_untimestamped_xemm = True
     elif args.xemm_untimestamped == "exclude":

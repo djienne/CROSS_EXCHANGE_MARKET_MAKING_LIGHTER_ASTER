@@ -8,7 +8,7 @@
 # by docker-compose and are NEVER baked into an image layer.
 #
 # Build locally (fast box, plenty of RAM) and ship the image to the 2 GB VPS:
-#   docker compose build                       # tags lighter_aster_bot:live
+#   docker compose build bot                   # tags lighter_aster_bot:live (a bare `build` makes the dry run's image)
 #   docker save lighter_aster_bot:live | gzip | ssh ... 'gunzip | docker load'
 # The VPS never compiles (a Rust LTO release build would risk OOM on 1.9 GiB).
 

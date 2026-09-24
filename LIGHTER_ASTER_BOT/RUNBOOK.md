@@ -2,9 +2,10 @@
 
 `lighter_aster_bot run` trades one market with both engines in one process. The taker–taker
 engine and the reduce-only XEMM engine take turns holding execution rights; the controller
-switches them in memory. Commands run from this directory (`LIGHTER_ASTER_BOT/`) and read
-`bot.toml`. `run --mode live`, `taker run` without `--observe-only` and the
-`*-market`/`*-roundtrip` probes submit real orders.
+switches them in memory. `--mode live` trades real money; `--mode dry-run` runs the same bot
+against simulated venues fed by live market data ([Dry run](#dry-run)). Commands run from
+this directory (`LIGHTER_ASTER_BOT/`) and read `bot.toml`. `run --mode live`, `taker run`
+without `--observe-only` and the `*-market`/`*-roundtrip` probes submit real orders.
 
 ## How `run` switches
 
@@ -42,8 +43,8 @@ cargo build --release --locked        # Rust 1.92; never `cargo fmt`
 - Every Aster signer process shares `ASTER_NONCE_DIR`, a memory-mapped counter per signer that
   survives restarts. The default is the OS temp dir's `lighter-aster-nonces`. Keep it
   persistent, writable by the bot user, and never delete it while any signer runs.
-- `bot.toml` has `[controller]`, `[taker]` and `[maker]`. Unknown or misplaced keys fail the
-  load, and so do the retired XEMM switches (`live.partials.max_pending_count`,
+- `bot.toml` has `[controller]`, `[taker]`, `[maker]` and `[dry_run]`. Unknown or misplaced
+  keys fail the load, and so do the retired XEMM switches (`live.partials.max_pending_count`,
   `live.quote.price_change_ticks_to_requote`, `expires_after_ms`, …) and non-mainnet
   `[maker.live]` URLs.
   The mode is a command-line choice only. `[taker.live] enabled = true, mode = "live"` arms
@@ -74,7 +75,118 @@ clean stop; nonzero means a halt, an unresolved engine stop or an unwritable eve
 
 Only one live writer per market runs at a time: `run --mode live` and `taker run` (unless
 `--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock` and name the holder's pid
-on contention.
+on contention. A dry run locks `runs/dry-run/bot-<MARKET>.lock`, so it can run beside live.
+
+## Dry run
+
+`run --mode dry-run` is the whole bot, both engines, the controller and every client and
+signer unchanged, against an in-process simulated Aster and Lighter on loopback. The
+simulator follows the live public market data and answers in each venue's own protocol. It
+needs no credentials: the bot signs with a fixed dry-run identity whose keys exist on no
+venue, so a request that escaped to mainnet could not trade. Its files live in
+`runs/dry-run/`, which live never touches.
+
+The venues respond as seen from AWS Tokyo, and pessimistically where the data cannot decide
+(`[dry_run]` in `bot.toml` cites each value's source):
+
+- **Time shift.** The simulated world is the live one `shift_ms` (1000) late, timestamps
+  included, so the bot sees books as fresh as a Tokyo host would, by its own clocks. A frame
+  that reaches this host later than that is applied on arrival and counted as late.
+- **Latency.** Each request draws a lognormal round trip from the benchmarked `[p50, p99]`
+  and takes effect at `effect_fraction` (0.9) of it. Lighter taker orders wait a further
+  `lighter_taker_delay_ms` (300, the Standard account's delay).
+- **Takers** fill against the worse of the two book states around their effect time, and
+  liquidity the bot took stays gone until the feed shows that level smaller.
+- **Makers** wait behind the visible size at their price times `1 + hidden_queue_multiplier`.
+  Prints at their price work through that queue before filling them; a print through their
+  price, or a book that crosses them, fills them outright.
+- **Venue rules**: the live filters, reduce-only, the Aster deadman and listen-key expiry,
+  Lighter's sequential nonces, and both venues' rate limits (Lighter Standard: 60 REST
+  requests and 60 transactions a minute).
+- **Accounts**: one cross account per venue from the `[dry_run]` balances. Fees come from the
+  bot's own fee keys, so the dry run cannot catch a wrong one. Funding follows the public
+  rates at each venue's funding times. A maintenance-margin breach is reported, not
+  liquidated.
+
+Docker (from this directory; the fleet's `start_all.bat` also starts it):
+
+```bash
+docker compose up -d --build dryrun
+docker compose logs -f dryrun
+```
+
+Natively: `./target/release/lighter_aster_bot run --market HYPE --mode dry-run`.
+
+It stops like live (SIGINT, a drain, positions stay open) and saves the simulated venues;
+the next start takes up their accounts, positions and resting orders. The market moved
+meanwhile, so the first book fills any resting order it crosses, an expired Aster deadman
+cancels, and funding that fell due is charged. To start afresh, stop it and move
+`runs/dry-run/` away. Moving only `sim-<M>.state.json` would leave the drawdown baseline
+measuring the reset accounts. A fresh directory also restarts the taker's entry-gate
+history: as after a fresh live start, the taker trades only once it has seen 500
+opportunities above its required edge (`[taker.arb.entry_gate]`).
+
+An unclean stop (a host reboot, `docker kill`) loses at most the venues' last second. The
+next start archives the engines' unclean-session markers, whether a kill or an unresolved
+engine stop left them, as `<name>.unclean.<stamp>`. Live keeps them until an operator has
+resolved the session against the venues' records; here the simulated venues' own state is
+the only record, and the engines reconcile to it at start. Docker treats `docker kill` as a
+deliberate stop and does not restart the container; `docker compose up -d dryrun` does.
+
+**Halts.** A halted dry run parks: the process and the simulated venues keep running, the
+diagnostics too, until it is stopped, so the restart policy never resumes it unreviewed. The
+service passes `--ack-breaker`, so `docker compose restart dryrun` is the review. An
+equity-drawdown halt parks again, asking for `--reset-breaker-baseline`:
+
+```bash
+docker compose stop dryrun
+docker compose run --rm dryrun run --market HYPE --mode dry-run --ack-breaker --reset-breaker-baseline
+# Ctrl-C once it has started, then resume in the background:
+docker compose up -d dryrun
+```
+
+The engines' own loss latches ([Halts and recovery](#halts-and-recovery)) have dry-run
+resets: `python scripts/reset_breaker.py --runs-dir runs/dry-run --coin HYPE` for XEMM, and
+`docker compose run --rm dryrun taker reset-circuit-breaker --market HYPE --dry-run` for the
+taker. Without `--dry-run` that command resets live's breaker.
+
+**Diagnostics.** Every minute the simulator logs a one-line gist and appends a row to
+`runs/dry-run/sim-<M>.diag.jsonl`, per venue (quantiles are `{n, p50, p90, p99, max}`):
+
+| Field | Read it as |
+|---|---|
+| `late_frames` of `frames` | Frames later than the shift. Keep them under 1 %, or raise `shift_ms`. |
+| `lag_ms` (`book`, `top`, `trade`) | Arrival minus exchange time, clock skew included. The p99 must stay under `shift_ms` − 250 (the lookahead that finds the later book state). |
+| `stale_frames`, `gaps` | Out-of-order book frames, and upstream breaks. A gap closes the bot's streams, as the venue would, and orders are rejected `Unavailable` until the next snapshot. |
+| `lateness_ms` (whole row) | How late the simulator ran its events. Tens of ms mean the container is short of CPU. |
+| `rtt_ms`, `private_ms` | The latencies drawn. |
+| `requests`, `orders`, `rejects` | Rejects by reason. Each needs an explanation in the bot's log; `RateLimited` means the bot outran a venue limit, which is a finding about the bot. |
+| `maker_fills`, `taker_fills`, `queue_ahead`, `maker_wait_ms` | Fills, the queue ahead of each order that came to rest, and each maker fill's wait since placement. |
+| `prints`, `prints_inside_spread`, `prints_over_visible` | Trades the visible book cannot explain, i.e. hidden liquidity. Their share calibrates `hidden_queue_multiplier`. |
+| `account` | Balance, unrealized, equity, realized, fees, funding, positions, maintenance breach. |
+
+Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simulated` means
+the bot used something the simulator does not serve, so the dry run no longer matches live:
+treat it as a bug. The reports take `--dry-run` (`python3 combined_pnl.py --dry-run`;
+`python3 trade_history.py --dry-run` keeps its own database in `runs/dry-run/`).
+
+What the dry run cannot tell: whether the fee keys are right; the bot's market impact beyond
+the liquidity it takes; how Aster's ~100 ms splits around matching, and how Lighter treats an
+IOC it cannot fill (both assumed pessimistically until live acks calibrate them); anything
+about liquidation. Lighter signatures are not verified.
+
+**Going live.**
+
+1. The dry run has run for days with no unexplained reject, halt or `no route` warning, and
+   its reports agree with the simulated equity net of funding and open-position marks.
+2. `aster.env` and `lighter.env` are in place ([Build, secrets, configuration](#build-secrets-configuration)).
+3. Build the live image: `docker compose build bot` (the dry run's image is separate).
+4. The read-only probes pass: `docker compose run --rm bot probe aster-balance`, then
+   `probe lighter-balance`, `probe lighter-open-orders` and `taker probe --market HYPE`.
+5. The fee keys in `bot.toml` match both accounts' actual tiers.
+6. Neither venue has open orders, and positions are flat or paired.
+7. `docker compose run --rm --name bot-hype bot run --market HYPE --mode live`. Its files are
+   in `runs/`, and its drawdown baseline starts at the first sample.
 
 ## Runtime files (`runs/`)
 
@@ -90,7 +202,8 @@ on contention.
 | `active_session_<M>.json`, `circuit_breaker_<M>.json` | Taker unclean-session marker and loss breaker |
 
 The taker's observe-only history still feeds `opportunities_<M>.jsonl`, as live history
-collection does.
+collection does. A dry run writes the same files in `runs/dry-run/`, plus the simulated
+venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 
 ## Halts and recovery
 
@@ -198,7 +311,7 @@ docker compose run --rm bot taker probe --market HYPE
 ```
 
 Compose mounts this directory read-only (config, signers, env files), `runs/` read-write and
-the nonce dir at `/nonce`. It never restarts the bot: a halt stays halted until reviewed.
+the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted until reviewed.
 
 ## Probes
 

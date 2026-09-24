@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
-from combined_pnl import DEFAULT_SINCE, dec, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, utc_now
+from combined_pnl import DEFAULT_SINCE, dec, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, report_roots, utc_now
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -953,13 +953,13 @@ def print_human(stats: list[IngestStats], report: dict[str, Any] | None) -> None
 
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
-    bot_root = stack_root / "LIGHTER_ASTER_BOT"
     parser = argparse.ArgumentParser(description="Canonical local trade-history DB and PnL report.")
     parser.add_argument("--mode", choices=["lan", "local"], default="lan", help="lan/local: local artifacts only; no exchange API calls.")
+    parser.add_argument("--dry-run", action="store_true", help="The dry run's files and its own DB (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
-    parser.add_argument("--db", type=Path, default=stack_root / "runs/trade_history.sqlite")
+    parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite (a dry run's in its own directory).")
     parser.add_argument("--taker-trades", type=Path, default=None)
     parser.add_argument("--orchestrator-trades", type=Path, default=None, help="The retired orchestrator's normalized trade ledger (historical XEMM rows).")
     parser.add_argument("--xemm-journal", type=Path, action="append", default=None, help="XEMM raw journal with logical/attempt execution evidence and economic timestamps; repeatable. Default: the retired orchestrator's journal, then `run`'s.")
@@ -975,17 +975,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-fills", type=Path, action="append", default=[], help="Own-account execution_trade JSONL with venue/order identities, notional and fee evidence; repeatable.")
     args = parser.parse_args()
     args.mode = "lan"
+    roots = report_roots(stack_root, args.dry_run)
+    legacy_runs, bot_runs = roots
+    if args.db is None:
+        args.db = legacy_runs / "trade_history.sqlite"
     if args.taker_trades is None:
-        args.taker_trades = bot_root / f"runs/trades_{args.market}.jsonl"
+        args.taker_trades = bot_runs / f"trades_{args.market}.jsonl"
     if args.orchestrator_trades is None:
-        args.orchestrator_trades = stack_root / f"runs/orchestrator_trades_{args.market}.jsonl"
+        args.orchestrator_trades = legacy_runs / f"orchestrator_trades_{args.market}.jsonl"
     if args.xemm_journal is None:
         args.xemm_journal = [
-            stack_root / f"runs/orchestrator-xemm-{args.market}-journal.jsonl",
-            bot_root / f"runs/bot-{args.market}-journal.jsonl",
+            legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
+            bot_runs / f"bot-{args.market}-journal.jsonl",
         ]
     if args.orchestrator_state is None:
-        args.orchestrator_state = default_state_path(stack_root, args.market)
+        args.orchestrator_state = default_state_path(roots, args.market)
     return args
 
 

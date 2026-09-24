@@ -203,21 +203,29 @@ pub(crate) async fn run_with(
         let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
         Some(crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?)
     };
-    let files = supervisor::Files::new(&runs_dir, &market);
-    let mut events = EventLog::new(files.events.clone());
-    risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
-    if reset_baseline && files.baseline.exists() {
-        std::fs::remove_file(&files.baseline)?;
-        events.emit("baseline_reset", serde_json::json!({"path": files.baseline.display().to_string()}));
-    }
-    let taker_ledger = crate::taker::pnl::ledger_path(&cfg.taker.pnl, &taker_markets[0].id());
-    let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
     let parked = stop.clone();
-    let result = supervisor::Supervisor::new(cfg.controller, market, mode, files, taker_ledger, engines, events, stop).run().await;
+    let result = async move {
+        let files = supervisor::Files::new(&runs_dir, &market);
+        let mut events = EventLog::new(files.events.clone());
+        if !live {
+            let taker_session = crate::taker::pnl::session_path(&cfg.taker.pnl, &taker_markets[0].id());
+            archive_unclean_sessions([taker_session, crate::livebot::breaker::active_path(&files.xemm_stem)], &mut events)?;
+        }
+        risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
+        if reset_baseline && files.baseline.exists() {
+            std::fs::remove_file(&files.baseline)?;
+            events.emit("baseline_reset", serde_json::json!({"path": files.baseline.display().to_string()}));
+        }
+        let taker_ledger = crate::taker::pnl::ledger_path(&cfg.taker.pnl, &taker_markets[0].id());
+        let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
+        supervisor::Supervisor::new(cfg.controller, market, mode, files, taker_ledger, engines, events, stop).run().await
+    }
+    .await;
     if let Some(sim) = sim {
         if let Err(error) = &result {
-            // Exiting would let a restart policy resume it unreviewed; a deliberate restart is
-            // the review.
+            // Once the venues are up, a dry run parks on any halt, a refused start included:
+            // exiting would let a restart policy resume it unreviewed (or loop), and a
+            // deliberate restart is the review.
             warn!("dry run halted, parked until stopped: {error:#}");
             parked.cancelled().await;
         }
@@ -226,6 +234,21 @@ pub(crate) async fn run_with(
         }
     }
     result
+}
+
+/// The engines' unclean-session markers (`markers`) a killed dry run, or an unresolved engine
+/// stop, left behind. Live keeps them until an operator resolves the session against the venues'
+/// records; the simulated venues' own saved state is the only record here, and the engines
+/// reconcile to it at start (a halt was already recorded, and restarting is its review).
+/// Archives each as `<name>.unclean.<stamp>`.
+fn archive_unclean_sessions(markers: [PathBuf; 2], events: &mut EventLog) -> Result<()> {
+    for marker in markers.into_iter().filter(|path| path.exists()) {
+        let archived = PathBuf::from(format!("{}.unclean.{}", marker.display(), Utc::now().format("%Y%m%dT%H%M%SZ")));
+        std::fs::rename(&marker, &archived).with_context(|| format!("archiving {}", marker.display()))?;
+        warn!("dry run: the last run stopped uncleanly; archived {} as {}", marker.display(), archived.display());
+        events.emit("dry_run_unclean_session_archived", serde_json::json!({"path": marker.display().to_string(), "archived": archived.display().to_string()}));
+    }
+    Ok(())
 }
 
 /// Live refuses credential files readable by group or other (mode must be 600).
@@ -451,7 +474,6 @@ mod tests {
         assert!(row.final_net_position.is_zero(), "{row:?}");
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
-        fresh.abort();
         // The final save keeps the hedged pair for the next start.
         let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE.state.json")).unwrap();
         let state: serde_json::Value = serde_json::from_str(&state).unwrap();
@@ -460,6 +482,28 @@ mod tests {
         let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         written.sort();
         assert_eq!(written, ["bot.toml", "dry-run"], "a dry run writes under runs/dry-run only");
+
+        // A restart that must not resume (a drawdown halt acknowledged without a baseline
+        // reset) parks, so a restart policy cannot loop on it. A kill had also left the
+        // taker's unclean-session marker, which the dry run archives.
+        let latch = r#"{"reason":"pnl_breaker","details":{"breaker_reason":"equity_drawdown"}}"#;
+        std::fs::write(dir.join("dry-run").join("bot-HYPE.breaker.json"), latch).unwrap();
+        let marker = dir.join("dry-run").join("active_session_HYPE.json");
+        std::fs::write(&marker, "{}").unwrap();
+        let (cfg, stop) = (crate::dryrun::tests::shipped_config(&market, &dir), CancellationToken::new());
+        let again = tokio::spawn({
+            let (stop, runs) = (stop.clone(), dir.clone());
+            async move { run_with(cfg, &runs, "HYPE", LiveMode::DryRun, true, false, stop).await }
+        });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(!again.is_finished(), "a refused dry-run start parks");
+        stop.cancel();
+        let error = again.await.unwrap().expect_err("still a halt");
+        assert!(format!("{error:#}").contains("--reset-breaker-baseline"), "{error:#}");
+        let archived = std::fs::read_dir(dir.join("dry-run")).unwrap().flatten()
+            .any(|entry| entry.file_name().to_string_lossy().starts_with("active_session_HYPE.json.unclean."));
+        assert!(!marker.exists() && archived, "the unclean-session marker is archived");
+        fresh.abort();
         std::fs::remove_dir_all(dir).unwrap();
     }
 

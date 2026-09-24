@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from decimal import Decimal
 from pathlib import Path
 
@@ -367,6 +368,16 @@ class TradeHistoryTests(unittest.TestCase):
             self.assertEqual(Decimal(str(lighter_fee)), Decimal("0.01"))
             self.assertEqual(Decimal(str(net)), Decimal("0.99"))
             self.assertEqual(source, "xemm_journal")
+
+    def test_dry_run_reports_read_and_write_only_the_dry_run_directory(self) -> None:
+        dry = Path(trade_history.__file__).resolve().parent / "LIGHTER_ASTER_BOT" / "runs" / "dry-run"
+        for module in (combined_pnl, trade_history):
+            for flags in ([], ["--dry-run"]):
+                with mock.patch.object(sys, "argv", [module.__name__, *flags]):
+                    args = module.parse_args()
+                keys = ("taker_trades", "orchestrator_state", "db", "orchestrator_trades")
+                paths = [getattr(args, key) for key in keys if hasattr(args, key)] + args.xemm_journal
+                self.assertEqual({dry in path.parents for path in paths}, {bool(flags)}, (module.__name__, flags))
 
 
 if __name__ == "__main__":

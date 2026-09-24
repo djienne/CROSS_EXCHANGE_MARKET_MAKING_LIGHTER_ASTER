@@ -4,7 +4,20 @@
 # ONE image, supplied a command per run. Secrets are MOUNTED read-only (never baked).
 # The runs/ dir (journals, ledgers, latches, controller state) is a persistent bind mount.
 #
-# ---- Typical commands (run from this dir on the VPS; config = bot.toml) -----------
+# `docker compose build` / `up -d` touch only `dryrun`, the same bot against simulated venues
+# (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun). The real-money
+# `bot` service sits behind the `live` profile: only a command naming it builds or starts it,
+# so never set COMPOSE_PROFILES=live here.
+#
+# ---- Dry run (safe unattended; the fleet's start_all.bat starts it) ---------------
+#   docker compose up -d --build dryrun
+#   docker compose logs -f dryrun
+#   docker compose restart dryrun     # after a halt: the restart is the review
+#
+# ---- Typical live commands (run from this dir on the VPS; config = bot.toml) -------
+#
+# Build the live image (scripts/deploy_vps.sh image does this and ships it):
+#   docker compose build bot
 #
 # No-risk credential / connectivity check (signed reads, places NO orders):
 #   docker compose run --rm bot probe aster-balance
@@ -22,6 +35,7 @@
 
 services:
   bot:
+    profiles: ["live"]
     build:
       context: .
       dockerfile: Dockerfile
@@ -50,3 +64,42 @@ services:
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.
     command: ["--help"]
+
+  # The same bot against simulated Aster and Lighter venues fed by live public market data
+  # (RUNBOOK.md, "Dry run"). No credentials are mounted, and its dry-run identity signs for
+  # no real account.
+  dryrun:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Its own tag: the fleet's start_all.bat rebuilds this from the working tree, which must
+    # never retag the live image.
+    image: lighter_aster_bot:dryrun
+    container_name: lighter-aster-dryrun
+    working_dir: /app
+    user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
+    # Only what the dry run reads and writes; the Aster nonce counter stays in the
+    # container's /tmp (the nonces are clock-based, so a fresh counter is safe).
+    volumes:
+      - ./bot.toml:/app/bot.toml:ro
+      - ./signers:/app/signers:ro
+      - ./runs/dry-run:/app/runs/dry-run
+    # A halted dry run parks until stopped, so this policy never resumes one unreviewed; a
+    # deliberate restart acknowledges the halt.
+    command: ["run", "--market", "HYPE", "--mode", "dry-run", "--ack-breaker"]
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 200s
+    # A latency simulator must not be CFS-throttled, and the quota also sizes the tokio worker
+    # pool: 2 CPUs is ~100x the ~2 % of one core measured, a ceiling against a runaway only.
+    # The value is the fleet policy's override (HELPERS\cpu_limits); cpu_limits.bat keeps it.
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"

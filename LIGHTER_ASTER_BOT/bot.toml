@@ -249,10 +249,11 @@ lighter_symbol      = "ETH"
 # Tokyo (ap-northeast-1) would see it; files go to runs/dry-run/. Latencies are [p50, p99] ms,
 # drawn lognormal. Fees and leverage are the engines' own keys above.
 [dry_run]
-# The simulated world is the real one delayed by shift_ms, which must cover this host's feed lag
-# (Europe: ~125 ms typical; one Aster aggTrade came ~220 ms late) plus the 250 ms lookahead that
-# matches takers against the worse of the two book states around them.
-shift_ms = 500
+# The simulated world is the real one delayed by shift_ms. Every frame must reach this host in
+# under shift_ms minus the 250 ms lookahead that matches takers against the worse of the two book
+# states around them. Measured here in Docker on 2026-09-24 (sim-<M>.diag.jsonl `lag_ms`): book
+# p50 ~200 ms, p99 ~390 ms; trades p99 up to ~620 ms. The shift itself is invisible to the bot.
+shift_ms = 1000
 seed     = 0
 aster_port   = 18081
 lighter_port = 18082
