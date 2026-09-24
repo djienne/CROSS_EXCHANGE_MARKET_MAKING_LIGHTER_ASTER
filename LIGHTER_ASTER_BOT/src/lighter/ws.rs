@@ -8,13 +8,12 @@
 //! the strategy thread aborts the process (`taker::abort_on_panic`).
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 /// The `/stream` websocket of the Lighter venue whose REST base is `base`: Lighter serves both
@@ -197,7 +196,7 @@ async fn session<F>(
 where
     F: FnMut(&LighterFrame<'_>),
 {
-    let (ws_stream, _) = connect_async(&opts.url).await?;
+    let ws_stream = crate::connectors::connect_guarded(&opts.url).await?;
     let (mut write, mut read) = ws_stream.split();
     tracing::info!("connected to {} for {}", opts.url, opts.label);
 
@@ -206,7 +205,7 @@ where
         if let Some(auth) = opts.channel_auths.get(ch) {
             sub["auth"] = Value::String(auth.clone());
         }
-        write.send(Message::Text(sub.to_string())).await?;
+        crate::connectors::send_guarded(&mut write, Message::Text(sub.to_string())).await?;
     }
     tracing::info!("{} subscribed to {:?}", opts.label, opts.channels);
 
@@ -218,22 +217,22 @@ where
     let mut last_frame = Instant::now();
     let mut last_data = Instant::now();
     loop {
-        // Non-blocking forced-reconnect check.
-        if let Some(rc) = reconnect {
-            if rc.notified().now_or_never().is_some() {
-                tracing::info!(
-                    "{} reconnect requested; dropping for fresh snapshot",
-                    opts.label
-                );
+        // Race the read against the keepalive tick and the forced-reconnect Notify. On the tick
+        // we send a proactive client Ping (so a quiet stream still satisfies Lighter's 2-min
+        // "send a frame" rule). Socket liveness is based on ANY received frame; optional data
+        // freshness is based only on real application messages. The Notify is a real arm, so a
+        // request during a quiet stretch fires at once; recreating `notified()` per pass is
+        // safe, as an unconsumed permit stays stored.
+        let msg = tokio::select! {
+            _ = async {
+                match reconnect {
+                    Some(rc) => rc.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                tracing::info!("{} reconnect requested; dropping for fresh snapshot", opts.label);
                 return Ok(());
             }
-        }
-
-        // Race the read against the keepalive tick. On the tick we send a proactive client Ping
-        // (so a quiet stream still satisfies Lighter's 2-min "send a frame" rule). Socket
-        // liveness is based on ANY received frame; optional data freshness is based only on real
-        // application messages.
-        let msg = tokio::select! {
             _ = ping_tick.tick() => {
                 if last_frame.elapsed() > frame_to {
                     tracing::warn!("{} watchdog: no frames for {}s", opts.label, opts.frame_timeout);
@@ -318,15 +317,13 @@ where
     }
 }
 
-// bring `now_or_never` into scope
-use futures_util::future::FutureExt;
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio::net::TcpListener;
+    use futures_util::SinkExt;
     use tokio::time::{sleep, timeout};
     use tokio_tungstenite::accept_async;
 
@@ -481,5 +478,86 @@ mod tests {
             .unwrap();
         server.await.unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
+    async fn subscription_message_includes_channel_auth_when_configured() {
+        let (listener, url) = local_ws_url().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let Message::Text(raw) = ws.next().await.unwrap().unwrap() else {
+                panic!("expected text subscribe frame");
+            };
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(v["type"], "subscribe");
+            assert_eq!(v["channel"], "test/channel");
+            assert_eq!(v["auth"], "secret-token");
+            ws.close(None).await.unwrap();
+        });
+        let mut opts = opts(url);
+        opts.channel_auths.insert("test/channel".to_string(), "secret-token".to_string());
+        opts.frame_timeout = 1.0;
+        let mut on_message = |_frame: &LighterFrame<'_>| {};
+        timeout(Duration::from_secs(2), session(&opts, None, &mut on_message))
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn frames_without_a_type_tag_are_still_delivered() {
+        let (listener, url) = local_ws_url().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _sub = ws.next().await.unwrap().unwrap();
+            ws.send(Message::Text(r#"{"n":1}"#.into())).await.unwrap();
+            sleep(Duration::from_millis(200)).await;
+        });
+        let mut opts = opts(url);
+        opts.data_timeout = Some(0.12);
+        opts.frame_timeout = 2.0;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_cb = calls.clone();
+        let mut on_message = move |frame: &LighterFrame<'_>| {
+            assert_eq!(frame.raw, r#"{"n":1}"#);
+            calls_for_cb.fetch_add(1, Ordering::Relaxed);
+        };
+        timeout(Duration::from_secs(2), session(&opts, None, &mut on_message))
+            .await
+            .unwrap()
+            .unwrap();
+        server.abort();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_notify_fires_immediately_on_a_quiet_stream() {
+        // A request during a quiet stretch (no frames, no ping tick) ends the session at once.
+        let (listener, url) = local_ws_url().await;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            let _sub = ws.next().await.unwrap().unwrap();
+            sleep(Duration::from_secs(5)).await;
+        });
+        let mut opts = opts(url);
+        opts.data_timeout = None;
+        opts.frame_timeout = 30.0;
+        opts.ping_interval = Duration::from_secs(20);
+        let reconnect = Arc::new(Notify::new());
+        let rc = reconnect.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            rc.notify_one();
+        });
+        let mut on_message = |_frame: &LighterFrame<'_>| {};
+        timeout(Duration::from_millis(500), session(&opts, Some(&reconnect), &mut on_message))
+            .await
+            .expect("session must return promptly on reconnect notify")
+            .unwrap();
+        server.abort();
     }
 }

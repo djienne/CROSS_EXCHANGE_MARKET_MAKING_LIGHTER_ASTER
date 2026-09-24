@@ -301,6 +301,18 @@ impl Tap {
 /// fires on a genuinely stalled sink.
 pub(crate) const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `connect_async` with a stall guard: a TCP, TLS or upgrade step that hangs must end the
+/// attempt so the caller's reconnect loop runs, not hold the feed dark with no reader to wake.
+pub(crate) async fn connect_guarded(
+    url: &str,
+) -> anyhow::Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url)).await {
+        Ok(res) => Ok(res?.0),
+        Err(_) => anyhow::bail!("ws connect stalled >{}s", CONNECT_TIMEOUT.as_secs()),
+    }
+}
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Send a control/keepalive frame (Pong, subscribe, ping) with a stall guard.
 /// Awaiting `write.send(...)` directly inside the reader's `select!` means a wedged
 /// write side would starve the idle-timeout and reconnect arms; bounding the send

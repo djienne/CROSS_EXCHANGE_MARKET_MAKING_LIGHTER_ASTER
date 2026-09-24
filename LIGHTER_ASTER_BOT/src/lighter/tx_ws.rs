@@ -104,6 +104,7 @@ impl TxWebSocket {
 
     async fn reconnect_loop(state: Arc<State>) {
         let mut backoff = Duration::from_millis(250);
+        let mut opened: Option<tokio::time::Instant> = None;
         loop {
             if state.is_ready() {
                 tokio::select! {
@@ -111,6 +112,16 @@ impl TxWebSocket {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
                 if state.is_ready() { continue; }
+            }
+            // A connection that died young (a server accepting, then closing) is not reopened
+            // at handshake rate: only one that lived 10 s resets the backoff.
+            if let Some(at) = opened.take() {
+                if at.elapsed() < Duration::from_secs(10) {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                } else {
+                    backoff = Duration::from_millis(250);
+                }
             }
             let mut guard = state.conn.lock().await;
             if guard.as_ref().is_some_and(Conn::is_alive) { continue; }
@@ -121,7 +132,7 @@ impl TxWebSocket {
                     let alive = conn.alive.clone();
                     *guard = Some(conn);
                     *state.published_alive.write().unwrap_or_else(|e| e.into_inner()) = Some(alive);
-                    backoff = Duration::from_millis(250);
+                    opened = Some(tokio::time::Instant::now());
                     continue;
                 }
                 Ok(Err(error)) => tracing::warn!("Lighter tx reconnect failed: {error:#}"),

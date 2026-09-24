@@ -15,7 +15,6 @@ use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::sync::Notify;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::taker::book::OrderBook;
@@ -137,7 +136,7 @@ async fn depth_session(
     state: Arc<AsterBookState>,
     reconnect: Arc<Notify>,
 ) -> Result<()> {
-    let (ws, _) = connect_async(url).await?;
+    let ws = crate::connectors::connect_guarded(url).await?;
     let (mut write, mut read) = ws.split();
     tracing::info!("Aster depth connected: symbol={} url={}", symbol, url);
 

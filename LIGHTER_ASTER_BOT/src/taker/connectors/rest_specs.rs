@@ -156,7 +156,7 @@ async fn fetch_lighter_meta(
     base_url: &str,
 ) -> Result<HashMap<String, LighterMarketMeta>> {
     let url = endpoint(base_url, "/api/v1/orderBooks");
-    let resp: crate::taker::lighter::messages::OrderBooksResponse = client
+    let resp: crate::lighter::messages::OrderBooksResponse = client
         .get(&url)
         .send()
         .await

@@ -11,7 +11,6 @@ pub(crate) mod config;
 mod connectors;
 mod decimal;
 mod entry_gate;
-mod lighter;
 mod markets;
 pub(crate) mod pnl;
 pub(crate) mod status;

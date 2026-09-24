@@ -42,7 +42,6 @@ pub struct QuoteEngineConfig {
     #[serde(alias = "min_lighter_bbo_depth_multiple")]
     pub depth_liquidity_multiple: Decimal,
     pub max_hedge_slippage_bps: Decimal,
-    pub min_requote_interval_ms: u64,
     pub price_change_ticks_to_requote: u32,
     /// When `desired_notional` buys fewer than the venue minimum lot (e.g. $50 is
     /// below BTC's ~0.001 BTC minimum), clamp the order UP to the smallest size
@@ -399,7 +398,9 @@ pub fn compute_desired_quote_with_aster_touch_source(
         qty = eff_min_qty;
         size_clamped_up = true;
     }
-    if qty <= Decimal::ZERO || qty < min_qty {
+    // Below the both-venue minimum (clamping off, or a cap shrank it): its fill could not be
+    // hedged on Lighter.
+    if qty <= Decimal::ZERO || qty < eff_min_qty {
         if reduce_only_qty.is_some_and(|h| h < min_qty) {
             return Err(RejectReason::PositionReduceOnly);
         }
@@ -621,7 +622,6 @@ mod tests {
             max_aster_touch_hysteresis_ms: 300_000,
             depth_liquidity_multiple: dec!(10.0),
             max_hedge_slippage_bps: dec!(5.0),
-            min_requote_interval_ms: 20,
             price_change_ticks_to_requote: 1,
             clamp_to_min_lot: true,
             min_requote_bps: dec!(1.0),
@@ -1237,6 +1237,13 @@ mod tests {
         let r = compute_desired_quote(
             &edge(), &cfg, &a, &h, Side::Buy,
             dec!(0.01), dec!(0.001), dec!(2.0), dec!(5), dec!(5), 750, ts(),
+            &PositionContext::unconstrained(),
+        );
+        assert_eq!(r.unwrap_err(), RejectReason::QuantityBelowMinimum);
+        // Above Aster's minimum but under a $150 Lighter minimum: its fill could not be hedged.
+        let r = compute_desired_quote(
+            &edge(), &cfg, &a, &h, Side::Buy,
+            dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(150), 750, ts(),
             &PositionContext::unconstrained(),
         );
         assert_eq!(r.unwrap_err(), RejectReason::QuantityBelowMinimum);

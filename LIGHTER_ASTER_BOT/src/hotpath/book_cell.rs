@@ -1,6 +1,6 @@
 //! The lock-free latest-book cell — one per (market, venue). A single writer (the
 //! venue ingest thread) publishes the freshest [`OrderBook`] via an atomic pointer
-//! swap; many readers (the stream watchdog, a future strategy hot loop) read it
+//! swap; many readers (the stream watchdog, the XEMM strategy) read it
 //! wait-free. A separate atomic stamps the last-message time for staleness checks.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -32,7 +32,7 @@ impl VenueTag {
 /// One venue's latest book for one market, plus a liveness stamp.
 ///
 /// Writer: the venue ingest thread (single writer per cell). Readers: the watchdog
-/// and a future strategy loop (many readers, wait-free). `book` is `None` until the
+/// and the XEMM strategy (many readers, wait-free). `book` is `None` until the
 /// first snapshot arrives.
 pub struct VenueBook {
     book: ArcSwapOption<OrderBook>,

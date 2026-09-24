@@ -749,6 +749,19 @@ impl Config {
             if self.book_check.max_rest_snapshot_age_ms <= 0 {
                 bail!("book_check.max_rest_snapshot_age_ms must be positive");
             }
+            // Each check reads Lighter's book over REST: at 1 s that is a Standard account's
+            // whole 60 calls a minute.
+            if self.book_check.interval_secs < 10 {
+                bail!("book_check.interval_secs must be >= 10");
+            }
+        }
+        let e = &self.edge;
+        for (name, bps) in [("min_net_profit_bps", e.min_net_profit_bps), ("slippage_buffer_bps", e.slippage_buffer_bps),
+            ("latency_buffer_bps", e.latency_buffer_bps), ("basis_buffer_bps", e.basis_buffer_bps),
+            ("funding_buffer_bps", e.funding_buffer_bps)] {
+            if bps < Decimal::ZERO {
+                bail!("edge.{name} must be non-negative: a negative one admits quotes below the fees");
+            }
         }
         if self.live.max_book_staleness_ms < 0 {
             bail!("live.max_book_staleness_ms must be non-negative");
@@ -824,7 +837,6 @@ desired_notional = "100"
 max_quote_distance_bps = "5.0"
 min_lighter_bbo_depth_multiple = "10.0"
 max_hedge_slippage_bps = "5.0"
-min_requote_interval_ms = 20
 price_change_ticks_to_requote = 1
 clamp_to_min_lot = true
 
@@ -1044,8 +1056,8 @@ lighter_symbol = "DOGE"
     #[test]
     fn negative_touch_hysteresis_rejected() {
         let bad = SAMPLE.replace(
-            "min_requote_interval_ms = 20\n",
-            "min_requote_interval_ms = 20\nmin_aster_touch_hysteresis_bps = \"-1\"\n",
+            "price_change_ticks_to_requote = 1\n",
+            "price_change_ticks_to_requote = 1\nmin_aster_touch_hysteresis_bps = \"-1\"\n",
         );
         assert!(toml::from_str::<Config>(&bad).unwrap().validate().is_err());
     }
@@ -1053,8 +1065,8 @@ lighter_symbol = "DOGE"
     #[test]
     fn negative_touch_hysteresis_timeout_rejected() {
         let bad = SAMPLE.replace(
-            "min_requote_interval_ms = 20\n",
-            "min_requote_interval_ms = 20\nmax_aster_touch_hysteresis_ms = -1\n",
+            "price_change_ticks_to_requote = 1\n",
+            "price_change_ticks_to_requote = 1\nmax_aster_touch_hysteresis_ms = -1\n",
         );
         assert!(toml::from_str::<Config>(&bad).unwrap().validate().is_err());
     }

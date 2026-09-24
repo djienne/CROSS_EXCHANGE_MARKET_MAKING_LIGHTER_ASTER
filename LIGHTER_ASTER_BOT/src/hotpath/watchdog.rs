@@ -1,9 +1,10 @@
 //! Stream-staleness watchdog. A dedicated OS thread scans every [`VenueBook`]'s
 //! liveness stamp; when a stream goes silent (a half-open socket that never sent a
 //! Close frame) it (a) asks that reader to drop and reconnect via a lock-free
-//! [`ReconnectHandle`], and (b) closes a [`TradingGate`] so a future strategy hot
-//! loop pulls its quotes. Everything here is lock-free atomics + an edge-triggered
-//! `Notify`; no mutexes on the read side.
+//! [`ReconnectHandle`], and (b) closes a [`TradingGate`], which only drives the
+//! OPEN/CLOSED log (the strategy gates each market on its own feed freshness).
+//! Everything here is lock-free atomics + an edge-triggered `Notify`; no mutexes on
+//! the read side.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,8 +119,10 @@ pub fn scan_once(
         if cell.age_ms(now_ns) > conn_stale_ms {
             // No frames at all: connection is silent. Close the gate; reconnect only a
             // feed that was alive and went quiet (never-alive cells are the connector's).
+            // A feed already known down is reconnecting on its own: a request stored now
+            // would end its next session before the first frame, every time.
             all_healthy = false;
-            if cell.last_msg_ns() != 0 {
+            if cell.last_msg_ns() != 0 && !cell.stream_down() {
                 reconnect.push(key.clone());
             }
         } else if cell.quote_age_ms(now_ns) > book_stale_ms {
@@ -252,6 +255,10 @@ mod tests {
         let reconnect = scan_once(&reg, &gate, 1_000, 1_000, future);
         assert_eq!(reconnect.len(), 2);
         assert!(!gate.is_open());
+
+        // Once a connector has seen its stream drop, it reconnects by itself: no request.
+        reg.cell(&"BTC".into(), VenueTag::Aster).unwrap().mark_stream_down();
+        assert_eq!(scan_once(&reg, &gate, 1_000, 1_000, future).len(), 1);
     }
 
     #[test]

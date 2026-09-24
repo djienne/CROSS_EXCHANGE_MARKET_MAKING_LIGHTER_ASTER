@@ -13,18 +13,18 @@ use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 
 use crate::taker::aster::creds::LighterCreds;
 use crate::taker::book::{OrderBook, MAX_BOOK_LEVELS};
-use crate::taker::lighter::auth::generate_ws_auth_token;
-use crate::taker::lighter::messages::{
+use crate::lighter::auth::generate_ws_auth_token;
+use crate::lighter::messages::{
     AccountAllMsg, AccountAllPositionsMsg, BookUpdateContiguity, OrderBookMsgRef, PriceLevelRef,
     RemoteOrder, TradePayload, UserStatsMsg,
 };
-use crate::taker::lighter::nonce::NonceManager;
-use crate::taker::lighter::rest::RestClient;
-use crate::taker::lighter::signer::{
+use crate::lighter::nonce::NonceManager;
+use crate::lighter::rest::RestClient;
+use crate::lighter::signer::{
     Signer, DEFAULT_IOC_EXPIRY, NIL_TRIGGER_PRICE, ORDER_TYPE_MARKET, TIF_IMMEDIATE_OR_CANCEL,
 };
-use crate::taker::lighter::tx_ws::TxWebSocket;
-use crate::taker::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions};
+use crate::lighter::tx_ws::TxWebSocket;
+use crate::lighter::ws::{subscribe_loop, subscribe_loop_authed, SubscribeOptions};
 use crate::taker::markets::MarketSpec;
 use crate::taker::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side, TxSendStatus};
 
@@ -1498,7 +1498,8 @@ fn spawn_account_all_positions_stream(
         subscribe_loop(
             opts,
             None,
-            move |raw| {
+            move |frame| {
+                let raw = frame.raw;
                 if let Ok(msg) = serde_json::from_str::<AccountAllPositionsMsg>(raw) {
                     apply_account_all_positions(&account_feed, &known_markets, &msg);
                 }
@@ -1531,7 +1532,8 @@ fn spawn_account_all_stream(
                     HashMap::new()
                 }
             },
-            move |raw| {
+            move |frame| {
+                let raw = frame.raw;
                 if let Ok(msg) = serde_json::from_str::<AccountAllMsg>(raw) {
                     for trades in msg.trades.values() {
                         for trade in trades {
@@ -1558,7 +1560,8 @@ fn spawn_user_stats_stream(
         subscribe_loop(
             opts,
             None,
-            move |raw| {
+            move |frame| {
+                let raw = frame.raw;
                 if let Ok(msg) = serde_json::from_str::<UserStatsMsg>(raw) {
                     account_feed.set_user_stats(value_dec(msg.stats.available_balance.as_ref()));
                 }
@@ -1594,7 +1597,8 @@ fn spawn_account_all_orders_stream(
                     HashMap::new()
                 }
             },
-            move |raw| {
+            move |frame| {
+                let raw = frame.raw;
                 // Cold path: keep the owned-Value handler contract, just parse locally.
                 let Ok(data) = serde_json::from_str::<serde_json::Value>(raw) else {
                     return;
@@ -1632,7 +1636,8 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
             subscribe_loop(
                 opts,
                 Some(reconnect),
-                move |raw| {
+                move |frame| {
+                    let raw = frame.raw;
                     if let Ok(msg) = serde_json::from_str::<OrderBookMsgRef<'_>>(raw) {
                         if !books.apply(market_id, &msg) {
                             tracing::warn!(
@@ -1688,7 +1693,7 @@ fn apply_levels(side: &mut BTreeMap<Decimal, Decimal>, levels: &[PriceLevelRef<'
     true
 }
 
-fn signed_position_payload_dec(p: &crate::taker::lighter::messages::PositionPayload) -> Decimal {
+fn signed_position_payload_dec(p: &crate::lighter::messages::PositionPayload) -> Decimal {
     let mag = p
         .position
         .as_deref()
@@ -2061,7 +2066,7 @@ mod tests {
 
     #[test]
     fn signed_position_payload_uses_decimal_not_float() {
-        let position = crate::taker::lighter::messages::PositionPayload {
+        let position = crate::lighter::messages::PositionPayload {
             position: Some("0.8499999999999999777955395072".to_string()),
             sign: Some(-1),
             avg_entry_price: None,

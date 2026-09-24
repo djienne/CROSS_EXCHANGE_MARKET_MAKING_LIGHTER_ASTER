@@ -4,7 +4,7 @@
 //! into the vetted Go/cgo library so signatures are byte-identical to the live bot.
 //!
 //! ABI validated against lighter-python `signer_client.py`:
-//!   * structs `CreateOrderTxReq`, `SignedTxResponse`, `StrOrErr`, `ApiKeyResponse`
+//!   * structs `SignedTxResponse`, `StrOrErr`
 //!   * `CreateClient` returns an *error-string pointer* (NULL on success); client state
 //!     is held inside the library keyed by (api_key_index, account_index).
 //!   * every returned `char*` is malloc'd by the library and must be freed with libc
@@ -21,16 +21,11 @@ use std::path::Path;
 pub const ORDER_TYPE_LIMIT: i32 = 0;
 pub const ORDER_TYPE_MARKET: i32 = 1;
 pub const TIF_IMMEDIATE_OR_CANCEL: i32 = 0;
-pub const TIF_GOOD_TILL_TIME: i32 = 1;
 pub const TIF_POST_ONLY: i32 = 2;
-pub const CANCEL_ALL_TIF_IMMEDIATE: i32 = 0;
-pub const CANCEL_ALL_TIF_SCHEDULED: i32 = 1;
-pub const CANCEL_ALL_TIF_ABORT: i32 = 2;
 pub const NIL_TRIGGER_PRICE: i32 = 0;
 pub const DEFAULT_28_DAY_ORDER_EXPIRY: i64 = -1;
 pub const DEFAULT_IOC_EXPIRY: i64 = 0;
 pub const MARGIN_MODE_CROSS: i32 = 0;
-pub const MARGIN_MODE_ISOLATED: i32 = 1;
 
 // ---- repr(C) structs mirroring ctypes.Structure layouts ----
 #[repr(C)]
@@ -74,28 +69,6 @@ type SignCreateOrderFn = unsafe extern "C" fn(
     c_int,      // api_key_index
     c_longlong, // account_index
 ) -> SignedTxResponse;
-type SignCancelOrderFn =
-    unsafe extern "C" fn(c_int, c_longlong, c_longlong, c_int, c_longlong) -> SignedTxResponse;
-type SignCancelAllOrdersFn =
-    unsafe extern "C" fn(c_int, c_longlong, c_longlong, c_int, c_longlong) -> SignedTxResponse;
-type SignModifyOrderFn = unsafe extern "C" fn(
-    c_int,      // market_index
-    c_longlong, // order_index
-    c_longlong, // base_amount
-    c_longlong, // price
-    c_longlong, // trigger_price
-    c_longlong, // nonce
-    c_int,      // api_key_index
-    c_longlong, // account_index
-) -> SignedTxResponse;
-type SignUpdateLeverageFn = unsafe extern "C" fn(
-    c_int,      // market_index
-    c_int,      // fraction
-    c_int,      // margin_mode
-    c_longlong, // nonce
-    c_int,      // api_key_index
-    c_longlong, // account_index
-) -> SignedTxResponse;
 type CreateAuthTokenFn = unsafe extern "C" fn(c_longlong, c_int, c_longlong) -> StrOrErr;
 
 /// A signed transaction ready to send: (tx_type, tx_info json, tx_hash).
@@ -113,10 +86,6 @@ pub struct Signer {
     create_client: CreateClientFn,
     check_client: CheckClientFn,
     sign_create_order: SignCreateOrderFn,
-    sign_cancel_order: SignCancelOrderFn,
-    sign_cancel_all_orders: SignCancelAllOrdersFn,
-    sign_modify_order: SignModifyOrderFn,
-    sign_update_leverage: SignUpdateLeverageFn,
     create_auth_token: CreateAuthTokenFn,
 }
 
@@ -169,10 +138,6 @@ impl Signer {
             create_client: sym!(b"CreateClient\0", CreateClientFn),
             check_client: sym!(b"CheckClient\0", CheckClientFn),
             sign_create_order: sym!(b"SignCreateOrder\0", SignCreateOrderFn),
-            sign_cancel_order: sym!(b"SignCancelOrder\0", SignCancelOrderFn),
-            sign_cancel_all_orders: sym!(b"SignCancelAllOrders\0", SignCancelAllOrdersFn),
-            sign_modify_order: sym!(b"SignModifyOrder\0", SignModifyOrderFn),
-            sign_update_leverage: sym!(b"SignUpdateLeverage\0", SignUpdateLeverageFn),
             create_auth_token: sym!(b"CreateAuthToken\0", CreateAuthTokenFn),
         };
 
@@ -249,85 +214,6 @@ impl Signer {
                 reduce_only as c_int,
                 trigger_price,
                 order_expiry,
-                nonce,
-                api_key_index,
-                self.account_index,
-            )
-        };
-        self.decode(r)
-    }
-
-    pub fn sign_cancel_order(
-        &self,
-        market_index: i32,
-        order_index: i64,
-        nonce: i64,
-        api_key_index: i32,
-    ) -> Result<SignedTx> {
-        let r = unsafe {
-            (self.sign_cancel_order)(market_index, order_index, nonce, api_key_index, self.account_index)
-        };
-        self.decode(r)
-    }
-
-    pub fn sign_cancel_all_orders(
-        &self,
-        time_in_force: i32,
-        timestamp_ms: i64,
-        nonce: i64,
-        api_key_index: i32,
-    ) -> Result<SignedTx> {
-        let r = unsafe {
-            (self.sign_cancel_all_orders)(
-                time_in_force,
-                timestamp_ms,
-                nonce,
-                api_key_index,
-                self.account_index,
-            )
-        };
-        self.decode(r)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn sign_modify_order(
-        &self,
-        market_index: i32,
-        order_index: i64,
-        base_amount: i64,
-        price: i64,
-        trigger_price: i64,
-        nonce: i64,
-        api_key_index: i32,
-    ) -> Result<SignedTx> {
-        let r = unsafe {
-            (self.sign_modify_order)(
-                market_index,
-                order_index,
-                base_amount,
-                price,
-                trigger_price,
-                nonce,
-                api_key_index,
-                self.account_index,
-            )
-        };
-        self.decode(r)
-    }
-
-    pub fn sign_update_leverage(
-        &self,
-        market_index: i32,
-        fraction: i32,
-        margin_mode: i32,
-        nonce: i64,
-        api_key_index: i32,
-    ) -> Result<SignedTx> {
-        let r = unsafe {
-            (self.sign_update_leverage)(
-                market_index,
-                fraction,
-                margin_mode,
                 nonce,
                 api_key_index,
                 self.account_index,

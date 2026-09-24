@@ -3180,7 +3180,6 @@ mod tests {
             max_aster_touch_hysteresis_ms: 300_000,
             depth_liquidity_multiple: dec!(10.0),
             max_hedge_slippage_bps: dec!(50.0),
-            min_requote_interval_ms: 20,
             price_change_ticks_to_requote: 1,
             clamp_to_min_lot: true,
             min_requote_bps: dec!(1.0),
@@ -3966,7 +3965,6 @@ taker_fee_bps = "4.5"
 desired_notional = "100"
 max_quote_distance_bps = "50.0"
 max_hedge_slippage_bps = "50.0"
-min_requote_interval_ms = 20
 price_change_ticks_to_requote = 1
 clamp_to_min_lot = true
 [live]

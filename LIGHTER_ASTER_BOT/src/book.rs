@@ -1,6 +1,7 @@
-//! In-memory order book built from a partial-depth snapshot (both venues push
-//! whole-book snapshots, so there is no diff/sequence maintenance). Bids are
-//! sorted descending, asks ascending; zero-qty levels are dropped on build.
+//! In-memory order book built from partial-depth levels (Aster pushes whole snapshots;
+//! Lighter deltas are merged in `lighter::local_book` first, so this type keeps no
+//! diff/sequence state). Bids are sorted descending, asks ascending; zero-qty levels
+//! are dropped on build.
 
 use arrayvec::ArrayVec;
 use chrono::{DateTime, Utc};

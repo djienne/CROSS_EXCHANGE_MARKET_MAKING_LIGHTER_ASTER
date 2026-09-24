@@ -51,16 +51,6 @@ pub struct NextNonceResponse {
     pub nonce: i64,
 }
 
-/// Response shape shared by REST sendTx[Batch] and the tx WebSocket.
-#[derive(Debug, Deserialize, Default)]
-pub struct TxResponse {
-    pub code: i64,
-    #[serde(default)]
-    pub message: String,
-    #[serde(default)]
-    pub volume_quota_remaining: Option<i64>,
-}
-
 #[derive(Debug, Deserialize, Default)]
 pub struct AccountActiveOrdersResponse {
     pub code: i64,

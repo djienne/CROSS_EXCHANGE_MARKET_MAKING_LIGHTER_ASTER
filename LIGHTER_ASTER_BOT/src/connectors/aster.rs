@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tokio::time::{sleep, Duration};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::tungstenite::protocol::Message;
 use tracing::{debug, info, warn};
 
 use super::Tap;
@@ -112,7 +112,7 @@ async fn stream_once(
     tap: &Tap,
 ) -> Result<()> {
     let url = format!("{ws_root}/stream?streams={symbol}@depth20@100ms/{symbol}@bookTicker/{symbol}@aggTrade");
-    let (ws, _) = connect_async(&url).await.context("connect Aster ws")?;
+    let ws = super::connect_guarded(&url).await.context("connect Aster ws")?;
     let (mut write, mut read) = ws.split();
     info!("[ASTER {}] subscribed depth20@100ms + bookTicker + aggTrade", symbol);
 

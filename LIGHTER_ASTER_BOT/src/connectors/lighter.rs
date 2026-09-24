@@ -67,7 +67,7 @@ pub async fn run_with_tap(
             if !handle_raw(frame.raw, &tap, &mut state) {
                 state.gap_resyncs += 1;
                 warn!(
-                    "Lighter order_book sequence gap for market {} (resync #{}); reconnecting for fresh snapshot",
+                    "Lighter order_book gap or unusable frame for market {} (resync #{}); reconnecting for fresh snapshot",
                     market_id, state.gap_resyncs
                 );
                 state.reset();

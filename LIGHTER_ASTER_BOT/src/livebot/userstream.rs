@@ -232,7 +232,7 @@ async fn connect_and_read(
     liveness: &StreamLiveness,
     shutdown: &CancellationToken,
 ) -> Result<bool> {
-    let (ws, _) = tokio_tungstenite::connect_async(url).await?;
+    let ws = crate::connectors::connect_guarded(url).await?;
     let (mut write, mut read) = ws.split();
     info!("aster user stream connected");
     liveness.touch();

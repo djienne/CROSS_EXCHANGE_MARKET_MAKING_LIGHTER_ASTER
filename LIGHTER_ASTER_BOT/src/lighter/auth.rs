@@ -1,14 +1,13 @@
 //! WS auth token generation for private channels (account_orders, accountActiveOrders).
-//! Port of `_generate_ws_auth_token` + the 9-minute refresh loop. The native signer's
+//! Port of `_generate_ws_auth_token`, minted per (re)connect. The native signer's
 //! `CreateAuthToken` takes an ABSOLUTE unix-seconds deadline (Python passes `now + ttl`).
 
 use crate::lighter::signer::Signer;
 use anyhow::Result;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Server token TTL is ~10 min; refresh at 9 min to avoid expiry races.
+/// Server token TTL is ~10 min.
 pub const AUTH_TTL_SECS: i64 = 600;
-pub const AUTH_REFRESH_SECS: u64 = 540;
 
 fn now_unix() -> i64 {
     SystemTime::now()

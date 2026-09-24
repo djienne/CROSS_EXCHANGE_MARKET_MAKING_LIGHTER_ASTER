@@ -139,7 +139,6 @@ min_aster_touch_hysteresis_bps = "1.0" # re-arm at 19 bps
 max_aster_touch_hysteresis_ms = 300000 # after 5m, fall back to the 18 bps base guard
 depth_liquidity_multiple           = "10.0" # require 10x quote qty in visible depth for Lighter hedge VWAP and Aster effective touch
 max_hedge_slippage_bps       = "5.0"
-min_requote_interval_ms      = 20
 price_change_ticks_to_requote = 2
 clamp_to_min_lot             = true
 # Per-side requote deadband: skip a cancel/replace while the new desired price is within this many
