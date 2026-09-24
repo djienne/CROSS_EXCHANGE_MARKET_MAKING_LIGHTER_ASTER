@@ -21,8 +21,10 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use super::account::{Account, AccountView, Working};
 use super::book::{BookUpdate, Level, Replica};
@@ -264,23 +266,73 @@ pub enum FeedEvent {
     Gap,
 }
 
-/// Per-venue readouts for the diagnostics log.
-#[derive(Debug, Clone, Default, Serialize)]
+/// Per-venue readouts for the diagnostics log, over one report window.
+#[derive(Debug, Clone, Default)]
 pub struct Diag {
     pub frames: u64,
     /// Frames that arrived after their shifted time (applied on arrival instead).
     pub late_frames: u64,
     pub stale_frames: u64,
     pub gaps: u64,
+    /// Arrival minus exchange time per stream (`book`, `top`, `trade`), µs: the feed lag the
+    /// shift must cover (clock skew shows here too).
+    pub lag_us: BTreeMap<&'static str, Vec<i64>>,
     pub requests: u64,
+    pub orders: u64,
     pub rejects: BTreeMap<String, u64>,
+    /// The round trips and private-stream delays drawn, µs.
+    pub rtt_us: Vec<i64>,
+    pub private_us: Vec<i64>,
     pub maker_fills: u64,
     pub taker_fills: u64,
+    /// The queue ahead of each order that came to rest, and each maker fill's wait since
+    /// its order was placed (µs).
+    pub queue_ahead: Vec<Decimal>,
+    pub maker_wait_us: Vec<i64>,
     pub prints: u64,
     /// Prints the visible book cannot explain: inside the spread, or bigger than the level
     /// they hit. Hidden orders (or a stale book); they calibrate `hidden_queue_multiplier`.
     pub prints_inside_spread: u64,
     pub prints_over_visible: u64,
+}
+
+impl Diag {
+    /// The window's counts, and quantiles of its samples (times in ms).
+    pub fn report(&self) -> Value {
+        let ms = |samples: &[i64]| quantiles(samples.iter().map(|&us| us as f64 / 1e3).collect());
+        let lag: serde_json::Map<String, Value> = self.lag_us.iter().map(|(stream, s)| (stream.to_string(), ms(s))).collect();
+        json!({
+            "frames": self.frames,
+            "late_frames": self.late_frames,
+            "stale_frames": self.stale_frames,
+            "gaps": self.gaps,
+            "lag_ms": lag,
+            "requests": self.requests,
+            "orders": self.orders,
+            "rejects": self.rejects,
+            "rtt_ms": ms(&self.rtt_us),
+            "private_ms": ms(&self.private_us),
+            "maker_fills": self.maker_fills,
+            "taker_fills": self.taker_fills,
+            "queue_ahead": quantiles(self.queue_ahead.iter().filter_map(|q| q.to_f64()).collect()),
+            "maker_wait_ms": ms(&self.maker_wait_us),
+            "prints": self.prints,
+            "prints_inside_spread": self.prints_inside_spread,
+            "prints_over_visible": self.prints_over_visible,
+        })
+    }
+}
+
+/// `{n, p50, p90, p99, max}` of `samples` by nearest rank, or `{n: 0}`.
+pub fn quantiles(mut samples: Vec<f64>) -> Value {
+    if samples.is_empty() {
+        return json!({"n": 0});
+    }
+    samples.sort_by(f64::total_cmp);
+    let n = samples.len();
+    let rank = |q: f64| samples[((q * n as f64).ceil() as usize).clamp(1, n) - 1];
+    let round = |x: f64| (x * 100.0).round() / 100.0;
+    json!({"n": n, "p50": round(rank(0.5)), "p90": round(rank(0.9)), "p99": round(rank(0.99)), "max": round(samples[n - 1])})
 }
 
 /// A request limit over a sliding window (the venues' own windows may be fixed; sliding
@@ -331,11 +383,15 @@ fn admit(windows: &mut [Window], now: i64, weight: u32, orders: u32) -> bool {
 }
 
 /// One venue's account state: what a restart must keep (the rest rebuilds from the feed).
+/// Finished orders and fills are not kept: the bot restarts with the venues and never asks for
+/// older history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VenueState {
     pub account: Account,
     pub open: BTreeMap<u64, Order>,
+    #[serde(skip)]
     pub closed: VecDeque<Order>,
+    #[serde(skip)]
     pub fills: VecDeque<Fill>,
     pub last_id: u64,
     /// Next expected Lighter nonce per API key.
@@ -476,6 +532,8 @@ pub struct Exchange {
     /// Per venue: when the private stream last delivered (it delivers in order).
     streams: [i64; 2],
     pub diag: [Diag; 2],
+    /// How late due events ran on this host (µs): scheduling, and CPU throttling.
+    pub lateness_us: Vec<i64>,
 }
 
 impl Exchange {
@@ -494,11 +552,51 @@ impl Exchange {
             lanes: HashMap::new(),
             streams: [i64::MIN; 2],
             diag: Default::default(),
+            lateness_us: Vec::new(),
         }
     }
 
     pub fn now(&self) -> i64 {
         self.now
+    }
+
+    /// What a restart must keep, per venue.
+    pub fn state(&self) -> &[VenueState; 2] {
+        &self.venues
+    }
+
+    /// Takes up a saved state: accounts, working orders, ids, nonces, deadmen and funding
+    /// rates. The first warm book then fills whatever the market crossed while the venues
+    /// were down; [`Exchange::resume`] runs the deadmen afterwards.
+    pub fn restore(&mut self, saved: [VenueState; 2]) {
+        for (st, saved) in self.venues.iter_mut().zip(saved) {
+            *st = VenueState {
+                books: std::mem::take(&mut st.books),
+                filters: std::mem::take(&mut st.filters),
+                marks: std::mem::take(&mut st.marks),
+                limits: std::mem::take(&mut st.limits),
+                ..saved
+            };
+        }
+        for venue in [Venue::Aster, Venue::Lighter] {
+            let due: Vec<(String, i64)> = self.venues[venue.ix()].funding.iter()
+                .flat_map(|(market, rates)| rates.keys().map(move |&exch_us| (market.clone(), exch_us)))
+                .collect();
+            for (market, exch_us) in due {
+                self.schedule(exch_us + self.p.shift_us, RANK_FUNDING, Pending::Funding { venue, market, exch_us });
+            }
+        }
+    }
+
+    /// Re-arms the restored deadmen: one that ran out while the venues were down cancels its
+    /// market's orders now.
+    pub fn resume(&mut self) {
+        for venue in [Venue::Aster, Venue::Lighter] {
+            let armed: Vec<(String, i64)> = self.venues[venue.ix()].deadman.iter().map(|(m, &d)| (m.clone(), d)).collect();
+            for (market, deadline) in armed {
+                self.schedule(deadline, RANK_ACTION, Pending::Deadman { venue, market, deadline });
+            }
+        }
     }
 
     /// Adds a market; `depth` is how many levels per side its feed shows (None = full book).
@@ -512,7 +610,8 @@ impl Exchange {
         self.venues[venue.ix()].books.get(market)
     }
 
-    /// Queues a feed event for its shifted time, or for now if it arrived too late for that.
+    /// Queues a feed event, arriving now, for its shifted time, or for now if it arrived too
+    /// late for that.
     pub fn ingest(&mut self, venue: Venue, market: &str, exch_us: i64, event: FeedEvent) {
         let at = exch_us + self.p.shift_us;
         let diag = &mut self.diag[venue.ix()];
@@ -520,11 +619,15 @@ impl Exchange {
         if at < self.now {
             diag.late_frames += 1;
         }
-        let rank = match event {
-            FeedEvent::Trade { .. } => RANK_TRADE,
-            FeedEvent::Book(BookUpdate::Top { .. }) => RANK_TOP,
-            _ => RANK_BOOK,
+        let (rank, stream) = match event {
+            FeedEvent::Trade { .. } => (RANK_TRADE, Some("trade")),
+            FeedEvent::Book(BookUpdate::Top { .. }) => (RANK_TOP, Some("top")),
+            FeedEvent::Book(_) => (RANK_BOOK, Some("book")),
+            FeedEvent::Gap => (RANK_BOOK, None),
         };
+        if let Some(stream) = stream {
+            diag.lag_us.entry(stream).or_default().push(self.now - exch_us);
+        }
         self.schedule(at, rank, Pending::Feed { venue, market: market.to_string(), exch_us, event });
     }
 
@@ -546,6 +649,7 @@ impl Exchange {
     pub fn submit(&mut self, envelope: Envelope) -> u64 {
         self.tickets += 1;
         let rtt = self.p.rtt[envelope.venue.ix()].sample_us(&mut self.rng);
+        self.diag[envelope.venue.ix()].rtt_us.push(rtt);
         let effect = self.now + (rtt as f64 * self.p.effect_fraction).round() as i64;
         let lane = self.lanes.entry(envelope.lane).or_insert((i64::MIN, i64::MIN));
         let gateway = effect.max(lane.0);
@@ -573,6 +677,7 @@ impl Exchange {
                 break;
             }
             let ((at, ..), pending) = entry.remove_entry();
+            self.lateness_us.push(to - at);
             self.now = self.now.max(at);
             match pending {
                 Pending::Feed { venue, market, exch_us, event } => self.on_feed(venue, &market, exch_us, event),
@@ -608,7 +713,9 @@ impl Exchange {
 
     fn push_event(&mut self, venue: Venue, event: Event) {
         let v = venue.ix();
-        let at = (self.now + self.p.private[v].sample_us(&mut self.rng)).max(self.streams[v]);
+        let delay = self.p.private[v].sample_us(&mut self.rng);
+        self.diag[v].private_us.push(delay);
+        let at = (self.now + delay).max(self.streams[v]);
         self.streams[v] = at;
         self.schedule(at, RANK_DELIVER, Pending::Deliver(Output::Event { venue, event }));
     }
@@ -776,6 +883,7 @@ impl Exchange {
 
     fn place(&mut self, venue: Venue, spec: &OrderSpec) -> Result<Order, Reject> {
         let v = venue.ix();
+        self.diag[v].orders += 1;
         if spec.tif == Tif::PostOnly && spec.price.is_none() {
             return Err(Reject::TickSize);
         }
@@ -855,6 +963,7 @@ impl Exchange {
                 let later = next.as_ref().and_then(|n| n.visible(spec.side, price)).unwrap_or_default();
                 size.max(later) * hidden
             });
+            self.diag[v].queue_ahead.extend(order.ahead);
         }
         let snapshot = order.clone();
         self.settle(venue, order);
@@ -901,6 +1010,7 @@ impl Exchange {
         }
         if maker {
             self.diag[v].maker_fills += 1;
+            self.diag[v].maker_wait_us.push(self.now - order.created_us);
         } else {
             self.diag[v].taker_fills += 1;
         }
@@ -1069,11 +1179,15 @@ impl Exchange {
 
     fn on_funding(&mut self, venue: Venue, market: String, exch_us: i64) {
         let v = venue.ix();
+        // No mark before the first book (a restart): settle once there is one.
+        let Some(mark) = self.venues[v].marks.get(&market).copied() else {
+            self.schedule(self.now + 1_000_000, RANK_FUNDING, Pending::Funding { venue, market, exch_us });
+            return;
+        };
         let st = &mut self.venues[v];
         let Some(rate) = st.funding.get_mut(&market).and_then(|rates| rates.remove(&exch_us)) else { return };
         st.settled.insert(market.clone(), exch_us);
         let qty = st.account.position(&market).qty;
-        let Some(mark) = st.marks.get(&market).copied() else { return };
         if qty.is_zero() {
             return;
         }
@@ -1131,8 +1245,18 @@ mod tests {
         }
 
         fn with(p: SimParams) -> Self {
+            let mut sim = Self::cold(p, 0);
+            for venue in [Venue::Aster, Venue::Lighter] {
+                sim.book(venue, 0, &[(dec!(99), dec!(5)), (dec!(98), dec!(5))], &[(dec!(101), dec!(5)), (dec!(102), dec!(5))]);
+            }
+            sim.at(0);
+            sim
+        }
+
+        /// The venues before any book, at exchange time `ms`.
+        fn cold(p: SimParams, ms: i64) -> Self {
             let shift = p.shift_us;
-            let mut ex = Exchange::new(p, 0);
+            let mut ex = Exchange::new(p, ms * MS + shift);
             let filters = Filters {
                 tick: dec!(0.01),
                 step: dec!(0.01),
@@ -1142,12 +1266,7 @@ mod tests {
             };
             ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
             ex.add_market(Venue::Lighter, HYPE, None, filters);
-            let mut sim = Self { ex, shift, out: Vec::new(), nonce: 0 };
-            for venue in [Venue::Aster, Venue::Lighter] {
-                sim.book(venue, 0, &[(dec!(99), dec!(5)), (dec!(98), dec!(5))], &[(dec!(101), dec!(5)), (dec!(102), dec!(5))]);
-            }
-            sim.at(0);
-            sim
+            Self { ex, shift, out: Vec::new(), nonce: 0 }
         }
 
         fn feed(&mut self, venue: Venue, ms: i64, event: FeedEvent) {
@@ -1520,6 +1639,49 @@ mod tests {
         assert_eq!(account.balance, account.initial + account.realized - account.fees + account.funding);
         let fills: Decimal = sim.fills(Venue::Aster).iter().map(|f| f.1).sum();
         assert_eq!(account.position(HYPE).qty, fills);
+    }
+
+    #[test]
+    fn a_restart_keeps_the_accounts_and_settles_what_happened_while_down() {
+        let mut sim = Sim::new();
+        // Long 1 at 101; bids at 99.5 and 98.5 under a 1 s deadman; Lighter nonce 0 used; a
+        // funding settlement due at 5 s.
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(102), Tif::Ioc));
+        let crossed = sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(99.5), Tif::PostOnly));
+        let expired = sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(98.5), Tif::PostOnly));
+        sim.send(Venue::Aster, Request::Deadman { market: HYPE.into(), countdown_ms: 1_000 });
+        sim.tx(Request::Noop);
+        sim.ex.funding(Venue::Aster, HYPE, 5_000 * MS, dec!(0.0001));
+        sim.at(200);
+        let (crossed, expired) = (placed(&sim, crossed).id, placed(&sim, expired).id);
+        let saved = serde_json::to_string(sim.ex.state()).unwrap();
+
+        // Back at 10 s: the settlement waits for a mark, and the first book, at 10.2 s, shows an
+        // ask through the 99.5 bid.
+        let mut back = Sim::cold(params(500), 10_000);
+        back.ex.restore(serde_json::from_str(&saved).unwrap());
+        back.book(Venue::Aster, 10_200, &[(dec!(99), dec!(5))], &[(dec!(99.4), dec!(1)), (dec!(100), dec!(5))]);
+        back.at(10_300);
+        back.ex.resume();
+        let next = back.ex.submit(Envelope { venue: Venue::Lighter, lane: 3, weight: 1, orders: 0, nonce: None, request: Request::NextNonce { key: 9 } });
+        let order = back.send(Venue::Aster, limit(Side::Sell, dec!(1), dec!(100.5), Tif::PostOnly));
+        back.at(12_000);
+        assert_eq!(back.fills(Venue::Aster), vec![(dec!(99.5), dec!(1), true)], "the market crossed the bid while down");
+        assert_eq!(back.last_status(Venue::Aster, expired), Some(Status::Done(End::Deadman)));
+        assert_eq!(back.last_status(Venue::Aster, crossed), Some(Status::Filled));
+        assert_eq!(back.reply(next), Some(&Reply::Nonce(1)));
+        assert!(placed(&back, order).id > sim.ex.state()[0].last_id, "ids never repeat");
+        let account = &back.ex.venues[0].account;
+        // Long 2 at the first mark (99.2) pays 0.0001 of its value, once.
+        assert_eq!((account.position(HYPE).qty, account.funding), (dec!(2), dec!(-0.01984)));
+        assert_eq!(account.balance, account.initial + account.realized - account.fees + account.funding);
+    }
+
+    #[test]
+    fn quantiles_take_the_nearest_rank() {
+        let samples: Vec<f64> = (1..=200).map(f64::from).collect();
+        assert_eq!(quantiles(samples), json!({"n": 200, "p50": 100.0, "p90": 180.0, "p99": 198.0, "max": 200.0}));
+        assert_eq!(quantiles(vec![]), json!({"n": 0}));
     }
 
     #[test]

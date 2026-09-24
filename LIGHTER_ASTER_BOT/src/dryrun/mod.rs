@@ -18,20 +18,23 @@ pub mod matching;
 pub mod server;
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{ensure, Context, Result};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use self::account::AccountView;
 use self::clock::{wall_us, Latency};
 use self::feed::{Follower, Hub, Input};
-use self::matching::{Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, Request, SimParams, Venue, LOOKAHEAD_US};
+use self::matching::{
+    quantiles, Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, Request, SimParams, Venue, VenueState, LOOKAHEAD_US,
+};
 use crate::controller::BotConfig;
 use crate::decimal::parse_dec;
 use crate::lighter::messages::OrderBooksResponse;
@@ -99,8 +102,9 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Starts the simulated venues for `market` on loopback, fed by the live market data of the
 /// venues `cfg` points at, then points both engines at them: every venue URL, the dry-run
-/// identity, and the taker's files under `runs_dir`. Returns once both replicas hold a book.
-pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::config::MarketCfg, runs_dir: &Path) -> Result<()> {
+/// identity, and the taker's files under `runs_dir`. The venues take up the state a previous
+/// run saved there. Returns once both replicas hold a book.
+pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::config::MarketCfg, runs_dir: &Path) -> Result<Venues> {
     let aster_base = cfg.maker.live.aster.base_url.trim_end_matches('/').to_string();
     let lighter_base = cfg.maker.live.hyperliquid.base_url.trim_end_matches('/').to_string();
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
@@ -154,13 +158,19 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
     };
     core.add_market(Venue::Aster, &symbol, Some(ASTER_DEPTH), aster_filters);
     core.add_market(Venue::Lighter, &lighter_market, None, lighter);
+    let files = SimFiles::new(runs_dir, &market.id().0);
+    if let Some(saved) = files.load()? {
+        let (aster, lighter) = (saved[0].account.balance, saved[1].account.balance);
+        tracing::info!("dry run: resuming the simulated accounts of {} (Aster {aster} USDT, Lighter {lighter} USDC)", files.state.display());
+        core.restore(saved);
+    }
     let shift = dry.shift_ms * 1_000;
     let hubs = [
         Arc::new(Mutex::new(Hub::new(shift, feed::aster_streams(&symbol)))),
         Arc::new(Mutex::new(Hub::new(shift, [format!("order_book/{lighter_market}")]))),
     ];
     let (inputs, feed_rx) = mpsc::unbounded_channel();
-    let venues = Venues::start(core, feed_rx, hubs.clone(), [dry.aster_feed_ms, dry.lighter_feed_ms], dry.seed);
+    let venues = Venues::start(core, feed_rx, hubs.clone(), [dry.aster_feed_ms, dry.lighter_feed_ms], dry.seed, Some(files));
     let aster_ws = crate::connectors::aster::ws_root(&aster_base);
     let [aster_hub, lighter_hub] = hubs;
     tokio::spawn(feed::aster_upstream(aster_ws, vec![symbol.clone()], shift, aster_hub, inputs.clone()));
@@ -179,8 +189,105 @@ pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::
 
     let markets = [(Venue::Aster, symbol.as_str()), (Venue::Lighter, lighter_market.as_str())];
     tokio::time::timeout(WARM_TIMEOUT, venues.warm(&markets)).await.context("the live market data gave no book within 60 s")?;
+    // The first books have filled what the market crossed while the venues were down; now
+    // the deadmen that ran out meanwhile cancel the rest.
+    venues.resume();
     tracing::info!("dry run: simulated Aster at {aster_url}, Lighter at {lighter_url}; the world is shifted {} ms", dry.shift_ms);
-    Ok(())
+    Ok(venues)
+}
+
+/// How often the simulated venues' state is saved, and the diagnostics reported.
+const SAVE_EVERY: Duration = Duration::from_secs(5);
+const REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// A dry run's own files in its runs directory: the simulated venues' state, which the next
+/// start takes up, and one diagnostics row per window. Ponytail: the diagnostics file grows by
+/// about 2 MB a day, with no rotation.
+pub struct SimFiles {
+    state: PathBuf,
+    diag: PathBuf,
+    /// The state as last written: an unchanged state is not rewritten.
+    written: String,
+    window_start_us: i64,
+}
+
+impl SimFiles {
+    pub fn new(runs_dir: &Path, market: &str) -> Self {
+        let market = market.to_ascii_uppercase();
+        Self {
+            state: runs_dir.join(format!("sim-{market}.state.json")),
+            diag: runs_dir.join(format!("sim-{market}.diag.jsonl")),
+            written: String::new(),
+            window_start_us: wall_us(),
+        }
+    }
+
+    /// The state a previous run saved, if any.
+    fn load(&self) -> Result<Option<[VenueState; 2]>> {
+        let text = match std::fs::read_to_string(&self.state) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", self.state.display())),
+        };
+        let saved = serde_json::from_str(&text)
+            .with_context(|| format!("{} is unreadable; move it away to start the simulated accounts afresh", self.state.display()))?;
+        Ok(Some(saved))
+    }
+
+    fn save(&mut self, core: &Exchange, durable: bool) -> Result<()> {
+        let json = serde_json::to_string(core.state())?;
+        if json != self.written {
+            let raw = serde_json::value::RawValue::from_string(json.clone())?;
+            crate::taker::pnl::write_json_atomic(&self.state, &raw, durable)?;
+            self.written = json;
+        }
+        Ok(())
+    }
+
+    /// Appends the window's diagnostics, logs their gist, and starts the next window.
+    fn report(&mut self, core: &mut Exchange) -> Result<()> {
+        let now = wall_us();
+        let window_s = (now - self.window_start_us) as f64 / 1e6;
+        let lateness = std::mem::take(&mut core.lateness_us);
+        let lateness = quantiles(lateness.into_iter().map(|us| us as f64 / 1e3).collect());
+        let mut gist = vec![format!("scheduler lateness p99 {} ms", lateness["p99"])];
+        let mut row = json!({"ts_ms": now / 1_000, "window_s": window_s, "lateness_ms": lateness});
+        for (venue, name) in [(Venue::Aster, "aster"), (Venue::Lighter, "lighter")] {
+            let diag = std::mem::take(&mut core.diag[venue.ix()]);
+            let (view, _) = core.peek(venue);
+            let account = &core.state()[venue.ix()].account;
+            let mut readout = diag.report();
+            let lag: Vec<String> = diag.lag_us.keys().map(|s| format!("{s} {}", readout["lag_ms"][*s]["p99"])).collect();
+            gist.push(format!(
+                "{name}: {} frames ({} late; lag p99 ms: {}), {} orders, {}/{} maker/taker fills, {} rejects, equity {}",
+                diag.frames,
+                diag.late_frames,
+                lag.join(", "),
+                diag.orders,
+                diag.maker_fills,
+                diag.taker_fills,
+                diag.rejects.values().sum::<u64>(),
+                view.equity.round_dp(2),
+            ));
+            readout["account"] = json!({
+                "balance": view.balance,
+                "unrealized": view.unrealized,
+                "equity": view.equity,
+                "realized": account.realized,
+                "fees": account.fees,
+                "funding": account.funding,
+                "positions": view.positions,
+                "maintenance_breach": view.maintenance_breach,
+            });
+            row[name] = readout;
+        }
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&self.diag)
+            .with_context(|| format!("opening {}", self.diag.display()))?;
+        std::io::Write::write_all(&mut file, format!("{row}\n").as_bytes())?;
+        tracing::info!("dry run, last {window_s:.0} s: {}", gist.join(" | "));
+        self.window_start_us = now;
+        Ok(())
+    }
 }
 
 /// Serves `handler` on loopback `port` (0: any free port) and returns its URL.
@@ -194,6 +301,8 @@ async fn serve<H: server::Handler>(port: u16, handler: H) -> Result<String> {
 enum Command {
     Call(Envelope, oneshot::Sender<Reply>),
     Peek(Venue, oneshot::Sender<(AccountView, Vec<Order>)>),
+    Resume,
+    Save(oneshot::Sender<Result<()>>),
 }
 
 /// Private events a connection may fall behind by before it is dropped.
@@ -211,12 +320,32 @@ pub struct Venues {
 }
 
 impl Venues {
-    /// Runs `core` on this host's wall clock, fed by `feed`, until every handle is dropped.
-    pub fn start(core: Exchange, feed: mpsc::UnboundedReceiver<Input>, hubs: [Arc<Mutex<Hub>>; 2], feed_latency: [Latency; 2], seed: u64) -> Self {
+    /// Runs `core` on this host's wall clock, fed by `feed`, until every handle is dropped,
+    /// saving it and reporting its diagnostics to `files`.
+    pub fn start(
+        core: Exchange,
+        feed: mpsc::UnboundedReceiver<Input>,
+        hubs: [Arc<Mutex<Hub>>; 2],
+        feed_latency: [Latency; 2],
+        seed: u64,
+        files: Option<SimFiles>,
+    ) -> Self {
         let (commands, rx) = mpsc::unbounded_channel();
         let events = [broadcast::channel(EVENTS).0, broadcast::channel(EVENTS).0];
-        tokio::spawn(drive(core, feed, rx, events.clone()));
+        tokio::spawn(drive(core, feed, rx, events.clone(), files));
         Self { commands, events, hubs, feed_latency, seed }
+    }
+
+    /// Runs the deadmen a restored state armed; call once the books are warm.
+    pub fn resume(&self) {
+        let _ = self.commands.send(Command::Resume);
+    }
+
+    /// Saves the venues' state now, durably.
+    pub async fn save(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.commands.send(Command::Save(tx));
+        rx.await.context("the simulated venues stopped")?
     }
 
     /// Sends one request now; its reply comes back after the venue's round trip.
@@ -261,10 +390,13 @@ async fn drive(
     mut feed: mpsc::UnboundedReceiver<Input>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: [broadcast::Sender<Arc<Event>>; 2],
+    mut files: Option<SimFiles>,
 ) {
     let mut waiting: HashMap<u64, oneshot::Sender<Reply>> = HashMap::new();
     let mut out = Vec::new();
     let mut feeding = true;
+    let every = |period| tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    let (mut save, mut report) = (every(SAVE_EVERY), every(REPORT_EVERY));
     loop {
         let wait = core.next_due().map(|due| Duration::from_micros((due - wall_us()).max(0) as u64));
         tokio::select! {
@@ -288,9 +420,23 @@ async fn drive(
                     Command::Peek(venue, reply) => {
                         let _ = reply.send(core.peek(venue));
                     }
+                    Command::Resume => core.resume(),
+                    Command::Save(reply) => {
+                        let _ = reply.send(files.as_mut().map_or(Ok(()), |files| files.save(&core, true)));
+                    }
                 }
             }
             _ = tokio::time::sleep(wait.unwrap_or_default()), if wait.is_some() => {}
+            _ = save.tick() => {
+                if let Some(Err(error)) = files.as_mut().map(|files| files.save(&core, false)) {
+                    tracing::warn!("dry run: saving the simulated venues: {error:#}");
+                }
+            }
+            _ = report.tick() => {
+                if let Some(Err(error)) = files.as_mut().map(|files| files.report(&mut core)) {
+                    tracing::warn!("dry run: writing the diagnostics: {error:#}");
+                }
+            }
         }
         core.advance(wall_us(), &mut out);
         for output in out.drain(..) {
@@ -324,7 +470,8 @@ pub(crate) mod tests {
     use super::aster::Aster;
     use super::feed::{aster_frame, aster_streams, forward, lighter_frame, Frame};
     use super::lighter::Lighter;
-    use super::matching::{Fees, Filters, SimParams};
+    use super::book::BookUpdate;
+    use super::matching::{Fees, FeedEvent, Filters, SimParams};
     use super::*;
     use crate::hotpath::clock::mono_now_ns;
     use crate::lighter::messages::{OrderBooksResponse, TradePayload};
@@ -388,7 +535,7 @@ pub(crate) mod tests {
                 Arc::new(Mutex::new(Hub::new(shift, ["order_book/24".to_string()]))),
             ];
             let (inputs, feed) = mpsc::unbounded_channel();
-            let venues = Venues::start(core, feed, hubs.clone(), [Latency::ZERO; 2], 1);
+            let venues = Venues::start(core, feed, hubs.clone(), [Latency::ZERO; 2], 1, None);
             let markets = serde_json::from_str::<OrderBooksResponse>(ORDER_BOOKS).unwrap().order_books;
             let aster = serve(0, Aster::new(venues.clone(), ASTER_EXCHANGE_INFO.into(), vec!["HYPEUSDT".into()], dec!(1))).await.unwrap();
             let lighter = serve(0, Lighter::new(venues.clone(), ORDER_BOOKS.into(), markets, [dec!(0); 2], dec!(1))).await.unwrap();
@@ -512,6 +659,30 @@ pub(crate) mod tests {
         assert_eq!(Path::new(&cfg.taker.pnl.persist_dir), runs);
         let rest = RestClient::new(&cfg.taker.venues.lighter_base_url, 0).unwrap();
         assert_eq!(rest.order_books().await.unwrap()[0].market_id, 24, "the simulated venue lists the real instruments");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_dry_run_saves_its_venues_and_reports_each_window() {
+        let dir = temp_dir("dry-run-files");
+        std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
+        let dry = BotConfig::load(&dir.join("bot.toml")).unwrap().dry_run.unwrap();
+        let mut files = SimFiles::new(&dir, "hype");
+        assert!(files.load().unwrap().is_none(), "a first run starts afresh");
+        let fees = [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }];
+        let mut core = Exchange::new(dry.sim_params(fees, dec!(1)), wall_us());
+        core.add_market(Venue::Aster, "HYPEUSDT", Some(20), Filters::default());
+        let top = BookUpdate::Top { bid: (dec!(99), dec!(1)), ask: (dec!(101), dec!(1)) };
+        core.ingest(Venue::Aster, "HYPEUSDT", core.now() - 30_000, FeedEvent::Book(top));
+        files.save(&core, true).unwrap();
+        let saved = files.load().unwrap().expect("the saved state");
+        assert_eq!(serde_json::to_value(&saved).unwrap(), serde_json::to_value(core.state()).unwrap());
+        files.report(&mut core).unwrap();
+        let text = std::fs::read_to_string(dir.join("sim-HYPE.diag.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(row["aster"]["lag_ms"]["top"], json!({"n": 1, "p50": 30.0, "p90": 30.0, "p99": 30.0, "max": 30.0}));
+        assert_eq!(row["lighter"]["account"]["balance"], "200");
+        assert_eq!(core.diag[0].frames, 0, "each report starts a new window");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

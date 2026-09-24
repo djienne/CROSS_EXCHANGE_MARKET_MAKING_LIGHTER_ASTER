@@ -195,13 +195,14 @@ pub(crate) async fn run_with(
     // Live and dry-run never share a file.
     let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
     let _lock = lock_market(&runs_dir, &market)?;
-    if live {
+    let sim = if live {
         refuse_insecure_env_files()?;
         refuse_legacy_stack(&market, &[runs_root, Path::new("../runs")])?;
+        None
     } else {
         let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
-        crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?;
-    }
+        Some(crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?)
+    };
     let files = supervisor::Files::new(&runs_dir, &market);
     let mut events = EventLog::new(files.events.clone());
     risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
@@ -213,11 +214,16 @@ pub(crate) async fn run_with(
     let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
     let parked = stop.clone();
     let result = supervisor::Supervisor::new(cfg.controller, market, mode, files, taker_ledger, engines, events, stop).run().await;
-    if let (false, Err(error)) = (live, &result) {
-        // Exiting would let a restart policy resume it unreviewed; a deliberate restart is
-        // the review.
-        warn!("dry run halted, parked until stopped: {error:#}");
-        parked.cancelled().await;
+    if let Some(sim) = sim {
+        if let Err(error) = &result {
+            // Exiting would let a restart policy resume it unreviewed; a deliberate restart is
+            // the review.
+            warn!("dry run halted, parked until stopped: {error:#}");
+            parked.cancelled().await;
+        }
+        if let Err(error) = sim.save().await {
+            warn!("dry run: saving the simulated venues: {error:#}");
+        }
     }
     result
 }
@@ -446,6 +452,11 @@ mod tests {
         stop.cancel();
         tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
         fresh.abort();
+        // The final save keeps the hedged pair for the next start.
+        let state = std::fs::read_to_string(dir.join("dry-run").join("sim-HYPE.state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_str(&state).unwrap();
+        let qty = |venue: usize, market: &str| state[venue]["account"]["positions"][market]["qty"].as_str().and_then(|q| q.parse::<Decimal>().ok());
+        assert_eq!((qty(0, "HYPEUSDT"), qty(1, "24")), (Some(dec!(0.13)), Some(dec!(-0.13))), "{state}");
         let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         written.sort();
         assert_eq!(written, ["bot.toml", "dry-run"], "a dry run writes under runs/dry-run only");
