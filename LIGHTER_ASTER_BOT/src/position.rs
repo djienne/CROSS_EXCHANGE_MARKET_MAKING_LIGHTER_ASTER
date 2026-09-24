@@ -7,11 +7,12 @@
 //! the margin a position consumes equals its notional.
 
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use crate::types::Side;
 
 /// Signed open position on one leg. `qty > 0` is net long, `qty < 0` is net short.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedPosition {
     pub qty: Decimal,
     /// Size-weighted average entry price of the currently-open position (0 when flat).

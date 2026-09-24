@@ -9,6 +9,8 @@ pub mod config;
 pub mod controller;
 pub mod connectors;
 pub mod decimal;
+/// `run --mode dry-run`: simulated Aster and Lighter venues, seen from AWS Tokyo.
+pub mod dryrun;
 pub mod edge;
 pub mod hot_types;
 /// Lock-free real-time substrate (latest-book cell, stream watchdog, execution

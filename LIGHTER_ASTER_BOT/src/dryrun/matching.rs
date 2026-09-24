@@ -1,0 +1,1539 @@
+//! The simulated venues: a deterministic discrete-event machine on this host's wall clock (µs).
+//!
+//! Inputs are feed events stamped with exchange time T, applied at T + D (the shift), and
+//! requests sent now, which reach the venue at now + f·RTT and are answered at now + RTT.
+//! Outputs (replies and private-stream events) come out of `advance` when due. Nothing here
+//! reads a clock or does I/O: a run is a pure function of its inputs and seed.
+//!
+//! Matching, pessimistic where the data cannot decide:
+//! - A taker order fills against the worse (per level) of the two book states around its
+//!   effect time, less what we took before. The later state is in hand because matching runs
+//!   D behind reality ([`LOOKAHEAD_US`]).
+//! - A post-only order expires only if it crosses the book it arrives at. If the book crosses it
+//!   later, it rests and the crossing size trades against it (the adverse outcome; expiring
+//!   it instead would be the kind one).
+//! - A resting order has visible × (1 + h) ahead of it at its price. A print at its price
+//!   eats that queue, then fills it. A print through its price proves the level emptied
+//!   (hidden orders too), so it fills it at once. A print at a better price is another
+//!   level's business. Our resting orders share each print's size.
+//! - If the book crosses a resting order (the market moved through it, or a feed gap hid the
+//!   prints), the crossing size fills it at its price.
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+use super::account::{Account, AccountView, Working};
+use super::book::{BookUpdate, Level, Replica};
+use super::clock::{Latency, Rng};
+use crate::types::Side;
+
+/// How far past an effect time matching looks for the next book state. The shift minus the
+/// feed lag must exceed it for that state to have arrived (the diagnostics report the lag).
+pub const LOOKAHEAD_US: i64 = 250_000;
+
+/// Closed orders and fills kept for queries.
+const KEEP: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Venue {
+    Aster,
+    Lighter,
+}
+
+impl Venue {
+    fn ix(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fees {
+    pub maker: Decimal,
+    pub taker: Decimal,
+}
+
+#[derive(Debug, Clone)]
+pub struct SimParams {
+    pub shift_us: i64,
+    pub seed: u64,
+    /// Fraction of a round trip that passes before a request takes effect.
+    pub effect_fraction: f64,
+    /// Request round trip, per venue (`[Aster, Lighter]`, as every pair below).
+    pub rtt: [Latency; 2],
+    /// Private-stream delay after an effect.
+    pub private: [Latency; 2],
+    /// Lighter's speed bump for orders that may take liquidity.
+    pub lighter_taker_delay_us: i64,
+    /// Hidden size assumed ahead of us, as a multiple of the visible size at our price.
+    pub hidden_queue_multiplier: Decimal,
+    pub fees: [Fees; 2],
+    pub leverage: Decimal,
+    pub balances: [Decimal; 2],
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    pub tick: Decimal,
+    pub step: Decimal,
+    pub min_qty: Decimal,
+    pub min_notional: Decimal,
+    /// PERCENT_PRICE: buys at most mark × (1 + band), sells at least mark × (1 − band).
+    pub price_band: Option<Decimal>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tif {
+    Gtc,
+    Ioc,
+    PostOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Reject {
+    /// The replica is cold (upstream gap): the venue cannot match.
+    Unavailable,
+    RateLimited,
+    BadNonce,
+    UnknownMarket,
+    UnknownOrder,
+    TickSize,
+    StepSize,
+    MinQty,
+    MinNotional,
+    PriceBand,
+    ReduceOnly,
+    Margin,
+}
+
+/// Why an order stopped working.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum End {
+    Canceled,
+    Deadman,
+    /// The unfilled rest of an immediate-or-cancel order.
+    Ioc,
+    PostOnly,
+    /// A reduce-only order with no position left to reduce.
+    ReduceOnly,
+    /// A Lighter transaction the sequencer accepted but execution refused.
+    Rejected(Reject),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Status {
+    New,
+    PartiallyFilled,
+    Filled,
+    Done(End),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Order {
+    pub id: u64,
+    pub client_id: String,
+    pub market: String,
+    pub side: Side,
+    /// `None` for a market order.
+    pub price: Option<Decimal>,
+    pub qty: Decimal,
+    pub tif: Tif,
+    pub reduce_only: bool,
+    pub filled: Decimal,
+    pub filled_quote: Decimal,
+    pub fee: Decimal,
+    pub status: Status,
+    pub created_us: i64,
+    pub updated_us: i64,
+    /// Queue ahead at our price; `None` while the feed's depth cut hides our level.
+    pub ahead: Option<Decimal>,
+}
+
+impl Order {
+    pub fn remaining(&self) -> Decimal {
+        self.qty - self.filled
+    }
+
+    pub fn working(&self) -> bool {
+        matches!(self.status, Status::New | Status::PartiallyFilled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Fill {
+    pub id: u64,
+    pub order_id: u64,
+    pub market: String,
+    pub side: Side,
+    pub price: Decimal,
+    pub qty: Decimal,
+    pub fee: Decimal,
+    pub maker: bool,
+    pub realized: Decimal,
+    pub at_us: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OrderRef {
+    Id(u64),
+    Client(String),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderSpec {
+    pub market: String,
+    pub client_id: String,
+    pub side: Side,
+    pub qty: Decimal,
+    /// `None` for a market order.
+    pub price: Option<Decimal>,
+    pub tif: Tif,
+    pub reduce_only: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    Place(OrderSpec),
+    Cancel { market: String, order: OrderRef },
+    CancelAll { market: Option<String> },
+    /// Aster `countdownCancelAll`: cancels the market's orders unless re-armed in time; 0 disarms.
+    Deadman { market: String, countdown_ms: i64 },
+    Account,
+    OpenOrders { market: Option<String> },
+    Order { order: OrderRef },
+    Fills { market: Option<String> },
+    Book { market: String },
+    NextNonce { key: u64 },
+    /// Accepted without changing anything here (e.g. a leverage update).
+    Noop,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Envelope {
+    pub venue: Venue,
+    /// The connection it travels on: one connection delivers in order.
+    pub lane: u64,
+    /// Aster request weight, or 1 per Lighter REST call.
+    pub weight: u32,
+    /// Aster order count, or 1 per Lighter transaction.
+    pub orders: u32,
+    /// A Lighter transaction's `(api key, nonce)`. The sequencer answers a transaction when it
+    /// accepts it; execution follows, and its outcome only shows on the private streams.
+    pub nonce: Option<(u64, i64)>,
+    pub request: Request,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    Ok,
+    Order(Order),
+    Orders(Vec<Order>),
+    Fills(Vec<Fill>),
+    Account(AccountView),
+    Book { bids: Vec<Level>, asks: Vec<Level> },
+    Nonce(i64),
+    Reject(Reject),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// An order was accepted, filled (with the fill) or finished.
+    Order { order: Order, fill: Option<Fill>, account: AccountView },
+    Funding { market: String, amount: Decimal, account: AccountView },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Output {
+    Reply { ticket: u64, reply: Reply },
+    Event { venue: Venue, event: Event },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FeedEvent {
+    Book(BookUpdate),
+    /// A print; `taker` is the aggressor's side.
+    Trade { price: Decimal, qty: Decimal, taker: Side },
+    /// The upstream stream broke: the replica is unusable until its next snapshot.
+    Gap,
+}
+
+/// Per-venue readouts for the diagnostics log.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Diag {
+    pub frames: u64,
+    /// Frames that arrived after their shifted time (applied on arrival instead).
+    pub late_frames: u64,
+    pub stale_frames: u64,
+    pub gaps: u64,
+    pub requests: u64,
+    pub rejects: BTreeMap<String, u64>,
+    pub maker_fills: u64,
+    pub taker_fills: u64,
+    pub prints: u64,
+    /// Prints the visible book cannot explain: inside the spread, or bigger than the level
+    /// they hit. Hidden orders (or a stale book); they calibrate `hidden_queue_multiplier`.
+    pub prints_inside_spread: u64,
+    pub prints_over_visible: u64,
+}
+
+/// A request limit over a sliding window (the venues' own windows may be fixed; sliding
+/// never admits more).
+#[derive(Debug, Clone)]
+struct Window {
+    span_us: i64,
+    cap: u32,
+    counts_orders: bool,
+    hits: VecDeque<(i64, u32)>,
+    used: u32,
+}
+
+impl Window {
+    fn new(span_s: i64, cap: u32, counts_orders: bool) -> Self {
+        Self { span_us: span_s * 1_000_000, cap, counts_orders, hits: VecDeque::new(), used: 0 }
+    }
+}
+
+fn venue_limits(venue: Venue) -> Vec<Window> {
+    match venue {
+        // Aster exchangeInfo: REQUEST_WEIGHT 2400/min; ORDERS 1200/min and 300/10 s.
+        Venue::Aster => vec![Window::new(60, 2_400, false), Window::new(60, 1_200, true), Window::new(10, 300, true)],
+        // Lighter docs, Standard account: 60 REST requests and 60 transactions per minute.
+        Venue::Lighter => vec![Window::new(60, 60, false), Window::new(60, 60, true)],
+    }
+}
+
+/// Takes `weight`/`orders` from every window, or from none if any would overflow.
+fn admit(windows: &mut [Window], now: i64, weight: u32, orders: u32) -> bool {
+    let cost = |w: &Window| if w.counts_orders { orders } else { weight };
+    for w in windows.iter_mut() {
+        while w.hits.front().is_some_and(|&(at, _)| at <= now - w.span_us) {
+            w.used -= w.hits.pop_front().unwrap().1;
+        }
+    }
+    if windows.iter().any(|w| w.used + cost(w) > w.cap) {
+        return false;
+    }
+    for w in windows.iter_mut() {
+        let n = cost(w);
+        if n > 0 {
+            w.hits.push_back((now, n));
+            w.used += n;
+        }
+    }
+    true
+}
+
+/// One venue's account state: what a restart must keep (the rest rebuilds from the feed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VenueState {
+    pub account: Account,
+    pub open: BTreeMap<u64, Order>,
+    pub closed: VecDeque<Order>,
+    pub fills: VecDeque<Fill>,
+    pub last_id: u64,
+    /// Next expected Lighter nonce per API key.
+    pub nonces: BTreeMap<u64, i64>,
+    /// Armed Aster deadman per market: its deadline (µs).
+    pub deadman: BTreeMap<String, i64>,
+    /// Funding rate per market and settlement time (exchange µs); the latest poll wins.
+    pub funding: BTreeMap<String, BTreeMap<i64, Decimal>>,
+    #[serde(skip)]
+    books: BTreeMap<String, Replica>,
+    #[serde(skip)]
+    filters: BTreeMap<String, Filters>,
+    #[serde(skip)]
+    marks: BTreeMap<String, Decimal>,
+    #[serde(skip)]
+    limits: Vec<Window>,
+}
+
+impl VenueState {
+    fn new(balance: Decimal) -> Self {
+        Self {
+            account: Account::new(balance),
+            open: BTreeMap::new(),
+            closed: VecDeque::new(),
+            fills: VecDeque::new(),
+            last_id: 0,
+            nonces: BTreeMap::new(),
+            deadman: BTreeMap::new(),
+            funding: BTreeMap::new(),
+            books: BTreeMap::new(),
+            filters: BTreeMap::new(),
+            marks: BTreeMap::new(),
+            limits: Vec::new(),
+        }
+    }
+
+    fn next_id(&mut self) -> u64 {
+        self.last_id += 1;
+        self.last_id
+    }
+
+    fn working(&self) -> BTreeMap<String, Working> {
+        let mut working: BTreeMap<String, Working> = BTreeMap::new();
+        for order in self.open.values() {
+            let w = working.entry(order.market.clone()).or_default();
+            match order.side {
+                Side::Buy => w.buys += order.remaining(),
+                Side::Sell => w.sells += order.remaining(),
+            }
+        }
+        working
+    }
+
+    fn view(&self, working: &BTreeMap<String, Working>, leverage: Decimal) -> AccountView {
+        self.account.view(&|market: &str| self.marks.get(market).copied(), working, leverage)
+    }
+}
+
+enum Pending {
+    Feed { venue: Venue, market: String, exch_us: i64, event: FeedEvent },
+    Funding { venue: Venue, market: String, exch_us: i64 },
+    Gateway { ticket: u64, reply_at: i64, envelope: Envelope },
+    /// A Lighter transaction coming out of the speed bump.
+    Execute { venue: Venue, request: Request },
+    Deadman { venue: Venue, market: String, deadline: i64 },
+    Deliver(Output),
+}
+
+// Same-µs order: a print before the book change it causes, market before our actions
+// (pessimistic), deliveries last.
+const RANK_TRADE: u8 = 0;
+const RANK_TOP: u8 = 1;
+const RANK_BOOK: u8 = 2;
+const RANK_FUNDING: u8 = 3;
+const RANK_ACTION: u8 = 4;
+const RANK_DELIVER: u8 = 5;
+
+/// Is `a` a better price than `b` for orders resting on `side`?
+fn better(side: Side, a: Decimal, b: Decimal) -> bool {
+    match side {
+        Side::Buy => a > b,
+        Side::Sell => a < b,
+    }
+}
+
+/// How much a `side` order can reduce `position` by.
+fn reducible(position: Decimal, side: Side) -> Decimal {
+    match side {
+        Side::Buy if position < Decimal::ZERO => -position,
+        Side::Sell if position > Decimal::ZERO => position,
+        _ => Decimal::ZERO,
+    }
+}
+
+fn check_filters(f: &Filters, spec: &OrderSpec, mark: Option<Decimal>) -> Result<(), Reject> {
+    let off = |value: Decimal, step: Decimal| !step.is_zero() && !(value % step).is_zero();
+    if let Some(price) = spec.price {
+        if price <= Decimal::ZERO || off(price, f.tick) {
+            return Err(Reject::TickSize);
+        }
+        if let (Some(band), Some(mark)) = (f.price_band, mark) {
+            let outside = match spec.side {
+                Side::Buy => price > mark * (Decimal::ONE + band),
+                Side::Sell => price < mark * (Decimal::ONE - band),
+            };
+            if outside {
+                return Err(Reject::PriceBand);
+            }
+        }
+    }
+    if spec.qty <= Decimal::ZERO || off(spec.qty, f.step) {
+        return Err(Reject::StepSize);
+    }
+    if spec.qty < f.min_qty {
+        return Err(Reject::MinQty);
+    }
+    let notional = spec.qty * spec.price.or(mark).unwrap_or_default();
+    if !spec.reduce_only && notional < f.min_notional {
+        return Err(Reject::MinNotional);
+    }
+    Ok(())
+}
+
+pub struct Exchange {
+    p: SimParams,
+    rng: Rng,
+    now: i64,
+    seq: u64,
+    tickets: u64,
+    pending: BTreeMap<(i64, u8, u64), Pending>,
+    venues: [VenueState; 2],
+    /// Per connection: when its last request reached the venue and when it was answered.
+    lanes: HashMap<u64, (i64, i64)>,
+    /// Per venue: when the private stream last delivered (it delivers in order).
+    streams: [i64; 2],
+    pub diag: [Diag; 2],
+}
+
+impl Exchange {
+    pub fn new(p: SimParams, start_us: i64) -> Self {
+        let mut venues = [VenueState::new(p.balances[0]), VenueState::new(p.balances[1])];
+        venues[0].limits = venue_limits(Venue::Aster);
+        venues[1].limits = venue_limits(Venue::Lighter);
+        Self {
+            rng: Rng::new(p.seed),
+            p,
+            now: start_us,
+            seq: 0,
+            tickets: 0,
+            pending: BTreeMap::new(),
+            venues,
+            lanes: HashMap::new(),
+            streams: [i64::MIN; 2],
+            diag: Default::default(),
+        }
+    }
+
+    pub fn now(&self) -> i64 {
+        self.now
+    }
+
+    /// Adds a market; `depth` is how many levels per side its feed shows (None = full book).
+    pub fn add_market(&mut self, venue: Venue, market: &str, depth: Option<usize>, filters: Filters) {
+        let st = &mut self.venues[venue.ix()];
+        st.books.entry(market.to_string()).or_insert_with(|| Replica::new(depth));
+        st.filters.insert(market.to_string(), filters);
+    }
+
+    pub fn replica(&self, venue: Venue, market: &str) -> Option<&Replica> {
+        self.venues[venue.ix()].books.get(market)
+    }
+
+    /// Queues a feed event for its shifted time, or for now if it arrived too late for that.
+    pub fn ingest(&mut self, venue: Venue, market: &str, exch_us: i64, event: FeedEvent) {
+        let at = exch_us + self.p.shift_us;
+        let diag = &mut self.diag[venue.ix()];
+        diag.frames += 1;
+        if at < self.now {
+            diag.late_frames += 1;
+        }
+        let rank = match event {
+            FeedEvent::Trade { .. } => RANK_TRADE,
+            FeedEvent::Book(BookUpdate::Top { .. }) => RANK_TOP,
+            _ => RANK_BOOK,
+        };
+        self.schedule(at, rank, Pending::Feed { venue, market: market.to_string(), exch_us, event });
+    }
+
+    /// Records the funding rate a settlement at `exch_us` will use (re-polls update it).
+    pub fn funding(&mut self, venue: Venue, market: &str, exch_us: i64, rate: Decimal) {
+        let rates = self.venues[venue.ix()].funding.entry(market.to_string()).or_default();
+        if rates.insert(exch_us, rate).is_none() {
+            let at = exch_us + self.p.shift_us;
+            self.schedule(at, RANK_FUNDING, Pending::Funding { venue, market: market.to_string(), exch_us });
+        }
+    }
+
+    /// Sends a request now; its reply comes out of `advance` as `Output::Reply` with this ticket.
+    pub fn submit(&mut self, envelope: Envelope) -> u64 {
+        self.tickets += 1;
+        let rtt = self.p.rtt[envelope.venue.ix()].sample_us(&mut self.rng);
+        let effect = self.now + (rtt as f64 * self.p.effect_fraction).round() as i64;
+        let lane = self.lanes.entry(envelope.lane).or_insert((i64::MIN, i64::MIN));
+        let gateway = effect.max(lane.0);
+        let reply_at = (self.now + rtt).max(gateway).max(lane.1);
+        *lane = (gateway, reply_at);
+        let ticket = self.tickets;
+        self.schedule(gateway, RANK_ACTION, Pending::Gateway { ticket, reply_at, envelope });
+        ticket
+    }
+
+    pub fn next_due(&self) -> Option<i64> {
+        self.pending.first_key_value().map(|(key, _)| key.0)
+    }
+
+    /// Runs every event due by `to`, appending what the bot receives to `out`.
+    pub fn advance(&mut self, to: i64, out: &mut Vec<Output>) {
+        while let Some(entry) = self.pending.first_entry() {
+            if entry.key().0 > to {
+                break;
+            }
+            let ((at, ..), pending) = entry.remove_entry();
+            self.now = self.now.max(at);
+            match pending {
+                Pending::Feed { venue, market, exch_us, event } => self.on_feed(venue, &market, exch_us, event),
+                Pending::Funding { venue, market, exch_us } => self.on_funding(venue, market, exch_us),
+                Pending::Gateway { ticket, reply_at, envelope } => self.on_gateway(ticket, reply_at, envelope),
+                Pending::Execute { venue, request } => self.execute_tx(venue, request),
+                Pending::Deadman { venue, market, deadline } => {
+                    if self.venues[venue.ix()].deadman.get(&market) == Some(&deadline) {
+                        self.venues[venue.ix()].deadman.remove(&market);
+                        self.cancel_all(venue, Some(&market), End::Deadman);
+                    }
+                }
+                Pending::Deliver(output) => out.push(output),
+            }
+        }
+        self.now = self.now.max(to);
+    }
+
+    fn schedule(&mut self, at: i64, rank: u8, pending: Pending) {
+        self.seq += 1;
+        self.pending.insert((at.max(self.now), rank, self.seq), pending);
+    }
+
+    fn reject(&mut self, venue: Venue, reject: Reject) -> Reply {
+        *self.diag[venue.ix()].rejects.entry(format!("{reject:?}")).or_default() += 1;
+        Reply::Reject(reject)
+    }
+
+    fn account_view(&self, venue: Venue) -> AccountView {
+        let st = &self.venues[venue.ix()];
+        st.view(&st.working(), self.p.leverage)
+    }
+
+    fn push_event(&mut self, venue: Venue, event: Event) {
+        let v = venue.ix();
+        let at = (self.now + self.p.private[v].sample_us(&mut self.rng)).max(self.streams[v]);
+        self.streams[v] = at;
+        self.schedule(at, RANK_DELIVER, Pending::Deliver(Output::Event { venue, event }));
+    }
+
+    fn emit(&mut self, venue: Venue, order: &Order, fill: Option<Fill>) {
+        let account = self.account_view(venue);
+        self.push_event(venue, Event::Order { order: order.clone(), fill, account });
+    }
+
+    fn on_gateway(&mut self, ticket: u64, reply_at: i64, envelope: Envelope) {
+        let venue = envelope.venue;
+        let v = venue.ix();
+        self.diag[v].requests += 1;
+        let reply = if !admit(&mut self.venues[v].limits, self.now, envelope.weight, envelope.orders) {
+            self.reject(venue, Reject::RateLimited)
+        } else if let Some((key, nonce)) = envelope.nonce {
+            let expected = self.venues[v].nonces.get(&key).copied().unwrap_or(0);
+            if nonce != expected {
+                self.reject(venue, Reject::BadNonce)
+            } else {
+                self.venues[v].nonces.insert(key, expected + 1);
+                let bumped = matches!(&envelope.request, Request::Place(spec) if spec.tif != Tif::PostOnly);
+                if venue == Venue::Lighter && bumped {
+                    let at = self.now + self.p.lighter_taker_delay_us;
+                    self.schedule(at, RANK_ACTION, Pending::Execute { venue, request: envelope.request });
+                } else {
+                    self.execute_tx(venue, envelope.request);
+                }
+                Reply::Ok
+            }
+        } else {
+            self.execute(venue, envelope.request)
+        };
+        self.schedule(reply_at, RANK_DELIVER, Pending::Deliver(Output::Reply { ticket, reply }));
+    }
+
+    /// A transaction's outcome goes to the private stream only: a refused placement becomes
+    /// an order that ends `Rejected`.
+    fn execute_tx(&mut self, venue: Venue, request: Request) {
+        match request {
+            Request::Place(spec) => {
+                if let Err(reject) = self.place(venue, &spec) {
+                    self.reject(venue, reject);
+                    let id = self.venues[venue.ix()].next_id();
+                    let order = Order {
+                        id,
+                        client_id: spec.client_id,
+                        market: spec.market,
+                        side: spec.side,
+                        price: spec.price,
+                        qty: spec.qty,
+                        tif: spec.tif,
+                        reduce_only: spec.reduce_only,
+                        filled: Decimal::ZERO,
+                        filled_quote: Decimal::ZERO,
+                        fee: Decimal::ZERO,
+                        status: Status::Done(End::Rejected(reject)),
+                        created_us: self.now,
+                        updated_us: self.now,
+                        ahead: None,
+                    };
+                    self.emit(venue, &order, None);
+                    self.close(venue, order);
+                }
+            }
+            other => {
+                self.execute(venue, other);
+            }
+        }
+    }
+
+    fn execute(&mut self, venue: Venue, request: Request) -> Reply {
+        let v = venue.ix();
+        match request {
+            Request::Place(spec) => match self.place(venue, &spec) {
+                Ok(order) => Reply::Order(order),
+                Err(reject) => self.reject(venue, reject),
+            },
+            Request::Cancel { market, order: which } => {
+                let found = self.venues[v].open.values()
+                    .find(|o| o.market == market && match &which {
+                        OrderRef::Id(id) => o.id == *id,
+                        OrderRef::Client(client_id) => &o.client_id == client_id,
+                    })
+                    .map(|o| o.id);
+                let Some(id) = found else { return self.reject(venue, Reject::UnknownOrder) };
+                let mut order = self.venues[v].open.remove(&id).unwrap();
+                self.finish(venue, &mut order, End::Canceled);
+                Reply::Order(order)
+            }
+            Request::CancelAll { market } => {
+                self.cancel_all(venue, market.as_deref(), End::Canceled);
+                Reply::Ok
+            }
+            Request::Deadman { market, countdown_ms } => {
+                if countdown_ms <= 0 {
+                    self.venues[v].deadman.remove(&market);
+                } else {
+                    let deadline = self.now + countdown_ms * 1_000;
+                    self.venues[v].deadman.insert(market.clone(), deadline);
+                    self.schedule(deadline, RANK_ACTION, Pending::Deadman { venue, market, deadline });
+                }
+                Reply::Ok
+            }
+            Request::Account => Reply::Account(self.account_view(venue)),
+            Request::OpenOrders { market } => Reply::Orders(
+                self.venues[v].open.values()
+                    .filter(|o| market.as_ref().is_none_or(|m| &o.market == m))
+                    .cloned()
+                    .collect(),
+            ),
+            Request::Order { order: which } => {
+                let st = &self.venues[v];
+                let matches = |o: &&Order| match &which {
+                    OrderRef::Id(id) => o.id == *id,
+                    OrderRef::Client(client_id) => &o.client_id == client_id,
+                };
+                let found = st.open.values().find(matches).or_else(|| st.closed.iter().rev().find(matches)).cloned();
+                match found {
+                    Some(order) => Reply::Order(order),
+                    None => self.reject(venue, Reject::UnknownOrder),
+                }
+            }
+            Request::Fills { market } => Reply::Fills(
+                self.venues[v].fills.iter()
+                    .filter(|f| market.as_ref().is_none_or(|m| &f.market == m))
+                    .cloned()
+                    .collect(),
+            ),
+            Request::Book { market } => {
+                let book = self.venues[v].books.get(&market)
+                    .map(|b| b.warm().then(|| (b.levels(Side::Buy).collect(), b.levels(Side::Sell).collect())));
+                match book {
+                    Some(Some((bids, asks))) => Reply::Book { bids, asks },
+                    Some(None) => self.reject(venue, Reject::Unavailable),
+                    None => self.reject(venue, Reject::UnknownMarket),
+                }
+            }
+            Request::NextNonce { key } => Reply::Nonce(self.venues[v].nonces.get(&key).copied().unwrap_or(0)),
+            Request::Noop => Reply::Ok,
+        }
+    }
+
+    /// The book state after the next update due within the lookahead, if any.
+    fn next_state(&self, venue: Venue, market: &str) -> Option<Replica> {
+        let current = self.venues[venue.ix()].books.get(market)?;
+        let window = (self.now, 0, 0)..=(self.now + LOOKAHEAD_US, u8::MAX, u64::MAX);
+        self.pending.range(window).find_map(|(_, pending)| match pending {
+            Pending::Feed { venue: v, market: m, exch_us, event: FeedEvent::Book(update) }
+                if *v == venue && m == market =>
+            {
+                let mut next = current.clone();
+                next.apply(*exch_us, update);
+                Some(next)
+            }
+            _ => None,
+        })
+    }
+
+    fn place(&mut self, venue: Venue, spec: &OrderSpec) -> Result<Order, Reject> {
+        let v = venue.ix();
+        if spec.tif == Tif::PostOnly && spec.price.is_none() {
+            return Err(Reject::TickSize);
+        }
+        let st = &self.venues[v];
+        let (Some(book), Some(filters)) = (st.books.get(&spec.market), st.filters.get(&spec.market)) else {
+            return Err(Reject::UnknownMarket);
+        };
+        if !book.warm() {
+            return Err(Reject::Unavailable);
+        }
+        let mark = st.marks.get(&spec.market).copied();
+        check_filters(filters, spec, mark)?;
+        let mut qty = spec.qty;
+        if spec.reduce_only {
+            let room = reducible(st.account.position(&spec.market).qty, spec.side);
+            if room.is_zero() {
+                return Err(Reject::ReduceOnly);
+            }
+            qty = qty.min(room);
+        } else {
+            let mut working = st.working();
+            let w = working.entry(spec.market.clone()).or_default();
+            match spec.side {
+                Side::Buy => w.buys += qty,
+                Side::Sell => w.sells += qty,
+            }
+            if st.view(&working, self.p.leverage).available < Decimal::ZERO {
+                return Err(Reject::Margin);
+            }
+        }
+        let next = self.next_state(venue, &spec.market);
+        let id = self.venues[v].next_id();
+        let mut order = Order {
+            id,
+            client_id: spec.client_id.clone(),
+            market: spec.market.clone(),
+            side: spec.side,
+            price: spec.price,
+            qty,
+            tif: spec.tif,
+            reduce_only: spec.reduce_only,
+            filled: Decimal::ZERO,
+            filled_quote: Decimal::ZERO,
+            fee: Decimal::ZERO,
+            status: Status::New,
+            created_us: self.now,
+            updated_us: self.now,
+            ahead: None,
+        };
+        if let (Tif::PostOnly, Some(price)) = (spec.tif, spec.price) {
+            if self.venues[v].books[&spec.market].crosses(spec.side, price) {
+                self.finish(venue, &mut order, End::PostOnly);
+                return Ok(order);
+            }
+        }
+        self.emit(venue, &order, None);
+        if spec.tif != Tif::PostOnly {
+            let levels = self.venues[v].books[&spec.market].takeable(next.as_ref(), spec.side, spec.price);
+            for (level, free) in levels {
+                let qty = self.fillable(venue, &order).min(free);
+                if qty <= Decimal::ZERO {
+                    break;
+                }
+                self.venues[v].books.get_mut(&spec.market).unwrap().consume(spec.side.opposite(), level, qty);
+                self.fill(venue, &mut order, level, qty, false);
+            }
+        }
+        if order.working() {
+            if spec.tif == Tif::Ioc || spec.price.is_none() {
+                self.finish(venue, &mut order, End::Ioc);
+                return Ok(order);
+            }
+            let price = spec.price.unwrap();
+            let book = &self.venues[v].books[&spec.market];
+            let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
+            order.ahead = book.visible(spec.side, price).map(|size| {
+                let later = next.as_ref().and_then(|n| n.visible(spec.side, price)).unwrap_or_default();
+                size.max(later) * hidden
+            });
+        }
+        let snapshot = order.clone();
+        self.settle(venue, order);
+        Ok(snapshot)
+    }
+
+    /// What a resting or taking order can still fill: its remainder, capped for reduce-only
+    /// orders by the position left to reduce.
+    fn fillable(&self, venue: Venue, order: &Order) -> Decimal {
+        let remaining = order.remaining();
+        if !order.reduce_only {
+            return remaining;
+        }
+        remaining.min(reducible(self.venues[venue.ix()].account.position(&order.market).qty, order.side))
+    }
+
+    fn fill(&mut self, venue: Venue, order: &mut Order, price: Decimal, qty: Decimal, maker: bool) {
+        let v = venue.ix();
+        let rates = &self.p.fees[v];
+        let fee = price * qty * if maker { rates.maker } else { rates.taker };
+        let st = &mut self.venues[v];
+        let realized = st.account.fill(&order.market, order.side, qty, price, fee);
+        order.filled += qty;
+        order.filled_quote += price * qty;
+        order.fee += fee;
+        order.updated_us = self.now;
+        order.status = if order.remaining().is_zero() { Status::Filled } else { Status::PartiallyFilled };
+        let fill = Fill {
+            id: st.next_id(),
+            order_id: order.id,
+            market: order.market.clone(),
+            side: order.side,
+            price,
+            qty,
+            fee,
+            maker,
+            realized,
+            at_us: self.now,
+        };
+        st.fills.push_back(fill.clone());
+        if st.fills.len() > KEEP {
+            st.fills.pop_front();
+        }
+        if maker {
+            self.diag[v].maker_fills += 1;
+        } else {
+            self.diag[v].taker_fills += 1;
+        }
+        self.emit(venue, order, Some(fill));
+        // Resting reduce-only orders die with the position they were reducing.
+        let dead: Vec<u64> = self.venues[v].open.values()
+            .filter(|o| o.market == order.market && o.reduce_only && self.fillable(venue, o).is_zero())
+            .map(|o| o.id)
+            .collect();
+        for id in dead {
+            let mut stale = self.venues[v].open.remove(&id).unwrap();
+            self.finish(venue, &mut stale, End::ReduceOnly);
+        }
+    }
+
+    fn finish(&mut self, venue: Venue, order: &mut Order, end: End) {
+        order.status = Status::Done(end);
+        order.updated_us = self.now;
+        self.emit(venue, order, None);
+        self.close(venue, order.clone());
+    }
+
+    fn close(&mut self, venue: Venue, order: Order) {
+        let closed = &mut self.venues[venue.ix()].closed;
+        closed.push_back(order);
+        if closed.len() > KEEP {
+            closed.pop_front();
+        }
+    }
+
+    /// Puts a still-working order back on the book, or closes it.
+    fn settle(&mut self, venue: Venue, mut order: Order) {
+        if order.working() && order.reduce_only && self.fillable(venue, &order).is_zero() {
+            self.finish(venue, &mut order, End::ReduceOnly);
+        } else if order.working() {
+            self.venues[venue.ix()].open.insert(order.id, order);
+        } else {
+            self.close(venue, order);
+        }
+    }
+
+    fn cancel_all(&mut self, venue: Venue, market: Option<&str>, end: End) {
+        let v = venue.ix();
+        let ids: Vec<u64> = self.venues[v].open.values()
+            .filter(|o| market.is_none_or(|m| o.market == m))
+            .map(|o| o.id)
+            .collect();
+        for id in ids {
+            let mut order = self.venues[v].open.remove(&id).unwrap();
+            self.finish(venue, &mut order, end);
+        }
+    }
+
+    /// Our resting orders in `market` (on `side`, if given), each side best price first, then
+    /// oldest first.
+    fn resting(&self, venue: Venue, market: &str, side: Option<Side>) -> Vec<u64> {
+        let mut orders: Vec<&Order> = self.venues[venue.ix()].open.values()
+            .filter(|o| o.market == market && side.is_none_or(|s| o.side == s))
+            .collect();
+        orders.sort_by(|a, b| {
+            let (pa, pb) = (a.price.unwrap_or_default(), b.price.unwrap_or_default());
+            (a.side == Side::Sell).cmp(&(b.side == Side::Sell))
+                .then(match a.side {
+                    Side::Buy => pb.cmp(&pa),
+                    Side::Sell => pa.cmp(&pb),
+                })
+                .then(a.id.cmp(&b.id))
+        });
+        orders.iter().map(|o| o.id).collect()
+    }
+
+    fn on_feed(&mut self, venue: Venue, market: &str, exch_us: i64, event: FeedEvent) {
+        let v = venue.ix();
+        let Some(book) = self.venues[v].books.get_mut(market) else { return };
+        match event {
+            FeedEvent::Book(update) => {
+                if !book.apply(exch_us, &update) {
+                    self.diag[v].stale_frames += 1;
+                } else if book.warm() {
+                    if let Some(mid) = book.mid() {
+                        self.venues[v].marks.insert(market.to_string(), mid);
+                    }
+                    self.on_book(venue, market);
+                }
+            }
+            FeedEvent::Trade { price, qty, taker } => {
+                if book.warm() {
+                    self.on_trade(venue, market, price, qty, taker);
+                }
+            }
+            FeedEvent::Gap => {
+                book.invalidate();
+                self.diag[v].gaps += 1;
+            }
+        }
+    }
+
+    /// After a book update: re-cap each resting order's queue by what is still visible at its
+    /// price (the only cancel credit), then fill whatever the book now crosses.
+    fn on_book(&mut self, venue: Venue, market: &str) {
+        let v = venue.ix();
+        let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
+        for id in self.resting(venue, market, None) {
+            // A fill above may have closed it (reduce-only orders die with their position).
+            let Some(mut order) = self.venues[v].open.remove(&id) else { continue };
+            let price = order.price.expect("resting orders have a price");
+            let book = &self.venues[v].books[market];
+            if let Some(size) = book.visible(order.side, price) {
+                let cap = size * hidden;
+                order.ahead = Some(order.ahead.map_or(cap, |ahead| ahead.min(cap)));
+            }
+            for (level, free) in book.takeable(None, order.side, Some(price)) {
+                let qty = self.fillable(venue, &order).min(free);
+                if qty <= Decimal::ZERO {
+                    break;
+                }
+                self.venues[v].books.get_mut(market).unwrap().consume(order.side.opposite(), level, qty);
+                self.fill(venue, &mut order, price, qty, true);
+            }
+            self.settle(venue, order);
+        }
+    }
+
+    fn on_trade(&mut self, venue: Venue, market: &str, price: Decimal, qty: Decimal, taker: Side) {
+        let v = venue.ix();
+        let passive = taker.opposite();
+        let book = &self.venues[v].books[market];
+        let diag = &mut self.diag[v];
+        diag.prints += 1;
+        if book.best(passive).is_some_and(|(best, _)| better(passive, price, best)) {
+            diag.prints_inside_spread += 1;
+        } else if book.visible(passive, price).is_some_and(|size| qty > size) {
+            diag.prints_over_visible += 1;
+        }
+        let hidden = Decimal::ONE + self.p.hidden_queue_multiplier;
+        let mut left = qty;
+        for id in self.resting(venue, market, Some(passive)) {
+            if left <= Decimal::ZERO {
+                break;
+            }
+            let Some(ours) = self.venues[v].open.get(&id).map(|o| o.price.expect("resting orders have a price")) else {
+                continue;
+            };
+            if better(passive, price, ours) {
+                break;
+            }
+            let mut order = self.venues[v].open.remove(&id).unwrap();
+            if price != ours {
+                order.ahead = Some(Decimal::ZERO);
+            } else if order.ahead.is_none() {
+                order.ahead = self.venues[v].books[market].visible(passive, ours).map(|size| size * hidden);
+            }
+            if let Some(ahead) = order.ahead {
+                let eaten = ahead.min(left);
+                order.ahead = Some(ahead - eaten);
+                left -= eaten;
+                let qty = self.fillable(venue, &order).min(left);
+                if qty > Decimal::ZERO {
+                    left -= qty;
+                    self.fill(venue, &mut order, ours, qty, true);
+                }
+            }
+            self.settle(venue, order);
+        }
+    }
+
+    fn on_funding(&mut self, venue: Venue, market: String, exch_us: i64) {
+        let v = venue.ix();
+        let st = &mut self.venues[v];
+        let Some(rate) = st.funding.get_mut(&market).and_then(|rates| rates.remove(&exch_us)) else { return };
+        let qty = st.account.position(&market).qty;
+        let Some(mark) = st.marks.get(&market).copied() else { return };
+        if qty.is_zero() {
+            return;
+        }
+        // Longs pay a positive rate.
+        let amount = -qty * mark * rate;
+        st.account.fund(amount);
+        let account = self.account_view(venue);
+        self.push_event(venue, Event::Funding { market, amount, account });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    const MS: i64 = 1_000;
+    const HYPE: &str = "HYPE";
+
+    fn fixed(ms: f64) -> Latency {
+        if ms == 0.0 { Latency::ZERO } else { Latency::try_from([ms, ms]).unwrap() }
+    }
+
+    fn params(shift_ms: i64) -> SimParams {
+        SimParams {
+            shift_us: shift_ms * MS,
+            seed: 7,
+            effect_fraction: 0.9,
+            rtt: [fixed(100.0), fixed(10.0)],
+            private: [fixed(10.0), fixed(5.0)],
+            lighter_taker_delay_us: 300 * MS,
+            hidden_queue_multiplier: dec!(0.5),
+            fees: [Fees { maker: dec!(0), taker: dec!(0.0004) }, Fees { maker: dec!(0), taker: dec!(0) }],
+            leverage: dec!(1),
+            balances: [dec!(1000), dec!(1000)],
+        }
+    }
+
+    fn levels(v: &[(Decimal, Decimal)]) -> Vec<Level> {
+        v.to_vec()
+    }
+
+    /// A market around 100 on both venues, a fixed timeline in exchange ms, and everything the
+    /// bot received.
+    struct Sim {
+        ex: Exchange,
+        shift: i64,
+        out: Vec<Output>,
+        nonce: i64,
+    }
+
+    impl Sim {
+        fn new() -> Self {
+            Self::with(params(500))
+        }
+
+        fn with(p: SimParams) -> Self {
+            let shift = p.shift_us;
+            let mut ex = Exchange::new(p, 0);
+            let filters = Filters {
+                tick: dec!(0.01),
+                step: dec!(0.01),
+                min_qty: dec!(0.01),
+                min_notional: dec!(5),
+                price_band: Some(dec!(0.02)),
+            };
+            ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
+            ex.add_market(Venue::Lighter, HYPE, None, filters);
+            let mut sim = Self { ex, shift, out: Vec::new(), nonce: 0 };
+            for venue in [Venue::Aster, Venue::Lighter] {
+                sim.book(venue, 0, &[(dec!(99), dec!(5)), (dec!(98), dec!(5))], &[(dec!(101), dec!(5)), (dec!(102), dec!(5))]);
+            }
+            sim.at(0);
+            sim
+        }
+
+        fn feed(&mut self, venue: Venue, ms: i64, event: FeedEvent) {
+            self.ex.ingest(venue, HYPE, ms * MS, event);
+        }
+
+        fn book(&mut self, venue: Venue, ms: i64, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+            let update = BookUpdate::Replace { bids: levels(bids), asks: levels(asks) };
+            self.feed(venue, ms, FeedEvent::Book(update));
+        }
+
+        fn delta(&mut self, venue: Venue, ms: i64, bids: &[(Decimal, Decimal)], asks: &[(Decimal, Decimal)]) {
+            let update = BookUpdate::Delta { bids: levels(bids), asks: levels(asks) };
+            self.feed(venue, ms, FeedEvent::Book(update));
+        }
+
+        fn print(&mut self, venue: Venue, ms: i64, price: Decimal, qty: Decimal, taker: Side) {
+            self.feed(venue, ms, FeedEvent::Trade { price, qty, taker });
+        }
+
+        /// Advances to the wall time at which the venue is at exchange time `ms`.
+        fn at(&mut self, ms: i64) {
+            self.ex.advance(ms * MS + self.shift, &mut self.out);
+        }
+
+        fn send(&mut self, venue: Venue, request: Request) -> u64 {
+            let orders = u32::from(matches!(request, Request::Place(_)));
+            self.ex.submit(Envelope { venue, lane: 1, weight: 1, orders, nonce: None, request })
+        }
+
+        fn tx(&mut self, request: Request) -> u64 {
+            self.nonce += 1;
+            let nonce = Some((9, self.nonce - 1));
+            self.ex.submit(Envelope { venue: Venue::Lighter, lane: 2, weight: 0, orders: 1, nonce, request })
+        }
+
+        fn reply(&self, ticket: u64) -> Option<&Reply> {
+            self.out.iter().find_map(|o| match o {
+                Output::Reply { ticket: t, reply } if *t == ticket => Some(reply),
+                _ => None,
+            })
+        }
+
+        fn fills(&self, venue: Venue) -> Vec<(Decimal, Decimal, bool)> {
+            self.out.iter().filter_map(|o| match o {
+                Output::Event { venue: v, event: Event::Order { fill: Some(f), .. } } if *v == venue => {
+                    Some((f.price, f.qty, f.maker))
+                }
+                _ => None,
+            }).collect()
+        }
+
+        fn last_status(&self, venue: Venue, id: u64) -> Option<Status> {
+            self.out.iter().rev().find_map(|o| match o {
+                Output::Event { venue: v, event: Event::Order { order, .. } } if *v == venue && order.id == id => {
+                    Some(order.status)
+                }
+                _ => None,
+            })
+        }
+
+        fn open(&self, venue: Venue) -> Vec<&Order> {
+            self.ex.venues[venue.ix()].open.values().collect()
+        }
+    }
+
+    fn limit(side: Side, qty: Decimal, price: Decimal, tif: Tif) -> Request {
+        Request::Place(OrderSpec {
+            market: HYPE.into(),
+            client_id: "c".into(),
+            side,
+            qty,
+            price: Some(price),
+            tif,
+            reduce_only: false,
+        })
+    }
+
+    fn reduce_only(side: Side, qty: Decimal, price: Decimal, tif: Tif) -> Request {
+        match limit(side, qty, price, tif) {
+            Request::Place(spec) => Request::Place(OrderSpec { reduce_only: true, ..spec }),
+            _ => unreachable!(),
+        }
+    }
+
+    fn placed(sim: &Sim, ticket: u64) -> Order {
+        match sim.reply(ticket) {
+            Some(Reply::Order(order)) => order.clone(),
+            other => panic!("expected an order reply, got {other:?}"),
+        }
+    }
+
+    // --- The maker queue (ported from the retired fill_sweep, with two corrections: better-
+    // priced prints no longer advance us, and a print through our price empties the level). ---
+
+    #[test]
+    fn prints_at_our_level_eat_the_visible_queue_then_fill_us() {
+        let mut sim = Sim::new();
+        let ticket = sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99), Tif::PostOnly));
+        sim.at(100);
+        assert_eq!(placed(&sim, ticket).ahead, Some(dec!(7.5)));
+        sim.print(Venue::Aster, 200, dec!(99), dec!(6), Side::Sell);
+        sim.print(Venue::Aster, 300, dec!(99), dec!(3), Side::Sell);
+        sim.print(Venue::Aster, 400, dec!(99), dec!(1), Side::Sell);
+        sim.at(500);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99), dec!(1.5), true), (dec!(99), dec!(0.5), true)]);
+        assert!(sim.open(Venue::Aster).is_empty());
+    }
+
+    #[test]
+    fn better_priced_prints_leave_our_queue_alone() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(98), Tif::PostOnly));
+        sim.print(Venue::Aster, 200, dec!(99), dec!(10), Side::Sell);
+        sim.print(Venue::Aster, 300, dec!(98), dec!(1), Side::Sell);
+        sim.at(400);
+        assert_eq!(sim.open(Venue::Aster)[0].ahead, Some(dec!(6.5)));
+        assert!(sim.fills(Venue::Aster).is_empty());
+    }
+
+    #[test]
+    fn a_print_through_our_price_fills_us_despite_the_queue() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99), Tif::PostOnly));
+        sim.print(Venue::Aster, 200, dec!(98.5), dec!(3), Side::Sell);
+        sim.at(300);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99), dec!(2), true)]);
+    }
+
+    #[test]
+    fn prints_from_the_wrong_side_or_before_the_order_exists_never_fill() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Sell, dec!(1), dec!(100.5), Tif::PostOnly));
+        // The order takes effect at 90 ms: an earlier print cannot reach it.
+        sim.print(Venue::Aster, 50, dec!(100.6), dec!(9), Side::Buy);
+        sim.print(Venue::Aster, 150, dec!(100.4), dec!(9), Side::Sell);
+        sim.at(200);
+        assert!(sim.fills(Venue::Aster).is_empty());
+        // Our ask is lifted by a market buy through it.
+        sim.print(Venue::Aster, 250, dec!(100.6), dec!(9), Side::Buy);
+        sim.at(300);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(100.5), dec!(1), true)]);
+    }
+
+    #[test]
+    fn one_print_is_shared_across_our_orders() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99.5), Tif::PostOnly));
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99.4), Tif::PostOnly));
+        sim.print(Venue::Aster, 200, dec!(99.4), dec!(3), Side::Sell);
+        sim.at(300);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99.5), dec!(2), true), (dec!(99.4), dec!(1), true)]);
+    }
+
+    #[test]
+    fn a_crossed_book_fills_resting_orders_once_even_after_a_gap() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99.5), Tif::PostOnly));
+        sim.feed(Venue::Aster, 400, FeedEvent::Gap);
+        let asks = [(dec!(99.4), dec!(1)), (dec!(99.6), dec!(5))];
+        sim.book(Venue::Aster, 500, &[(dec!(99), dec!(5))], &asks);
+        sim.book(Venue::Aster, 600, &[(dec!(99), dec!(5))], &asks);
+        sim.at(700);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99.5), dec!(1), true)]);
+        // The same ask growing behind what we took fills the rest.
+        sim.book(Venue::Aster, 800, &[(dec!(99), dec!(5))], &[(dec!(99.4), dec!(4))]);
+        sim.at(900);
+        assert_eq!(sim.fills(Venue::Aster)[1], (dec!(99.5), dec!(1), true));
+    }
+
+    #[test]
+    fn the_queue_is_capped_by_what_stays_visible() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(99), Tif::PostOnly));
+        sim.book(Venue::Aster, 200, &[(dec!(99), dec!(2))], &[(dec!(101), dec!(5))]);
+        sim.book(Venue::Aster, 300, &[(dec!(99), dec!(9))], &[(dec!(101), dec!(5))]);
+        sim.at(400);
+        assert_eq!(sim.open(Venue::Aster)[0].ahead, Some(dec!(3)));
+    }
+
+    // --- Taking liquidity. ---
+
+    #[test]
+    fn takers_fill_against_the_worse_of_the_bracketing_states() {
+        let mut sim = Sim::new();
+        // Effect at 90 ms; the next top (at 120 ms) shows 101 almost gone; one far past the
+        // lookahead is ignored.
+        sim.feed(Venue::Aster, 120, FeedEvent::Book(BookUpdate::Top { bid: (dec!(99), dec!(5)), ask: (dec!(101), dec!(1)) }));
+        sim.feed(Venue::Aster, 900, FeedEvent::Book(BookUpdate::Top { bid: (dec!(99), dec!(5)), ask: (dec!(102), dec!(1)) }));
+        let ticket = sim.send(Venue::Aster, limit(Side::Buy, dec!(4), dec!(102), Tif::Ioc));
+        sim.at(200);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(101), dec!(1), false), (dec!(102), dec!(3), false)]);
+        let order = placed(&sim, ticket);
+        assert_eq!((order.status, order.fee), (Status::Filled, dec!(0.1628)));
+        // What we took stays taken: the next taker finds 102 short by our 3.
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(4), dec!(102), Tif::Ioc));
+        sim.at(400);
+        assert_eq!(sim.fills(Venue::Aster)[2..], [(dec!(102), dec!(2), false)]);
+    }
+
+    #[test]
+    fn post_only_expires_if_it_crosses_on_arrival_and_is_hit_if_the_book_crosses_later() {
+        let mut sim = Sim::new();
+        let crossing = sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(101), Tif::PostOnly));
+        // Lands at 90 ms; an ask at its price shows up at 150 ms and trades against it.
+        let resting = sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(100.5), Tif::PostOnly));
+        sim.feed(Venue::Aster, 150, FeedEvent::Book(BookUpdate::Top { bid: (dec!(99), dec!(5)), ask: (dec!(100.5), dec!(3)) }));
+        sim.at(200);
+        assert_eq!(placed(&sim, crossing).status, Status::Done(End::PostOnly));
+        assert_eq!(placed(&sim, resting).status, Status::New);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(100.5), dec!(1), true)]);
+    }
+
+    #[test]
+    fn fills_that_beat_a_cancel_stand() {
+        let mut sim = Sim::new();
+        let place = sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(99.5), Tif::PostOnly));
+        sim.at(100);
+        let id = placed(&sim, place).id;
+        let cancel = sim.send(Venue::Aster, Request::Cancel { market: HYPE.into(), order: OrderRef::Id(id) });
+        // The cancel lands at 190 ms; a print at 150 ms gets there first.
+        sim.print(Venue::Aster, 150, dec!(99.5), dec!(1), Side::Sell);
+        sim.at(300);
+        assert_eq!(sim.fills(Venue::Aster), vec![(dec!(99.5), dec!(1), true)]);
+        let canceled = placed(&sim, cancel);
+        assert_eq!((canceled.status, canceled.filled), (Status::Done(End::Canceled), dec!(1)));
+        let again = sim.send(Venue::Aster, Request::Cancel { market: HYPE.into(), order: OrderRef::Id(id) });
+        sim.at(500);
+        assert_eq!(sim.reply(again), Some(&Reply::Reject(Reject::UnknownOrder)));
+    }
+
+    // --- Venue rules. ---
+
+    #[test]
+    fn lighter_taker_orders_wait_out_the_speed_bump() {
+        let mut sim = Sim::new();
+        // Gateway at 9 ms, execution at 309 ms, private event at 314 ms.
+        let ticket = sim.tx(limit(Side::Buy, dec!(1), dec!(102), Tif::Ioc));
+        sim.delta(Venue::Lighter, 200, &[], &[(dec!(101), dec!(0))]);
+        sim.at(100);
+        assert_eq!(sim.reply(ticket), Some(&Reply::Ok));
+        sim.at(313);
+        assert!(sim.fills(Venue::Lighter).is_empty());
+        sim.at(314);
+        assert_eq!(sim.fills(Venue::Lighter), vec![(dec!(102), dec!(1), false)]);
+        // Post-only orders and cancels skip the bump.
+        sim.tx(limit(Side::Buy, dec!(1), dec!(99), Tif::PostOnly));
+        sim.at(330);
+        assert_eq!(sim.open(Venue::Lighter).len(), 1);
+    }
+
+    #[test]
+    fn lighter_nonces_must_follow_on_exactly() {
+        let mut sim = Sim::new();
+        let key = 9;
+        let tx = |nonce| Envelope { venue: Venue::Lighter, lane: 2, weight: 0, orders: 1, nonce: Some((key, nonce)), request: Request::Noop };
+        let tickets: Vec<u64> = [0, 0, 2, 1].into_iter().map(|n| sim.ex.submit(tx(n))).collect();
+        let next = sim.ex.submit(Envelope { venue: Venue::Lighter, lane: 3, weight: 1, orders: 0, nonce: None, request: Request::NextNonce { key } });
+        sim.at(100);
+        let replies: Vec<_> = tickets.iter().map(|&t| sim.reply(t).cloned().unwrap()).collect();
+        let bad = Reply::Reject(Reject::BadNonce);
+        assert_eq!(replies, vec![Reply::Ok, bad.clone(), bad, Reply::Ok]);
+        assert_eq!(sim.reply(next), Some(&Reply::Nonce(2)));
+    }
+
+    #[test]
+    fn one_connection_keeps_its_order_under_random_latency() {
+        let jittery = || {
+            let mut p = params(500);
+            p.rtt[1] = Latency::try_from([5.0, 100.0]).unwrap();
+            Sim::with(p)
+        };
+        let tx = |lane: u64, nonce: i64| Envelope {
+            venue: Venue::Lighter, lane, weight: 0, orders: 0, nonce: Some((1, nonce)), request: Request::Noop,
+        };
+        let mut sim = jittery();
+        let tickets: Vec<u64> = (0..50).map(|n| sim.ex.submit(tx(7, n))).collect();
+        sim.at(1_000);
+        assert!(tickets.iter().all(|&t| sim.reply(t) == Some(&Reply::Ok)));
+        // The same transactions spread over separate connections overtake each other.
+        let mut sim = jittery();
+        let tickets: Vec<u64> = (0..50).map(|n| sim.ex.submit(tx(100 + n as u64, n))).collect();
+        sim.at(1_000);
+        assert!(tickets.iter().any(|&t| sim.reply(t) == Some(&Reply::Reject(Reject::BadNonce))));
+    }
+
+    #[test]
+    fn reduce_only_refuses_to_add_and_dies_with_the_position() {
+        let mut sim = Sim::new();
+        let flat = sim.send(Venue::Aster, reduce_only(Side::Sell, dec!(1), dec!(99), Tif::Ioc));
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(101), Tif::Ioc));
+        sim.at(200);
+        assert_eq!(sim.reply(flat), Some(&Reply::Reject(Reject::ReduceOnly)));
+        // A resting reduce-only ask, then an IOC that closes the long first.
+        let resting = sim.send(Venue::Aster, reduce_only(Side::Sell, dec!(3), dec!(100.5), Tif::PostOnly));
+        sim.at(400);
+        let resting = placed(&sim, resting);
+        assert_eq!(resting.qty, dec!(1));
+        sim.send(Venue::Aster, reduce_only(Side::Sell, dec!(5), dec!(98), Tif::Ioc));
+        sim.at(600);
+        assert_eq!(sim.fills(Venue::Aster)[1], (dec!(99), dec!(1), false));
+        assert_eq!(sim.last_status(Venue::Aster, resting.id), Some(Status::Done(End::ReduceOnly)));
+        assert_eq!(sim.ex.venues[0].account.position(HYPE).qty, dec!(0));
+    }
+
+    #[test]
+    fn filters_and_margin_refuse_bad_orders() {
+        let mut sim = Sim::new();
+        let cases = [
+            (limit(Side::Buy, dec!(1), dec!(99.001), Tif::PostOnly), Reject::TickSize),
+            (limit(Side::Buy, dec!(1.001), dec!(99), Tif::PostOnly), Reject::StepSize),
+            (limit(Side::Buy, dec!(0.05), dec!(99), Tif::PostOnly), Reject::MinNotional),
+            (limit(Side::Buy, dec!(1), dec!(102.5), Tif::Ioc), Reject::PriceBand),
+            (limit(Side::Buy, dec!(11), dec!(99), Tif::PostOnly), Reject::Margin),
+        ];
+        let tickets: Vec<(u64, Reject)> = cases.into_iter().map(|(r, want)| (sim.send(Venue::Aster, r), want)).collect();
+        sim.at(1_000);
+        for (ticket, want) in tickets {
+            assert_eq!(sim.reply(ticket), Some(&Reply::Reject(want)));
+        }
+        // On Lighter the sequencer accepts the transaction; execution refuses the order.
+        let ticket = sim.tx(limit(Side::Buy, dec!(11), dec!(99), Tif::PostOnly));
+        sim.at(1_100);
+        assert_eq!(sim.reply(ticket), Some(&Reply::Ok));
+        assert_eq!(sim.last_status(Venue::Lighter, 1), Some(Status::Done(End::Rejected(Reject::Margin))));
+    }
+
+    #[test]
+    fn rate_limits_answer_429_until_the_window_slides() {
+        let mut sim = Sim::new();
+        let rest = |sim: &mut Sim| sim.ex.submit(Envelope { venue: Venue::Lighter, lane: 3, weight: 1, orders: 0, nonce: None, request: Request::Account });
+        let tickets: Vec<u64> = (0..61).map(|_| rest(&mut sim)).collect();
+        sim.at(100);
+        assert!(tickets[..60].iter().all(|&t| matches!(sim.reply(t), Some(Reply::Account(_)))));
+        assert_eq!(sim.reply(tickets[60]), Some(&Reply::Reject(Reject::RateLimited)));
+        sim.at(60_100);
+        let later = rest(&mut sim);
+        sim.at(60_200);
+        assert!(matches!(sim.reply(later), Some(Reply::Account(_))));
+    }
+
+    #[test]
+    fn the_deadman_cancels_unless_re_armed() {
+        let mut sim = Sim::new();
+        let arm = |countdown_ms| Request::Deadman { market: HYPE.into(), countdown_ms };
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(99), Tif::PostOnly));
+        sim.send(Venue::Aster, arm(1_000));
+        sim.at(500);
+        sim.send(Venue::Aster, arm(1_000));
+        sim.at(1_200);
+        assert_eq!(sim.open(Venue::Aster).len(), 1);
+        sim.at(1_700);
+        assert!(sim.open(Venue::Aster).is_empty());
+        assert_eq!(sim.last_status(Venue::Aster, 1), Some(Status::Done(End::Deadman)));
+    }
+
+    #[test]
+    fn funding_settles_on_the_position_and_the_books_close() {
+        let mut sim = Sim::new();
+        sim.send(Venue::Aster, limit(Side::Buy, dec!(2), dec!(102), Tif::Ioc));
+        sim.ex.funding(Venue::Aster, HYPE, 1_000 * MS, dec!(0.0001));
+        sim.ex.funding(Venue::Aster, HYPE, 1_000 * MS, dec!(0.0002));
+        sim.at(2_000);
+        let account = &sim.ex.venues[0].account;
+        // Long 2 at mid 100 pays 0.0002 × 200.
+        assert_eq!(account.funding, dec!(-0.04));
+        assert_eq!(account.balance, account.initial + account.realized - account.fees + account.funding);
+        let fills: Decimal = sim.fills(Venue::Aster).iter().map(|f| f.1).sum();
+        assert_eq!(account.position(HYPE).qty, fills);
+    }
+
+    #[test]
+    fn results_do_not_depend_on_the_shift() {
+        // The same market and the same orders, sent at the same shifted times, under two shifts.
+        fn session(shift_ms: i64) -> (Vec<Output>, Vec<Account>) {
+            let mut p = params(shift_ms);
+            p.rtt = [Latency::try_from([100.0, 164.0]).unwrap(), Latency::try_from([8.0, 36.0]).unwrap()];
+            let mut sim = Sim::with(p);
+            for i in 0..20 {
+                let ms = 100 * i;
+                let px = dec!(99) + Decimal::from(i % 3) / dec!(10);
+                let top = BookUpdate::Top { bid: (px, dec!(3)), ask: (px + dec!(1.5), dec!(2)) };
+                sim.feed(Venue::Aster, ms + 5, FeedEvent::Book(top));
+                sim.print(Venue::Aster, ms + 7, px, dec!(4), Side::Sell);
+                sim.delta(Venue::Lighter, ms + 9, &[(px, dec!(4))], &[(px + dec!(1), dec!(3))]);
+            }
+            for i in 0..8 {
+                sim.at(200 * i);
+                sim.send(Venue::Aster, limit(Side::Buy, dec!(1), dec!(99.1), Tif::PostOnly));
+                sim.tx(limit(Side::Buy, dec!(0.5), dec!(101), Tif::Ioc));
+            }
+            sim.at(3_000);
+            let shift = shift_ms * MS;
+            let unshift = |mut order: Order| {
+                order.created_us -= shift;
+                order.updated_us -= shift;
+                order
+            };
+            let outputs = sim.out.into_iter().map(|o| match o {
+                Output::Event { venue, event: Event::Order { order, fill, account } } => {
+                    let fill = fill.map(|f| Fill { at_us: f.at_us - shift, ..f });
+                    Output::Event { venue, event: Event::Order { order: unshift(order), fill, account } }
+                }
+                Output::Reply { ticket, reply: Reply::Order(order) } => {
+                    Output::Reply { ticket, reply: Reply::Order(unshift(order)) }
+                }
+                other => other,
+            }).collect();
+            (outputs, sim.ex.venues.iter().map(|st| st.account.clone()).collect())
+        }
+        let (a, accounts_a) = session(300);
+        let (b, accounts_b) = session(900);
+        let fills = a.iter().filter(|o| matches!(o, Output::Event { event: Event::Order { fill: Some(_), .. }, .. })).count();
+        assert!(fills >= 8, "the session should trade on both venues, got {fills} fills");
+        assert_eq!(a, b);
+        assert_eq!(accounts_a, accounts_b);
+    }
+}

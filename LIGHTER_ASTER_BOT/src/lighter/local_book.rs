@@ -63,6 +63,23 @@ impl BookSide {
     pub fn top_descending(&self, count: usize) -> impl Iterator<Item = (Decimal, Decimal)> + '_ {
         self.prices.iter().copied().zip(self.sizes.iter().copied()).rev().take(count)
     }
+
+    /// Size resting at `price` (0 when there is no level).
+    pub fn size_at(&self, price: Decimal) -> Decimal {
+        self.prices.binary_search(&price).map_or(Decimal::ZERO, |index| self.sizes[index])
+    }
+    /// Drops every level priced above `price`.
+    pub fn remove_above(&mut self, price: Decimal) {
+        let keep = self.prices.partition_point(|p| *p <= price);
+        self.prices.truncate(keep);
+        self.sizes.truncate(keep);
+    }
+    /// Drops every level priced below `price`.
+    pub fn remove_below(&mut self, price: Decimal) {
+        let cut = self.prices.partition_point(|p| *p < price);
+        self.prices.drain(..cut);
+        self.sizes.drain(..cut);
+    }
 }
 
 #[derive(Debug, Clone, Default)]
