@@ -63,7 +63,8 @@ are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run).
 
 Run from the repository root. Both reports read the bot's records in `LIGHTER_ASTER_BOT/runs/`
 and, where they exist, the retired orchestrator's in the root `runs/`; with `--dry-run` they
-read only `LIGHTER_ASTER_BOT/runs/dry-run/`.
+read only `LIGHTER_ASTER_BOT/runs/dry-run/` and, without `--since`, count from the dry run's
+first start.
 
 ```bash
 python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z   # add --json for JSON

@@ -1004,9 +1004,11 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
             snapshot.ledger_path.display(),
             snapshot.breaker_path.display()
         );
+        // A dry run's breaker lives in runs/dry-run: without the flag the reset hits live's.
+        let reset = if cfg.venues.dry_run { "reset-circuit-breaker --dry-run" } else { "reset-circuit-breaker" };
         if let Some(breaker) = tracker.active_breaker()? {
             bail!(
-                "circuit breaker active: market={} since={} cumulative_pnl=${} max_loss=${}; reset with reset-circuit-breaker",
+                "circuit breaker active: market={} since={} cumulative_pnl=${} max_loss=${}; reset with {reset}",
                 breaker.market,
                 format_ts(breaker.pnl_since),
                 breaker.cumulative_pnl_usdc,
@@ -1015,7 +1017,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
         }
         if let Some(breaker) = tracker.trip_from_loaded_pnl_if_needed()? {
             bail!(
-                "circuit breaker triggered from persisted PnL: market={} since={} cumulative_pnl=${} max_loss=${}; reset with reset-circuit-breaker after changing pnl.since or limit",
+                "circuit breaker triggered from persisted PnL: market={} since={} cumulative_pnl=${} max_loss=${}; reset with {reset} after changing pnl.since or limit",
                 breaker.market,
                 format_ts(breaker.pnl_since),
                 breaker.cumulative_pnl_usdc,

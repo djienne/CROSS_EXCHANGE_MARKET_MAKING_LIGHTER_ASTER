@@ -40,8 +40,10 @@ const ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
 /// At startup, long enough for the Aster deadman countdown (10 s) to cancel orders left by a
 /// crashed process.
 const STARTUP_ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
-/// Above XEMM's worst-case bounded drain (175 s), below compose's stop_grace_period (200 s).
-const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(185);
+/// Above XEMM's worst-case bounded drain (~190 s: 5 quiesce + 4x2 sends + 70 + 65 + 30 verify
+/// + 5 journal + 5 trip retry). Compose's stop_grace_period (460 s) covers a status tick in
+/// progress (2 x STATUS_TIMEOUT) plus this for the active engine and again for the observer.
+const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(200);
 /// The third spontaneous exit of the active engine, counting only exits under 10 minutes of
 /// uptime, halts (no time window, as in the original).
 const CRASH_LOOP_EXITS: u32 = 3;

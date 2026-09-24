@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
-from combined_pnl import DEFAULT_SINCE, dec, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, report_roots, utc_now
+from combined_pnl import DEFAULT_SINCE, dec, default_since, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, report_roots, utc_now
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
@@ -957,7 +957,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mode", choices=["lan", "local"], default="lan", help="lan/local: local artifacts only; no exchange API calls.")
     parser.add_argument("--dry-run", action="store_true", help="The dry run's files and its own DB (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
     parser.add_argument("--market", default="HYPE")
-    parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
+    parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--db", type=Path, default=None, help="Default: runs/trade_history.sqlite in the repository root (with --dry-run, in LIGHTER_ASTER_BOT/runs/dry-run/).")
     parser.add_argument("--taker-trades", type=Path, default=None)
@@ -977,6 +977,7 @@ def parse_args() -> argparse.Namespace:
     args.mode = "lan"
     roots = report_roots(stack_root, args.dry_run)
     legacy_runs, bot_runs = roots
+    args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
     if args.db is None:
         args.db = legacy_runs / "trade_history.sqlite"
     if args.taker_trades is None:

@@ -15,7 +15,6 @@ from economics import optional_decimal, parse_timestamp, xemm_journal, taker_eco
 
 SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
 DEFAULT_SINCE = "2026-06-28T00:00:00Z"
-DEFAULT_INCLUDE_UNTIMESTAMPED_XEMM = False
 
 
 def utc_now() -> datetime:
@@ -125,20 +124,6 @@ def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> 
         "known_net_pnl_usdc":net,"estimated_net_pnl_usdc":estimated,"incomplete_trades":unknown}
 
 
-def detail_dec(detail: dict[str, Any], key: str) -> Decimal:
-    value = detail.get(key)
-    if value is None:
-        raise ValueError(f"journal detail missing {key!r}")
-    return dec(value)
-
-
-def normalize_side(value: Any) -> str:
-    side = str(value or "").strip().lower()
-    if side == "buy":
-        return "buy"
-    if side == "sell":
-        return "sell"
-    return side
 
 
 def summarize_xemm_journal(
@@ -225,6 +210,18 @@ def report_roots(stack_root: Path, dry_run: bool = False) -> tuple[Path, Path]:
     so both resolve there."""
     bot_runs = stack_root / "LIGHTER_ASTER_BOT" / "runs"
     return (bot_runs / "dry-run", bot_runs / "dry-run") if dry_run else (stack_root / "runs", bot_runs)
+
+
+def default_since(bot_runs: Path, market: str, dry_run: bool) -> str:
+    """Live reports from DEFAULT_SINCE. A dry run reports from its first start, the first row of
+    its append-only event log, so projections annualize over the time it actually ran."""
+    if dry_run:
+        try:
+            with (bot_runs / f"bot-{market}.events.jsonl").open(encoding="utf-8") as f:
+                return json.loads(f.readline())["timestamp"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+    return DEFAULT_SINCE
 
 
 def default_state_path(roots: tuple[Path, Path], market: str) -> Path:
@@ -336,15 +333,12 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     capital_source = "cli"
     if capital is None:
         capital, capital_source = latest_capital_from_state(args.orchestrator_state)
-        if capital is None:
-            fallback_state = args.taker_trades.parent / f"orchestrator_state_{args.market}.json"
-            capital, capital_source = latest_capital_from_state(fallback_state)
     proj = projection(total["net_pnl_usdc"], capital, since, now)
     notes = [
         "Execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
         "Unknown/legacy fee evidence makes full net totals and return projections unavailable; known subtotals remain visible.",
         "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately.",
-        "By default XEMM includes only the production run/live/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
+        "By default XEMM includes only the production run/orchestrator journals. Pass --xemm-journal for exact files or --xemm-runs-dir for an mtime-based scan.",
     ]
     if xemm["untimestamped_trades"]:
         notes.append(
@@ -505,7 +499,7 @@ def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Combined execution economics report for taker arb + XEMM.")
     parser.add_argument("--dry-run", action="store_true", help="Report the dry run (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
-    parser.add_argument("--since", default=DEFAULT_SINCE, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}.")
+    parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
     parser.add_argument("--now", default=None, help="Override report end time. Defaults to current UTC time.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--json", action="store_true", help="Print machine-readable JSON.")
@@ -515,14 +509,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--xemm-journal", type=Path, action="append", default=[], help="Explicit XEMM journal to include. Repeatable. Overrides default journal selection.")
     parser.add_argument(
         "--xemm-untimestamped",
-        choices=["auto", "include", "exclude"],
-        default="auto",
-        help="How to handle legacy XEMM fill/hedge rows without wall-clock timestamps. auto follows the script default policy, currently exclude for the default recent window.",
+        choices=["include", "exclude"],
+        default="exclude",
+        help="How to handle legacy XEMM fill/hedge rows without wall-clock timestamps.",
     )
     parser.add_argument("--bot-state", "--orchestrator-state", dest="orchestrator_state", type=Path, default=None, help="Controller state file. Default: `run`'s, else the retired orchestrator's.")
     args = parser.parse_args()
     roots = report_roots(stack_root, args.dry_run)
     legacy_runs, bot_runs = roots
+    args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
     explicit_xemm_journals = bool(args.xemm_journal)
     explicit_xemm_runs_dirs = args.xemm_runs_dir is not None
     if args.taker_trades is None:
@@ -532,7 +527,6 @@ def parse_args() -> argparse.Namespace:
     if not explicit_xemm_journals and not explicit_xemm_runs_dirs:
         args.xemm_journal = [
             legacy_runs / f"orchestrator-xemm-{args.market}-journal.jsonl",
-            bot_runs / f"live-{args.market.lower()}-lighter-journal.jsonl",
             bot_runs / f"bot-{args.market}-journal.jsonl",
         ]
         args.xemm_journal_selection = "default_production_journals"
@@ -545,12 +539,7 @@ def parse_args() -> argparse.Namespace:
         args.require_xemm_journal_paths = False
     if args.orchestrator_state is None:
         args.orchestrator_state = default_state_path(roots, args.market)
-    if args.xemm_untimestamped == "include":
-        args.include_untimestamped_xemm = True
-    elif args.xemm_untimestamped == "exclude":
-        args.include_untimestamped_xemm = False
-    else:
-        args.include_untimestamped_xemm = DEFAULT_INCLUDE_UNTIMESTAMPED_XEMM if args.since == DEFAULT_SINCE else False
+    args.include_untimestamped_xemm = args.xemm_untimestamped == "include"
     return args
 
 

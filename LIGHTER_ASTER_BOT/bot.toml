@@ -142,7 +142,8 @@ max_hedge_slippage_bps       = "5.0"
 price_change_ticks_to_requote = 2
 clamp_to_min_lot             = true
 # Per-side requote deadband: skip a cancel/replace while the new desired price is within this many
-# bps of the resting quote (even if marginally unprofitable). Suppresses sub-bps requote churn.
+# bps of the resting quote, once it has passed the profitability recheck. Suppresses sub-bps
+# requote churn.
 min_requote_bps              = "2.0"
 
 [maker.capital]

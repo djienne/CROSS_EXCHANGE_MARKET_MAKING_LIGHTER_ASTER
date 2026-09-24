@@ -43,13 +43,17 @@ services:
       # Persistent + WRITABLE outputs; this nested mount overrides the read-only parent
       # for the runs/ subtree only.
       - ./runs:/app/runs
+      # The retired orchestrator's runs/ at the stack root: `run --mode live` refuses to start
+      # while its lock is held or its latches exist (RUNBOOK.md, "Orchestrator leftovers").
+      - ../runs:/runs:ro
       # Shared with any host-side Aster signer (native probes) on the Linux host.
       - ${ASTER_NONCE_DIR:-/tmp/lighter-aster-nonces}:/nonce
     # SIGINT, SIGTERM and SIGHUP all start the same graceful drain. Positions stay OPEN.
     stop_signal: SIGINT
-    # Above the worst-case bounded drain + verification (5+70+65+30+5 = 175 s); a shorter
+    # A status tick in progress (<= 50 s), then the active engine's and the observer's stops,
+    # each capped at 200 s (ENGINE_STOP_TIMEOUT in src/controller/supervisor.rs); a shorter
     # grace SIGKILLs a legitimate drain and leaves fills unhedged.
-    stop_grace_period: 200s
+    stop_grace_period: 460s
     # A halt must stay halted until an operator reviews it; never auto-restart.
     restart: "no"
     # Default = print help and exit; real runs override the command per invocation.
@@ -79,7 +83,7 @@ services:
     command: ["run", "--market", "HYPE", "--mode", "dry-run", "--ack-breaker"]
     restart: unless-stopped
     stop_signal: SIGINT
-    stop_grace_period: 200s
+    stop_grace_period: 460s
     # A latency simulator must not be CFS-throttled, and the quota also sizes the tokio worker
     # pool: 2 CPUs is ~100x the ~2 % of one core measured, a ceiling against a runaway only.
     # The value is the fleet policy's override (HELPERS\cpu_limits); cpu_limits.bat keeps it.

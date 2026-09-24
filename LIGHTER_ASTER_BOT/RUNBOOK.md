@@ -28,7 +28,7 @@ submit real orders.
 
 Rights move only after the previous holder has fully stopped; when XEMM hands over, its
 status must also show no open order on either venue. An engine that fails its drain or does
-not stop within 185 s halts the bot instead of switching. The `[controller]` table of
+not stop within 200 s halts the bot instead of switching. The `[controller]` table of
 `bot.toml` holds these thresholds and the cross-engine loss stop.
 
 ## Build, secrets, configuration
@@ -73,11 +73,12 @@ bot, so the drain is still logged.
 Stop with Ctrl-C, SIGINT, SIGTERM or SIGHUP (`tmux send-keys -t lighter_aster_bot C-c`,
 `docker kill --signal=SIGINT bot-hype`). The active engine drains first, then the observer.
 XEMM quiesces admission, cancels makers, drains fills and execution outcomes, corrects net
-residuals, reconciles and flushes persistence; this can take up to 175 s. Never stop
-it with a shorter kill: `docker stop` needs `-t 200`, and compose already sets
-`stop_grace_period: 200s`. Paired positions stay open and delta-neutral. Exit 0 means a
-clean stop; nonzero means a halt, an unresolved engine stop or an unwritable event log. A
-panic outside XEMM's strategy thread aborts the process at once, with no drain, like a kill.
+residuals, reconciles and flushes persistence; this can take up to ~190 s per engine, after
+any status poll in progress (up to 50 s). Never stop it with a shorter kill: `docker stop`
+needs `-t 460`, and compose already sets `stop_grace_period: 460s`. Paired positions stay
+open and delta-neutral. Exit 0 means a clean stop; nonzero means a halt, an unresolved engine
+stop or an unwritable event log. A panic outside XEMM's strategy thread aborts the process at
+once, with no drain, like a kill.
 
 Only one live writer per market runs at a time: `run --mode live` and `taker run` (unless
 `--observe-only`) take the exclusive lock `runs/bot-<MARKET>.lock` and name the holder's pid

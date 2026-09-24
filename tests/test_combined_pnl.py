@@ -172,6 +172,17 @@ class XemmSummaryTests(unittest.TestCase):
                          (Decimal("0"), Decimal("-0.40"), 1))
         self.assertIsNone(out["net_pnl_usdc"])
 
+    def test_dry_run_reports_from_its_first_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            self.assertEqual(combined_pnl.default_since(runs, "HYPE", True), combined_pnl.DEFAULT_SINCE)
+            write_jsonl(runs / "bot-HYPE.events.jsonl", [
+                {"kind": "bot_started", "timestamp": "2026-09-24T14:14:54Z"},
+                {"kind": "bot_started", "timestamp": "2026-09-25T00:00:00Z"},
+            ])
+            self.assertEqual(combined_pnl.default_since(runs, "HYPE", True), "2026-09-24T14:14:54Z")
+            self.assertEqual(combined_pnl.default_since(runs, "HYPE", False), combined_pnl.DEFAULT_SINCE)
+
 
 if __name__ == "__main__":
     unittest.main()
