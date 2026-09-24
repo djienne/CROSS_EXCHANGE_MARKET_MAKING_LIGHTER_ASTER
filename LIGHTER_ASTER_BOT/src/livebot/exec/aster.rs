@@ -314,6 +314,11 @@ impl AsterRest {
 
     // --- user-data stream listenKey lifecycle (signed; NO listenKey param per V3 docs) ---
 
+    /// The websocket root of this client's venue, where the listenKey stream is served.
+    pub fn ws_root(&self) -> String {
+        crate::connectors::aster::ws_root(&self.base_url)
+    }
+
     /// Create a user-data stream listenKey (`POST /fapi/v3/listenKey`).
     pub async fn create_listen_key(&self) -> Result<String> {
         let body = self.signed_request(Method::POST, "/fapi/v3/listenKey", vec![]).await?;

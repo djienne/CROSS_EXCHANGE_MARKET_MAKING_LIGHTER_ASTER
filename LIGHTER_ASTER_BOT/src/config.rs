@@ -606,11 +606,21 @@ fn default_min_requote_interval_ms() -> u64 {
 fn default_max_replaces_per_min() -> u32 {
     100
 }
-fn default_aster_base_url() -> String {
+pub(crate) fn default_aster_base_url() -> String {
     "https://fapi.asterdex.com".to_string()
 }
-fn default_hl_base_url() -> String {
+pub(crate) fn default_hl_base_url() -> String {
     "https://mainnet.zklighter.elliot.ai".to_string()
+}
+
+/// File-loaded operational configs of both engines perform venue I/O: pin the supported origins.
+pub(crate) fn require_mainnet_origins(aster_base_url: &str, lighter_base_url: &str) -> Result<()> {
+    if aster_base_url.trim_end_matches('/') != default_aster_base_url()
+        || lighter_base_url.trim_end_matches('/') != default_hl_base_url()
+    {
+        bail!("operational venue URLs must use the supported Aster and Lighter mainnet origins");
+    }
+    Ok(())
 }
 fn default_lighter_signers_dir() -> String {
     "signers".to_string()
@@ -711,12 +721,7 @@ impl Config {
         }
         let cfg: Config = strict_from_toml(value)?;
         cfg.validate()?;
-        // File-loaded operational configs perform venue I/O: pin the supported origins.
-        if cfg.live.aster.base_url.trim_end_matches('/') != default_aster_base_url()
-            || cfg.live.hyperliquid.base_url.trim_end_matches('/') != default_hl_base_url()
-        {
-            bail!("operational venue URLs must use the supported Aster and Lighter mainnet origins");
-        }
+        require_mainnet_origins(&cfg.live.aster.base_url, &cfg.live.hyperliquid.base_url)?;
         Ok(cfg)
     }
 

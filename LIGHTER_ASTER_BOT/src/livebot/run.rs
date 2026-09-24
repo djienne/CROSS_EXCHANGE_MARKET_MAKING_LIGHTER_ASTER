@@ -134,6 +134,8 @@ pub async fn run(
     let mut reconnect_map: HashMap<(MarketId, VenueTag), ReconnectHandle> = HashMap::new();
     let mut venue_handles = Vec::new();
     let spec_by_id: HashMap<MarketId, &MarketSpec> = specs.iter().map(|s| (s.market_id.clone(), s)).collect();
+    let aster_ws = crate::connectors::aster::ws_root(&cfg.live.aster.base_url);
+    let lighter_ws = crate::lighter::ws::stream_url(&cfg.live.hyperliquid.base_url);
     let mut core_hint = 0usize;
     for m in &markets {
         let id = m.id();
@@ -142,14 +144,15 @@ pub async fn run(
         } else {
             None
         };
-        for (venue, symbol) in [
-            (VenueTag::Aster, m.aster_symbol.to_lowercase()),
+        for (venue, ws_url, symbol) in [
+            (VenueTag::Aster, &aster_ws, m.aster_symbol.to_lowercase()),
             (
                 VenueTag::Hyperliquid,
+                &lighter_ws,
                 spec_by_id
                     .get(&id)
                     .map(|s| format!("{}:{}", s.lighter_market_id, s.hl_coin))
-                    .unwrap_or_else(|| format!("0:{}", m.hl_coin)),
+                    .expect("build_market_specs resolves every market or fails"),
             ),
         ] {
             let cell = registry.cell(&id, venue).expect("registry has every cell");
@@ -157,7 +160,7 @@ pub async fn run(
             let notify = handle.notify();
             reconnect_map.insert((id.clone(), venue), handle);
             venue_handles.push(spawn_venue_thread(
-                venue, symbol, id.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
+                venue, ws_url.clone(), symbol, id.clone(), cell, notify, feeds_shutdown.clone(), Some(core_hint),
                 scale.clone(),
             ));
             core_hint += 1;

@@ -17,7 +17,20 @@ use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
+/// The `/stream` websocket of the Lighter venue whose REST base is `base`: Lighter serves both
+/// from one host, so every stream follows the configured origin (mainnet, or the dry-run venue).
+pub fn stream_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if let Some(host) = base.strip_prefix("https://") {
+        format!("wss://{host}/stream")
+    } else if let Some(host) = base.strip_prefix("http://") {
+        format!("ws://{host}/stream")
+    } else if base.starts_with("ws://") || base.starts_with("wss://") {
+        format!("{base}/stream")
+    } else {
+        format!("wss://{base}/stream")
+    }
+}
 
 /// A routed application frame: the raw JSON text plus its already-extracted top-level
 /// `type` tag. Handlers deserialize the raw text straight into typed structs
@@ -60,9 +73,9 @@ pub struct SubscribeOptions {
 }
 
 impl SubscribeOptions {
-    pub fn new(label: &str, channels: Vec<String>) -> Self {
+    pub fn new(url: &str, label: &str, channels: Vec<String>) -> Self {
         Self {
-            url: WS_URL.to_string(),
+            url: url.to_string(),
             channels,
             channel_auths: HashMap::new(),
             data_timeout: Some(30.0),
@@ -324,12 +337,24 @@ mod tests {
     }
 
     fn opts(url: String) -> SubscribeOptions {
-        let mut opts = SubscribeOptions::new("test", vec!["test/channel".to_string()]);
-        opts.url = url;
+        let mut opts = SubscribeOptions::new(&url, "test", vec!["test/channel".to_string()]);
         opts.reconnect_base = 0.01;
         opts.reconnect_max = 0.01;
         opts.ping_interval = Duration::from_millis(50);
         opts
+    }
+
+    #[test]
+    fn stream_url_follows_the_configured_base() {
+        for (base, url) in [
+            ("https://mainnet.zklighter.elliot.ai", "wss://mainnet.zklighter.elliot.ai/stream"),
+            ("https://testnet.zklighter.elliot.ai/", "wss://testnet.zklighter.elliot.ai/stream"),
+            ("http://127.0.0.1:18082/", "ws://127.0.0.1:18082/stream"),
+            ("wss://example.test/ws", "wss://example.test/ws/stream"),
+            ("example.test", "wss://example.test/stream"),
+        ] {
+            assert_eq!(stream_url(base), url, "{base}");
+        }
     }
 
     #[tokio::test]

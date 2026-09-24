@@ -251,19 +251,8 @@ fn parse_levels(raw: &[[&str; 2]]) -> Result<Vec<(Decimal, Decimal)>> {
 }
 
 fn futures_depth_url(rest_base_url: &str, symbol_upper: &str) -> String {
-    let symbol = symbol_upper.to_ascii_lowercase();
-    let trimmed = rest_base_url.trim_end_matches('/');
-    if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        if trimmed.contains("/ws/") || trimmed.contains("/stream") {
-            return trimmed.to_string();
-        }
-        return format!("{trimmed}/ws/{symbol}@depth20@100ms");
-    }
-    if trimmed.contains("testnet") {
-        format!("wss://fstream5.asterdex-testnet.com/ws/{symbol}@depth20@100ms")
-    } else {
-        format!("wss://fstream.asterdex.com/ws/{symbol}@depth20@100ms")
-    }
+    let root = crate::connectors::aster::ws_root(rest_base_url);
+    format!("{root}/ws/{}@depth20@100ms", symbol_upper.to_ascii_lowercase())
 }
 
 fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
@@ -307,10 +296,14 @@ mod tests {
     }
 
     #[test]
-    fn derives_mainnet_futures_url_from_rest_base() {
+    fn derives_the_depth_stream_from_the_rest_base() {
         assert_eq!(
             futures_depth_url("https://fapi.asterdex.com", "HYPEUSDT"),
             "wss://fstream.asterdex.com/ws/hypeusdt@depth20@100ms"
+        );
+        assert_eq!(
+            futures_depth_url("http://127.0.0.1:18081/", "HYPEUSDT"),
+            "ws://127.0.0.1:18081/ws/hypeusdt@depth20@100ms"
         );
     }
 }

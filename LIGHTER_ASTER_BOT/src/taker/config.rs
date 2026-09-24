@@ -34,6 +34,7 @@ impl Config {
     pub fn from_table(value: toml::Value) -> Result<Self> {
         let cfg: Config = crate::config::strict_from_toml(value)?;
         cfg.validate()?;
+        crate::config::require_mainnet_origins(&cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)?;
         Ok(cfg)
     }
 
@@ -484,8 +485,8 @@ pub struct VenueCfg {
 impl Default for VenueCfg {
     fn default() -> Self {
         VenueCfg {
-            aster_base_url: "https://fapi.asterdex.com".to_string(),
-            lighter_base_url: "https://mainnet.zklighter.elliot.ai".to_string(),
+            aster_base_url: crate::config::default_aster_base_url(),
+            lighter_base_url: crate::config::default_hl_base_url(),
             signers_dir: "signers".to_string(),
         }
     }
@@ -603,6 +604,21 @@ mod tests {
         assert!(!cfg.live.enabled);
         assert!(cfg.arb.entry_gate.enabled);
         assert_eq!(cfg.arb.entry_gate.mode,EntryGateMode::Shadow);
+    }
+
+    #[test]
+    fn the_file_loader_pins_the_mainnet_origins() {
+        let table = |venues: &str| {
+            let raw = format!("[[markets]]\naster_symbol=\"HYPEUSDT\"\nlighter_symbol=\"HYPE\"\n{venues}");
+            Config::from_table(toml::from_str(&raw).unwrap())
+        };
+        table("").unwrap();
+        let venues = "[venues]\nsigners_dir=\"signers\"\naster_base_url=\"https://fapi.asterdex.com/\"\n";
+        table(&format!("{venues}lighter_base_url=\"https://mainnet.zklighter.elliot.ai\"")).unwrap();
+        for lighter in ["http://127.0.0.1:18082", "https://testnet.zklighter.elliot.ai"] {
+            let err = table(&format!("{venues}lighter_base_url=\"{lighter}\"")).unwrap_err();
+            assert!(format!("{err:#}").contains("mainnet origins"), "{lighter}: {err:#}");
+        }
     }
 
     #[test]

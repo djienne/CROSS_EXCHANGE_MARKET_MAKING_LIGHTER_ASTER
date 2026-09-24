@@ -31,8 +31,6 @@ use crate::types::{MarketId, Side};
 use super::exec::aster::AsterRest;
 use super::fills::AsterFill;
 
-/// Default Aster WS root for the user stream (mainnet V3).
-pub const ASTER_WS_ROOT: &str = "wss://fstream.asterdex.com";
 /// listenKey keepalive cadence (the key lives 60 min; refresh well inside that, and NOT
 /// immediately after POST — the first tick is delayed a full interval).
 const KEEPALIVE: Duration = Duration::from_secs(25 * 60);
@@ -160,6 +158,7 @@ pub async fn run_aster_user_stream(
     // Arc so the periodic keepalive can run on its own task instead of blocking the
     // fill-read select (a keepalive REST round trip must never delay a fill->hedge).
     let aster = Arc::new(aster);
+    let ws_root = aster.ws_root();
     info!("aster user stream starting");
     let mut listen_key: Option<String> = None;
     let mut listen_backoff = Backoff::new(RECONNECT_DELAY, LISTEN_KEY_BACKOFF_MAX);
@@ -201,7 +200,7 @@ pub async fn run_aster_user_stream(
             },
         };
 
-        let url = format!("{ASTER_WS_ROOT}/ws/{key}");
+        let url = format!("{ws_root}/ws/{key}");
         match connect_and_read(&url, &sym_to_market, &fill_tx, &aster, &liveness, &shutdown).await {
             Ok(expired) => {
                 if expired {

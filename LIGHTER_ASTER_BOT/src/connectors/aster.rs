@@ -17,7 +17,17 @@ use super::Tap;
 use crate::book::PriceLevel;
 use crate::decimal::parse_dec;
 
-const WS_BASE: &str = "wss://fstream.asterdex.com";
+/// The websocket root that serves the same venue as the REST base `rest_base`. Mainnet streams
+/// live on their own host; any other base (the dry-run venue on loopback) serves both on one.
+/// Deriving it keeps one configured origin per venue, so no stream can fall back to mainnet.
+pub fn ws_root(rest_base: &str) -> String {
+    let base = rest_base.trim_end_matches('/');
+    match base.strip_prefix("https://") {
+        Some("fapi.asterdex.com") => "wss://fstream.asterdex.com".to_string(),
+        Some(host) => format!("wss://{host}"),
+        None => base.strip_prefix("http://").map_or_else(|| base.to_string(), |host| format!("ws://{host}")),
+    }
+}
 
 #[derive(Deserialize)]
 struct Combined<'a> {
@@ -74,13 +84,14 @@ const HEALTHY_AFTER: Duration = Duration::from_secs(60);
 /// Run forever (until aborted), reconnecting on error: fans each book out to the
 /// lock-free [`Tap`] and honors the watchdog's reconnect signal.
 pub async fn run_with_tap(
+    ws_root: String,
     symbol_lower: String,
     tap: Tap,
 ) {
     let mut backoff = 1u64;
     loop {
         let started = std::time::Instant::now();
-        match stream_once(&symbol_lower, &tap).await {
+        match stream_once(&ws_root, &symbol_lower, &tap).await {
             Ok(()) => info!("[ASTER {}] stream closed", symbol_lower),
             Err(e) => warn!("[ASTER {}] error: {e:#}", symbol_lower),
         }
@@ -96,10 +107,11 @@ pub async fn run_with_tap(
 }
 
 async fn stream_once(
+    ws_root: &str,
     symbol: &str,
     tap: &Tap,
 ) -> Result<()> {
-    let url = format!("{WS_BASE}/stream?streams={symbol}@depth20@100ms/{symbol}@bookTicker/{symbol}@aggTrade");
+    let url = format!("{ws_root}/stream?streams={symbol}@depth20@100ms/{symbol}@bookTicker/{symbol}@aggTrade");
     let (ws, _) = connect_async(&url).await.context("connect Aster ws")?;
     let (mut write, mut read) = ws.split();
     info!("[ASTER {}] subscribed depth20@100ms + bookTicker + aggTrade", symbol);
@@ -216,6 +228,20 @@ fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_root_follows_the_configured_rest_base() {
+        for (rest, ws) in [
+            ("https://fapi.asterdex.com", "wss://fstream.asterdex.com"),
+            ("https://fapi.asterdex.com/", "wss://fstream.asterdex.com"),
+            ("http://127.0.0.1:18081", "ws://127.0.0.1:18081"),
+            ("http://127.0.0.1:18081/", "ws://127.0.0.1:18081"),
+            ("https://fapi.example.test", "wss://fapi.example.test"),
+            ("ws://127.0.0.1:9000", "ws://127.0.0.1:9000"),
+        ] {
+            assert_eq!(ws_root(rest), ws, "{rest}");
+        }
+    }
 
     #[tokio::test]
     async fn invalid_book_ticker_never_latches_the_hot_only_guard() {

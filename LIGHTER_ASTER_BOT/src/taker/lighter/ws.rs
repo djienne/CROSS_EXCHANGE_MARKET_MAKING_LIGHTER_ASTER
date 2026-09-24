@@ -17,8 +17,6 @@ use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-pub const WS_URL: &str = "wss://mainnet.zklighter.elliot.ai/stream";
-
 /// Control-frame probe: deserializes ONLY the top-level `type`/`channel` tags to route a
 /// frame (allocation-free skip-scan). Application frames are handed to the callback as raw
 /// text; handlers deserialize straight into typed structs. `Cow` because JSON escapes in a
@@ -55,9 +53,9 @@ pub struct SubscribeOptions {
 }
 
 impl SubscribeOptions {
-    pub fn new(label: &str, channels: Vec<String>) -> Self {
+    pub fn new(url: &str, label: &str, channels: Vec<String>) -> Self {
         Self {
-            url: WS_URL.to_string(),
+            url: url.to_string(),
             channels,
             channel_auths: HashMap::new(),
             data_timeout: Some(30.0),
@@ -311,8 +309,7 @@ mod tests {
     }
 
     fn opts(url: String) -> SubscribeOptions {
-        let mut opts = SubscribeOptions::new("test", vec!["test/channel".to_string()]);
-        opts.url = url;
+        let mut opts = SubscribeOptions::new(&url, "test", vec!["test/channel".to_string()]);
         opts.reconnect_base = 0.01;
         opts.reconnect_max = 0.01;
         opts.ping_interval = Duration::from_millis(50);

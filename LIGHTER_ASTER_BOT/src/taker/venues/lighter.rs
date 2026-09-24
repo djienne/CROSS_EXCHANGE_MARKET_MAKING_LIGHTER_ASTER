@@ -821,7 +821,7 @@ impl LighterVenue {
         signer.check_client(creds.api_key_index)?;
         let nonce =
             Arc::new(NonceManager::init(&rest, creds.account_index, creds.api_key_index).await?);
-        let ws_url = lighter_ws_url(base_url);
+        let ws_url = crate::lighter::ws::stream_url(base_url);
         let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
         tx_ws
             .connect()
@@ -912,7 +912,7 @@ impl LighterVenue {
             creds.account_index,
             creds.api_key_index,
         ));
-        let ws_url = lighter_ws_url(base_url);
+        let ws_url = crate::lighter::ws::stream_url(base_url);
         let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
         let fills = Arc::new(FillTracker::default());
         let account_feed = Arc::new(AccountFeedState { account_index: Some(creds.account_index), ..Default::default() });
@@ -1529,8 +1529,7 @@ fn spawn_account_all_positions_stream(
     account_feed: Arc<AccountFeedState>,
 ) {
     let channel = format!("account_all_positions/{account_index}");
-    let mut opts = SubscribeOptions::new("lighter-account-all-positions", vec![channel]);
-    opts.url = ws_url;
+    let mut opts = SubscribeOptions::new(&ws_url, "lighter-account-all-positions", vec![channel]);
     opts.data_timeout = None;
     opts.frame_timeout = 90.0;
     tokio::spawn(async move {
@@ -1557,8 +1556,7 @@ fn spawn_account_all_stream(
 ) {
     let channel = format!("account_all/{account_index}");
     let auth_channel = channel.clone();
-    let mut opts = SubscribeOptions::new("lighter-account-all", vec![channel]);
-    opts.url = ws_url;
+    let mut opts = SubscribeOptions::new(&ws_url, "lighter-account-all", vec![channel]);
     opts.data_timeout = None;
     opts.frame_timeout = 90.0;
     tokio::spawn(async move {
@@ -1591,8 +1589,7 @@ fn spawn_user_stats_stream(
     account_feed: Arc<AccountFeedState>,
 ) {
     let channel = format!("user_stats/{account_index}");
-    let mut opts = SubscribeOptions::new("lighter-user-stats", vec![channel]);
-    opts.url = ws_url;
+    let mut opts = SubscribeOptions::new(&ws_url, "lighter-user-stats", vec![channel]);
     opts.data_timeout = None;
     opts.frame_timeout = 90.0;
     tokio::spawn(async move {
@@ -1623,8 +1620,7 @@ fn spawn_account_all_orders_stream(
 ) {
     let channel = format!("account_all_orders/{account_index}");
     let auth_channel = channel.clone();
-    let mut opts = SubscribeOptions::new("lighter-account-all-orders", vec![channel]);
-    opts.url = ws_url;
+    let mut opts = SubscribeOptions::new(&ws_url, "lighter-account-all-orders", vec![channel]);
     opts.data_timeout = None;
     opts.frame_timeout = 90.0;
     tokio::spawn(async move {
@@ -1661,8 +1657,7 @@ fn spawn_order_book_stream(ws_url: String, specs: &[MarketSpec], book_feed: Arc<
         let market_id = spec.lighter_market_id;
         let channel = format!("order_book/{market_id}");
         let mut opts =
-            SubscribeOptions::new(&format!("lighter-order-book-{market_id}"), vec![channel]);
-        opts.url = ws_url.clone();
+            SubscribeOptions::new(&ws_url, &format!("lighter-order-book-{market_id}"), vec![channel]);
         // Every sequence-gap resync blanks the book and then waits out the reconnect
         // delay; with max_book_staleness_ms=2000 the 5s default base is a ≥5-6s full
         // scan/trading blackout per gap (the Aster feed's base is 0.25s). Healthy
@@ -1754,19 +1749,6 @@ fn signed_position_payload_dec(p: &crate::taker::lighter::messages::PositionPayl
 fn signed_position_json_dec(position: Option<&serde_json::Value>, sign: i64) -> Option<Decimal> {
     let mag = value_dec(position)?.abs();
     Some(if sign < 0 { -mag } else { mag })
-}
-
-fn lighter_ws_url(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}/stream")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}/stream")
-    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        format!("{trimmed}/stream")
-    } else {
-        format!("wss://{trimmed}/stream")
-    }
 }
 
 fn trade_matches_side(trade: &TradePayload, client_order_index: i64, side: Side) -> bool {
@@ -1877,18 +1859,6 @@ mod tests {
             assert!(idx >= 0);
             assert!(idx <= MAX_CLIENT_ORDER_INDEX);
         }
-    }
-
-    #[test]
-    fn lighter_ws_url_tracks_configured_rest_base() {
-        assert_eq!(
-            lighter_ws_url("https://mainnet.zklighter.elliot.ai"),
-            "wss://mainnet.zklighter.elliot.ai/stream"
-        );
-        assert_eq!(
-            lighter_ws_url("http://localhost:8080/"),
-            "ws://localhost:8080/stream"
-        );
     }
 
     #[test]

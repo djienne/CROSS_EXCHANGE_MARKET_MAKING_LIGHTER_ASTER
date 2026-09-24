@@ -35,12 +35,14 @@ impl StreamState {
 }
 
 pub async fn run_with_tap(
+    ws_url: String,
     market_id: u32,
     label: String,
     tap: Tap,
 ) {
     let channel = format!("order_book/{market_id}");
     let mut opts = SubscribeOptions::new(
+        &ws_url,
         &format!("lighter-order-book-{label}-{market_id}"),
         vec![channel],
     );

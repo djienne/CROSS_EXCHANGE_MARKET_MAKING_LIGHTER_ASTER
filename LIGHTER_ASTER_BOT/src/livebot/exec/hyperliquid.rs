@@ -513,7 +513,7 @@ impl HlExchange {
             .context("Lighter CheckClient")?;
         let nonce =
             Arc::new(NonceManager::init(&rest, creds.account_index, creds.api_key_index).await?);
-        let ws_url = lighter_ws_url(&base_url);
+        let ws_url = crate::lighter::ws::stream_url(&base_url);
         let tx_ws = Arc::new(TxWebSocket::new(&ws_url));
         tx_ws
             .connect()
@@ -613,8 +613,7 @@ impl HlExchange {
         let signer = self.signer.clone();
         let api_key_index = self.api_key_index;
         let channel = format!("account_all/{}", self.account_index);
-        let mut opts = SubscribeOptions::new("lighter-account-all", vec![channel.clone()]);
-        opts.url = self.ws_url.clone();
+        let mut opts = SubscribeOptions::new(&self.ws_url, "lighter-account-all", vec![channel.clone()]);
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
         // The ~10-min auth-token TTL drops this socket every session; the 5s default
@@ -648,8 +647,7 @@ impl HlExchange {
         shutdown: CancellationToken,
     ) -> tokio::task::JoinHandle<()> {
         let channel = format!("account_all_positions/{}", self.account_index);
-        let mut opts = SubscribeOptions::new("lighter-account-all-positions", vec![channel]);
-        opts.url = self.ws_url.clone();
+        let mut opts = SubscribeOptions::new(&self.ws_url, "lighter-account-all-positions", vec![channel]);
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
         // The ~10-min auth-token TTL drops this socket every session; the 5s default
@@ -681,8 +679,7 @@ impl HlExchange {
         let api_key_index = self.api_key_index;
         let channel = format!("account_all_orders/{}", self.account_index);
         let auth_channel = channel.clone();
-        let mut opts = SubscribeOptions::new("lighter-account-all-orders", vec![channel]);
-        opts.url = self.ws_url.clone();
+        let mut opts = SubscribeOptions::new(&self.ws_url, "lighter-account-all-orders", vec![channel]);
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
         // The ~10-min auth-token TTL drops this socket every session; the 5s default
@@ -714,8 +711,7 @@ impl HlExchange {
         let signer = self.signer.clone();
         let api_key_index = self.api_key_index;
         let channel = format!("user_stats/{}", self.account_index);
-        let mut opts = SubscribeOptions::new("lighter-user-stats", vec![channel.clone()]);
-        opts.url = self.ws_url.clone();
+        let mut opts = SubscribeOptions::new(&self.ws_url, "lighter-user-stats", vec![channel.clone()]);
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
         // The ~10-min auth-token TTL drops this socket every session; the 5s default
@@ -1516,10 +1512,10 @@ fn spawn_order_book_stream(
 ) -> tokio::task::JoinHandle<()> {
     let channel = format!("order_book/{market_id}");
     let mut opts = SubscribeOptions::new(
+        &ws_url,
         &format!("lighter-order-book-{symbol}-{market_id}"),
         vec![channel],
     );
-    opts.url = ws_url;
     // Sequence-gap resyncs deliberately drop the session for a fresh snapshot; the 5s
     // default base leaves the exec's book cache dark that whole time. 0.5s restores it
     // promptly; consecutive failures still back off toward reconnect_max.
@@ -1646,19 +1642,6 @@ fn position_entry_px_dec(p: &crate::lighter::messages::PositionPayload) -> Decim
         .as_deref()
         .and_then(|s| s.parse::<Decimal>().ok())
         .unwrap_or(Decimal::ZERO)
-}
-
-fn lighter_ws_url(base_url: &str) -> String {
-    let trimmed = base_url.trim_end_matches('/');
-    if let Some(rest) = trimmed.strip_prefix("https://") {
-        format!("wss://{rest}/stream")
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        format!("ws://{rest}/stream")
-    } else if trimmed.starts_with("ws://") || trimmed.starts_with("wss://") {
-        format!("{trimmed}/stream")
-    } else {
-        format!("wss://{trimmed}/stream")
-    }
 }
 
 fn lighter_leverage_from_account(
@@ -2137,21 +2120,5 @@ mod tests {
         }))
         .unwrap();
         assert!(!feed.apply(24, &unsequenced));
-    }
-
-    #[test]
-    fn lighter_ws_url_tracks_configured_base_url() {
-        assert_eq!(
-            lighter_ws_url("https://mainnet.zklighter.elliot.ai"),
-            "wss://mainnet.zklighter.elliot.ai/stream"
-        );
-        assert_eq!(
-            lighter_ws_url("http://localhost:8080/"),
-            "ws://localhost:8080/stream"
-        );
-        assert_eq!(
-            lighter_ws_url("wss://example.test/ws"),
-            "wss://example.test/ws/stream"
-        );
     }
 }
