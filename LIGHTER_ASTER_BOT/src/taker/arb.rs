@@ -435,6 +435,40 @@ fn spawn_control_refresher(
     result
 }
 
+/// A missing book (`fetch_books` failing, e.g. while a websocket reconnects). The scan loop
+/// retries every `poll_interval_ms`, so a warning per attempt floods the log for as long as
+/// the outage lasts (~90 lines/s seen during a feed stall). This warns when the outage starts
+/// and every `LOG_EVERY` while it lasts, and gives its length once the books are back.
+#[derive(Default)]
+struct BookOutage {
+    /// When the fetch started failing, and when that was last logged.
+    since: Option<(tokio::time::Instant, tokio::time::Instant)>,
+}
+
+impl BookOutage {
+    const LOG_EVERY: Duration = Duration::from_secs(5);
+
+    /// A failed fetch at `now`: the outage's length so far, if this failure is to be logged.
+    fn failed(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        match &mut self.since {
+            None => {
+                self.since = Some((now, now));
+                Some(Duration::ZERO)
+            }
+            Some((start, logged)) if now - *logged >= Self::LOG_EVERY => {
+                *logged = now;
+                Some(now - *start)
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// A successful fetch at `now`: the length of the outage it ends, if any.
+    fn recovered(&mut self, now: tokio::time::Instant) -> Option<Duration> {
+        self.since.take().map(|(start, _)| now - start)
+    }
+}
+
 async fn wait_for_scan(wake: &Notify, interval_ms: u64) {
     tokio::select! {
         _ = wake.notified() => {}
@@ -1101,6 +1135,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
     let mut reduce_signal_tracker = ReduceSignalTracker::new(&options);
     let mut last_stale_account_log_at: Option<tokio::time::Instant> = None;
     let mut last_book_sanity_block_log_at: Option<tokio::time::Instant> = None;
+    let mut book_outage = BookOutage::default();
     // Gated/standby decisions can repeat every 10ms scan while an edge stays visible;
     // log only on decision change or every 5s (recorded samples stay unthrottled).
     let mut last_gate_log: Option<(&'static str, tokio::time::Instant)> = None;
@@ -1208,9 +1243,20 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
         }
 
         let (aster_book, lighter_book) = match fetch_books(&spec, &aster_books, &lighter) {
-            Ok(v) => v,
+            Ok(v) => {
+                if let Some(lasted) = book_outage.recovered(tokio::time::Instant::now()) {
+                    info!("books back after {:.1}s without one", lasted.as_secs_f64());
+                }
+                v
+            }
             Err(e) => {
-                warn!("book fetch failed: {e:#}");
+                if let Some(lasted) = book_outage.failed(tokio::time::Instant::now()) {
+                    warn!(
+                        "book fetch failed ({:.1}s so far, repeated every {}s): {e:#}",
+                        lasted.as_secs_f64(),
+                        BookOutage::LOG_EVERY.as_secs()
+                    );
+                }
                 wait_for_scan(&scan_wake, cfg.arb.poll_interval_ms).await;
                 continue;
             }
@@ -3718,6 +3764,19 @@ mod tests {
     use super::*;
     use crate::taker::config::{ArbCfg, LiveCfg, PnlCfg, RiskCfg, VenueCfg};
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn a_missing_book_warns_once_then_every_five_seconds() {
+        let (t0, ms) = (tokio::time::Instant::now(), Duration::from_millis);
+        let mut outage = BookOutage::default();
+        assert_eq!(outage.failed(t0), Some(Duration::ZERO), "the first failure warns");
+        assert_eq!(outage.failed(t0 + ms(10)), None, "retries every poll interval stay quiet");
+        assert_eq!(outage.failed(t0 + ms(5_000)), Some(ms(5_000)), "a reminder every 5 s");
+        assert_eq!(outage.failed(t0 + ms(5_010)), None);
+        assert_eq!(outage.recovered(t0 + ms(9_000)), Some(ms(9_000)), "the recovery gives the length");
+        assert_eq!(outage.recovered(t0 + ms(9_010)), None, "only once");
+        assert_eq!(outage.failed(t0 + ms(9_020)), Some(Duration::ZERO), "a new outage warns at once");
+    }
 
     #[test]
     fn scan_skip_requires_same_books_same_generation_and_recent_full_eval() {
