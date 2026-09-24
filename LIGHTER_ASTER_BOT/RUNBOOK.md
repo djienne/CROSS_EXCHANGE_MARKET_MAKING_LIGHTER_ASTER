@@ -196,7 +196,9 @@ bind-mounted files as mode 777, and live refuses env files that others can read.
 2. The fee keys in `bot.toml` match both accounts' actual tiers.
 3. Ship the sources, the secrets and the live image with `scripts/deploy_vps.sh` ([Deploy](#deploy)).
 4. On the host, the read-only probes pass: `docker compose run --rm bot probe aster-balance`,
-   then `probe lighter-balance`, `probe lighter-open-orders` and `taker probe --market HYPE`.
+   then `probe lighter-balance`, `probe lighter-open-orders`, `probe leverage` and `taker probe
+   --market HYPE`. Both venues must be at 1x cross and Aster in one-way position mode: XEMM
+   checks this only when it first takes the rights, possibly hours in with inventory to unwind.
 5. Neither venue has open orders, and positions are flat or paired.
 6. `runs/` holds no latch from an earlier run (`bot-<M>.breaker.json`, `*.trip.json`,
    `circuit_breaker_<M>.json`): each engine checks its own only when it first starts, which

@@ -5,7 +5,7 @@
 //! the integer hot types accelerate the touch/crossed/staleness pre-checks and carry the
 //! order representation, but money math stays exact.
 //!
-//! This file holds the **pure decision table** ([`evaluate_side`]) — exhaustively testable —
+//! This file holds the **pure decision table** (`evaluate_side_with_hl_sources`) — exhaustively testable —
 //! and the async driver ([`run_strategy`]) that turns decisions into [`ExecCommand`]s and
 //! folds fills into the hedge/risk state machine.
 
@@ -184,7 +184,6 @@ struct SelectedHlBook {
     path: HlHedgePath,
     book: Arc<OrderBook>,
     age_ms: i64,
-    bbo_depth: Option<HlBboDepthSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,21 +191,6 @@ struct SelectedHlHotBook {
     source: HlQuoteSource,
     book: Arc<HotBook>,
     age_ms: i64,
-    bbo_depth: Option<HlBboHotDepthSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-struct HlBboDepthSnapshot {
-    top_qty: Option<Decimal>,
-    required_qty: Decimal,
-    sufficient: bool,
-}
-
-#[derive(Debug, Clone)]
-struct HlBboHotDepthSnapshot {
-    top_lots: Option<i64>,
-    required_lots: i64,
-    sufficient: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -277,33 +261,6 @@ fn hl_bbo_top_lots(book: &HotBook, hedge_side: Side) -> Option<i64> {
     }
 }
 
-fn hl_bbo_depth_snapshot(
-    book: &OrderBook,
-    hedge_side: Side,
-    hedge_qty: Decimal,
-    multiple: Decimal,
-) -> HlBboDepthSnapshot {
-    let multiple = multiple.max(Decimal::ONE);
-    let required_qty = hedge_qty * multiple;
-    let top_qty = hl_bbo_top_qty(book, hedge_side);
-    let sufficient = top_qty.is_some_and(|qty| qty >= required_qty);
-    HlBboDepthSnapshot { top_qty, required_qty, sufficient }
-}
-
-fn hl_bbo_hot_depth_snapshot(
-    scale: &MarketScale,
-    book: &HotBook,
-    hedge_side: Side,
-    hedge_qty: Decimal,
-    multiple: Decimal,
-) -> HlBboHotDepthSnapshot {
-    let multiple = multiple.max(Decimal::ONE);
-    let required_lots = scale.hl_qty_to_lots_ceil(hedge_qty * multiple);
-    let top_lots = hl_bbo_top_lots(book, hedge_side);
-    let sufficient = required_lots > 0 && top_lots.is_some_and(|qty| qty >= required_lots);
-    HlBboHotDepthSnapshot { top_lots, required_lots, sufficient }
-}
-
 #[inline]
 fn hl_bbo_depth_sufficient(
     book: &OrderBook,
@@ -311,7 +268,19 @@ fn hl_bbo_depth_sufficient(
     hedge_qty: Decimal,
     multiple: Decimal,
 ) -> bool {
-    hl_bbo_depth_snapshot(book, hedge_side, hedge_qty, multiple).sufficient
+    let required_qty = hedge_qty * multiple.max(Decimal::ONE);
+    hl_bbo_top_qty(book, hedge_side).is_some_and(|qty| qty >= required_qty)
+}
+
+fn hl_bbo_hot_depth_sufficient(
+    scale: &MarketScale,
+    book: &HotBook,
+    hedge_side: Side,
+    hedge_qty: Decimal,
+    multiple: Decimal,
+) -> bool {
+    let required_lots = scale.hl_qty_to_lots_ceil(hedge_qty * multiple.max(Decimal::ONE));
+    required_lots > 0 && hl_bbo_top_lots(book, hedge_side).is_some_and(|qty| qty >= required_lots)
 }
 
 #[inline]
@@ -497,8 +466,6 @@ fn compute_desired_quote_select_books<'a>(
     Ok((desired, l2, HlQuoteSource::L2, aster_source))
 }
 
-/// Pure decision for one market side. `may_quote` folds the feed gate + risk freeze +
-/// cooldown (false ⇒ we may only cancel). `current` is the resting order, if any.
 /// Aggressive IOC hedge price that CROSSES the executable HL touch: a buy hedge crosses the best
 /// ask (+slippage), a sell hedge crosses the best bid (−slippage). Pricing off the touch (NOT mid,
 /// NOT the Aster fill price) guarantees the IOC takes liquidity unless the touch moved more than
@@ -513,6 +480,9 @@ fn crossing_hedge_px(book: &OrderBook, hedge_side: Side, slip_bps: Decimal) -> O
     }
 }
 
+/// Pure decision for one market side. `may_quote` folds the feed gate + risk freeze +
+/// cooldown (false ⇒ we may only cancel). `current` is the resting order, if any.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn evaluate_side(
     edge: &EdgeConfig,
@@ -1317,13 +1287,13 @@ impl Strategy {
         let bbo_age_ms = cell.bbo_age_ms(now_ns);
         let bbo = cell.load_bbo();
         if bbo_age_ms <= max_stale_ms && bbo.as_deref().is_some_and(executable_quote_book) {
-            return bbo.map(|book| SelectedHlBook { source: HlQuoteSource::Bbo, path: HlHedgePath::Decimal, book, age_ms: bbo_age_ms, bbo_depth: None });
+            return bbo.map(|book| SelectedHlBook { source: HlQuoteSource::Bbo, path: HlHedgePath::Decimal, book, age_ms: bbo_age_ms });
         }
 
         let l2_age_ms = cell.book_age_ms(now_ns);
         let l2 = cell.load();
         if l2_age_ms <= max_stale_ms && l2.as_deref().is_some_and(executable_quote_book) {
-            return l2.map(|book| SelectedHlBook { source: HlQuoteSource::L2, path: HlHedgePath::Decimal, book, age_ms: l2_age_ms, bbo_depth: None });
+            return l2.map(|book| SelectedHlBook { source: HlQuoteSource::L2, path: HlHedgePath::Decimal, book, age_ms: l2_age_ms });
         }
 
         None
@@ -1349,27 +1319,23 @@ impl Strategy {
 
         let bbo_age_ms = cell.bbo_age_ms(now_ns);
         let bbo = cell.load_bbo();
-        let mut bbo_depth = None;
         if bbo_age_ms <= max_stale_ms
             && bbo.as_deref().is_some_and(executable_quote_book)
             && bbo.as_deref().is_some_and(|b| bbo_not_older_than_l2(b, l2.as_deref()))
         {
             let book = bbo.as_ref().expect("checked above");
-            let snapshot = hl_bbo_depth_snapshot(book.as_ref(), hedge_side, hedge_qty, depth_multiple);
-            if snapshot.sufficient {
+            if hl_bbo_depth_sufficient(book.as_ref(), hedge_side, hedge_qty, depth_multiple) {
                 return Some(SelectedHlBook {
                     source: HlQuoteSource::Bbo,
                     path: HlHedgePath::Decimal,
                     book: Arc::clone(book),
                     age_ms: bbo_age_ms,
-                    bbo_depth: Some(snapshot),
                 });
             }
-            bbo_depth = Some(snapshot);
         }
 
         if l2_ok {
-            return l2.map(|book| SelectedHlBook { source: HlQuoteSource::L2, path: HlHedgePath::Decimal, book, age_ms: l2_age_ms, bbo_depth });
+            return l2.map(|book| SelectedHlBook { source: HlQuoteSource::L2, path: HlHedgePath::Decimal, book, age_ms: l2_age_ms });
         }
 
         None
@@ -1398,27 +1364,23 @@ impl Strategy {
 
         let bbo_age_ms = cell.bbo_age_ms(now_ns);
         let bbo = cell.load_bbo_hot();
-        let mut bbo_depth = None;
         if bbo
             .as_deref()
             .is_some_and(|b| b.age_ms(now_ns) <= max_stale_ns / 1_000_000 && executable_hot_book(b))
             && bbo.as_deref().is_some_and(|b| hot_bbo_not_older_than_l2(b, l2.as_deref()))
         {
             let book = bbo.as_ref().expect("checked above");
-            let snapshot = hl_bbo_hot_depth_snapshot(&ctx.scale, book.as_ref(), hedge_side, hedge_qty, depth_multiple);
-            if snapshot.sufficient {
+            if hl_bbo_hot_depth_sufficient(&ctx.scale, book.as_ref(), hedge_side, hedge_qty, depth_multiple) {
                 return Some(SelectedHlHotBook {
                     source: HlQuoteSource::Bbo,
                     book: Arc::clone(book),
                     age_ms: bbo_age_ms,
-                    bbo_depth: Some(snapshot),
                 });
             }
-            bbo_depth = Some(snapshot);
         }
 
         if l2_ok {
-            return l2.map(|book| SelectedHlHotBook { source: HlQuoteSource::L2, book, age_ms: l2_age_ms, bbo_depth });
+            return l2.map(|book| SelectedHlHotBook { source: HlQuoteSource::L2, book, age_ms: l2_age_ms });
         }
 
         None
@@ -1437,7 +1399,6 @@ impl Strategy {
     ) -> Option<SelectedHlBook> {
         let cell = self.cell(market, VenueTag::Hyperliquid)?;
         if cell.stream_down() || cell.is_divergent() { return None; }
-        let ctx = self.ctx.get(market)?;
         let max_stale_ms = self.cfg.live.max_book_staleness_ms;
         let depth_multiple = self.cfg.quote.depth_liquidity_multiple;
 
@@ -1456,8 +1417,7 @@ impl Strategy {
                 {
                     return None;
                 }
-                let snapshot = hl_bbo_depth_snapshot(bbo.as_ref(), hedge_side, hedge_qty, depth_multiple);
-                if !snapshot.sufficient {
+                if !hl_bbo_depth_sufficient(bbo.as_ref(), hedge_side, hedge_qty, depth_multiple) {
                     return None;
                 }
                 Some(SelectedHlBook {
@@ -1465,7 +1425,6 @@ impl Strategy {
                     path: HlHedgePath::Hot,
                     book: bbo,
                     age_ms: selected.age_ms,
-                    bbo_depth: Some(snapshot),
                 })
             }
             HlQuoteSource::L2 => {
@@ -1478,11 +1437,6 @@ impl Strategy {
                     path: HlHedgePath::Hot,
                     book: l2,
                     age_ms: selected.age_ms,
-                    bbo_depth: selected.bbo_depth.as_ref().map(|d| HlBboDepthSnapshot {
-                        top_qty: d.top_lots.map(|lots| ctx.scale.hl_lots_to_qty(lots)),
-                        required_qty: ctx.scale.hl_lots_to_qty(d.required_lots),
-                        sufficient: d.sufficient,
-                    }),
                 })
             }
         }
@@ -1935,7 +1889,7 @@ impl Strategy {
                                     continue;
                                 };
                                 let cmd = ExecCommand::Cancel {
-                                    market: market.clone(), side, client_id, venue_order_id,
+                                    market: market.clone(), client_id, venue_order_id,
                                 };
                                 match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                                     ExecDispatch::Sent => {
@@ -2079,7 +2033,7 @@ impl Strategy {
                 };
                 // Dispatch FIRST; mutate local state only if the command is actually queued.
                 // A dropped cancel that silently desyncs local state is a safety hazard.
-                let cmd = ExecCommand::Cancel { market: market.clone(), side, client_id, venue_order_id };
+                let cmd = ExecCommand::Cancel { market: market.clone(), client_id, venue_order_id };
                 match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                     ExecDispatch::Sent => {
                         self.orders.on_cancel_sent(market, side, now_ns);
@@ -2166,7 +2120,6 @@ impl Strategy {
                     };
                     let cmd = ExecCommand::Cancel {
                         market: market.clone(),
-                        side,
                         client_id,
                         venue_order_id,
                     };
@@ -2209,9 +2162,9 @@ impl Strategy {
                 if qty_lots <= 0 {
                     return;
                 }
-                let (old_cid, old_voi) = match self.orders.slot(market, side) {
-                    Some(s) if s.state == OrderLifecycle::Open => (s.client_id.clone(), s.venue_order_id.clone()),
-                    None => (None, None),
+                let old_cid = match self.orders.slot(market, side) {
+                    Some(s) if s.state == OrderLifecycle::Open => s.client_id.clone(),
+                    None => None,
                     Some(_) => return,
                 };
                 let Some(old_cid) = old_cid else { return };
@@ -2237,7 +2190,6 @@ impl Strategy {
                     };
                     let cmd = ExecCommand::Cancel {
                         market: market.clone(),
-                        side,
                         client_id,
                         venue_order_id,
                     };
@@ -2265,7 +2217,6 @@ impl Strategy {
                         market: market.clone(),
                         side,
                         old_client_id: old_cid,
-                        old_venue_order_id: old_voi,
                         new_client_id: new_cid.clone(),
                         price_ticks,
                         qty_lots,
@@ -2420,7 +2371,7 @@ impl Strategy {
             if let Some(aggressive_px) = price.filter(|_| qty > Decimal::ZERO) {
                 intent.mark_submitted(now_ns);
                 self.hedges.insert(cloid.to_hex(), intent.clone());
-                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: slip, emergency: false }).is_err() {
+                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px }).is_err() {
                     if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
                         h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
                     }
@@ -2455,7 +2406,7 @@ impl Strategy {
             };
             // Dispatch FIRST; a dropped post-fill cancel leaves a maker order resting (could
             // re-fill) while local state says cancelled — escalate to a freeze, never silent.
-            let cmd = ExecCommand::Cancel { market: market.clone(), side, client_id, venue_order_id };
+            let cmd = ExecCommand::Cancel { market: market.clone(), client_id, venue_order_id };
             match self.try_send_aster_cmd(cmd, AsterCommandPriority::RiskReducing, now_ns) {
                 ExecDispatch::Sent => self.orders.on_cancel_sent(market, side, now_ns),
                 ExecDispatch::BudgetBlocked => {
@@ -2490,7 +2441,6 @@ impl Strategy {
                     );
                     let cmd = ExecCommand::Cancel {
                         market: market.clone(),
-                        side,
                         client_id: client_id.clone(),
                         venue_order_id: cancel_venue_order_id,
                     };
@@ -2576,7 +2526,6 @@ impl Strategy {
             ExecEvent::ExecutionProgress { cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms } => {
                 self.apply_execution_progress(cloid, cumulative_qty, cumulative_quote_usd, cumulative_fee_usd, terminal, venue_order_id, event_time_ms, now_ns);
             }
-            ExecEvent::ExecutionTrade(trade) => self.journal.execution_trade(now_ns, trade),
             ExecEvent::HedgeUnknown { cloid, reason } => {
                 if let Some(h) = self.hedges.get_mut(&cloid.to_hex()) {
                     if !h.terminal { h.mark_unknown(); }
@@ -2645,7 +2594,7 @@ impl Strategy {
                 intent.arm_admission(self.cfg.live.max_unhedged_age_ms);
                 intent.mark_submitted(now_ns);
                 self.hedges.insert(next.to_hex(), intent.clone());
-                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px, slippage_bps: slip, emergency: true }).is_ok() { return; }
+                if self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px }).is_ok() { return; }
                 if let Some(h) = self.hedges.get_mut(&next.to_hex()) {
                     h.admission.cancel_queued(); h.mark_rejected(); h.terminal_ns = Some(now_ns);
                 }
@@ -2810,7 +2759,7 @@ impl Strategy {
         for (m, inv) in &self.pending {
             let mark = self.book(m, VenueTag::Aster).and_then(|b| b.mid()).unwrap_or(inv.avg_aster_px);
             if inventory::check_pending_limits(inv, self.cfg.live.partials.max_pending_notional_usd,
-                self.cfg.live.partials.max_pending_age_ms, mark, Utc::now()).is_some() {
+                self.cfg.live.partials.max_pending_age_ms, mark, Utc::now()) {
                 expired.push(m.clone());
             }
         }
@@ -2951,7 +2900,7 @@ impl Strategy {
             self.try_send_aster_cmd(ExecCommand::FlattenAster { intent, client_id }, AsterCommandPriority::Safety, now_ns) == ExecDispatch::Sent
         } else {
             self.hedges.insert(cloid.to_hex(), intent.clone());
-            self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px: price, slippage_bps: slip, emergency: true }).is_ok()
+            self.hedge_tx.try_send(HedgeCommand::Hedge { intent, aggressive_px: price }).is_ok()
         };
         if sent {
             *self.correction_attempts.entry(market.clone()).or_insert(0) += 1;
@@ -3086,25 +3035,16 @@ pub async fn run_strategy(
                 strat.refresh_mark_cache();
                 match &strat.dirty {
                     Some(dirty) => {
-                        if dirty.take_reprice_all() {
-                            let n_markets = strat.markets.len();
-                            for i in 0..n_markets {
-                                let m = strat.markets[i].clone();
-                                strat.reprice_market(&m, now, now_ns, false).await;
-                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
-                            }
-                        } else {
-                            dirty.take_into(&mut dirty_idx_buf);
-                            dirty_market_buf.clear();
-                            dirty_market_buf.extend(
-                                dirty_idx_buf
-                                    .iter()
-                                    .filter_map(|&idx| strat.registry.market_id(idx).cloned()),
-                            );
-                            for m in &dirty_market_buf {
-                                strat.reprice_market(m, now, now_ns, false).await;
-                                drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
-                            }
+                        dirty.take_into(&mut dirty_idx_buf);
+                        dirty_market_buf.clear();
+                        dirty_market_buf.extend(
+                            dirty_idx_buf
+                                .iter()
+                                .filter_map(|&idx| strat.registry.market_id(idx).cloned()),
+                        );
+                        for m in &dirty_market_buf {
+                            strat.reprice_market(m, now, now_ns, false).await;
+                            drain_priority_events(&mut strat, &mut exec_events, &mut maker_fills).await;
                         }
                     }
                     None => {
@@ -3262,7 +3202,6 @@ mod tests {
             &book,
             &scale,
             crate::livebot::scale::HotQtyScale::Hyperliquid,
-            0,
             recv_ns,
         );
         strat
@@ -3279,7 +3218,6 @@ mod tests {
             &book,
             &scale,
             crate::livebot::scale::HotQtyScale::Hyperliquid,
-            0,
             recv_ns,
         );
         strat
@@ -3349,10 +3287,6 @@ mod tests {
             .fresh_hl_hedge_book(&m, crate::hotpath::clock::mono_now_ns(), Side::Sell, dec!(0.2))
             .unwrap();
         assert_eq!(selected.source, HlQuoteSource::L2);
-        let depth = selected.bbo_depth.as_ref().expect("must explain BBO fallback");
-        assert_eq!(depth.top_qty, Some(dec!(0.2)));
-        assert_eq!(depth.required_qty, dec!(2.0));
-        assert!(!depth.sufficient);
     }
 
     #[test]
@@ -3372,10 +3306,6 @@ mod tests {
             .fresh_hl_hedge_book(&m, crate::hotpath::clock::mono_now_ns(), Side::Sell, dec!(0.2))
             .unwrap();
         assert_eq!(selected.source, HlQuoteSource::Bbo);
-        let depth = selected.bbo_depth.as_ref().expect("BBO selection should carry depth details");
-        assert_eq!(depth.top_qty, Some(dec!(2.1)));
-        assert_eq!(depth.required_qty, dec!(2.0));
-        assert!(depth.sufficient);
     }
 
     #[test]
@@ -3394,10 +3324,6 @@ mod tests {
 
         assert_eq!(selected.source, HlQuoteSource::Bbo);
         assert_eq!(selected.path, HlHedgePath::Hot);
-        let depth = selected.bbo_depth.as_ref().expect("hot BBO should carry depth");
-        assert_eq!(depth.top_qty, Some(dec!(2.1)));
-        assert_eq!(depth.required_qty, dec!(2.0));
-        assert!(depth.sufficient);
     }
 
     #[test]
@@ -3416,14 +3342,12 @@ mod tests {
             .unwrap();
         assert_eq!(sell.source, HlQuoteSource::L2);
         assert_eq!(sell.path, HlHedgePath::Hot);
-        assert_eq!(sell.bbo_depth.as_ref().unwrap().top_qty, Some(dec!(0.2)));
 
         let buy = strat
             .fresh_hl_hedge_book_hot_first(&m, 2_000_000, Side::Buy, dec!(0.2))
             .unwrap();
         assert_eq!(buy.source, HlQuoteSource::Bbo);
         assert_eq!(buy.path, HlHedgePath::Hot);
-        assert_eq!(buy.bbo_depth.as_ref().unwrap().top_qty, Some(dec!(2.1)));
     }
 
     #[test]
@@ -3480,8 +3404,7 @@ mod tests {
 
         let cmd = hrx.try_recv().expect("primary hedge command must be sent");
         match cmd {
-            HedgeCommand::Hedge { aggressive_px, emergency, intent, .. } => {
-                assert!(!emergency);
+            HedgeCommand::Hedge { aggressive_px, intent } => {
                 assert_eq!(intent.hedge_side, Side::Sell);
                 assert_eq!(intent.qty, dec!(0.2));
                 assert_eq!(aggressive_px, dec!(99.96) * (Decimal::ONE - strat.cfg.live.hyperliquid.normal_slippage_bps / Decimal::from(10_000)));
@@ -3503,7 +3426,6 @@ mod tests {
 
         let acked = |cid: &str| ExecCommand::Cancel {
             market: m.clone(),
-            side: Side::Sell,
             client_id: cid.into(),
             venue_order_id: Some("v1".into()),
         };
@@ -3520,7 +3442,6 @@ mod tests {
         // Un-acked cancel → normal lane only.
         let unacked = ExecCommand::Cancel {
             market: m.clone(),
-            side: Side::Sell,
             client_id: "c3".into(),
             venue_order_id: None,
         };
@@ -3752,7 +3673,7 @@ mod tests {
     fn aster_bbo_selected_when_fresh() {
         let (a, h) = books();
         let a_bbo = aster_bbo_at(dec!(99.99), dec!(100.03), ts());
-        let (desired, _hl_book, hl_source, aster_source) = compute_desired_quote_select_books(
+        let (_desired, _hl_book, hl_source, aster_source) = compute_desired_quote_select_books(
             &edge(),
             &qcfg(),
             &a,
@@ -3768,7 +3689,6 @@ mod tests {
         .unwrap();
         assert_eq!(aster_source, AsterQuoteSource::Bbo);
         assert_eq!(hl_source, HlQuoteSource::L2);
-        assert_eq!(desired.aster_mid, dec!(100.01));
     }
 
     #[test]
@@ -3787,7 +3707,7 @@ mod tests {
             now,
         );
         let old_bbo = aster_bbo_at_ts(dec!(99.99), dec!(100.03), ts(), now);
-        let (desired, _hl_book, _hl_source, aster_source) = compute_desired_quote_select_books(
+        let (_desired, _hl_book, _hl_source, aster_source) = compute_desired_quote_select_books(
             &edge(),
             &qcfg(),
             &a_newer,
@@ -3802,7 +3722,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(aster_source, AsterQuoteSource::L2);
-        assert_eq!(desired.aster_mid, dec!(100.00));
     }
 
     #[test]
@@ -3821,7 +3740,7 @@ mod tests {
             now,
         );
         let stale_bbo = aster_bbo_at(dec!(99.99), dec!(100.03), ts());
-        let (desired, _hl_book, _hl_source, aster_source) = compute_desired_quote_select_books(
+        let (_desired, _hl_book, _hl_source, aster_source) = compute_desired_quote_select_books(
             &edge(),
             &qcfg(),
             &a,
@@ -3836,7 +3755,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(aster_source, AsterQuoteSource::L2);
-        assert_eq!(desired.aster_mid, dec!(100.00));
     }
 
     #[test]
@@ -3850,8 +3768,8 @@ mod tests {
             newer_exch,
         );
         let old_bbo = aster_bbo_at_ts(dec!(99.99), dec!(100.03), ts(), newer_exch);
-        let l2_hot = crate::livebot::scale::build_hot_book(&l2, &scale, 0, 1_000);
-        let bbo_hot = crate::livebot::scale::build_hot_book(&old_bbo, &scale, 0, 2_000);
+        let l2_hot = crate::livebot::scale::build_hot_book(&l2, &scale, 1_000);
+        let bbo_hot = crate::livebot::scale::build_hot_book(&old_bbo, &scale, 2_000);
         let selected = select_aster_hot_for_precheck(Some(&l2_hot), Some(&bbo_hot), 2_000, 5_000_000_000)
             .expect("must pick one book");
         assert_eq!(selected.exch_ms, l2_hot.exch_ms);
@@ -4144,7 +4062,7 @@ lighter_symbol = "BTC"
     fn funded_snapshot(src: i64, a: Decimal, h: Decimal) -> AccountSnapshot {
         let mut snap = AccountSnapshot::empty();
         snap.source_ts_ns=src; snap.read_start_ns=src; snap.aster_margin_source_ns=src; snap.hl_margin_source_ns=src;
-        snap.aster_available_usd=dec!(1000); snap.aster_wallet_usd=dec!(1000); snap.hl_withdrawable_usd=dec!(1000);
+        snap.aster_available_usd=dec!(1000); snap.hl_withdrawable_usd=dec!(1000);
         snap.aster_equity_usd=dec!(1000); snap.hl_equity_usd=dec!(1000);
         for (venue, qty) in [(Venue::Aster,a),(Venue::Hyperliquid,h)] {
             let pos = crate::livebot::account::ScaledPosition { venue, market:"BTC".into(), signed_qty:qty, entry_px:dec!(100) };
@@ -4337,7 +4255,6 @@ lighter_symbol = "BTC"
         let now = 1_000_000_000_i64;
         let flat = |src: i64| AccountSnapshot {
             aster_available_usd: dec!(1000),
-            aster_wallet_usd: dec!(1000),
             aster_margin_source_ns: src,
             hl_margin_source_ns: src,
             hl_withdrawable_usd: dec!(1000),
@@ -4398,7 +4315,6 @@ lighter_symbol = "BTC"
 
         account.publish(AccountSnapshot {
             aster_available_usd: dec!(1000),
-            aster_wallet_usd: dec!(1000),
             aster_margin_source_ns: 200,
             hl_margin_source_ns: 200,
             hl_withdrawable_usd: dec!(1000),
@@ -4581,7 +4497,6 @@ lighter_symbol = "BTC"
         strat.aster_pos.insert(m.clone(), SignedPosition { qty: dec!(0.5), avg_px: dec!(100) });
         let orphan = |src: i64, read_start: i64| AccountSnapshot {
             aster_available_usd: dec!(1000),
-            aster_wallet_usd: dec!(1000),
             aster_margin_source_ns: src,
             hl_margin_source_ns: src,
             hl_withdrawable_usd: dec!(1000),

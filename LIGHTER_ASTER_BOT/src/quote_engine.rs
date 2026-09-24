@@ -87,69 +87,30 @@ impl QuoteEngineConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AsterEffectiveTouchSource {
-    Bbo,
-    Depth,
-}
-
-impl AsterEffectiveTouchSource {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            AsterEffectiveTouchSource::Bbo => "bbo",
-            AsterEffectiveTouchSource::Depth => "depth",
-        }
-    }
-}
-
-/// A fully-specified candidate quote with its pricing and queue diagnostics.
+/// A fully-specified candidate quote with its pricing and depth diagnostics.
 #[derive(Debug, Clone)]
 pub struct DesiredQuote {
-    pub aster_side: Side,
     pub price: Decimal,
     pub qty: Decimal,
 
     pub hedge_side: Side,
     pub expected_hl_vwap: Decimal,
     pub expected_hl_depth_filled_qty: Decimal,
-    pub expected_hl_slippage_bps: Decimal,
     pub expected_hl_worst_px: Decimal,
     pub expected_hl_depth_levels_used: usize,
 
     pub instant_edge_bps: Decimal,
-    pub profitable_bound_px: Decimal,
-    pub post_only_constraint_px: Decimal,
     pub required_bps: Decimal,
 
     pub ref_px: Decimal,
-    pub aster_mid: Decimal,
-    pub hl_mid: Decimal,
 
-    /// Visible volume at levels strictly better than our price.
-    pub better_levels_qty: Decimal,
-    /// Visible volume resting at our exact price (the queue ahead).
-    pub queue_ahead_qty: Decimal,
-
-    /// How far inside the Aster touch (bid for a buy, ask for a sell) our quote
-    /// rests, in bps. Diagnostic: a backward-priced XEMM quote naturally rests
-    /// ~(required + fees) bps deep, not at the touch.
-    pub distance_from_touch_bps: Decimal,
     /// Same-side Aster touch used for the distance gate after filtering out BBO
     /// levels too small to cover this candidate quote.
     pub effective_aster_touch_px: Decimal,
-    pub effective_aster_touch_source: AsterEffectiveTouchSource,
     pub depth_liquidity_multiple: Decimal,
     pub depth_target_qty: Decimal,
     pub aster_depth_filled_qty: Decimal,
     pub aster_depth_levels_used: usize,
-
-    /// True when `desired_notional` was below the venue minimum lot and the order
-    /// was clamped UP to the minimum.
-    pub size_clamped_up: bool,
-
-    /// True when the quote rests beyond Aster's captured `@depth20`, so the queue
-    /// ahead (`better_levels_qty`) is only a lower bound. A diagnostic, not a reject.
-    pub queue_truncated: bool,
 }
 
 /// The current signed position on each leg plus the per-leg capital caps, used to
@@ -170,7 +131,8 @@ pub struct PositionContext {
 }
 
 impl PositionContext {
-    /// No cap (used by unit tests and when `enforce_position_cap = false`).
+    /// No cap (used by unit tests).
+    #[cfg(test)]
     pub fn unconstrained() -> Self {
         PositionContext {
             aster_pos_qty: Decimal::ZERO,
@@ -334,7 +296,6 @@ pub fn compute_desired_quote_with_aster_touch_source(
         min_qty
     };
     let mut qty = desired_qty;
-    let mut size_clamped_up = false;
     // Set when the capital cap shrinks the order; carries the binding leg's reason
     // so a clamp-to-zero (or below the min order size) reports the cap, not a plain
     // QuantityBelowMinimum.
@@ -396,7 +357,6 @@ pub fn compute_desired_quote_with_aster_touch_source(
             return Err(cap_binding.unwrap_or(RejectReason::MinLotExceedsHeadroom));
         }
         qty = eff_min_qty;
-        size_clamped_up = true;
     }
     // Below the both-venue minimum (clamping off, or a cap shrank it): its fill could not be
     // hedged on Lighter.
@@ -417,7 +377,7 @@ pub fn compute_desired_quote_with_aster_touch_source(
         return Err(RejectReason::HlHedgeSlippageTooHigh);
     }
 
-    let (price, profitable_bound_px, post_only_constraint_px) = match side {
+    let price = match side {
         Side::Buy => {
             let cap = aster_ask.px - tick; // post-only: bid must rest below best ask
             let bound =
@@ -429,7 +389,7 @@ pub fn compute_desired_quote_with_aster_touch_source(
             if px <= Decimal::ZERO {
                 return Err(RejectReason::NoProfitableAsterBid);
             }
-            (px, bound, cap)
+            px
         }
         Side::Sell => {
             let floor = aster_bid.px + tick; // post-only: ask must rest above best bid
@@ -439,7 +399,7 @@ pub fn compute_desired_quote_with_aster_touch_source(
             if px <= aster_bid.px {
                 return Err(RejectReason::AsterPostOnlyPriceInvalid);
             }
-            (px, bound, floor)
+            px
         }
     };
 
@@ -476,48 +436,28 @@ pub fn compute_desired_quote_with_aster_touch_source(
         return Err(RejectReason::QuoteTooCloseToTouch);
     }
 
-    let better_levels_qty = aster_depth_book.qty_better_than(side, price);
-    let queue_ahead_qty = aster_depth_book.qty_at_price(side, price);
-    // The quote may rest deeper than Aster's captured depth20; if so `better_levels_qty`
-    // is only a lower bound on the true queue ahead (the unseen levels between the
-    // captured bottom and our price). Flag it.
-    let queue_truncated = aster_depth_book.queue_truncated_at(side, price);
-
     Ok(DesiredQuote {
-        aster_side: side,
         price,
         qty,
         hedge_side,
         expected_hl_vwap: hv.vwap,
         expected_hl_depth_filled_qty: hv.filled_qty,
-        expected_hl_slippage_bps: hv.slippage_bps,
         expected_hl_worst_px: hv.worst_px,
         expected_hl_depth_levels_used: hv.levels_used,
         instant_edge_bps,
-        profitable_bound_px,
-        post_only_constraint_px,
         required_bps: edge.required_bps(),
         ref_px,
-        aster_mid,
-        hl_mid,
-        better_levels_qty,
-        queue_ahead_qty,
-        distance_from_touch_bps: distance_bps,
         effective_aster_touch_px: effective_touch.px,
-        effective_aster_touch_source: effective_touch.source,
         depth_liquidity_multiple,
         depth_target_qty,
         aster_depth_filled_qty: effective_touch.filled_qty,
         aster_depth_levels_used: effective_touch.levels_used,
-        size_clamped_up,
-        queue_truncated,
     })
 }
 
 #[derive(Debug, Clone, Copy)]
 struct EffectiveAsterTouch {
     px: Decimal,
-    source: AsterEffectiveTouchSource,
     filled_qty: Decimal,
     levels_used: usize,
 }
@@ -539,7 +479,6 @@ fn effective_aster_touch(
     if raw_touch_is_bbo && raw.qty >= target_qty {
         return Ok(EffectiveAsterTouch {
             px: raw.px,
-            source: AsterEffectiveTouchSource::Bbo,
             filled_qty: target_qty,
             levels_used: 1,
         });
@@ -564,7 +503,6 @@ fn effective_aster_touch(
         if cumulative >= target_qty {
             return Ok(EffectiveAsterTouch {
                 px: level.px,
-                source: AsterEffectiveTouchSource::Depth,
                 filled_qty: target_qty,
                 levels_used,
             });
@@ -675,7 +613,6 @@ mod tests {
             &PositionContext::unconstrained(),
         )
         .unwrap();
-        assert_eq!(q.aster_side, Side::Buy);
         assert!(q.price < a.best_ask().unwrap().px, "must rest below ask");
         assert!(q.instant_edge_bps >= edge().min_net_profit_bps);
         assert_eq!(q.hedge_side, Side::Sell);
@@ -783,7 +720,6 @@ mod tests {
         )
         .unwrap();
         assert!(dq.instant_edge_bps >= edge().min_net_profit_bps);
-        assert!(dq.distance_from_touch_bps > dec!(5));
         assert!(dq.price < a.best_ask().unwrap().px, "must rest below ask (post-only)");
     }
 
@@ -837,38 +773,6 @@ mod tests {
     }
 
     #[test]
-    fn aster_depth_book_remains_queue_source() {
-        let hl = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(100))],
-            vec![(dec!(100.01), dec!(100))],
-            ts(),
-            ts(),
-        );
-        let depth = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(7)), (dec!(99.50), dec!(8))],
-            vec![(dec!(100.01), dec!(9))],
-            ts(),
-            ts(),
-        );
-        let touch = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(1000))],
-            vec![(dec!(100.01), dec!(1000))],
-            ts(),
-            ts(),
-        );
-        let mut cfg = qcfg();
-        cfg.max_quote_distance_bps = dec!(50.0);
-        let dq = compute_desired_quote_with_aster_touch(
-            &edge(), &cfg, &depth, &touch, &hl, Side::Buy,
-            dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(),
-            &PositionContext::unconstrained(),
-        )
-        .unwrap();
-        assert_eq!(dq.better_levels_qty, dec!(7));
-        assert_ne!(dq.better_levels_qty, dec!(1000));
-    }
-
-    #[test]
     fn effective_touch_uses_bbo_when_top_covers_depth_target() {
         let (depth, hl) = tight_books();
         let bbo = OrderBook::from_levels(
@@ -885,7 +789,6 @@ mod tests {
             &PositionContext::unconstrained(),
         )
         .unwrap();
-        assert_eq!(dq.effective_aster_touch_source, AsterEffectiveTouchSource::Bbo);
         assert_eq!(dq.effective_aster_touch_px, dec!(99.99));
     }
 
@@ -917,7 +820,6 @@ mod tests {
             &PositionContext::unconstrained(),
         )
         .unwrap();
-        assert_eq!(dq.effective_aster_touch_source, AsterEffectiveTouchSource::Depth);
         assert_eq!(dq.effective_aster_touch_px, dec!(99.80));
     }
 
@@ -1011,53 +913,6 @@ mod tests {
         )
         .unwrap();
         assert!(dq.price < dec!(99.90), "post-only cap must respect raw tiny ask");
-        assert_eq!(dq.post_only_constraint_px, dec!(99.89));
-    }
-
-    #[test]
-    fn queue_truncated_flag_tracks_captured_depth() {
-        // HL tight around 100 so the backward-priced buy rests ~12bps deep (~99.88).
-        let hl = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(100))],
-            vec![(dec!(100.01), dec!(100))],
-            ts(),
-            ts(),
-        );
-        let mut loose = qcfg();
-        loose.max_quote_distance_bps = dec!(50.0);
-
-        // Shallow Aster: only the top bid 99.99 is captured, so the deep quote rests
-        // below it -> queue ahead is truncated.
-        let shallow = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(100))],
-            vec![(dec!(100.01), dec!(100))],
-            ts(),
-            ts(),
-        );
-        let dq_trunc = compute_desired_quote(
-            &edge(), &loose, &shallow, &hl, Side::Buy,
-            dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(),
-            &PositionContext::unconstrained(),
-        )
-        .unwrap();
-        assert!(dq_trunc.queue_truncated, "quote below the only captured bid is truncated");
-
-        // Deep Aster: identical top of book, but lower bids (99.00) are also captured,
-        // so the SAME ~99.88 quote now rests within observed depth.
-        let deep = OrderBook::from_levels(
-            vec![(dec!(99.99), dec!(100)), (dec!(99.50), dec!(100)), (dec!(99.00), dec!(100))],
-            vec![(dec!(100.01), dec!(100))],
-            ts(),
-            ts(),
-        );
-        let dq_obs = compute_desired_quote(
-            &edge(), &loose, &deep, &hl, Side::Buy,
-            dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(),
-            &PositionContext::unconstrained(),
-        )
-        .unwrap();
-        assert_eq!(dq_obs.price, dq_trunc.price, "pricing is unchanged by deeper levels");
-        assert!(!dq_obs.queue_truncated, "quote above the lowest captured bid is observed");
     }
 
     #[test]
@@ -1079,12 +934,11 @@ mod tests {
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
         );
         assert_eq!(buy.unwrap_err(), RejectReason::AsterPositionCapReached);
-        let sell = compute_desired_quote(
+        compute_desired_quote(
             &edge(), &qcfg(), &a, &h, Side::Sell,
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
         )
         .unwrap();
-        assert_eq!(sell.aster_side, Side::Sell);
     }
 
     #[test]
@@ -1112,12 +966,11 @@ mod tests {
     fn reduce_position_only_short_aster_long_hl_allows_only_buy() {
         let (a, h) = books();
         let pos = position_ctx(dec!(-1.5), dec!(1.5), true);
-        let buy = compute_desired_quote(
+        compute_desired_quote(
             &edge(), &qcfg(), &a, &h, Side::Buy,
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
         )
         .unwrap();
-        assert_eq!(buy.aster_side, Side::Buy);
         let sell = compute_desired_quote(
             &edge(), &qcfg(), &a, &h, Side::Sell,
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
@@ -1134,12 +987,11 @@ mod tests {
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
         );
         assert_eq!(buy.unwrap_err(), RejectReason::PositionReduceOnly);
-        let sell = compute_desired_quote(
+        compute_desired_quote(
             &edge(), &qcfg(), &a, &h, Side::Sell,
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
         )
         .unwrap();
-        assert_eq!(sell.aster_side, Side::Sell);
     }
 
     #[test]
@@ -1147,12 +999,11 @@ mod tests {
         let (a, h) = books();
         let pos = position_ctx(dec!(0), dec!(0), true);
         for side in [Side::Buy, Side::Sell] {
-            let q = compute_desired_quote(
+            compute_desired_quote(
                 &edge(), &qcfg(), &a, &h, side,
                 dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
             )
             .unwrap();
-            assert_eq!(q.aster_side, side);
         }
     }
 
@@ -1184,12 +1035,11 @@ mod tests {
         let (a, h) = books();
         let pos = position_ctx(dec!(0), dec!(0), false);
         for side in [Side::Buy, Side::Sell] {
-            let q = compute_desired_quote(
+            compute_desired_quote(
                 &edge(), &qcfg(), &a, &h, side,
                 dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(), &pos,
             )
             .unwrap();
-            assert_eq!(q.aster_side, side);
         }
     }
 
@@ -1205,7 +1055,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dq.qty, dec!(2.0));
-        assert!(dq.size_clamped_up);
         assert!(dq.instant_edge_bps >= edge().min_net_profit_bps);
     }
 

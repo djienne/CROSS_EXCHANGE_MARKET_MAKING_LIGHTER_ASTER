@@ -14,7 +14,6 @@ pub enum HotPrecheck {
 #[derive(Debug, Clone, Copy)]
 pub struct HotCurrentOrder {
     pub px_ticks: i64,
-    pub qty_lots: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +99,7 @@ mod tests {
             asks.iter().map(|&(p, q)| (p, q)),
             now, now,
         );
-        build_hot_book(&book, &scale(), 1, recv_ns)
+        build_hot_book(&book, &scale(), recv_ns)
     }
 
     fn pcfg() -> HotPrecheckConfig {
@@ -122,7 +121,7 @@ mod tests {
         let aster = hot(&[(dec!(101), dec!(1))], &[(dec!(100), dec!(1))], 0);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], 0);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), 0, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), 0, &pcfg()),
             HotPrecheck::CancelFast("crossed"),
         );
     }
@@ -133,7 +132,7 @@ mod tests {
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], 0);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::CancelFast("stale_aster"),
         );
     }
@@ -144,7 +143,7 @@ mod tests {
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], 0);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::CancelFast("stale_hl"),
         );
     }
@@ -166,7 +165,7 @@ mod tests {
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1001, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1001 }), now_ns, &pcfg()),
             HotPrecheck::CancelFast("would_cross_postonly"),
         );
     }
@@ -177,7 +176,7 @@ mod tests {
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Sell, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Sell, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::CancelFast("would_cross_postonly"),
         );
     }
@@ -188,7 +187,7 @@ mod tests {
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
         let hl = hot(&[(dec!(99.9), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::NeedExactQuote,
         );
     }
@@ -199,7 +198,7 @@ mod tests {
         let aster = hot(&[(dec!(100.5), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000, qty_lots: 10 }), now_ns, &pcfg()),
+            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::NeedExactQuote,
         );
     }

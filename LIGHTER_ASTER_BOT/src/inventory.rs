@@ -51,33 +51,6 @@ pub struct FillOutcome {
     pub netted: Option<NettedRecord>,
     /// A hedge to schedule, if the net inventory became hedgeable.
     pub hedge: Option<HedgeOrder>,
-    /// Notional now sitting in pending inventory (set when accumulating).
-    pub accumulated_notional: Option<Decimal>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingRiskKind {
-    TooOld,
-    TooLarge,
-}
-
-impl PendingRiskKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            PendingRiskKind::TooOld => "PENDING_INVENTORY_TOO_OLD",
-            PendingRiskKind::TooLarge => "PENDING_INVENTORY_TOO_LARGE",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct PendingRiskEvent {
-    pub kind: PendingRiskKind,
-    pub signed_qty: Decimal,
-    pub avg_aster_px: Decimal,
-    pub mark_px: Decimal,
-    pub notional: Decimal,
-    pub mark_to_market_pnl: Decimal,
 }
 
 /// Minimum hedgeable quantity on HL for a given reference price ($10 min notional
@@ -185,7 +158,6 @@ pub fn handle_fill_parts(
             pending: None,
             netted,
             hedge: None,
-            accumulated_notional: None,
         };
     }
 
@@ -200,54 +172,30 @@ pub fn handle_fill_parts(
             pending: None,
             netted,
             hedge: Some(hedge),
-            accumulated_notional: None,
         }
     } else {
         FillOutcome {
             pending: Some(inv),
             netted,
             hedge: None,
-            accumulated_notional: Some(abs * ref_px),
         }
     }
 }
 
-/// Flag pending inventory that has aged out or grown too large, with a
-/// diagnostic mark-to-market PnL. The caller freezes new exposure and retains
-/// the inventory until an actual execution changes the position.
+/// True when pending inventory has aged out or grown too large (notional at `mark_px`).
+/// The caller freezes new exposure and retains the inventory until an actual execution
+/// changes the position.
 pub fn check_pending_limits(
     inv: &PendingInventory,
     max_pending_notional: Decimal,
     max_pending_age_ms: i64,
     mark_px: Decimal,
     now: DateTime<Utc>,
-) -> Option<PendingRiskEvent> {
+) -> bool {
     let abs = inv.signed_qty.abs();
-    if abs == Decimal::ZERO {
-        return None;
-    }
-    let notional = abs * mark_px;
-    let age_ms = (now - inv.first_fill_ts).num_milliseconds();
-    let mtm = if inv.signed_qty > Decimal::ZERO {
-        abs * (mark_px - inv.avg_aster_px)
-    } else {
-        abs * (inv.avg_aster_px - mark_px)
-    };
-    let kind = if notional > max_pending_notional {
-        PendingRiskKind::TooLarge
-    } else if age_ms > max_pending_age_ms {
-        PendingRiskKind::TooOld
-    } else {
-        return None;
-    };
-    Some(PendingRiskEvent {
-        kind,
-        signed_qty: inv.signed_qty,
-        avg_aster_px: inv.avg_aster_px,
-        mark_px,
-        notional,
-        mark_to_market_pnl: mtm,
-    })
+    abs > Decimal::ZERO
+        && (abs * mark_px > max_pending_notional
+            || (now - inv.first_fill_ts).num_milliseconds() > max_pending_age_ms)
 }
 
 #[cfg(test)]
@@ -318,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_marks_to_market_when_too_old() {
+    fn pending_too_old_hits_limit() {
         let inv = PendingInventory {
             signed_qty: dec!(0.05),
             avg_aster_px: dec!(100),
@@ -326,8 +274,6 @@ mod tests {
             last_fill_ts: ts(),
         };
         let now = ts() + chrono::Duration::milliseconds(2_000);
-        let e = check_pending_limits(&inv, dec!(25), 1_000, dec!(99), now).unwrap();
-        assert_eq!(e.kind, PendingRiskKind::TooOld);
-        assert_eq!(e.mark_to_market_pnl, dec!(-0.05)); // long marked down
+        assert!(check_pending_limits(&inv, dec!(25), 1_000, dec!(99), now));
     }
 }

@@ -22,22 +22,19 @@ pub struct VenueRegistry {
 
 impl VenueRegistry {
     /// Build a registry with an Aster and a Hyperliquid cell for each market.
+    #[cfg(test)]
     pub fn new(markets: &[MarketId]) -> Self {
-        Self::build(markets, None, None)
+        Self::build(markets, |_| VenueBook::new())
     }
 
     /// Like [`new`] but every cell publishes into a shared coalescing wakeup `Notify`,
-    /// so a live strategy loop parked on it wakes on the next book change of ANY cell.
-    pub fn with_wake(markets: &[MarketId], wake: Arc<Notify>) -> Self {
-        Self::build(markets, Some(wake), None)
-    }
-
-    /// Like [`with_wake`] but also wired to a shared dirty-market bitset.
+    /// so a live strategy loop parked on it wakes on the next book change of ANY cell,
+    /// and marks its market in a shared dirty-market bitset.
     pub fn with_wake_and_dirty(markets: &[MarketId], wake: Arc<Notify>, dirty: Arc<DirtyMarkets>) -> Self {
-        Self::build(markets, Some(wake), Some(dirty))
+        Self::build(markets, |idx| VenueBook::with_wake_and_dirty(wake.clone(), dirty.clone(), idx))
     }
 
-    fn build(markets: &[MarketId], wake: Option<Arc<Notify>>, dirty: Option<Arc<DirtyMarkets>>) -> Self {
+    fn build(markets: &[MarketId], new_cell: impl Fn(MarketIdx) -> VenueBook) -> Self {
         let mut cells = HashMap::new();
         let mut market_to_idx = HashMap::new();
         let mut idx_to_market = Vec::new();
@@ -48,12 +45,7 @@ impl VenueRegistry {
             idx_to_market.push(m.clone());
 
             for v in [VenueTag::Aster, VenueTag::Hyperliquid] {
-                let cell = match (&wake, &dirty) {
-                    (Some(w), Some(d)) => VenueBook::with_wake_and_dirty(w.clone(), d.clone(), idx),
-                    (Some(w), None) => VenueBook::with_wake(w.clone()),
-                    _ => VenueBook::new(),
-                };
-                cells.insert((m.clone(), v), Arc::new(cell));
+                cells.insert((m.clone(), v), Arc::new(new_cell(idx)));
             }
         }
         VenueRegistry { cells, market_to_idx, idx_to_market }
@@ -67,14 +59,6 @@ impl VenueRegistry {
     /// Iterate every cell with its key — used by the watchdog's staleness scan.
     pub fn iter(&self) -> impl Iterator<Item = (&(MarketId, VenueTag), &Arc<VenueBook>)> {
         self.cells.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.cells.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.cells.is_empty()
     }
 
     /// Dense index for a market (assigned at construction).
@@ -100,7 +84,7 @@ mod tests {
     #[test]
     fn builds_two_cells_per_market() {
         let reg = VenueRegistry::new(&["BTC".into(), "DOGE".into()]);
-        assert_eq!(reg.len(), 4);
+        assert_eq!(reg.iter().count(), 4);
         assert!(reg.cell(&"BTC".into(), VenueTag::Aster).is_some());
         assert!(reg.cell(&"BTC".into(), VenueTag::Hyperliquid).is_some());
         assert!(reg.cell(&"ETH".into(), VenueTag::Aster).is_none());

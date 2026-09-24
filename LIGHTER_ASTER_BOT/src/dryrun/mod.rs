@@ -488,6 +488,8 @@ pub(crate) mod tests {
     use super::book::BookUpdate;
     use super::matching::{Fees, FeedEvent, Filters, SimParams};
     use super::*;
+    use crate::connectors::rest_book::fetch_lighter_book_from_base;
+    use crate::connectors::rest_specs::fetch_lighter_meta_from_base;
     use crate::hotpath::clock::mono_now_ns;
     use crate::lighter::messages::{OrderBooksResponse, TradePayload};
     use crate::lighter::rest::RestClient;
@@ -497,7 +499,7 @@ pub(crate) mod tests {
     use crate::livebot::exec::aster::{AsterRest, CancelOutcome};
     use crate::livebot::exec::creds::{AsterCreds, LighterCreds};
     use crate::livebot::exec::sign::{AsterSigner, EvmAsterSigner};
-    use crate::livebot::exec::ExecEvent;
+    use crate::livebot::exec::command::ExecEvent;
     use crate::livebot::scale::MarketScale;
     use crate::livebot::userstream::{run_aster_user_stream, StreamLiveness};
     use crate::types::{MarketId, Side, TxSendStatus};
@@ -673,8 +675,8 @@ pub(crate) mod tests {
         }
         assert!(cfg.maker.live.dry_run && cfg.taker.venues.dry_run, "both engines sign with the dry-run identity");
         assert_eq!(Path::new(&cfg.taker.pnl.persist_dir), runs);
-        let rest = RestClient::new(&cfg.taker.venues.lighter_base_url, 0).unwrap();
-        assert_eq!(rest.order_books().await.unwrap()[0].market_id, 24, "the simulated venue lists the real instruments");
+        let lighter = fetch_lighter_meta_from_base(&reqwest::Client::new(), &cfg.taker.venues.lighter_base_url).await.unwrap();
+        assert_eq!(lighter["HYPE"].market_id, 24, "the simulated venue lists the real instruments");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -866,12 +868,17 @@ pub(crate) mod tests {
         tokio::task::block_in_place(|| signer.check_client(key)).unwrap();
 
         let rest = RestClient::new(&world.lighter, 0).unwrap();
-        let books = rest.order_books().await.unwrap();
-        assert_eq!((books[0].market_id, books[0].supported_size_decimals, books[0].supported_price_decimals), (24, 2, 4));
+        let http = reqwest::Client::new();
+        let meta = &fetch_lighter_meta_from_base(&http, &world.lighter).await.unwrap()["HYPE"];
+        assert_eq!((meta.market_id, meta.size_decimals, meta.price_decimals), (24, 2, 4));
         assert_eq!(rest.next_nonce(account, key).await.unwrap(), 0);
-        assert_eq!(rest.account_position(account, 24).await.unwrap(), Decimal::ZERO);
-        let top = rest.order_book_orders(24, 1).await.unwrap();
-        assert_eq!((top["bids"][0]["price"].as_str(), top["asks"][0]["price"].as_str()), (Some("99"), Some("101")));
+        let position = |raw: Value| {
+            let row = raw["accounts"][0]["positions"].as_array().unwrap().iter().find(|p| p["market_id"] == 24).unwrap().clone();
+            row["position"].as_str().unwrap().parse::<Decimal>().unwrap() * Decimal::from(row["sign"].as_i64().unwrap())
+        };
+        assert_eq!(position(rest.account_raw(account).await.unwrap()), Decimal::ZERO);
+        let top = fetch_lighter_book_from_base(&http, &world.lighter, 24, 1).await.unwrap();
+        assert_eq!((top.bids[0].px, top.asks[0].px), (dec!(99), dec!(101)));
 
         let url = stream_url(&world.lighter);
         let (frames_tx, frames_rx) = mpsc::unbounded_channel();
@@ -917,7 +924,7 @@ pub(crate) mod tests {
         let trades: Vec<TradePayload> = serde_json::from_value(update["trades"]["24"].clone()).unwrap();
         assert_eq!((trades[0].ask_client_id, trades[0].ask_account_id, trades[0].is_maker_ask), (Some(9), Some(account), Some(false)));
         assert_eq!(trades[0].size.as_deref().map(|s| s.parse::<Decimal>().unwrap()), Some(dec!(0.5)));
-        assert_eq!(rest.account_position(account, 24).await.unwrap(), dec!(-0.5));
+        assert_eq!(position(rest.account_raw(account).await.unwrap()), dec!(-0.5));
         stream.abort();
     }
 }

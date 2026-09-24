@@ -7,8 +7,6 @@ use arrayvec::ArrayVec;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 
-use crate::types::Side;
-
 pub const MAX_BOOK_LEVELS: usize = 20;
 
 /// One raw `(px, qty)` depth row as parsed off the wire.
@@ -77,60 +75,12 @@ impl OrderBook {
         }
     }
 
-    /// Visible quantity resting at exactly `px` on the quote's own side.
-    pub fn qty_at_price(&self, side: Side, px: Decimal) -> Decimal {
-        let levels = match side {
-            Side::Buy => self.bids.as_slice(),
-            Side::Sell => self.asks.as_slice(),
-        };
-        levels
-            .iter()
-            .filter(|l| l.px == px)
-            .map(|l| l.qty)
-            .sum()
-    }
-
-    /// Visible quantity at price levels strictly better than `px` on the quote's
-    /// own side (higher bids for a buy quote, lower asks for a sell quote) — the
-    /// volume a sweep must consume before reaching `px`.
-    pub fn qty_better_than(&self, side: Side, px: Decimal) -> Decimal {
-        match side {
-            Side::Buy => self
-                .bids
-                .iter()
-                .filter(|l| l.px > px)
-                .map(|l| l.qty)
-                .sum(),
-            Side::Sell => self
-                .asks
-                .iter()
-                .filter(|l| l.px < px)
-                .map(|l| l.qty)
-                .sum(),
-        }
-    }
-
     /// Age in milliseconds of this book relative to `now` (by local receive time).
     #[inline]
     pub fn age_ms(&self, now: DateTime<Utc>) -> i64 {
         let source_age = crate::hot_types::source_age_at_receive_ms(
             self.exch_ts.timestamp_millis(), self.local_recv_ts.timestamp_millis());
         (now - self.local_recv_ts).num_milliseconds().max(0).saturating_add(source_age)
-    }
-
-    /// True when a resting quote at `px` on `side` sits beyond the deepest captured
-    /// level (below the lowest bid for a buy, above the highest ask for a sell). The
-    /// book is a partial-depth snapshot (Aster `@depth20`), so when our quote rests
-    /// past the captured bottom, the levels between it and our price are unseen and
-    /// [`qty_better_than`] is only a LOWER bound on the true queue ahead. A
-    /// measurement flag, not a reject. Note: a genuinely shallow
-    /// book that pushed fewer than its cap of levels can also trip this; the flag
-    /// reads as "queue not fully observed from this snapshot."
-    pub fn queue_truncated_at(&self, side: Side, px: Decimal) -> bool {
-        match side {
-            Side::Buy => self.bids.last().is_some_and(|l| px < l.px),
-            Side::Sell => self.asks.last().is_some_and(|l| px > l.px),
-        }
     }
 }
 
@@ -241,25 +191,6 @@ mod tests {
         assert_eq!(b.asks.len(), 1);
         assert_eq!(b.best_bid().unwrap().qty, dec!(5));
         assert_eq!(b.best_ask().unwrap().qty, dec!(10));
-    }
-
-    #[test]
-    fn queue_volume_queries() {
-        let b = sample();
-        assert_eq!(b.qty_better_than(Side::Buy, dec!(99.9)), dec!(2));
-        assert_eq!(b.qty_at_price(Side::Buy, dec!(99.9)), dec!(5));
-        assert_eq!(b.qty_better_than(Side::Sell, dec!(100.2)), dec!(3));
-        assert_eq!(b.qty_at_price(Side::Sell, dec!(100.2)), dec!(4));
-    }
-
-    #[test]
-    fn queue_truncation_detection() {
-        let b = sample();
-        assert!(!b.queue_truncated_at(Side::Buy, dec!(99.8)));
-        assert!(!b.queue_truncated_at(Side::Buy, dec!(99.85)));
-        assert!(b.queue_truncated_at(Side::Buy, dec!(99.7)));
-        assert!(!b.queue_truncated_at(Side::Sell, dec!(100.2)));
-        assert!(b.queue_truncated_at(Side::Sell, dec!(100.3)));
     }
 
     #[test]

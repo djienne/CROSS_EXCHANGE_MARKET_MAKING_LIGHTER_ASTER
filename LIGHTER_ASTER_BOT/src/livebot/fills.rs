@@ -158,18 +158,6 @@ impl FillDedup {
     pub fn observe(&mut self, fill: &AsterFill) -> bool {
         self.hedged.insert(FillKey::of(fill))
     }
-
-    /// Whether this fill has already been hedged (without recording it).
-    pub fn already_hedged(&self, fill: &AsterFill) -> bool {
-        self.hedged.contains(&FillKey::of(fill))
-    }
-
-    pub fn len(&self) -> usize {
-        self.hedged.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.hedged.is_empty()
-    }
 }
 
 /// Fill-to-hedge lifecycle. Forward path:
@@ -190,20 +178,6 @@ pub enum HedgeState {
 }
 
 impl HedgeState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HedgeState::Created => "CREATED",
-            HedgeState::Submitted => "SUBMITTED",
-            HedgeState::Acked => "ACKED",
-            HedgeState::Filled => "FILLED",
-            HedgeState::Reconciled => "RECONCILED",
-            HedgeState::Rejected => "REJECTED",
-            HedgeState::PartiallyFilled => "PARTIALLY_FILLED",
-            HedgeState::Unknown => "UNKNOWN",
-            HedgeState::TimedOut => "TIMED_OUT",
-        }
-    }
-
     /// A fully resolved hedge: no further action and does not block quoting.
     pub fn is_resolved(self) -> bool {
         matches!(self, HedgeState::Reconciled)
@@ -224,8 +198,8 @@ impl HedgeState {
     }
 }
 
-/// One hedge obligation created from an Aster fill. Carries the deterministic cloid so it
-/// can be recovered by querying Hyperliquid `orderStatus` after a restart (§8.2).
+/// One hedge obligation created from an Aster fill. Its cloid finds the attempt in Lighter's
+/// order history when the send's outcome is unknown.
 #[derive(Debug, Clone)]
 pub struct HedgeIntent {
     pub cloid: Cloid,
@@ -272,15 +246,6 @@ pub fn cum_scaled(cum_filled_qty: Decimal) -> i64 {
 }
 
 impl HedgeIntent {
-    /// Create a hedge obligation from a fill (invariant 2: exactly one per fill). The hedge
-    /// side is the opposite of the Aster maker side; the cloid is deterministic and
-    /// **session-independent** (derived only from the exchange fill identity), so a restart
-    /// re-processing the same fill computes the SAME cloid and recovery-by-cloid works (§8.2).
-    pub fn from_fill(fill: &AsterFill, now_ns: i64) -> Self {
-        Self::with_qty(Cloid::hedge(&fill.order_id, &fill.trade_id, cum_scaled(fill.cum_filled_qty)),
-            fill.market.clone(), fill.aster_side.opposite(), fill.last_fill_qty, fill.last_fill_px, now_ns)
-    }
-
     /// A hedge intent for a given `qty` not tied 1:1 to a single fill — used both for an
     /// ACCUMULATED hedge (the net of several sub-min partials reached hedgeable size) and for a
     /// RECOVERY hedge (the reconciler backstop offsetting an orphaned net delta; set
@@ -320,24 +285,6 @@ impl HedgeIntent {
         self.state = HedgeState::Submitted;
         self.submitted_ns = Some(now_ns);
         self.attempts += 1;
-    }
-
-    pub fn mark_acked(&mut self, hl_oid: String) {
-        self.hl_oid = Some(hl_oid);
-        if self.state == HedgeState::Submitted {
-            self.state = HedgeState::Acked;
-        }
-    }
-
-    /// Apply a hedge fill increment. Transitions to `Filled` once fully hedged, else
-    /// `PartiallyFilled` (which freezes quoting until resolved).
-    pub fn apply_fill(&mut self, filled_qty: Decimal) {
-        self.filled_qty += filled_qty;
-        if self.filled_qty >= self.qty {
-            self.state = HedgeState::Filled;
-        } else {
-            self.state = HedgeState::PartiallyFilled;
-        }
     }
 
     pub fn mark_reconciled(&mut self) {
@@ -425,8 +372,6 @@ mod tests {
         let f = fill("100", "T7", dec!(0.5), dec!(0.5));
         assert!(d.observe(&f)); // first sighting => hedge
         assert!(!d.observe(&f)); // repeat => do NOT hedge again
-        assert!(d.already_hedged(&f));
-        assert_eq!(d.len(), 1);
     }
 
     #[test]
@@ -437,7 +382,6 @@ mod tests {
         assert!(d.observe(&a));
         assert!(d.observe(&b)); // distinct cumulative => distinct fill
         assert!(!d.observe(&a)); // a repeated again => deduped
-        assert_eq!(d.len(), 2);
     }
 
     #[test]
@@ -451,72 +395,21 @@ mod tests {
         assert!(matches!(FillKey::of(&a), FillKey::CumQty { .. }), "sentinel tid must fall back to CumQty");
         assert!(d.observe(&a));
         assert!(d.observe(&b), "distinct cumulative with sentinel tid must NOT be deduped away");
-        assert_eq!(d.len(), 2);
-    }
-
-    #[test]
-    fn hedge_intent_from_fill_is_opposite_side_and_deterministic() {
-        let f = fill("100", "T7", dec!(0.5), dec!(0.5));
-        let h1 = HedgeIntent::from_fill(&f, 1_000);
-        let h2 = HedgeIntent::from_fill(&f, 9_999);
-        assert_eq!(h1.hedge_side, Side::Sell); // Buy fill => Sell hedge
-        assert_eq!(h1.qty, dec!(0.5));
-        assert_eq!(h1.state, HedgeState::Created);
-        // same fill identity => same cloid regardless of wall-clock (idempotent recovery)
-        assert_eq!(h1.cloid, h2.cloid);
-        // cloid is session-independent: a freshly-constructed intent from the SAME exchange
-        // fill (no bot-side counter involved) is identical — restart recovery works.
-        let h3 = HedgeIntent::from_fill(&fill("100", "T7", dec!(0.5), dec!(0.5)), 42);
-        assert_eq!(h1.cloid, h3.cloid);
     }
 
     #[test]
     fn hedge_lifecycle_forward_path() {
-        let f = fill("100", "T7", dec!(0.5), dec!(0.5));
-        let mut h = HedgeIntent::from_fill(&f, 0);
+        let mut h = HedgeIntent::with_qty(Cloid::recovery(&"BTC".into(), 1), "BTC".into(), Side::Sell, dec!(0.5), dec!(100), 0);
         h.mark_submitted(10);
         assert_eq!(h.state, HedgeState::Submitted);
         assert_eq!(h.attempts, 1);
-        h.mark_acked("oid-1".into());
-        assert_eq!(h.state, HedgeState::Acked);
-        h.apply_fill(dec!(0.5));
-        assert_eq!(h.state, HedgeState::Filled);
-        assert_eq!(h.remaining_qty(), dec!(0));
         h.mark_reconciled();
         assert!(h.state.is_resolved());
     }
 
     #[test]
-    fn partial_hedge_is_dangerous() {
-        let f = fill("100", "T7", dec!(0.5), dec!(0.5));
-        let mut h = HedgeIntent::from_fill(&f, 0);
-        h.mark_submitted(0);
-        h.apply_fill(dec!(0.2)); // only 0.2 of 0.5
-        assert_eq!(h.state, HedgeState::PartiallyFilled);
-        assert!(h.state.is_dangerous());
-        assert_eq!(h.remaining_qty(), dec!(0.3));
-    }
-
-    #[test]
-    fn accumulated_fills_reach_filled() {
-        // A hedge reported across MULTIPLE fill events must reach Filled once the cumulative
-        // filled reaches qty — at which point the strategy reconciles it. (A genuine shortfall
-        // larger than the venue qty step stays PartiallyFilled and is handled by recovery.)
-        let f = fill("100", "T7", dec!(0.5), dec!(0.5));
-        let mut h = HedgeIntent::from_fill(&f, 0);
-        h.mark_submitted(0);
-        h.apply_fill(dec!(0.3));
-        assert_eq!(h.state, HedgeState::PartiallyFilled);
-        assert_eq!(h.remaining_qty(), dec!(0.2));
-        h.apply_fill(dec!(0.2)); // cumulative 0.5 == qty
-        assert_eq!(h.state, HedgeState::Filled);
-        assert_eq!(h.remaining_qty(), dec!(0));
-    }
-
-    #[test]
     fn hedge_times_out_when_in_flight_too_long() {
-        let f = fill("100", "T7", dec!(0.5), dec!(0.5));
-        let mut h = HedgeIntent::from_fill(&f, 0);
+        let mut h = HedgeIntent::with_qty(Cloid::recovery(&"BTC".into(), 1), "BTC".into(), Side::Sell, dec!(0.5), dec!(100), 0);
         h.mark_submitted(0);
         h.check_timeout(500, 1_000); // not yet
         assert!(h.state.is_in_flight());

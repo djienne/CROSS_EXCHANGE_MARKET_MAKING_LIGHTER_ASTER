@@ -21,8 +21,10 @@ use std::path::Path;
 pub const ORDER_TYPE_LIMIT: i32 = 0;
 pub const ORDER_TYPE_MARKET: i32 = 1;
 pub const TIF_IMMEDIATE_OR_CANCEL: i32 = 0;
+#[cfg(test)]
 pub const TIF_POST_ONLY: i32 = 2;
 pub const NIL_TRIGGER_PRICE: i32 = 0;
+#[cfg(test)]
 pub const DEFAULT_28_DAY_ORDER_EXPIRY: i64 = -1;
 pub const DEFAULT_IOC_EXPIRY: i64 = 0;
 pub const MARGIN_MODE_CROSS: i32 = 0;

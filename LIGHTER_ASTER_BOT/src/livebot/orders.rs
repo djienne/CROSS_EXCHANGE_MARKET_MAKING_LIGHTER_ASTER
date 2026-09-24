@@ -5,7 +5,7 @@
 //!
 //! Single-owner: this lives inside the strategy thread, so it needs no locks.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use crate::types::{MarketId, Side};
 
@@ -77,7 +77,6 @@ impl CancelAfterAckReason {
 #[derive(Debug, Clone)]
 pub struct MakerSlot {
     queued_admission: Option<std::sync::Arc<super::fills::Admission>>,
-    pub side: Side,
     pub state: OrderLifecycle,
     pub client_id: Option<String>,
     pub venue_order_id: Option<String>,
@@ -107,10 +106,9 @@ pub struct MakerSlot {
 }
 
 impl MakerSlot {
-    fn new(side: Side) -> Self {
+    fn new() -> Self {
         MakerSlot {
             queued_admission: None,
-            side,
             state: OrderLifecycle::Idle,
             client_id: None,
             venue_order_id: None,
@@ -188,8 +186,8 @@ impl OrderManager {
             .iter()
             .map(|m| MarketSlots {
                 market: m.clone(),
-                bid: MakerSlot::new(Side::Buy),
-                ask: MakerSlot::new(Side::Sell),
+                bid: MakerSlot::new(),
+                ask: MakerSlot::new(),
                 replace_times_ns: VecDeque::new(),
             })
             .collect();
@@ -238,10 +236,7 @@ impl OrderManager {
 
     pub fn current_hot_order(&self, market: &MarketId, side: Side) -> Option<HotCurrentOrder> {
         self.slot(market, side).and_then(|s| {
-            (s.is_live() && s.remaining_lots() > 0).then(|| HotCurrentOrder {
-                px_ticks: s.price_ticks,
-                qty_lots: s.remaining_lots(),
-            })
+            (s.is_live() && s.remaining_lots() > 0).then(|| HotCurrentOrder { px_ticks: s.price_ticks })
         })
     }
 
@@ -524,20 +519,10 @@ impl OrderManager {
         }
     }
 
-    /// Count of place/cancel/replace timestamps within the last 60s of `now_ns` (non-mutating, for
-    /// diagnostics/observability — see `Strategy::log_quote_diag`). Surfacing this makes a
-    /// rate-limited no-quote state visible instead of looking like a silent stall.
-    pub fn replaces_in_window(&self, market: &MarketId, now_ns: i64) -> u32 {
-        let cutoff = now_ns - 60_000_000_000;
-        self.market(market)
-            .map(|m| m.replace_times_ns.iter().filter(|&&t| t >= cutoff).count() as u32)
-            .unwrap_or(0)
-    }
-
-    /// Every live order's client id — the "known orders" set the clean-start reconciliation
-    /// (invariant 7) checks the venue's open orders against.
-    pub fn known_client_ids(&self) -> HashSet<String> {
-        let mut out = HashSet::new();
+    /// Every live order's client id.
+    #[cfg(test)]
+    pub fn known_client_ids(&self) -> std::collections::HashSet<String> {
+        let mut out = std::collections::HashSet::new();
         for m in &self.slots {
             for slot in [&m.bid, &m.ask] {
                 if let Some(id) = &slot.client_id {
@@ -636,7 +621,6 @@ mod tests {
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().state, OrderLifecycle::Open);
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().filled_lots, 4);
         assert_eq!(m.slot(&"BTC".into(), Side::Buy).unwrap().remaining_lots(), 6);
-        assert_eq!(m.current_hot_order(&"BTC".into(), Side::Buy).unwrap().qty_lots, 6);
 
         // A duplicate/out-of-order smaller cumulative update must not move filled_lots backwards.
         m.on_maker_fill_progress(&"BTC".into(), Side::Buy, &id, 3);
@@ -731,15 +715,6 @@ mod tests {
         assert!(m.replace_rate_ok(&"BTC".into(), 3, 120_000_000_000));
     }
 
-    #[test]
-    fn replaces_in_window_counts_only_recent() {
-        let mut m = mgr();
-        m.record_replace(&"BTC".into(), 0);
-        m.record_replace(&"BTC".into(), 1_000_000);
-        assert_eq!(m.replaces_in_window(&"BTC".into(), 2_000_000), 2);
-        // 120s later, both fall outside the 60s window.
-        assert_eq!(m.replaces_in_window(&"BTC".into(), 120_000_000_000), 0);
-    }
     #[test]
     fn pending_cancel_suppresses_duplicate_until_backoff() {
         let mut m = mgr();

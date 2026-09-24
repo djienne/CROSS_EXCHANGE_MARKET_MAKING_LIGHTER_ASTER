@@ -17,4 +17,4 @@ pub use book_cell::{VenueBook, VenueTag};
 pub use book_check::{run_book_check, BookCheckParams, BookCheckTarget};
 pub use registry::VenueRegistry;
 pub use venue_thread::{spawn_venue_thread, maybe_pin_core};
-pub use watchdog::{run_watchdog, scan_once, ReconnectHandle, TradingGate};
+pub use watchdog::{run_watchdog, ReconnectHandle, TradingGate};

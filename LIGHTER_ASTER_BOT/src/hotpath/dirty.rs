@@ -4,14 +4,13 @@
 //! `take_into()` on wake to get exactly the dirty set and reprice only those markets.
 //! For < 64 markets a single `AtomicU64` on one cache line is sufficient.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::types::MarketIdx;
 
 pub struct DirtyMarkets {
     segments: Vec<AtomicU64>,
     num_markets: usize,
-    reprice_all: AtomicBool,
 }
 
 impl DirtyMarkets {
@@ -20,7 +19,6 @@ impl DirtyMarkets {
         DirtyMarkets {
             segments: (0..num_segs).map(|_| AtomicU64::new(0)).collect(),
             num_markets,
-            reprice_all: AtomicBool::new(false),
         }
     }
 
@@ -33,18 +31,10 @@ impl DirtyMarkets {
         }
     }
 
-    pub fn mark_all(&self) {
-        self.reprice_all.store(true, Ordering::Release);
-    }
-
-    pub fn take_reprice_all(&self) -> bool {
-        self.reprice_all.swap(false, Ordering::AcqRel)
-    }
-
     /// Drain all currently dirty market indexes into a caller-owned scratch buffer.
     ///
-    /// This is the hot wake path, so the strategy reuses the same `Vec` every loop and avoids the
-    /// allocation that `take_all().collect()` would otherwise do on every BBO/depth wake.
+    /// This is the hot wake path, so the strategy reuses the same `Vec` every loop and avoids an
+    /// allocation on every BBO/depth wake.
     pub fn take_into(&self, out: &mut Vec<MarketIdx>) {
         out.clear();
         for (seg_idx, seg) in self.segments.iter().enumerate() {
@@ -61,37 +51,17 @@ impl DirtyMarkets {
         }
     }
 
-    pub fn take_all(&self) -> DirtyIter {
-        let mut indices = Vec::with_capacity(self.num_markets.min(64));
-        self.take_into(&mut indices);
-        DirtyIter { indices, pos: 0 }
-    }
-
-    #[allow(dead_code)]
-    pub fn num_markets(&self) -> usize {
-        self.num_markets
-    }
-}
-
-pub struct DirtyIter {
-    indices: Vec<MarketIdx>,
-    pos: usize,
-}
-
-impl Iterator for DirtyIter {
-    type Item = MarketIdx;
-    fn next(&mut self) -> Option<MarketIdx> {
-        let idx = self.indices.get(self.pos).copied();
-        if idx.is_some() {
-            self.pos += 1;
-        }
-        idx
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn take_all(d: &DirtyMarkets) -> Vec<MarketIdx> {
+        let mut out = Vec::new();
+        d.take_into(&mut out);
+        out
+    }
 
     #[test]
     fn mark_and_take_returns_exact_indices() {
@@ -99,7 +69,7 @@ mod tests {
         d.mark(MarketIdx(1));
         d.mark(MarketIdx(3));
         d.mark(MarketIdx(5));
-        let got: Vec<MarketIdx> = d.take_all().collect();
+        let got = take_all(&d);
         assert_eq!(got, vec![MarketIdx(1), MarketIdx(3), MarketIdx(5)]);
     }
 
@@ -107,8 +77,8 @@ mod tests {
     fn take_clears_bits() {
         let d = DirtyMarkets::new(8);
         d.mark(MarketIdx(2));
-        let _ = d.take_all().collect::<Vec<_>>();
-        assert_eq!(d.take_all().count(), 0);
+        take_all(&d);
+        assert!(take_all(&d).is_empty());
     }
 
     #[test]
@@ -127,14 +97,6 @@ mod tests {
     }
 
     #[test]
-    fn reprice_all_overrides() {
-        let d = DirtyMarkets::new(4);
-        d.mark_all();
-        assert!(d.take_reprice_all());
-        assert!(!d.take_reprice_all());
-    }
-
-    #[test]
     fn concurrent_mark_take() {
         let d = std::sync::Arc::new(DirtyMarkets::new(64));
         let handles: Vec<_> = (0..4)
@@ -150,13 +112,13 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
-        let got: std::collections::HashSet<u16> = d.take_all().map(|m| m.0).collect();
+        let got: std::collections::HashSet<u16> = take_all(&d).into_iter().map(|m| m.0).collect();
         assert_eq!(got.len(), 64);
     }
 
     #[test]
     fn empty_take_returns_nothing() {
         let d = DirtyMarkets::new(16);
-        assert_eq!(d.take_all().count(), 0);
+        assert!(take_all(&d).is_empty());
     }
 }

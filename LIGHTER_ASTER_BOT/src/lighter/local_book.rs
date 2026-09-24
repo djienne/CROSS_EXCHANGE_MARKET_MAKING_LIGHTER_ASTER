@@ -10,11 +10,6 @@ pub struct BookSide {
 }
 
 impl BookSide {
-    pub fn new() -> Self {
-        Self { prices: Vec::with_capacity(256), sizes: Vec::with_capacity(256) }
-    }
-
-    pub fn len(&self) -> usize { self.prices.len() }
     pub fn is_empty(&self) -> bool { self.prices.is_empty() }
     pub fn clear(&mut self) { self.prices.clear(); self.sizes.clear(); }
 
@@ -91,9 +86,6 @@ pub struct LocalBook {
 }
 
 impl LocalBook {
-    pub fn new() -> Self {
-        Self { bids: BookSide::new(), asks: BookSide::new(), initialized: false, last_offset: None }
-    }
     pub fn reset(&mut self) {
         self.bids.clear();
         self.asks.clear();
@@ -122,7 +114,7 @@ mod tests {
 
     #[test]
     fn decimal_snapshot_and_absolute_updates_preserve_wire_values() {
-        let mut book = LocalBook::new();
+        let mut book = LocalBook::default();
         book.apply_snapshot(vec![(dec!(64820.2), dec!(0.00051)), (dec!(64820.1), dec!(1))],
             vec![(dec!(64820.3), dec!(0.19283))]);
         assert_eq!(book.best_bid(), Some(dec!(64820.2)));
@@ -135,7 +127,7 @@ mod tests {
 
     #[test]
     fn best_level_iterators_have_correct_order_and_depth() {
-        let mut book = LocalBook::new();
+        let mut book = LocalBook::default();
         book.apply_snapshot(
             (0..25).map(|i| (Decimal::from(100 + i), Decimal::from(i + 1))).collect(),
             (0..25).map(|i| (Decimal::from(200 + i), Decimal::from(i + 1))).collect(),

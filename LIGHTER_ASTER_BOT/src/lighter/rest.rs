@@ -1,18 +1,12 @@
 //! Lighter REST client (reqwest). Endpoints + param encodings verified against the SDK:
-//!   GET  /api/v1/orderBooks
-//!   GET  /api/v1/orderBookOrders      ?market_id&limit
 //!   GET  /api/v1/nextNonce            ?account_index&api_key_index
 //!   GET  /api/v1/account              ?by=index&value
 //!   GET  /api/v1/accountActiveOrders  ?account_index&market_id (authorization header)
 //!   GET  /api/v1/accountInactiveOrders, /api/v1/trades   paged history (authorization header)
 //! Transactions go over the websocket (`tx_ws`), never REST.
 
-use crate::lighter::messages::{
-    AccountActiveOrdersResponse, NextNonceResponse, OrderBookDetail, OrderBooksResponse,
-    RemoteOrder,
-};
+use crate::lighter::messages::{AccountActiveOrdersResponse, NextNonceResponse, RemoteOrder};
 use anyhow::{bail, Context, Result};
-use rust_decimal::Decimal;
 use std::time::Duration;
 
 /// History pages (100 rows each, newest first) one order lookup reads per pass. A just-sent
@@ -82,19 +76,6 @@ impl RestClient {
         ], cursor).await
     }
 
-    pub async fn order_books(&self) -> Result<Vec<OrderBookDetail>> {
-        let resp: OrderBooksResponse = self
-            .http
-            .get(self.url("/api/v1/orderBooks"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("parse orderBooks")?;
-        Ok(resp.order_books)
-    }
-
     pub async fn next_nonce(&self, account_index: i64, api_key_index: i32) -> Result<i64> {
         let resp: NextNonceResponse = self
             .http
@@ -136,40 +117,6 @@ impl RestClient {
         Ok(resp.orders)
     }
 
-    /// Raw top-of-book via REST (sanity check). Returns the JSON value.
-    pub async fn order_book_orders(&self, market_id: u32, limit: u32) -> Result<serde_json::Value> {
-        let v: serde_json::Value = self
-            .http
-            .get(self.url("/api/v1/orderBookOrders"))
-            .query(&[
-                ("market_id", market_id.to_string()),
-                ("limit", limit.to_string()),
-            ])
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await
-            .context("parse orderBookOrders")?;
-        Ok(v)
-    }
-
-    /// Signed position (base units) for a market via REST — authoritative and independent of
-    /// the account WS (so position is never stale even if that WS dies).
-    pub async fn account_position(&self, account_index: i64, market_id: u32) -> Result<Decimal> {
-        let value = self.account_raw(account_index).await?;
-        let account = value.get("accounts").and_then(|v| v.as_array()).and_then(|v| v.first())
-            .context("Lighter account response is missing its account row")?;
-        let positions = account.get("positions").and_then(|v| v.as_array())
-            .context("Lighter account response is missing positions")?;
-        for position in positions {
-            if position.get("market_id").and_then(|v| v.as_u64()) == Some(market_id as u64) {
-                return signed_position_decimal(position.get("position"), position.get("sign").and_then(|v| v.as_i64()));
-            }
-        }
-        Ok(Decimal::ZERO)
-    }
-
     pub async fn account_raw(&self, account_index: i64) -> Result<serde_json::Value> {
         let value: serde_json::Value = self.http.get(self.url("/api/v1/account"))
             .query(&[("by", "index".to_string()), ("value", account_index.to_string())])
@@ -184,29 +131,9 @@ impl RestClient {
     }
 }
 
-fn value_decimal(v: Option<&serde_json::Value>) -> Option<Decimal> {
-    match v {
-        Some(serde_json::Value::String(s)) => s.parse::<Decimal>().ok(),
-        Some(serde_json::Value::Number(n)) => n.to_string().parse::<Decimal>().ok(),
-        _ => None,
-    }
-}
-
-fn signed_position_decimal(position: Option<&serde_json::Value>, sign: Option<i64>) -> Result<Decimal> {
-    let quantity = value_decimal(position).context("invalid Lighter position quantity")?;
-    if quantity < Decimal::ZERO { bail!("negative Lighter unsigned position magnitude"); }
-    if quantity.is_zero() { return Ok(Decimal::ZERO); }
-    match sign {
-        Some(1) => Ok(quantity),
-        Some(-1) => Ok(-quantity),
-        _ => bail!("invalid or missing Lighter position sign"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rust_decimal_macros::dec;
 
 
     #[tokio::test]
@@ -247,19 +174,5 @@ mod tests {
         }
         assert!(requests[1].contains("cursor=page%2F2"));
         assert!(requests[2].contains("order_index=99") && requests[2].contains("limit=100"));
-    }
-
-    #[test]
-    fn position_magnitude_and_sign_are_validated_without_inventing_flat() {
-        for value in [serde_json::json!("0.85"), serde_json::json!(0.85)] {
-            assert_eq!(signed_position_decimal(Some(&value), Some(1)).unwrap(), dec!(0.85));
-            assert_eq!(signed_position_decimal(Some(&value), Some(-1)).unwrap(), dec!(-0.85));
-            assert!(signed_position_decimal(Some(&value), None).is_err());
-            assert!(signed_position_decimal(Some(&value), Some(0)).is_err());
-        }
-        assert!(signed_position_decimal(None, Some(1)).is_err());
-        assert!(signed_position_decimal(Some(&serde_json::json!("garbage")), Some(1)).is_err());
-        assert!(signed_position_decimal(Some(&serde_json::json!("-0.85")), Some(1)).is_err());
-        assert_eq!(signed_position_decimal(Some(&serde_json::json!("0")), None).unwrap(), Decimal::ZERO);
     }
 }

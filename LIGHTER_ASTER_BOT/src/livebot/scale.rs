@@ -138,12 +138,6 @@ impl MarketScale {
         Decimal::from(lots) * self.step
     }
 
-    /// Exact Hyperliquid quantity for an HL lot count.
-    #[inline]
-    pub fn hl_lots_to_qty(&self, lots: i64) -> Decimal {
-        Decimal::from(lots) * self.hl_qty_step
-    }
-
     /// Exact ticks for an already-rounded Decimal price (nearest tick) — the numeric
     /// twin of [`price_str_to_ticks`]: it feeds the Decimal's own (mantissa, scale)
     /// into the SAME i128 rational core, so ticks are bit-identical to the string
@@ -250,15 +244,15 @@ fn pow10(exp: u32) -> Option<i128> {
 
 /// Convert a `Decimal` [`OrderBook`] into a scaled-integer [`HotBook`], truncating to
 /// [`HOT_LEVELS`] and dropping any level whose scaled price or qty rounds to <= 0.
-pub fn build_hot_book(book: &OrderBook, scale: &MarketScale, generation: u64, recv_ns: i64) -> HotBook {
-    build_hot_book_with_qty_scale(book, scale, HotQtyScale::Aster, generation, recv_ns)
+#[cfg(test)]
+pub fn build_hot_book(book: &OrderBook, scale: &MarketScale, recv_ns: i64) -> HotBook {
+    build_hot_book_with_qty_scale(book, scale, HotQtyScale::Aster, recv_ns)
 }
 
 pub fn build_hot_book_with_qty_scale(
     book: &OrderBook,
     scale: &MarketScale,
     qty_scale: HotQtyScale,
-    generation: u64,
     recv_ns: i64,
 ) -> HotBook {
     let mut bids = [HotLevel::default(); HOT_LEVELS];
@@ -270,7 +264,6 @@ pub fn build_hot_book_with_qty_scale(
         asks,
         bid_len,
         ask_len,
-        generation,
         recv_ns,
         book.exch_ts.timestamp_millis(),
     )
@@ -280,35 +273,11 @@ pub fn build_hot_book_with_qty_scale(
 /// hot-path builder: it avoids `rust_decimal::Decimal` allocation/construction for the
 /// integer precheck representation while preserving canonical ordering, duplicate-price
 /// aggregation, non-positive filtering, and [`HOT_LEVELS`] truncation.
-pub fn build_hot_book_from_strs<'a, I, J>(
-    bids_in: I,
-    asks_in: J,
-    scale: &MarketScale,
-    generation: u64,
-    recv_ns: i64,
-    exch_ms: i64,
-) -> HotBook
-where
-    I: IntoIterator<Item = (&'a str, &'a str)>,
-    J: IntoIterator<Item = (&'a str, &'a str)>,
-{
-    build_hot_book_from_strs_with_qty_scale(
-        bids_in,
-        asks_in,
-        scale,
-        HotQtyScale::Aster,
-        generation,
-        recv_ns,
-        exch_ms,
-    )
-}
-
 pub fn build_hot_book_from_strs_with_qty_scale<'a, I, J>(
     bids_in: I,
     asks_in: J,
     scale: &MarketScale,
     qty_scale: HotQtyScale,
-    generation: u64,
     recv_ns: i64,
     exch_ms: i64,
 ) -> HotBook
@@ -320,7 +289,7 @@ where
     let mut asks = [HotLevel::default(); HOT_LEVELS];
     let bid_len = fill_raw(&mut bids, bids_in, scale, qty_scale, true);
     let ask_len = fill_raw(&mut asks, asks_in, scale, qty_scale, false);
-    HotBook::new(bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms)
+    HotBook::new(bids, asks, bid_len, ask_len, recv_ns, exch_ms)
 }
 
 /// Build a [`HotBook`] from already-rounded Decimal levels (best-first), mirroring
@@ -332,7 +301,6 @@ pub fn build_hot_book_from_dec_levels_with_qty_scale(
     asks_in: &[(Decimal, Decimal)],
     scale: &MarketScale,
     qty_scale: HotQtyScale,
-    generation: u64,
     recv_ns: i64,
     exch_ms: i64,
 ) -> HotBook {
@@ -340,7 +308,7 @@ pub fn build_hot_book_from_dec_levels_with_qty_scale(
     let mut asks = [HotLevel::default(); HOT_LEVELS];
     let bid_len = fill_dec(&mut bids, bids_in, scale, qty_scale, true);
     let ask_len = fill_dec(&mut asks, asks_in, scale, qty_scale, false);
-    HotBook::new(bids, asks, bid_len, ask_len, generation, recv_ns, exch_ms)
+    HotBook::new(bids, asks, bid_len, ask_len, recv_ns, exch_ms)
 }
 
 /// Fill a fixed level array from `Decimal` levels (already canonically sorted by
@@ -483,8 +451,8 @@ mod tests {
         let scale = MarketScale::from_spec(&spec());
         let raw = [("100.04", "0.005"), ("100.041", "0.003"), ("99.9", "1.5"), ("99.8", "0.0004"), ("98.15", "0.25")];
         let decimals: Vec<(Decimal, Decimal)> = raw.iter().map(|(p,q)| (p.parse().unwrap(), q.parse().unwrap())).collect();
-        let decimal_book = build_hot_book_from_dec_levels_with_qty_scale(&decimals, &decimals, &scale, HotQtyScale::Hyperliquid, 7, 123, 456);
-        let wire_book = build_hot_book_from_strs_with_qty_scale(raw, raw, &scale, HotQtyScale::Hyperliquid, 7, 123, 456);
+        let decimal_book = build_hot_book_from_dec_levels_with_qty_scale(&decimals, &decimals, &scale, HotQtyScale::Hyperliquid, 123, 456);
+        let wire_book = build_hot_book_from_strs_with_qty_scale(raw, raw, &scale, HotQtyScale::Hyperliquid, 123, 456);
         for book in [decimal_book, wire_book] {
             let bids: Vec<_> = book.bids().iter().map(|l| (l.px_ticks, l.qty_lots)).collect();
             assert_eq!(bids, vec![(1000, 8), (999, 1500), (982, 250)]);
@@ -539,7 +507,6 @@ mod tests {
             [("100.1", "0.019")],
             &s,
             HotQtyScale::Aster,
-            1,
             100,
             1_700_000_000_000,
         );
@@ -548,7 +515,6 @@ mod tests {
             [("100.1", "0.019")],
             &s,
             HotQtyScale::Hyperliquid,
-            1,
             100,
             1_700_000_000_000,
         );
@@ -557,21 +523,19 @@ mod tests {
         assert_eq!(hl.bids()[0].qty_lots, 19);
         assert_eq!(s.hl_qty_to_lots(dec!(0.0199)), 19);
         assert_eq!(s.hl_qty_to_lots_ceil(dec!(0.0191)), 20);
-        assert_eq!(s.hl_lots_to_qty(19), dec!(0.019));
     }
 
     #[test]
     fn hot_book_from_strings_sorts_aggregates_and_truncates() {
         let s = MarketScale::from_spec(&spec());
-        let hb = build_hot_book_from_strs(
+        let hb = build_hot_book_from_strs_with_qty_scale(
             [("99.9", "1"), ("100.0", "2"), ("100.0", "3")],
             [("100.2", "1"), ("100.1", "4")],
             &s,
-            7,
+            HotQtyScale::Aster,
             123,
             1_700_000_000_000,
         );
-        assert_eq!(hb.generation, 7);
         assert_eq!(hb.exch_ms, 1_700_000_000_000);
         assert_eq!(hb.best_bid_ticks(), Some(1000));
         assert_eq!(hb.bids()[0].qty_lots, 5000);
@@ -581,17 +545,13 @@ mod tests {
     #[test]
     fn hot_book_from_decimal() {
         let s = MarketScale::from_spec(&spec());
-        let hb = build_hot_book(&book(), &s, 7, 123);
-        assert_eq!(hb.generation, 7);
+        let hb = build_hot_book(&book(), &s, 123);
         assert_eq!(hb.recv_ns, 123);
         assert_eq!(hb.best_bid_ticks(), Some(1000));
         assert_eq!(hb.best_ask_ticks(), Some(1001));
         assert_eq!(hb.bids().len(), 2);
         assert_eq!(hb.asks().len(), 2);
         assert!(!hb.is_crossed());
-        assert_eq!(hb.mid_half_ticks(), Some(2001));
-        assert_eq!(hb.touch_ticks(crate::types::Side::Buy), Some(1000));
-        assert_eq!(hb.touch_ticks(crate::types::Side::Sell), Some(1001));
     }
 
     #[test]
@@ -599,7 +559,7 @@ mod tests {
         let s = MarketScale::from_spec(&spec());
         let now = Utc::now();
         let crossed = OrderBook::from_levels(vec![(dec!(101), dec!(1))], vec![(dec!(100), dec!(1))], now, now);
-        let hb = build_hot_book(&crossed, &s, 1, 0);
+        let hb = build_hot_book(&crossed, &s, 0);
         assert!(hb.is_crossed());
     }
 
@@ -609,7 +569,7 @@ mod tests {
         let now = Utc::now();
         let many: Vec<(Decimal, Decimal)> = (0..30).map(|i| (dec!(100) - Decimal::from(i) * dec!(0.1), dec!(1))).collect();
         let deep = OrderBook::from_levels(many, vec![(dec!(100.1), dec!(1))], now, now);
-        let hb = build_hot_book(&deep, &s, 1, 0);
+        let hb = build_hot_book(&deep, &s, 0);
         assert_eq!(hb.bids().len(), HOT_LEVELS);
     }
 }

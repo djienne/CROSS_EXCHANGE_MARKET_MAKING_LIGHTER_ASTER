@@ -1,24 +1,11 @@
 //! Serde models for Lighter REST responses and WebSocket payloads.
 //!
 //! Field names verified against the live API (`/api/v1/orderBooks`) and live WS captures.
-//! Prices/sizes arrive as STRINGS — parse with `fast-float`. Account-channel models are
+//! Prices/sizes arrive as STRINGS. Account-channel models are
 //! modeled from the Python handlers and refined against live (authenticated) captures.
 
 use serde::Deserialize;
 use std::collections::HashMap;
-
-#[inline]
-pub fn parse_f64(s: &str) -> f64 {
-    fast_float::parse(s).unwrap_or(0.0)
-}
-
-/// Like [`parse_f64`] but surfaces malformed input instead of coercing it to `0.0`.
-/// Book ingest must use this: a malformed SIZE coerced to zero DELETES the level from
-/// the local book, and a malformed price silently drops it — both desync the book.
-#[inline]
-pub fn parse_f64_opt(s: &str) -> Option<f64> {
-    fast_float::parse(s).ok()
-}
 
 // ----------------------------- REST -----------------------------
 
@@ -40,10 +27,6 @@ pub struct OrderBookDetail {
     pub supported_size_decimals: u32,
     #[serde(default)]
     pub supported_price_decimals: u32,
-    #[serde(default)]
-    pub maker_fee: String,
-    #[serde(default)]
-    pub status: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,13 +85,6 @@ impl RemoteOrder {
 pub struct PriceLevel {
     pub price: String,
     pub size: String,
-}
-
-impl PriceLevel {
-    #[inline]
-    pub fn parsed(&self) -> (f64, f64) {
-        (parse_f64(&self.price), parse_f64(&self.size))
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,20 +215,6 @@ pub struct PriceLevelRef<'a> {
     pub size: std::borrow::Cow<'a, str>,
 }
 
-impl PriceLevelRef<'_> {
-    #[inline]
-    pub fn parsed(&self) -> (f64, f64) {
-        (parse_f64(&self.price), parse_f64(&self.size))
-    }
-
-    /// `None` when either field is unparseable — callers must treat that as a desynced
-    /// frame (resync for a fresh snapshot), never as a zero.
-    #[inline]
-    pub fn parsed_opt(&self) -> Option<(f64, f64)> {
-        Some((parse_f64_opt(&self.price)?, parse_f64_opt(&self.size)?))
-    }
-}
-
 #[derive(Debug, Deserialize)]
 pub struct OrderBookPayloadRef<'a> {
     #[serde(default)]
@@ -322,38 +284,11 @@ impl OrderBookMsgRef<'_> {
     }
 }
 
-/// `ticker/{m}` — best bid/ask nested under `ticker`.
-#[derive(Debug, Deserialize)]
-pub struct TickerMsg {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    #[serde(default)]
-    pub ticker: HashMap<String, serde_json::Value>,
-}
-
-impl TickerMsg {
-    fn field(&self, k: &str) -> Option<f64> {
-        self.ticker.get(k).and_then(|v| match v {
-            serde_json::Value::String(s) => fast_float::parse(s).ok(),
-            serde_json::Value::Number(n) => n.as_f64(),
-            _ => None,
-        })
-    }
-    pub fn best_bid(&self) -> Option<f64> {
-        self.field("best_bid").or_else(|| self.field("bid"))
-    }
-    pub fn best_ask(&self) -> Option<f64> {
-        self.field("best_ask").or_else(|| self.field("ask"))
-    }
-}
-
 /// `account_orders/{m}/{a}` / `account_all_orders/{a}` — `orders` keyed by market id.
-/// `type` is defaulted: the pre-typed consumer extracted `orders` regardless of the tag,
-/// and an untyped frame must keep updating the open-orders cache rather than stall it.
+/// The `type` tag is not read: an untyped frame must keep updating the open-orders cache
+/// rather than stall it.
 #[derive(Debug, Deserialize)]
 pub struct AccountOrdersMsg {
-    #[serde(rename = "type", default)]
-    pub msg_type: String,
     #[serde(default)]
     pub orders: HashMap<String, Vec<RemoteOrder>>,
 }
@@ -363,10 +298,6 @@ pub struct AccountOrdersMsg {
 /// from the dedicated `account_all_positions/{a}` stream below.
 #[derive(Debug, Deserialize)]
 pub struct AccountAllMsg {
-    #[serde(rename = "type")]
-    pub msg_type: String,
-    #[serde(default)]
-    pub positions: HashMap<String, PositionPayload>,
     #[serde(default)]
     pub trades: HashMap<String, Vec<TradePayload>>,
 }
@@ -398,21 +329,8 @@ pub struct PositionPayload {
     pub avg_entry_price: Option<String>,
 }
 
-impl PositionPayload {
-    /// Signed position size in base units.
-    pub fn signed(&self) -> f64 {
-        let mag = self.position.as_deref().map(parse_f64).unwrap_or(0.0);
-        match self.sign {
-            Some(s) if s < 0 => -mag.abs(),
-            _ => mag.abs(),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct TradePayload {
-    #[serde(rename = "type", default)]
-    pub trade_type: Option<String>,
     #[serde(default)]
     pub price: Option<String>,
     #[serde(default)]
@@ -433,10 +351,6 @@ pub struct TradePayload {
     pub ask_account_id: Option<i64>,
     #[serde(default)]
     pub bid_account_id: Option<i64>,
-    #[serde(default)]
-    pub ask_account_pnl: Option<String>,
-    #[serde(default)]
-    pub bid_account_pnl: Option<String>,
     #[serde(default, deserialize_with = "present_json")]
     pub maker_fee: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "present_json")]
@@ -457,41 +371,11 @@ fn present_json<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opt
 
 impl TradePayload {
     #[inline]
-    pub fn price_f64(&self) -> Option<f64> {
-        parse_opt_f64(&self.price)
-    }
-
-    #[inline]
-    pub fn size_f64(&self) -> Option<f64> {
-        parse_opt_f64(&self.size)
-    }
-
-    #[inline]
-    pub fn usd_amount_f64(&self) -> Option<f64> {
-        parse_opt_f64(&self.usd_amount)
-    }
-
-    #[inline]
-    pub fn ask_account_pnl_f64(&self) -> Option<f64> {
-        parse_opt_f64(&self.ask_account_pnl)
-    }
-
-    #[inline]
-    pub fn bid_account_pnl_f64(&self) -> Option<f64> {
-        parse_opt_f64(&self.bid_account_pnl)
-    }
-
-    #[inline]
     pub fn event_time_ms(&self) -> Option<i64> {
         self.transaction_time
             .or(self.timestamp)
             .map(normalize_timestamp_ms)
     }
-}
-
-#[inline]
-fn parse_opt_f64(v: &Option<String>) -> Option<f64> {
-    v.as_deref().and_then(|s| fast_float::parse(s).ok())
 }
 
 fn normalize_timestamp_ms(ts: i64) -> i64 {
@@ -522,23 +406,6 @@ pub struct StatsPayload {
     pub available_balance: Option<serde_json::Value>,
     #[serde(default)]
     pub portfolio_value: Option<serde_json::Value>,
-}
-
-fn val_f64(v: &Option<serde_json::Value>) -> Option<f64> {
-    match v {
-        Some(serde_json::Value::String(s)) => fast_float::parse(s).ok(),
-        Some(serde_json::Value::Number(n)) => n.as_f64(),
-        _ => None,
-    }
-}
-
-impl StatsPayload {
-    pub fn available_capital(&self) -> Option<f64> {
-        val_f64(&self.available_balance)
-    }
-    pub fn portfolio_value(&self) -> Option<f64> {
-        val_f64(&self.portfolio_value)
-    }
 }
 
 #[cfg(test)]
@@ -589,7 +456,7 @@ mod tests {
         let m: OrderBookMsg = serde_json::from_str(raw).unwrap();
         assert!(m.is_snapshot());
         assert_eq!(m.effective_offset(), Some(405053));
-        assert_eq!(m.order_book.bids[0].parsed(), (64820.2, 0.00051));
+        assert_eq!((m.order_book.bids[0].price.as_str(), m.order_book.bids[0].size.as_str()), ("64820.2", "0.00051"));
     }
 
     #[test]
@@ -618,7 +485,7 @@ mod tests {
                 assert_eq!(owned.effective_offset(), borrowed.effective_offset());
                 assert_eq!(owned.order_book.bids.len(), borrowed.order_book.bids.len());
                 for (o, b) in owned.order_book.bids.iter().zip(&borrowed.order_book.bids) {
-                    assert_eq!(o.parsed(), b.parsed());
+                    assert_eq!((&*o.price, &*o.size), (&*b.price, &*b.size));
                 }
                 }
         }
@@ -634,7 +501,7 @@ mod tests {
             "asks":[{"price":"101","size":"3"}],"offset":1}}"#;
         let m: OrderBookMsgRef<'_> = serde_json::from_str(raw).expect("escaped tag must parse");
         assert!(m.is_snapshot());
-        assert_eq!(m.order_book.bids[0].parsed(), (100.5, 2.0));
+        assert_eq!((&*m.order_book.bids[0].price, &*m.order_book.bids[0].size), ("100.5", "2"));
     }
 
     #[test]
@@ -646,17 +513,7 @@ mod tests {
         let btc = &r.order_books[0];
         assert_eq!(btc.market_id, 1);
         assert_eq!(btc.supported_price_decimals, 1);
-        assert_eq!(parse_f64(&btc.min_base_amount), 0.0002);
-    }
-
-    #[test]
-    fn position_sign() {
-        let p = PositionPayload {
-            position: Some("0.0050".into()),
-            sign: Some(-1),
-            avg_entry_price: None,
-        };
-        assert!((p.signed() + 0.005).abs() < 1e-12);
+        assert_eq!(btc.min_base_amount, "0.00020");
     }
 
     #[test]
@@ -685,17 +542,12 @@ mod tests {
         }"#;
         let msg: AccountAllMsg = serde_json::from_str(raw).unwrap();
         let t = &msg.trades["1"][0];
-        assert_eq!(t.trade_type.as_deref(), Some("trade"));
         assert_eq!(t.trade_id, Some(123));
         assert_eq!(t.ask_client_id, Some(111));
         assert_eq!(t.bid_client_id, Some(222));
         assert_eq!(t.ask_id, Some(11));
         assert_eq!(t.bid_id, Some(22));
         assert_eq!(t.event_time_ms(), Some(1_781_764_389_314));
-        assert!((t.price_f64().unwrap() - 64152.1).abs() < 1e-12);
-        assert!((t.size_f64().unwrap() - 0.00043).abs() < 1e-12);
-        assert!((t.usd_amount_f64().unwrap() - 27.585403).abs() < 1e-12);
-        assert!((t.ask_account_pnl_f64().unwrap() + 0.01).abs() < 1e-12);
-        assert!((t.bid_account_pnl_f64().unwrap() - 0.02).abs() < 1e-12);
+        assert_eq!((t.price.as_deref(), t.size.as_deref()), (Some("64152.1"), Some("0.00043")));
     }
 }

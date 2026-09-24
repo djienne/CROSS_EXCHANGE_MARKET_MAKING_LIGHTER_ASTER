@@ -26,5 +26,4 @@ pub mod status;
 pub mod strategy;
 pub mod userstream;
 
-pub use crate::config::{LiveCfg, LiveMode, PartialPolicy};
 pub use run::{run, STRATEGY_THREAD};

@@ -125,6 +125,7 @@ pub struct MakerGateInputs {
 
 impl MakerGateInputs {
     /// All-clear inputs (everything healthy) — a convenient test/base value.
+    #[cfg(test)]
     pub fn all_clear() -> Self {
         MakerGateInputs {
             clean_start_done: true,

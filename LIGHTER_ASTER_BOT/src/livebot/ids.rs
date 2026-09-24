@@ -1,17 +1,15 @@
-//! Deterministic client IDs. Idempotency and restart recovery are
-//! mandatory for a cross-exchange bot: every order carries an id we can recompute and
-//! query by, so a process that dies mid-hedge can ask the venue "did this fill?".
+//! Deterministic client IDs: every order carries an id we can recompute and query by, so
+//! an attempt whose outcome is unknown can ask the venue "did this fill?".
 //!
 //! - **Aster maker client id**: `X{session}-{market}-{B|S}-{epoch}` — unique per quote,
 //!   kept inside Aster's `newClientOrderId` charset/length budget (Binance-style
 //!   `^[A-Za-z0-9_:/.\-]{1,36}$`). Maker ids need not survive a restart (startup cancels
 //!   all Aster orders), only be unique within a session.
-//! - **Lighter hedge cloid** (a Hyperliquid-era name): a 128-bit id derived **purely** from
-//!   the exchange-supplied Aster fill identity `(aster_order_id, aster_trade_id, cumulative_filled_qty)` — every
-//!   input comes from the venue, NONE from a bot-side session counter — so it is
-//!   **session-independent**: re-processing the same fill after a restart yields the SAME
-//!   cloid, whose `client_order_index` finds the order in Lighter's history, so the fill is
-//!   never hedged twice (invariants 3 & 4).
+//! - **Lighter hedge cloid** (a Hyperliquid-era name): a 128-bit id per hedge attempt, from
+//!   `(session, market, attempt epoch)`, whose `client_order_index` finds the order in
+//!   Lighter's history. It does not survive a restart, and needs not: live refuses to start
+//!   after an unclean session until it is reviewed, and within a session the fill ledger
+//!   keeps a fill from being hedged twice.
 //!
 //! Hashing is a tiny inline FNV-1a (no new dependency, and stable across toolchains —
 //! `std`'s `DefaultHasher` is explicitly NOT stable, so it must not be used here).
@@ -45,8 +43,9 @@ impl SessionId {
         let n = u128::from_le_bytes(*u.as_bytes()) as u64;
         SessionId(base36(n, 6))
     }
-    /// Construct from an explicit tag (tests / reproducible runs). Sanitized to the
+    /// Construct from an explicit tag (tests). Sanitized to the
     /// allowed charset and clamped to 6 chars.
+    #[cfg(test)]
     pub fn from_tag(tag: &str) -> Self {
         let s: String = tag.chars().filter(|c| c.is_ascii_alphanumeric()).take(6).collect();
         SessionId(if s.is_empty() { "0".into() } else { s.to_ascii_lowercase() })
@@ -113,17 +112,10 @@ pub fn aster_client_id(session: &SessionId, market: &MarketId, side: Side, quote
 pub struct Cloid([u8; 16]);
 
 impl Cloid {
-    /// Deterministic hedge cloid from the Aster fill identity. SAME inputs ⇒ SAME cloid,
-    /// across restarts and processes — the basis for hedge idempotency / recovery (§8.2).
-    ///
-    /// CRITICAL: every input is **exchange-supplied and session-independent**: the order id,
-    /// the trade id, and the cumulative filled quantity (scaled to integer micro-units). It
-    /// must NOT depend on any bot-side session counter, or a restart that re-processes the
-    /// same fill would compute a different cloid and a recovery query by cloid would miss it.
-    /// `(order_id, trade_id)` uniquely identifies a fill; `cum_scaled` disambiguates the
-    /// rare case where the venue omits the trade id (mirrors [`super::fills::FillKey`]).
-    pub fn hedge(aster_order_id: &str, aster_trade_id: &str, cum_scaled: i64) -> Self {
-        let key = format!("XEMM-HEDGE-{aster_order_id}-{aster_trade_id}-{cum_scaled}");
+    /// Deterministic hedge-attempt cloid: SAME inputs ⇒ SAME cloid. The caller passes the
+    /// session, the market and a per-session attempt epoch, so each attempt is unique.
+    pub fn hedge(session: &str, market: &str, epoch: i64) -> Self {
+        let key = format!("XEMM-HEDGE-{session}-{market}-{epoch}");
         let lo = fnv1a64(key.as_bytes(), FNV_BASIS_A);
         let hi = fnv1a64(key.as_bytes(), FNV_BASIS_B);
         let mut b = [0u8; 16];
@@ -133,37 +125,14 @@ impl Cloid {
     }
 
     /// Deterministic RECOVERY cloid from a market + scaled net delta. Same inputs ⇒ same
-    /// cloid, so the STRATEGY can recognize (and skip) a re-dispatch for the same orphan net
-    /// while one is already in flight, by looking the cloid up in its own intent map.
+    /// cloid.
     ///
     /// IMPORTANT: the venue provides NO dedupe — Lighter keys orders on the derived
     /// `client_order_index` and happily accepts a reused one, which would cross-attribute
-    /// fills in the FillTracker. Uniqueness is therefore the STRATEGY's job: a redispatch
-    /// after a dangerous/Unknown attempt must use [`Cloid::recovery_attempt`] with a fresh
-    /// attempt number, never this base cloid again. Distinct from [`Cloid::hedge`] (the
-    /// `RECOVER` tag changes the hash).
+    /// fills in the FillTracker. Distinct from [`Cloid::hedge`] (the `RECOVER` tag changes
+    /// the hash).
     pub fn recovery(market: &MarketId, net_scaled: i64) -> Self {
         let key = format!("XEMM-RECOVER-{}-{net_scaled}", market.0);
-        Self::from_key(&key)
-    }
-
-    /// Attempt-salted recovery cloid: attempt 0 is the base [`Cloid::recovery`] id; each
-    /// re-dispatch after a dangerous (Unknown) attempt bumps the salt so the possibly-live
-    /// earlier order can never share a Lighter client_order_index with the new one.
-    pub fn recovery_attempt(market: &MarketId, net_scaled: i64, attempt: u32) -> Self {
-        if attempt == 0 {
-            return Self::recovery(market, net_scaled);
-        }
-        let key = format!("XEMM-RECOVER-{}-{net_scaled}-a{attempt}", market.0);
-        Self::from_key(&key)
-    }
-
-    /// FLATTEN cloid, salted with the dispatch time: flattens need no restart-recovery
-    /// identity (recovery is snapshot-driven; nothing queries Lighter by flatten id), and
-    /// per-dispatch uniqueness is what prevents FillTracker collisions between overlapping
-    /// flattens or an equal-sized recovery hedge (the venue does not dedupe indices).
-    pub fn flatten(market: &MarketId, qty_scaled: i64, dispatch_ns: i64) -> Self {
-        let key = format!("XEMM-FLATTEN-{}-{qty_scaled}-{dispatch_ns}", market.0);
         Self::from_key(&key)
     }
 
@@ -180,10 +149,6 @@ impl Cloid {
     /// (`hex::encode`) — this is on the fill→hedge hot path, so avoid the per-byte `format!` loop.
     pub fn to_hex(self) -> String {
         format!("0x{}", hex::encode(self.0))
-    }
-
-    pub fn bytes(self) -> [u8; 16] {
-        self.0
     }
 
     pub(crate) fn from_bytes_for_lighter(bytes: [u8; 16]) -> Self {
@@ -223,38 +188,6 @@ fn base36(mut n: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn flatten_cloid_distinct_from_recovery_same_inputs() {
-        let m: MarketId = "HYPE".into();
-        let recovery = Cloid::recovery(&m, 1_000_000);
-        let flatten = Cloid::flatten(&m, 1_000_000, 42);
-        assert_ne!(recovery.bytes(), flatten.bytes());
-        assert_ne!(
-            recovery.to_lighter_client_order_index(),
-            flatten.to_lighter_client_order_index(),
-            "an equal-sized flatten and recovery must never share a Lighter index"
-        );
-        // Flatten is additionally salted per dispatch time.
-        let flatten_later = Cloid::flatten(&m, 1_000_000, 43);
-        assert_ne!(flatten.bytes(), flatten_later.bytes());
-    }
-
-    #[test]
-    fn recovery_attempt_salt_changes_index() {
-        let m: MarketId = "HYPE".into();
-        let base = Cloid::recovery(&m, 5);
-        assert_eq!(Cloid::recovery_attempt(&m, 5, 0).bytes(), base.bytes());
-        let a1 = Cloid::recovery_attempt(&m, 5, 1);
-        let a2 = Cloid::recovery_attempt(&m, 5, 2);
-        assert_ne!(a1.bytes(), base.bytes());
-        assert_ne!(a1.bytes(), a2.bytes());
-        assert_ne!(
-            a1.to_lighter_client_order_index(),
-            a2.to_lighter_client_order_index(),
-            "each redispatch must get a fresh Lighter index"
-        );
-    }
 
     #[test]
     fn aster_id_is_unique_and_in_charset() {
@@ -301,7 +234,7 @@ mod tests {
         assert_eq!(h.len(), 34); // 0x + 32 hex
         assert!(h[2..].chars().all(|ch| ch.is_ascii_hexdigit()));
         // hex round-trips the bytes
-        let bytes = c.bytes();
+        let bytes = c.0;
         assert_eq!(&h[2..4], &format!("{:02x}", bytes[0]));
     }
 

@@ -105,7 +105,6 @@ pub struct LighterMarketMeta {
     pub symbol: String,
     pub size_decimals: u32,
     pub price_decimals: u32,
-    pub min_base_amount: Decimal,
     pub min_quote_amount: Decimal,
 }
 
@@ -123,7 +122,6 @@ pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &s
         .context("parsing Lighter orderBooks")?;
     let mut out = HashMap::new();
     for b in resp.order_books {
-        let min_base_amount = parse_dec(&b.min_base_amount).unwrap_or(Decimal::ZERO);
         let min_quote_amount = parse_dec(&b.min_quote_amount).unwrap_or(Decimal::ZERO);
         out.insert(
             b.symbol.to_ascii_uppercase(),
@@ -132,7 +130,6 @@ pub async fn fetch_lighter_meta_from_base(client: &reqwest::Client, base_url: &s
                 symbol: b.symbol,
                 size_decimals: b.supported_size_decimals,
                 price_decimals: b.supported_price_decimals,
-                min_base_amount,
                 min_quote_amount,
             },
         );

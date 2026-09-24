@@ -25,7 +25,6 @@ pub struct CommandBarrier {
 impl CommandBarrier {
     pub fn complete(&self, now_ns: i64) { self.completed_ns.store(now_ns, Ordering::Release); self.wake.notify_one(); }
     pub fn completed_ns(&self) -> i64 { self.completed_ns.load(Ordering::Acquire) }
-    pub async fn wait(&self) { while self.completed_ns() == 0 { self.wake.notified().await; } }
 }
 
 #[derive(Debug, Default)]
@@ -88,7 +87,6 @@ pub enum ExecCommand {
     /// Cancel a specific resting order.
     Cancel {
         market: MarketId,
-        side: Side,
         client_id: String,
         venue_order_id: Option<String>,
     },
@@ -98,7 +96,6 @@ pub enum ExecCommand {
         market: MarketId,
         side: Side,
         old_client_id: String,
-        old_venue_order_id: Option<String>,
         new_client_id: String,
         price_ticks: i64,
         qty_lots: i64,
@@ -142,14 +139,12 @@ pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
 /// `hyperliquid` name; there is no Hyperliquid venue).
 #[derive(Debug, Clone)]
 pub enum HedgeCommand {
-    /// Send an aggressive IOC hedge for this intent at `aggressive_px` with `slippage_bps`
-    /// as the acceptable cap. `emergency` selects the wider second-attempt slippage ladder.
+    /// Send an aggressive IOC hedge for this intent at `aggressive_px`, which the sender has
+    /// already priced with the normal or (for a retry) the wider emergency slippage.
     /// Residual corrections reuse this with a `ReduceDelta` intent.
     Hedge {
         intent: HedgeIntent,
         aggressive_px: Decimal,
-        slippage_bps: Decimal,
-        emergency: bool,
     },
     /// Drain and stop the worker.
     Shutdown,
@@ -198,14 +193,13 @@ pub enum ExecEvent {
     AttemptStarted { cloid: Cloid, proof: WireProof },
     AttemptNotSent { cloid: Cloid, reason: String },
     ExecutionProgress { cloid: Cloid, cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, cumulative_fee_usd: Option<Decimal>, terminal: bool, venue_order_id: Option<String>, event_time_ms: Option<i64> },
-    ExecutionTrade(ExecutionTrade),
     HedgeReject { cloid: Cloid, reason: String },
     /// Hedge outcome is ambiguous: the request may have reached Hyperliquid, but
     /// the worker did not receive a definitive response. The strategy must freeze
     /// and reconcile by deterministic cloid/position before any retry.
     HedgeUnknown { cloid: Cloid, reason: String },
-    AsterFlattenAck { cloid: Cloid, market: MarketId, side: Side, qty: Decimal },
-    AsterFlattenReject { cloid: Cloid, market: MarketId, side: Side, qty: Decimal, reason: String, terminal: bool },
+    AsterFlattenAck { cloid: Cloid },
+    AsterFlattenReject { cloid: Cloid, reason: String, terminal: bool },
 }
 
 /// Default bounded depth of each command queue. Deep enough to absorb a quoting burst, small

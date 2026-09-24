@@ -101,7 +101,6 @@ impl Tap {
             asks,
             scale,
             self.qty_scale,
-            0,
             recv_ns,
             exch_ts.timestamp_millis(),
         );
@@ -130,7 +129,6 @@ impl Tap {
             asks,
             scale,
             self.qty_scale,
-            0,
             recv_ns,
             exch_ts.timestamp_millis(),
         );
@@ -178,7 +176,6 @@ impl Tap {
                             &book,
                             scale,
                             self.qty_scale,
-                            0,
                             recv_ns,
                         )
                     });
@@ -224,7 +221,6 @@ impl Tap {
                             &book,
                             scale,
                             self.qty_scale,
-                            0,
                             recv_ns,
                         )
                     });
@@ -259,7 +255,6 @@ impl Tap {
                         &book,
                         scale,
                         self.qty_scale,
-                        0,
                         recv_ns,
                     )
                 });

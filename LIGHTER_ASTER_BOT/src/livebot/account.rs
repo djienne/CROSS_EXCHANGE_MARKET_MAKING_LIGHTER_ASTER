@@ -18,15 +18,6 @@ pub enum Venue {
     Hyperliquid,
 }
 
-impl Venue {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Venue::Aster => "aster",
-            Venue::Hyperliquid => "hyperliquid",
-        }
-    }
-}
-
 /// A reconciled signed position on one venue for one market. `signed_qty > 0` long.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScaledPosition {
@@ -62,7 +53,6 @@ impl OpenOrderSnapshot {
 #[derive(Debug, Clone)]
 pub struct AccountSnapshot {
     pub aster_available_usd: Decimal,
-    pub aster_wallet_usd: Decimal,
     pub aster_margin_source_ns: i64,
     pub hl_margin_source_ns: i64,
     pub hl_withdrawable_usd: Decimal,
@@ -101,7 +91,6 @@ impl AccountSnapshot {
     pub fn empty() -> Self {
         AccountSnapshot {
             aster_available_usd: Decimal::ZERO,
-            aster_wallet_usd: Decimal::ZERO,
             aster_margin_source_ns: 0,
             hl_margin_source_ns: 0,
             hl_withdrawable_usd: Decimal::ZERO,
@@ -138,17 +127,6 @@ impl AccountSnapshot {
             .find(|p| &p.market == market)
             .map(|p| p.signed_qty)
             .unwrap_or(Decimal::ZERO)
-    }
-
-    /// Bot-owned open orders not matched to any expected client id — the "unknown open
-    /// order" set the clean-start invariant (§8.1 inv 7) must be empty over.
-    pub fn unknown_bot_orders<'a>(
-        &'a self,
-        known: &'a std::collections::HashSet<String>,
-    ) -> impl Iterator<Item = &'a OpenOrderSnapshot> + 'a {
-        self.open_orders.iter().filter(move |o| {
-            o.is_bot_order() && o.client_id.as_deref().is_some_and(|c| !known.contains(c))
-        })
     }
 }
 
@@ -220,12 +198,10 @@ impl AccountState {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
-    use std::collections::HashSet;
 
     fn snap() -> AccountSnapshot {
         AccountSnapshot {
             aster_available_usd: dec!(1000),
-            aster_wallet_usd: dec!(1000),
             aster_margin_source_ns: 1,
             hl_margin_source_ns: 1,
             hl_withdrawable_usd: dec!(900),
@@ -277,19 +253,6 @@ mod tests {
         assert_eq!(s.reported_position(Venue::Aster, &"BTC".into()), dec!(0.5));
         assert_eq!(s.reported_position(Venue::Hyperliquid, &"BTC".into()), dec!(-0.5));
         assert_eq!(s.reported_position(Venue::Aster, &"ETH".into()), dec!(0)); // absent
-    }
-
-    #[test]
-    fn unknown_bot_orders_excludes_known_and_manual() {
-        let s = snap();
-        // No known ids: our Xabc order is unknown; the manual order is not a bot order.
-        let known: HashSet<String> = HashSet::new();
-        let unknown: Vec<_> = s.unknown_bot_orders(&known).collect();
-        assert_eq!(unknown.len(), 1);
-        assert_eq!(unknown[0].client_id.as_deref(), Some("Xabc-BTC-B-0"));
-        // Once we know that id, the unknown set is empty (clean start).
-        let known: HashSet<String> = ["Xabc-BTC-B-0".to_string()].into_iter().collect();
-        assert_eq!(s.unknown_bot_orders(&known).count(), 0);
     }
 
     #[test]

@@ -29,16 +29,13 @@ const NUM_BUCKETS: usize = BOUNDARIES.len() + 1; // 15 bounded + 1 overflow
 
 pub struct LatencyHistogram {
     buckets: [AtomicU64; NUM_BUCKETS],
-    sum_ns: AtomicU64,
     count: AtomicU64,
 }
 
 pub struct HistSnapshot {
     pub p50_us: u64,
-    pub p90_us: u64,
     pub p99_us: u64,
     pub count: u64,
-    pub mean_us: u64,
 }
 
 impl LatencyHistogram {
@@ -47,7 +44,6 @@ impl LatencyHistogram {
         const ZERO: AtomicU64 = AtomicU64::new(0);
         LatencyHistogram {
             buckets: [ZERO; NUM_BUCKETS],
-            sum_ns: ZERO,
             count: ZERO,
         }
     }
@@ -56,7 +52,6 @@ impl LatencyHistogram {
     pub fn record(&self, duration_ns: u64) {
         let idx = BOUNDARIES.iter().position(|&b| duration_ns < b).unwrap_or(BOUNDARIES.len());
         self.buckets[idx].fetch_add(1, Ordering::Relaxed);
-        self.sum_ns.fetch_add(duration_ns, Ordering::Relaxed);
         self.count.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -66,25 +61,21 @@ impl LatencyHistogram {
             bucket_counts[i] = b.load(Ordering::Relaxed);
         }
         let total = self.count.load(Ordering::Relaxed);
-        let sum = self.sum_ns.load(Ordering::Relaxed);
 
         if total == 0 {
-            return HistSnapshot { p50_us: 0, p90_us: 0, p99_us: 0, count: 0, mean_us: 0 };
+            return HistSnapshot { p50_us: 0, p99_us: 0, count: 0 };
         }
 
         let p50_us = percentile_us(&bucket_counts, total, 50);
-        let p90_us = percentile_us(&bucket_counts, total, 90);
         let p99_us = percentile_us(&bucket_counts, total, 99);
-        let mean_us = (sum / total) / 1_000;
 
-        HistSnapshot { p50_us, p90_us, p99_us, count: total, mean_us }
+        HistSnapshot { p50_us, p99_us, count: total }
     }
 
     pub fn reset(&self) {
         for b in &self.buckets {
             b.store(0, Ordering::Relaxed);
         }
-        self.sum_ns.store(0, Ordering::Relaxed);
         self.count.store(0, Ordering::Relaxed);
     }
 }
@@ -131,7 +122,6 @@ mod tests {
         let s = h.snapshot();
         assert_eq!(s.count, 1);
         assert_eq!(s.p50_us, 1); // upper bound of bucket 0 is 1µs
-        assert_eq!(s.mean_us, 0); // 500ns rounds to 0µs
     }
 
     #[test]
@@ -147,7 +137,7 @@ mod tests {
         let s = h.snapshot();
         assert_eq!(s.count, 100);
         assert_eq!(s.p50_us, 1);       // 50th pct in the 500ns bucket
-        assert_eq!(s.p90_us, 10_000);  // 90th pct: 5M ns >= 5M boundary → lands in <10ms bucket
+        assert_eq!(s.p99_us, 10_000);  // 99th pct: 5M ns >= 5M boundary → lands in <10ms bucket
     }
 
     #[test]

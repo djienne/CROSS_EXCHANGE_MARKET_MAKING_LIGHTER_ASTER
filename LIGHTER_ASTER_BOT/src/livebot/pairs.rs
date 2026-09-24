@@ -44,8 +44,6 @@ pub struct PairClassification {
     pub aster_min_fill_qty: Decimal,
     /// Minimum HL-hedgeable quantity at the reference price.
     pub hl_min_hedge_qty: Decimal,
-    /// The desired quote quantity (floored to a whole step).
-    pub desired_qty: Decimal,
 }
 
 /// Classify a market at `ref_px` for a `desired_notional` quote.
@@ -55,7 +53,6 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
             class: PairClass::D,
             aster_min_fill_qty: Decimal::ZERO,
             hl_min_hedge_qty: Decimal::ZERO,
-            desired_qty: Decimal::ZERO,
         };
     }
     let rules = HedgeabilityRules {
@@ -83,7 +80,6 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
         class,
         aster_min_fill_qty: aster_min_fill,
         hl_min_hedge_qty: hl_min,
-        desired_qty,
     }
 }
 

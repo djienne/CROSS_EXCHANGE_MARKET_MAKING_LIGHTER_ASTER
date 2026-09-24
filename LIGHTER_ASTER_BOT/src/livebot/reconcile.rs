@@ -356,7 +356,6 @@ impl Reconciler {
         };
         Ok(AccountSnapshot {
             aster_available_usd,
-            aster_wallet_usd,
             aster_margin_source_ns: read_start_ns,
             hl_margin_source_ns: ch.margin_source_ns,
             hl_withdrawable_usd,
@@ -394,7 +393,7 @@ impl Reconciler {
     /// (≤6 tries) so startup can't hang. With `require_clean_start`, a still-dirty book after the
     /// retries is a HARD error (refuse to quote into a dirty book). At startup the bot has placed
     /// nothing, so every `X…` order is by definition a prior-run stray (each run uses a fresh random
-    /// session id) — the empty-known-set analogue of [`AccountSnapshot::unknown_bot_orders`].
+    /// session id).
     pub async fn ensure_clean_start(&self, startup_cancel_all: bool, require_clean_start: bool) -> Result<()> {
         if startup_cancel_all {
             for market in self.aster_sym_to_market.values() {
@@ -625,7 +624,6 @@ mod tests {
             asset: asset.to_string(),
             balance: balance.to_string(),
             cross_wallet_balance: String::new(),
-            available_balance: String::new(),
         }
     }
 

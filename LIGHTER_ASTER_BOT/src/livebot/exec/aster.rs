@@ -58,8 +58,6 @@ pub struct AsterBalanceRow {
     pub balance: String,
     #[serde(rename = "crossWalletBalance", default)]
     pub cross_wallet_balance: String,
-    #[serde(rename = "availableBalance", default)]
-    pub available_balance: String,
 }
 
 /// A row of the signed `/fapi/v3/positionRisk` response.
@@ -298,11 +296,6 @@ impl AsterRest {
         };
         let body = self.signed_request(Method::GET, "/fapi/v3/openOrders", params).await?;
         serde_json::from_str(&body).map_err(|e| anyhow!("parse openOrders: {e}: {body}"))
-    }
-
-    /// The Aster symbol for a market (for probe display / position matching).
-    pub fn symbol_of(&self, market: &MarketId) -> Option<String> {
-        self.markets.get(market).map(|w| w.symbol.clone())
     }
 
     // --- user-data stream listenKey lifecycle (signed; NO listenKey param per V3 docs) ---
@@ -919,9 +912,7 @@ async fn process_cmd(
                 }).await;
                 match rest.flatten_result(&market, side, qty, &client_id).await {
                     Ok(body) => {
-                        let _ = tx.send(ExecEvent::AsterFlattenAck {
-                            cloid: intent.cloid, market, side, qty,
-                        }).await;
+                        let _ = tx.send(ExecEvent::AsterFlattenAck { cloid: intent.cloid }).await;
                         if let Some((filled, quote, terminal, order_id, event_time_ms)) = order_progress(&body) {
                             let _ = tx.send(ExecEvent::ExecutionProgress {
                                 cloid: intent.cloid, cumulative_qty: filled, cumulative_quote_usd: quote,
@@ -933,7 +924,7 @@ async fn process_cmd(
                         let reason = error.to_string();
                         if is_aster_rate_limit_reason(&reason) { rate_limit_reason = Some(reason.clone()); }
                         let _ = tx.send(ExecEvent::AsterFlattenReject {
-                            cloid: intent.cloid, market, side, qty, reason, terminal: definitive_no_fill(&error),
+                            cloid: intent.cloid, reason, terminal: definitive_no_fill(&error),
                         }).await;
                     }
                 }
@@ -1115,14 +1106,12 @@ mod tests {
         let m: MarketId = "BTC".into();
         assert!(is_priority_cmd(&ExecCommand::Cancel {
             market: m.clone(),
-            side: Side::Buy,
             client_id: "c".into(),
             venue_order_id: Some("42".into()),
         }));
         // Un-acked cancel: a Place for this id may still be queued — must stay FIFO (I1).
         assert!(!is_priority_cmd(&ExecCommand::Cancel {
             market: m.clone(),
-            side: Side::Buy,
             client_id: "c".into(),
             venue_order_id: None,
         }));
@@ -1189,7 +1178,7 @@ mod tests {
         first_rx.await.unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
         priority_tx.send(ExecCommand::Cancel {
-            market: "BTC".into(), side: Side::Buy, client_id: "urgent".into(),
+            market: "BTC".into(), client_id: "urgent".into(),
             venue_order_id: Some("2".into()),
         }).await.unwrap();
         let request = tokio::time::timeout(Duration::from_secs(1), server).await
@@ -1276,7 +1265,6 @@ mod tests {
         prio_tx
             .send(ExecCommand::Cancel {
                 market: "BTC".into(),
-                side: Side::Buy,
                 client_id: "C-prio".into(),
                 venue_order_id: Some("42".into()),
             })
@@ -1311,7 +1299,6 @@ mod tests {
         norm_tx
             .send(ExecCommand::Cancel {
                 market: "BTC".into(),
-                side: Side::Sell,
                 client_id: "C-late".into(),
                 venue_order_id: None,
             })

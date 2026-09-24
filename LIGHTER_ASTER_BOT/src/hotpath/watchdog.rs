@@ -54,7 +54,7 @@ impl TradingGate {
 /// An edge-triggered, lock-free "drop your socket and reconnect now" signal from the
 /// watchdog to one reader. Backed by `Notify::notify_one`, which stores a single
 /// permit when no reader is currently parked — so a request that races a
-/// reconnect-in-progress is NOT lost: the next [`ReconnectHandle::requested`] consumes
+/// reconnect-in-progress is NOT lost: the reader's next wait on [`ReconnectHandle::notify`] consumes
 /// the permit and reconnects. One handle drives exactly one reader, so the single-permit
 /// semantics are exact; repeated requests collapse to one pending reconnect (which is
 /// all that's needed). The 250ms watchdog re-request and the reader's idle timeout
@@ -69,8 +69,8 @@ impl ReconnectHandle {
         Self::default()
     }
     /// Ask the reader to reconnect. `notify_one` stores a permit if the reader is not
-    /// currently parked, closing the race where a request between two `requested()`
-    /// awaits would otherwise be dropped.
+    /// currently parked, closing the race where a request between two waits would
+    /// otherwise be dropped.
     pub fn request(&self) {
         self.notify.notify_one();
     }
@@ -78,11 +78,6 @@ impl ReconnectHandle {
     /// the same signal this handle triggers.
     pub fn notify(&self) -> Arc<Notify> {
         self.notify.clone()
-    }
-    /// Await a reconnect request — a `select!` arm in the reader. A `ReconnectHandle`
-    /// that nobody calls `request()` on simply never fires.
-    pub async fn requested(&self) {
-        self.notify.notified().await;
     }
 }
 
@@ -205,7 +200,7 @@ mod tests {
     async fn reconnect_handle_wakes_waiter() {
         let h = ReconnectHandle::new();
         let h2 = h.clone();
-        let waiter = tokio::spawn(async move { h2.requested().await });
+        let waiter = tokio::spawn(async move { h2.notify().notified().await });
         // Give the waiter a moment to park, then request.
         tokio::task::yield_now().await;
         h.request();
@@ -220,11 +215,11 @@ mod tests {
     async fn reconnect_request_is_buffered_when_no_waiter_parked() {
         // The race the notify_one fix closes: request() fires while the reader is NOT
         // parked (mid-frame/mid-reconnect). The stored permit makes the next
-        // requested() resolve immediately, rather than dropping the request (which
-        // notify_waiters would do, blocking requested() until the timeout below).
+        // wait resolve immediately, rather than dropping the request (which
+        // notify_waiters would do, blocking the wait until the timeout below).
         let h = ReconnectHandle::new();
         h.request(); // nobody is awaiting yet
-        tokio::time::timeout(Duration::from_secs(1), h.requested())
+        tokio::time::timeout(Duration::from_secs(1), h.notify().notified())
             .await
             .expect("a request with no parked reader must be buffered and delivered next");
     }

@@ -601,6 +601,7 @@ impl Exchange {
         }
     }
 
+    #[cfg(test)]
     pub fn now(&self) -> i64 {
         self.now
     }

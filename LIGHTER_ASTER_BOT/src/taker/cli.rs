@@ -11,7 +11,7 @@ use crate::taker::aster::sign::{AsterSigner, EvmAsterSigner};
 use crate::taker::config::Config;
 use crate::taker::connectors::rest_book;
 use crate::taker::connectors::rest_specs;
-use crate::taker::decimal::bps_to_rate;
+use crate::decimal::bps_to_rate;
 use crate::taker::types::Side;
 use crate::taker::venues::lighter::LighterVenue;
 use crate::taker::markets::MarketSpec;

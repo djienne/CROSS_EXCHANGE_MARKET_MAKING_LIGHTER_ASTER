@@ -3,7 +3,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -112,7 +112,6 @@ pub struct JournalRecord {
 #[derive(Default)]
 struct JournalState {
     unhealthy: AtomicBool,
-    dropped: AtomicU64,
     trip: OnceLock<super::breaker::TripSnapshot>,
     trip_path: OnceLock<PathBuf>,
     trip_wake: Notify,
@@ -131,6 +130,7 @@ pub struct Journal {
 }
 
 impl Journal {
+    #[cfg(test)]
     pub fn null() -> Self { Self { tx: None, state: Arc::new(JournalState::default()) } }
 
     pub fn channel() -> (Self, JournalReceiver) {
@@ -140,7 +140,6 @@ impl Journal {
     }
 
     pub fn healthy(&self) -> bool { !self.state.unhealthy.load(Ordering::Acquire) }
-    pub fn dropped(&self) -> u64 { self.state.dropped.load(Ordering::Acquire) }
     pub fn configure_trip_path(&self, path: PathBuf) { let _ = self.state.trip_path.set(path); }
 
     /// Called after the strategy has latched, frozen and dispatched cancellation.
@@ -156,7 +155,6 @@ impl Journal {
         let Some(tx) = &self.tx else { return };
         let ts_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
         if tx.try_send(JournalRecord { schema_version: 2, mono_ns, ts_ms, kind, market, detail, economic_status }).is_err() {
-            self.state.dropped.fetch_add(1, Ordering::Relaxed);
             self.state.unhealthy.store(true, Ordering::Release);
         }
     }

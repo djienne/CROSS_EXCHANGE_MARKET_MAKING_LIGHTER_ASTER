@@ -67,11 +67,6 @@ impl NonceManager {
         self.nonce.store(n - 1, Ordering::SeqCst);
         Ok(())
     }
-
-    #[inline]
-    pub fn api_key_index(&self) -> i32 {
-        self.api_key_index
-    }
 }
 
 #[cfg(test)]
@@ -96,7 +91,7 @@ mod tests {
         // The offline stub must never produce a plausible live nonce.
         let nm = NonceManager::offline(1, 0);
         assert!(nm.next() < 0);
-        assert_eq!(nm.api_key_index(), 0);
+        assert_eq!(nm.api_key_index, 0);
     }
 
     #[test]

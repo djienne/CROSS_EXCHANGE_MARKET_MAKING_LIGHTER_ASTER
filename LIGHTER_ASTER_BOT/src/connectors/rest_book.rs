@@ -131,10 +131,6 @@ fn ms_to_dt(ms: i64) -> chrono::DateTime<chrono::Utc> {
 /// the caller decides what divergence is actionable (tolerance, repeat count).
 #[derive(Debug, Clone)]
 pub struct BookComparison {
-    pub ws_bid: Option<Decimal>,
-    pub ws_ask: Option<Decimal>,
-    pub rest_bid: Option<Decimal>,
-    pub rest_ask: Option<Decimal>,
     pub ws_mid: Option<Decimal>,
     pub rest_mid: Option<Decimal>,
     /// `|ws_mid - rest_mid| / rest_mid` in basis points, if both mids exist.
@@ -145,7 +141,6 @@ pub struct BookComparison {
     /// (a feed whose top is right but whose hedge depth is stale or malformed).
     pub vwap_diff_bps: Option<Decimal>,
     pub ws_crossed: bool,
-    pub rest_crossed: bool,
 }
 
 impl BookComparison {
@@ -160,16 +155,11 @@ impl BookComparison {
         };
         let vwap_diff_bps = vwap_divergence_bps(ws, rest, vwap_size, rest_mid);
         BookComparison {
-            ws_bid: ws.best_bid().map(|l| l.px),
-            ws_ask: ws.best_ask().map(|l| l.px),
-            rest_bid: rest.best_bid().map(|l| l.px),
-            rest_ask: rest.best_ask().map(|l| l.px),
             ws_mid,
             rest_mid,
             mid_diff_bps,
             vwap_diff_bps,
             ws_crossed: ws.is_crossed(),
-            rest_crossed: rest.is_crossed(),
         }
     }
 }
@@ -265,6 +255,5 @@ mod tests {
         let rest = book(dec!(100.0), dec!(100.2));
         let c = BookComparison::compute(&ws, &rest, dec!(1));
         assert!(c.ws_crossed);
-        assert!(!c.rest_crossed);
     }
 }

@@ -96,8 +96,8 @@ pub struct VenueBook {
     /// generations, this also changes for coalesced size-only BBO updates.
     content_version: AtomicU64,
     /// Optional coalescing strategy wakeup. When a live strategy loop is attached
-    /// ([`VenueBook::with_wake`]) every `publish` calls `notify_one`, so the loop wakes
-    /// on the next book change instead of sleep-polling. `None` for a cell built with
+    /// ([`VenueBook::with_wake_and_dirty`]) every `publish` calls `notify_one`, so the loop
+    /// wakes on the next book change instead of sleep-polling. `None` for a cell built with
     /// [`VenueBook::new`].
     wake: Option<Arc<Notify>>,
     /// When set, each `publish`/`publish_hot` marks this market dirty in the shared
@@ -137,12 +137,6 @@ fn accept_exch_ts(atom: &AtomicI64, next_ms: i64) -> bool {
     }
 }
 
-impl Default for VenueBook {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VenueBook {
     /// Capture before reading a quote's books and compare again immediately before
     /// sending. Odd values are never admissible. Publishers are single-owner.
@@ -155,12 +149,14 @@ impl VenueBook {
         BookPublication(&self.content_version)
     }
 
+    #[cfg(test)]
     pub fn new() -> Self {
         Self::build(None)
     }
 
     /// Like [`new`] but wired to a shared coalescing strategy-wakeup handle: every
-    /// `publish` calls `wake.notify_one()`. Used only by the live bot's registry.
+    /// `publish` calls `wake.notify_one()`.
+    #[cfg(test)]
     pub fn with_wake(wake: Arc<Notify>) -> Self {
         Self::build(Some(wake))
     }
@@ -676,7 +672,7 @@ mod tests {
         assert_eq!(vb.content_version(), 2);
         let b = book_at(2_000, dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish(b.clone());
         vb.publish_hot(b.clone(), hot);
         vb.publish_hot_only(hot, b.exch_ts);
@@ -777,7 +773,7 @@ mod tests {
         assert!(vb.stream_down());
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish_hot(b, hot);
         assert!(!vb.stream_down(), "publish_hot must clear stream_down");
     }
@@ -879,7 +875,7 @@ mod tests {
         let vb = VenueBook::new();
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish_hot(b, hot);
         assert!(vb.load().is_some());
         let h = vb.load_hot();
@@ -894,7 +890,7 @@ mod tests {
         let vb = VenueBook::new();
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         let exch_ts = b.exch_ts.clone();
         vb.publish_hot_only(hot, exch_ts);
         assert!(vb.load_hot().is_some());
@@ -911,7 +907,7 @@ mod tests {
         let vb = VenueBook::new();
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish_bbo_hot_only(hot, b.exch_ts.clone());
         assert!(vb.load_bbo_hot().is_some());
         assert!(vb.has_hot_only_update());
@@ -931,7 +927,7 @@ mod tests {
         let vb = VenueBook::new();
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish_bbo_hot_only(hot, b.exch_ts.clone());
         assert!(vb.has_hot_only_update());
         let gen_before = vb.quote_generation();
@@ -961,7 +957,7 @@ mod tests {
         let vb = VenueBook::with_wake(wake.clone());
         let b = book(dec!(100));
         let scale = MarketScale { tick: dec!(0.1), step: dec!(0.001), hl_qty_step: dec!(0.001) };
-        let hot = build_hot_book(&b, &scale, 0, 12345);
+        let hot = build_hot_book(&b, &scale, 12345);
         vb.publish_hot(b, hot);
         assert_eq!(vb.generation(), 1);
         assert!(vb.last_book_ns() > 0);

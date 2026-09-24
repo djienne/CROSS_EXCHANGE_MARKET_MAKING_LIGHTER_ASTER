@@ -6,11 +6,6 @@ pub fn parse_dec(s: &str) -> Result<Decimal> {
         .map_err(|e| anyhow!("invalid decimal {s:?}: {e}"))
 }
 
-pub fn bps_to_rate(bps: Decimal) -> Decimal {
-    bps / Decimal::from(10_000)
-}
-
-
 pub fn trim_dec(d: Decimal) -> String {
     d.normalize().to_string()
 }
