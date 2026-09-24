@@ -5,6 +5,7 @@
 #
 # Run with (the mode is a command-line choice only):
 #   lighter_aster_bot run --config bot.toml --market HYPE --mode live
+#   lighter_aster_bot run --config bot.toml --market HYPE --mode dry-run   # see [dry_run]
 #
 # The engines' own commands read their table of this file, e.g.
 #   lighter_aster_bot taker run --config bot.toml --market HYPE --observe-only
@@ -242,3 +243,35 @@ lighter_symbol      = "BNB"
 [[maker.markets]]
 aster_symbol = "ETHUSDT"
 lighter_symbol      = "ETH"
+
+# `--mode dry-run`: the same bot, signing with a dry-run identity no venue knows, against
+# simulated Aster and Lighter venues on loopback. Live market data feeds them as a bot in AWS
+# Tokyo (ap-northeast-1) would see it; files go to runs/dry-run/. Latencies are [p50, p99] ms,
+# drawn lognormal. Fees and leverage are the engines' own keys above.
+[dry_run]
+# The simulated world is the real one delayed by shift_ms, which must cover this host's feed lag
+# (Europe: ~125 ms typical; one Aster aggTrade came ~220 ms late) plus the 250 ms lookahead that
+# matches takers against the worse of the two book states around them.
+shift_ms = 500
+seed     = 0
+aster_port   = 18081
+lighter_port = 18082
+aster_balance_usdt   = "200"
+lighter_balance_usdc = "200"
+# A request takes effect at this fraction of its round trip; 0.9 puts most of the latency before
+# matching (pessimistic until live acks calibrate it).
+effect_fraction = 0.9
+# latency.perps.trading benchmark from AWS Tokyo apne1-az4, 2026-09-23: post-only submit to
+# confirmation (Aster cancel p50 96).
+aster_rest_rtt_ms = [101, 164]
+lighter_rtt_ms    = [8, 36]
+# Lighter docs, account types: a Standard account's taker orders wait 300 ms (Premium 140).
+lighter_taker_delay_ms = 300
+# Estimates above the benchmark's network floors (Aster 0.4 ms, Lighter 2.9 ms); calibrate.
+aster_feed_ms        = [5, 30]
+lighter_feed_ms      = [5, 30]
+aster_user_stream_ms = [10, 50]
+lighter_account_ms   = [5, 30]
+# Hidden size ahead of us at our price, as a multiple of the visible size (Aster offers a HIDDEN
+# time in force); calibrate from the prints the visible book cannot explain.
+hidden_queue_multiplier = "0.5"

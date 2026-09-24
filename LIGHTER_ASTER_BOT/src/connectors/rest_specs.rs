@@ -36,28 +36,45 @@ fn client() -> Result<reqwest::Client> {
         .context("building http client")
 }
 
-/// Map of Aster symbol -> (tick, step, min_qty, min_notional).
+/// One symbol's order filters from Aster `exchangeInfo`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AsterFilters {
+    pub tick: Decimal,
+    pub step: Decimal,
+    pub min_qty: Decimal,
+    pub min_notional: Decimal,
+    /// PERCENT_PRICE `(multiplierDown, multiplierUp)`: buys at most mark × up, sells at least
+    /// mark × down.
+    pub percent_price: Option<(Decimal, Decimal)>,
+}
+
+/// Map of Aster symbol -> filters.
 pub async fn fetch_aster_exchange_info_from_base(
     client: &reqwest::Client,
     base_url: &str,
-) -> Result<HashMap<String, (Decimal, Decimal, Decimal, Decimal)>> {
+) -> Result<HashMap<String, AsterFilters>> {
     let url = endpoint(base_url, "/fapi/v3/exchangeInfo");
-    let info: ExchangeInfo = client
+    let body = client
         .get(&url)
         .send()
         .await
         .with_context(|| format!("GET Aster exchangeInfo from {base_url}"))?
         .error_for_status()?
-        .json()
-        .await
-        .context("parsing Aster exchangeInfo")?;
+        .text()
+        .await?;
+    parse_aster_exchange_info(&body)
+}
 
+/// The filters of every symbol in an `exchangeInfo` body that has a tick and a step.
+pub fn parse_aster_exchange_info(body: &str) -> Result<HashMap<String, AsterFilters>> {
+    let info: ExchangeInfo = serde_json::from_str(body).context("parsing Aster exchangeInfo")?;
     let mut out = HashMap::new();
     for s in info.symbols {
         let mut tick = None;
         let mut step = None;
         let mut min_qty = None;
         let mut min_notional = None;
+        let mut percent_price = None;
         for f in &s.filters {
             match f.get("filterType").and_then(|v| v.as_str()) {
                 Some("PRICE_FILTER") => tick = field_dec(f, "tickSize"),
@@ -66,19 +83,13 @@ pub async fn fetch_aster_exchange_info_from_base(
                     min_qty = field_dec(f, "minQty");
                 }
                 Some("MIN_NOTIONAL") => min_notional = field_dec(f, "notional"),
+                Some("PERCENT_PRICE") => percent_price = field_dec(f, "multiplierDown").zip(field_dec(f, "multiplierUp")),
                 _ => {}
             }
         }
         if let (Some(tick), Some(step)) = (tick, step) {
-            out.insert(
-                s.symbol,
-                (
-                    tick,
-                    step,
-                    min_qty.unwrap_or(step),
-                    min_notional.unwrap_or(Decimal::from(5)),
-                ),
-            );
+            let (min_qty, min_notional) = (min_qty.unwrap_or(step), min_notional.unwrap_or(Decimal::from(5)));
+            out.insert(s.symbol, AsterFilters { tick, step, min_qty, min_notional, percent_price });
         }
     }
     Ok(out)
@@ -142,7 +153,7 @@ pub async fn build_market_specs_with_bases(
 
     let mut specs = Vec::new();
     for m in markets {
-        let (tick, step, min_qty, min_notional) = aster
+        let AsterFilters { tick, step, min_qty, min_notional, .. } = aster
             .get(&m.aster_symbol)
             .copied()
             .ok_or_else(|| anyhow!("Aster symbol {} not found in exchangeInfo", m.aster_symbol))?;

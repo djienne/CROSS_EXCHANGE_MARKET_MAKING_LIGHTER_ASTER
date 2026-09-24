@@ -18,15 +18,178 @@ pub mod matching;
 pub mod server;
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use anyhow::{ensure, Context, Result};
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use self::account::AccountView;
 use self::clock::{wall_us, Latency};
 use self::feed::{Follower, Hub, Input};
-use self::matching::{Envelope, Event, Exchange, Order, Output, Reject, Reply, Venue};
+use self::matching::{Envelope, Event, Exchange, Fees, Filters, Order, Output, Reject, Reply, Request, SimParams, Venue, LOOKAHEAD_US};
+use crate::controller::BotConfig;
+use crate::decimal::parse_dec;
+use crate::lighter::messages::OrderBooksResponse;
+
+/// `[dry_run]` in bot.toml, where each value cites its source.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DryRunCfg {
+    pub shift_ms: i64,
+    pub seed: u64,
+    pub aster_port: u16,
+    pub lighter_port: u16,
+    pub aster_balance_usdt: Decimal,
+    pub lighter_balance_usdc: Decimal,
+    pub effect_fraction: f64,
+    pub aster_rest_rtt_ms: Latency,
+    pub lighter_rtt_ms: Latency,
+    pub lighter_taker_delay_ms: i64,
+    pub aster_feed_ms: Latency,
+    pub lighter_feed_ms: Latency,
+    pub aster_user_stream_ms: Latency,
+    pub lighter_account_ms: Latency,
+    pub hidden_queue_multiplier: Decimal,
+}
+
+impl DryRunCfg {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.shift_ms * 1_000 > LOOKAHEAD_US,
+            "[dry_run] shift_ms must exceed the {} ms matching lookahead plus this host's feed lag",
+            LOOKAHEAD_US / 1_000
+        );
+        ensure!((0.0..=1.0).contains(&self.effect_fraction), "[dry_run] effect_fraction must be within [0, 1]");
+        ensure!(self.lighter_taker_delay_ms >= 0, "[dry_run] lighter_taker_delay_ms must be >= 0");
+        ensure!(self.hidden_queue_multiplier >= Decimal::ZERO, "[dry_run] hidden_queue_multiplier must be >= 0");
+        ensure!(
+            self.aster_balance_usdt > Decimal::ZERO && self.lighter_balance_usdc > Decimal::ZERO,
+            "[dry_run] starting balances must be positive"
+        );
+        ensure!(self.aster_port != self.lighter_port || self.aster_port == 0, "[dry_run] the venues need different ports");
+        Ok(())
+    }
+
+    /// The core's parameters; `fees` (`[Aster, Lighter]`) and `leverage` come from the bot's own
+    /// keys, so the simulation charges what the strategy assumes.
+    pub fn sim_params(&self, fees: [Fees; 2], leverage: Decimal) -> SimParams {
+        SimParams {
+            shift_us: self.shift_ms * 1_000,
+            seed: self.seed,
+            effect_fraction: self.effect_fraction,
+            rtt: [self.aster_rest_rtt_ms, self.lighter_rtt_ms],
+            private: [self.aster_user_stream_ms, self.lighter_account_ms],
+            lighter_taker_delay_us: self.lighter_taker_delay_ms * 1_000,
+            hidden_queue_multiplier: self.hidden_queue_multiplier,
+            fees,
+            leverage,
+            balances: [self.aster_balance_usdt, self.lighter_balance_usdc],
+        }
+    }
+}
+
+/// The Aster stream the replica follows carries 20 levels a side.
+const ASTER_DEPTH: usize = 20;
+/// How long the live market data may take to give both replicas a book.
+const WARM_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Starts the simulated venues for `market` on loopback, fed by the live market data of the
+/// venues `cfg` points at, then points both engines at them: every venue URL, the dry-run
+/// identity, and the taker's files under `runs_dir`. Returns once both replicas hold a book.
+pub async fn start(dry: &DryRunCfg, cfg: &mut BotConfig, market: &crate::taker::config::MarketCfg, runs_dir: &Path) -> Result<()> {
+    let aster_base = cfg.maker.live.aster.base_url.trim_end_matches('/').to_string();
+    let lighter_base = cfg.maker.live.hyperliquid.base_url.trim_end_matches('/').to_string();
+    let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+    let fetch = |url: String| {
+        let request = http.get(url);
+        async move { request.send().await?.error_for_status()?.text().await }
+    };
+    let exchange_info = fetch(format!("{aster_base}/fapi/v3/exchangeInfo")).await.context("fetching Aster exchangeInfo")?;
+    let order_books = fetch(format!("{lighter_base}/api/v1/orderBooks")).await.context("fetching Lighter orderBooks")?;
+
+    let symbol = market.aster_symbol.to_ascii_uppercase();
+    let aster = crate::connectors::rest_specs::parse_aster_exchange_info(&exchange_info)?
+        .remove(&symbol)
+        .with_context(|| format!("Aster exchangeInfo has no {symbol}"))?;
+    let detail = serde_json::from_str::<OrderBooksResponse>(&order_books)
+        .context("parsing Lighter orderBooks")?
+        .order_books
+        .into_iter()
+        .find(|b| b.symbol.eq_ignore_ascii_case(&market.lighter_symbol))
+        .with_context(|| format!("Lighter orderBooks has no {}", market.lighter_symbol))?;
+    let lighter_market = detail.market_id.to_string();
+    let lighter = Filters {
+        tick: Decimal::new(1, detail.supported_price_decimals),
+        step: Decimal::new(1, detail.supported_size_decimals),
+        min_qty: parse_dec(&detail.min_base_amount)?,
+        min_notional: parse_dec(&detail.min_quote_amount)?,
+        percent_price: None,
+    };
+    // Fees are the bot's own keys (circular by construction); both engines must agree on the
+    // one they share.
+    let (edge, arb) = (&cfg.maker.edge, &cfg.taker.arb);
+    ensure!(
+        edge.taker_fee_bps == arb.lighter_taker_fee_bps,
+        "[maker.edge] taker_fee_bps and [taker.arb] lighter_taker_fee_bps are the same Lighter fee but differ"
+    );
+    let rate = |bps: Decimal| bps / Decimal::from(10_000);
+    let fees = [
+        Fees { maker: rate(edge.aster_maker_fee_bps), taker: rate(arb.aster_taker_fee_bps) },
+        // Lighter Standard accounts pay no maker fee, and the bot never makes on Lighter.
+        Fees { maker: Decimal::ZERO, taker: rate(arb.lighter_taker_fee_bps) },
+    ];
+    let leverage = cfg.maker.capital.leverage;
+
+    let mut core = Exchange::new(dry.sim_params(fees.clone(), leverage), wall_us());
+    let aster_filters = Filters {
+        tick: aster.tick,
+        step: aster.step,
+        min_qty: aster.min_qty,
+        min_notional: aster.min_notional,
+        percent_price: aster.percent_price,
+    };
+    core.add_market(Venue::Aster, &symbol, Some(ASTER_DEPTH), aster_filters);
+    core.add_market(Venue::Lighter, &lighter_market, None, lighter);
+    let shift = dry.shift_ms * 1_000;
+    let hubs = [
+        Arc::new(Mutex::new(Hub::new(shift, feed::aster_streams(&symbol)))),
+        Arc::new(Mutex::new(Hub::new(shift, [format!("order_book/{lighter_market}")]))),
+    ];
+    let (inputs, feed_rx) = mpsc::unbounded_channel();
+    let venues = Venues::start(core, feed_rx, hubs.clone(), [dry.aster_feed_ms, dry.lighter_feed_ms], dry.seed);
+    let aster_ws = crate::connectors::aster::ws_root(&aster_base);
+    let [aster_hub, lighter_hub] = hubs;
+    tokio::spawn(feed::aster_upstream(aster_ws, vec![symbol.clone()], shift, aster_hub, inputs.clone()));
+    let lighter_ws = crate::lighter::ws::stream_url(&lighter_base);
+    tokio::spawn(feed::lighter_upstream(lighter_ws, vec![lighter_market.clone()], shift, lighter_hub, inputs.clone()));
+    tokio::spawn(feed::aster_funding_poll(aster_base, vec![symbol.clone()], inputs));
+
+    let aster_url = serve(dry.aster_port, aster::Aster::new(venues.clone(), exchange_info, vec![symbol.clone()], leverage)).await?;
+    let lighter_fees = [fees[1].maker, fees[1].taker];
+    let lighter_url = serve(dry.lighter_port, lighter::Lighter::new(venues.clone(), order_books, vec![detail], lighter_fees, leverage)).await?;
+    let live = &mut cfg.maker.live;
+    (live.aster.base_url, live.hyperliquid.base_url, live.dry_run) = (aster_url.clone(), lighter_url.clone(), true);
+    let taker = &mut cfg.taker.venues;
+    (taker.aster_base_url, taker.lighter_base_url, taker.dry_run) = (aster_url.clone(), lighter_url.clone(), true);
+    cfg.taker.pnl.persist_dir = runs_dir.to_string_lossy().into_owned();
+
+    let markets = [(Venue::Aster, symbol.as_str()), (Venue::Lighter, lighter_market.as_str())];
+    tokio::time::timeout(WARM_TIMEOUT, venues.warm(&markets)).await.context("the live market data gave no book within 60 s")?;
+    tracing::info!("dry run: simulated Aster at {aster_url}, Lighter at {lighter_url}; the world is shifted {} ms", dry.shift_ms);
+    Ok(())
+}
+
+/// Serves `handler` on loopback `port` (0: any free port) and returns its URL.
+async fn serve<H: server::Handler>(port: u16, handler: H) -> Result<String> {
+    let listener = TcpListener::bind(("127.0.0.1", port)).await.with_context(|| format!("binding 127.0.0.1:{port}"))?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(server::serve(listener, Arc::new(handler)));
+    Ok(url)
+}
 
 enum Command {
     Call(Envelope, oneshot::Sender<Reply>),
@@ -79,6 +242,17 @@ impl Venues {
     pub fn follower(&self, venue: Venue, lane: u64, combined: bool) -> Follower {
         let v = venue.ix();
         Follower::new(self.hubs[v].clone(), self.feed_latency[v], self.seed ^ lane.rotate_left(32), combined)
+    }
+
+    /// Waits until each market's replica holds a book (the feed and the requests reach the core
+    /// on separate channels).
+    pub async fn warm(&self, markets: &[(Venue, &str)]) {
+        for &(venue, market) in markets {
+            let book = || Envelope { venue, lane: 0, weight: 0, orders: 0, nonce: None, request: Request::Book { market: market.into() } };
+            while matches!(self.call(book()).await, Reply::Reject(_)) {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }
 
@@ -138,19 +312,19 @@ async fn drive(
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::Path;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use std::time::Instant;
 
     use futures_util::StreamExt;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use serde_json::Value;
-    use tokio::net::TcpListener;
     use tokio_util::sync::CancellationToken;
 
     use super::aster::Aster;
     use super::feed::{aster_frame, aster_streams, forward, lighter_frame, Frame};
     use super::lighter::Lighter;
-    use super::matching::{Fees, Filters, Request, SimParams};
+    use super::matching::{Fees, Filters, SimParams};
     use super::*;
     use crate::hotpath::clock::mono_now_ns;
     use crate::lighter::messages::{OrderBooksResponse, TradePayload};
@@ -168,10 +342,12 @@ pub(crate) mod tests {
 
     /// Frames are stamped one shift in the past, so the core applies them at once.
     const SHIFT_MS: i64 = 50;
-    /// Lighter's `orderBooks`, cut to HYPE.
-    const ORDER_BOOKS: &str = r#"{"code":200,"order_books":[{"symbol":"HYPE","market_id":24,"status":"active","taker_fee":"0.0000","maker_fee":"0.0000","min_base_amount":"0.50","min_quote_amount":"10.000000","supported_size_decimals":2,"supported_price_decimals":4,"supported_quote_decimals":6}]}"#;
+    /// Lighter's `orderBooks`, cut to HYPE (minimum sizes as live on 2026-09-24).
+    const ORDER_BOOKS: &str = r#"{"code":200,"order_books":[{"symbol":"HYPE","market_id":24,"status":"active","taker_fee":"0.0000","maker_fee":"0.0000","min_base_amount":"0.07","min_quote_amount":"10.000000","supported_size_decimals":2,"supported_price_decimals":4,"supported_quote_decimals":6}]}"#;
+    /// Aster's `exchangeInfo` in the documented v3 shape, cut to HYPEUSDT.
+    const ASTER_EXCHANGE_INFO: &str = r#"{"timezone":"UTC","serverTime":1790235498000,"rateLimits":[{"rateLimitType":"REQUEST_WEIGHT","interval":"MINUTE","intervalNum":1,"limit":2400},{"rateLimitType":"ORDERS","interval":"MINUTE","intervalNum":1,"limit":1200}],"assets":[],"symbols":[{"symbol":"HYPEUSDT","pair":"HYPEUSDT","contractType":"PERPETUAL","status":"TRADING","baseAsset":"HYPE","quoteAsset":"USDT","marginAsset":"USDT","pricePrecision":3,"quantityPrecision":2,"filters":[{"filterType":"PRICE_FILTER","minPrice":"0.001","maxPrice":"100000","tickSize":"0.001"},{"filterType":"LOT_SIZE","stepSize":"0.01","maxQty":"100000","minQty":"0.01"},{"filterType":"MIN_NOTIONAL","notional":"5"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.0500","multiplierDown":"0.9500","multiplierDecimal":4}],"orderTypes":["LIMIT","MARKET"],"timeInForce":["GTC","IOC","FOK","GTX","HIDDEN"]}]}"#;
 
-    /// Both simulated venues on loopback: HYPE quoted 99 / 101 five deep, 1000 of collateral on
+    /// Both simulated venues on loopback: HYPE quoted 99 / 101 with 5 on each, 1000 of collateral on
     /// each, a few milliseconds away.
     pub(crate) struct World {
         pub(crate) aster: String,
@@ -179,13 +355,10 @@ pub(crate) mod tests {
         venues: Venues,
         inputs: mpsc::UnboundedSender<Input>,
         hubs: [Arc<Mutex<Hub>>; 2],
-    }
-
-    async fn serve<H: server::Handler>(handler: H) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(server::serve(listener, Arc::new(handler)));
-        url
+        /// The Aster top [`World::keep_fresh`] republishes.
+        aster_top: Mutex<(Decimal, Decimal)>,
+        /// The Lighter book's last nonce.
+        lighter_nonce: AtomicI64,
     }
 
     impl World {
@@ -204,8 +377,9 @@ pub(crate) mod tests {
                 balances: [dec!(1000), dec!(1000)],
             };
             let mut core = Exchange::new(params, wall_us());
-            let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), price_band: Some(dec!(0.05)) };
-            let lighter = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.5), min_notional: dec!(10), price_band: Some(dec!(0.05)) };
+            let band = Some((dec!(0.95), dec!(1.05)));
+            let aster = Filters { tick: dec!(0.001), step: dec!(0.01), min_qty: dec!(0.01), min_notional: dec!(5), percent_price: band };
+            let lighter = Filters { tick: dec!(0.0001), step: dec!(0.01), min_qty: dec!(0.07), min_notional: dec!(10), percent_price: band };
             core.add_market(Venue::Aster, "HYPEUSDT", Some(20), aster);
             core.add_market(Venue::Lighter, "24", None, lighter);
             let shift = SHIFT_MS * 1_000;
@@ -216,18 +390,13 @@ pub(crate) mod tests {
             let (inputs, feed) = mpsc::unbounded_channel();
             let venues = Venues::start(core, feed, hubs.clone(), [Latency::ZERO; 2], 1);
             let markets = serde_json::from_str::<OrderBooksResponse>(ORDER_BOOKS).unwrap().order_books;
-            let aster = serve(Aster::new(venues.clone(), "{}".into(), vec!["HYPEUSDT".into()], dec!(1))).await;
-            let lighter = serve(Lighter::new(venues.clone(), ORDER_BOOKS.into(), markets, [dec!(0); 2], dec!(1))).await;
-            let world = Self { aster, lighter, venues, inputs, hubs };
+            let aster = serve(0, Aster::new(venues.clone(), ASTER_EXCHANGE_INFO.into(), vec!["HYPEUSDT".into()], dec!(1))).await.unwrap();
+            let lighter = serve(0, Lighter::new(venues.clone(), ORDER_BOOKS.into(), markets, [dec!(0); 2], dec!(1))).await.unwrap();
+            let (aster_top, lighter_nonce) = (Mutex::new((dec!(99), dec!(101))), AtomicI64::new(1));
+            let world = Self { aster, lighter, venues, inputs, hubs, aster_top, lighter_nonce };
             world.aster_book(dec!(99), dec!(101));
             world.lighter_book(dec!(99), dec!(101));
-            // The feed and the requests reach the core on separate channels.
-            for (venue, market) in [(Venue::Aster, "HYPEUSDT"), (Venue::Lighter, "24")] {
-                let book = || Envelope { venue, lane: 0, weight: 0, orders: 0, nonce: None, request: Request::Book { market: market.into() } };
-                while matches!(world.venues.call(book()).await, Reply::Reject(_)) {
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-            }
+            world.venues.warm(&[(Venue::Aster, "HYPEUSDT"), (Venue::Lighter, "24")]).await;
             world
         }
 
@@ -261,6 +430,133 @@ pub(crate) mod tests {
             let text = format!(r#"{{"channel":"order_book:24","last_updated_at":{us},"offset":10,"order_book":{{"code":0,"asks":[{{"price":"{ask}","size":"5"}}],"bids":[{{"price":"{bid}","size":"5"}}],"offset":10,"nonce":1,"last_updated_at":{us},"begin_nonce":0}},"timestamp":{t},"type":"subscribed/order_book"}}"#);
             self.publish(lighter_frame(&text, SHIFT_MS * 1_000).unwrap().unwrap());
         }
+
+        /// A Lighter update that moves no level: it continues the nonce chain and the clock.
+        fn lighter_tick(&self) {
+            let begin = self.lighter_nonce.fetch_add(1, Ordering::Relaxed);
+            let (nonce, t) = (begin + 1, Self::due_ms());
+            let (us, offset) = (t * 1_000, nonce * 10);
+            let text = format!(r#"{{"channel":"order_book:24","last_updated_at":{us},"offset":{offset},"order_book":{{"code":0,"asks":[],"bids":[],"offset":{offset},"nonce":{nonce},"last_updated_at":{us},"begin_nonce":{begin}}},"timestamp":{t},"type":"update/order_book"}}"#);
+            self.publish(lighter_frame(&text, SHIFT_MS * 1_000).unwrap().unwrap());
+        }
+
+        /// Moves the Aster top; [`World::keep_fresh`] repeats it.
+        pub(crate) fn set_aster(&self, bid: Decimal, ask: Decimal) {
+            *self.aster_top.lock().unwrap() = (bid, ask);
+            self.aster_book(bid, ask);
+        }
+
+        /// Publishes both books every 100 ms, as the venues' streams tick: the bot's staleness
+        /// guards expect it.
+        pub(crate) fn keep_fresh(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+            let world = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    let (bid, ask) = *world.aster_top.lock().unwrap();
+                    world.aster_book(bid, ask);
+                    world.lighter_tick();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        }
+    }
+
+    /// The shipped bot.toml with `market` standing in for mainnet, and fast fixed latencies.
+    pub(crate) fn shipped_config(market: &World, dir: &Path) -> BotConfig {
+        std::fs::write(dir.join("bot.toml"), include_str!("../../bot.toml")).unwrap();
+        let mut cfg = BotConfig::load(&dir.join("bot.toml")).unwrap();
+        cfg.maker.live.aster.base_url = market.aster.clone();
+        cfg.maker.live.hyperliquid.base_url = market.lighter.clone();
+        let fixed = |ms: f64| Latency::try_from([ms, ms]).unwrap();
+        cfg.dry_run = Some(DryRunCfg {
+            shift_ms: 300,
+            seed: 1,
+            aster_port: 0,
+            lighter_port: 0,
+            aster_balance_usdt: dec!(200),
+            lighter_balance_usdc: dec!(200),
+            effect_fraction: 0.9,
+            aster_rest_rtt_ms: fixed(5.0),
+            lighter_rtt_ms: fixed(3.0),
+            lighter_taker_delay_ms: 300,
+            aster_feed_ms: fixed(1.0),
+            lighter_feed_ms: fixed(1.0),
+            aster_user_stream_ms: fixed(2.0),
+            lighter_account_ms: fixed(2.0),
+            hidden_queue_multiplier: dec!(0.5),
+        });
+        cfg
+    }
+
+    pub(crate) fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{label}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_leaves_both_engines_pointed_at_the_simulated_venues_only() {
+        let market = Arc::new(World::start().await);
+        let fresh = market.keep_fresh();
+        let dir = temp_dir("dry-run-start");
+        let mut cfg = shipped_config(&market, &dir);
+        let (dry, runs) = (cfg.dry_run.clone().unwrap(), dir.join("dry-run"));
+        let (taker_markets, _) = cfg.select("HYPE").unwrap();
+        start(&dry, &mut cfg, &taker_markets[0], &runs).await.unwrap();
+        fresh.abort();
+        let engines = format!("{:?} {:?}", cfg.maker, cfg.taker);
+        for venue in ["asterdex", "zklighter", &format!("\"{}\"", market.aster), &format!("\"{}\"", market.lighter)] {
+            assert!(!engines.contains(venue), "{venue} is still in the engines' config");
+        }
+        assert!(cfg.maker.live.dry_run && cfg.taker.venues.dry_run, "both engines sign with the dry-run identity");
+        assert_eq!(Path::new(&cfg.taker.pnl.persist_dir), runs);
+        let rest = RestClient::new(&cfg.taker.venues.lighter_base_url, 0).unwrap();
+        assert_eq!(rest.order_books().await.unwrap()[0].market_id, 24, "the simulated venue lists the real instruments");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The XEMM engine end to end on the dry-run venues: its resting Aster bid is filled by a sweep
+    /// and hedged by a Lighter IOC, and the journal reports one complete trade.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn xemm_quotes_is_filled_and_hedges_on_the_dry_run_venues() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let market = Arc::new(World::start().await);
+        let fresh = market.keep_fresh();
+        let dir = temp_dir("dry-run-xemm");
+        let mut cfg = shipped_config(&market, &dir);
+        let (dry, runs) = (cfg.dry_run.clone().unwrap(), dir.join("dry-run"));
+        let (taker_markets, maker_markets) = cfg.select("HYPE").unwrap();
+        start(&dry, &mut cfg, &taker_markets[0], &runs).await.unwrap();
+        let (stop, stem) = (CancellationToken::new(), runs.join("bot-HYPE"));
+        let xemm = tokio::spawn({
+            let (cfg, stop, stem) = (cfg.maker.clone(), stop.clone(), stem.clone());
+            async move { crate::livebot::run(&cfg, maker_markets, stem, stop).await }
+        });
+        let journal = crate::live_report::inferred_journal_path(&stem);
+        // Sells print through any bid the bot can quote (its edge keeps it under 99) until one fills.
+        let trade = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                market.aster_print(dec!(97.5), dec!(1), Side::Sell);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let trades = crate::live_report::summarize_path(&journal, None, None).map(|s| s.trades).unwrap_or_default();
+                if let Some(trade) = trades.into_iter().find(|t| t.lighter_qty > Decimal::ZERO) {
+                    break trade;
+                }
+            }
+        })
+        .await
+        .expect("no hedged maker fill within 60 s");
+        assert_eq!((trade.economic_status, trade.hedge_side), ("confirmed", Some(Side::Sell)), "{trade:?}");
+        assert!(trade.qty > Decimal::ZERO && trade.lighter_qty == trade.qty && trade.residual_qty.is_zero(), "{trade:?}");
+        assert!(trade.aster_px.is_some_and(|px| px < dec!(99)), "the maker fill is at the bot's own bid: {trade:?}");
+        assert_eq!(trade.lighter_px, Some(dec!(99)), "the hedge took the Lighter bid: {trade:?}");
+        assert!(trade.last_mono_ns - trade.first_mono_ns >= 300_000_000, "the hedge waited out the taker delay: {trade:?}");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(60), xemm).await.expect("the drain hung").unwrap().expect("a clean stop");
+        fresh.abort();
+        let summary = crate::live_report::summarize_path(&journal, None, None).unwrap();
+        assert_eq!((summary.trades.len(), summary.unmatched_fills, summary.qty_mismatches), (1, 0, 0), "{:?}", summary.trades);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     pub(crate) fn aster_signer() -> Arc<dyn AsterSigner> {
@@ -326,7 +622,7 @@ pub(crate) mod tests {
         world.aster_print(dec!(98.9), dec!(20), Side::Sell);
         let fill = tokio::time::timeout(Duration::from_secs(5), fills.recv()).await.unwrap().unwrap();
         assert_eq!((fill.client_id.as_str(), fill.aster_side, fill.last_fill_qty, fill.last_fill_px), ("q3", Side::Buy, dec!(0.1), dec!(99)));
-        assert_eq!(fill.commission, None, "a free maker fill carries no commission fields");
+        assert_eq!(fill.usd_fee(), Some(Decimal::ZERO), "a free maker fill carries no commission fields: none paid");
         shutdown.cancel();
 
         // Public streams, combined and raw, with the venue's timestamps moved by the shift.

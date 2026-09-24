@@ -25,12 +25,14 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Run the bot for one market: the taker holds execution rights while it has margin; a
-    /// reduce-only XEMM unwinds inventory when it does not. Sends REAL orders.
+    /// reduce-only XEMM unwinds inventory when it does not. Sends REAL orders in `--mode live`.
     Run {
         /// Market id, listed once in both [[taker.markets]] and [[maker.markets]] (e.g. HYPE).
         #[arg(long)]
         market: String,
-        /// live (required): real orders with the real credentials. A dry-run mode is planned.
+        /// Required. live: real orders with the real credentials, files in runs/. dry-run: the
+        /// same bot against simulated venues fed by live market data ([dry_run] in the config),
+        /// no credentials, files in runs/dry-run/.
         #[arg(long)]
         mode: String,
         /// Archive a latched bot breaker (`runs/bot-<M>.breaker.json`) and start.
@@ -102,7 +104,8 @@ fn parse_live_mode(s: &str) -> Result<crate::config::LiveMode> {
     use crate::config::LiveMode;
     match s.trim().to_ascii_lowercase().as_str() {
         "live" => Ok(LiveMode::Live),
-        other => anyhow::bail!("unknown --mode {other:?} (expected live)"),
+        "dry-run" => Ok(LiveMode::DryRun),
+        other => anyhow::bail!("unknown --mode {other:?} (expected live or dry-run)"),
     }
 }
 

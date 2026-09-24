@@ -80,8 +80,9 @@ pub struct Filters {
     pub step: Decimal,
     pub min_qty: Decimal,
     pub min_notional: Decimal,
-    /// PERCENT_PRICE: buys at most mark × (1 + band), sells at least mark × (1 − band).
-    pub price_band: Option<Decimal>,
+    /// PERCENT_PRICE `(down, up)` multipliers: buys at most mark × up, sells at least
+    /// mark × down.
+    pub percent_price: Option<(Decimal, Decimal)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -439,10 +440,10 @@ fn check_filters(f: &Filters, spec: &OrderSpec, mark: Option<Decimal>) -> Result
         if price <= Decimal::ZERO || off(price, f.tick) {
             return Err(Reject::TickSize);
         }
-        if let (Some(band), Some(mark)) = (f.price_band, mark) {
+        if let (Some((down, up)), Some(mark)) = (f.percent_price, mark) {
             let outside = match spec.side {
-                Side::Buy => price > mark * (Decimal::ONE + band),
-                Side::Sell => price < mark * (Decimal::ONE - band),
+                Side::Buy => price > mark * up,
+                Side::Sell => price < mark * down,
             };
             if outside {
                 return Err(Reject::PriceBand);
@@ -1137,7 +1138,7 @@ mod tests {
                 step: dec!(0.01),
                 min_qty: dec!(0.01),
                 min_notional: dec!(5),
-                price_band: Some(dec!(0.02)),
+                percent_price: Some((dec!(0.98), dec!(1.02))),
             };
             ex.add_market(Venue::Aster, HYPE, Some(20), filters.clone());
             ex.add_market(Venue::Lighter, HYPE, None, filters);

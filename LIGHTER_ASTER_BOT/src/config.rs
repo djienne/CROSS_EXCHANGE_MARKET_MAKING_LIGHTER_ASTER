@@ -133,20 +133,23 @@ impl Default for BookCheckCfg {
     }
 }
 
-/// Execution mode for the bot. One mode: `Live` (a single market, real funds, hard-gated
-/// behind `enabled = true`, explicit live mode, single-market selection, and a wired signer).
-/// The mode comes from the command line only (`--mode`); the config has no mode key.
+/// Execution mode of `run`, from the command line only (`--mode`); the config has no mode key.
+/// Both modes run the same engines on one market.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
 pub enum LiveMode {
     /// Real signed orders on Aster + Lighter. Real funds. Hard-gated.
     Live,
+    /// The simulated venues of `dryrun`, fed by live market data, and a dry-run identity no
+    /// venue knows: nothing can reach a real account.
+    DryRun,
 }
 
 impl LiveMode {
     pub fn as_str(self) -> &'static str {
         match self {
             LiveMode::Live => "live",
+            LiveMode::DryRun => "dry-run",
         }
     }
     /// True only for the mode that sends real orders.

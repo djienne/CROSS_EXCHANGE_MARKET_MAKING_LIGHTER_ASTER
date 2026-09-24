@@ -297,6 +297,11 @@ impl Aster {
             }
             _ => {}
         }
+        // Every endpoint served past here is signed (the bot signs all of them), so an unsigned
+        // request is for a public endpoint this venue lacks: 404 and a WARN, not a signature error.
+        if !params.contains_key("signature") {
+            return Err(NOT_FOUND);
+        }
         self.verify(request, &params)?;
         let symbol = get("symbol");
         match (request.method.as_str(), request.path.as_str()) {

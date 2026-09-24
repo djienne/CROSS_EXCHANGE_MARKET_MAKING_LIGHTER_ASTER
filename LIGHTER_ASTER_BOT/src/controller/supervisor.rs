@@ -26,6 +26,7 @@ use tokio_util::sync::CancellationToken;
 use super::regime::{py_decimal, Bot, Decision, ReduceLease, Regime, Target, TakerMode, TAKER_BOT, XEMM_BOT};
 use super::risk::{EquityTracker, RealizedTrades};
 use super::{iso, ControllerCfg, EventLog};
+use crate::config::LiveMode;
 use crate::taker::arb::{ExecutionLease, ReduceSignal};
 use crate::taker::pnl::write_json_atomic;
 
@@ -155,7 +156,7 @@ fn slot(bot: Bot) -> usize {
 pub struct Supervisor<E: Engines> {
     cfg: ControllerCfg,
     market: String,
-    live: bool,
+    run_mode: LiveMode,
     files: Files,
     engines: E,
     events: EventLog,
@@ -191,7 +192,7 @@ impl<E: Engines> Supervisor<E> {
     pub fn new(
         cfg: ControllerCfg,
         market: String,
-        live: bool,
+        run_mode: LiveMode,
         files: Files,
         taker_ledger: PathBuf,
         engines: E,
@@ -215,7 +216,7 @@ impl<E: Engines> Supervisor<E> {
             regime: Regime::new(cfg.thresholds()),
             cfg,
             market,
-            live,
+            run_mode,
             files,
             engines,
             events,
@@ -245,14 +246,12 @@ impl<E: Engines> Supervisor<E> {
     }
 
     pub async fn run(mut self) -> Result<()> {
-        self.events.emit("bot_started", json!({"market": self.market, "live": self.live}));
+        self.events.emit("bot_started", json!({"market": self.market, "run_mode": self.run_mode.as_str()}));
         self.trades.prime();
-        if self.live {
-            // In-process engines die with the process: a crash can leave orders resting, so
-            // no engine starts until both venues are verified clear.
-            if let Err(status) = self.verify_orders_clear(STARTUP_ORDERS_CLEAR_TIMEOUT).await {
-                self.safe_halt("startup_orders_not_clear", json!({"xemm_status": status})).await;
-            }
+        // In-process engines die with the process: a crash can leave orders resting, so no
+        // engine starts until both venues are verified clear.
+        if let Err(status) = self.verify_orders_clear(STARTUP_ORDERS_CLEAR_TIMEOUT).await {
+            self.safe_halt("startup_orders_not_clear", json!({"xemm_status": status})).await;
         }
         let mut next_tick = Instant::now();
         while !self.stopping() {
@@ -743,7 +742,7 @@ impl<E: Engines> Supervisor<E> {
         let field = |status: Option<&Value>, key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);
         let lease = self.regime.lease.as_ref();
         let state = json!({
-            "timestamp": iso(now), "market": self.market, "live": self.live,
+            "timestamp": iso(now), "market": self.market, "run_mode": self.run_mode.as_str(),
             "active_bot": self.regime.active.map(Bot::label),
             "active_taker_mode": (self.regime.active == Some(Bot::Taker)).then(|| self.regime.taker_mode.as_str()),
             "observer": {
@@ -866,7 +865,7 @@ mod tests {
         let fake = Fake { shared: shared.clone(), on_stop: on_stop.iter().copied().collect(), exit_at_once };
         let files = Files::new(&dir, "HYPE");
         let events = EventLog::new(files.events.clone());
-        let sup = Supervisor::new(ControllerCfg::default(), "HYPE".into(), true, files, dir.join("trades_HYPE.jsonl"), fake, events, CancellationToken::new());
+        let sup = Supervisor::new(ControllerCfg::default(), "HYPE".into(), LiveMode::Live, files, dir.join("trades_HYPE.jsonl"), fake, events, CancellationToken::new());
         (sup, shared, dir)
     }
 

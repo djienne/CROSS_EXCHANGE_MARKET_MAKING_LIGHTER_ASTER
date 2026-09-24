@@ -128,7 +128,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 anyhow::bail!("no markets selected");
             }
             let _lock = match (observe_only, selected.as_slice()) {
-                (false, [market]) => Some(crate::controller::lock_market(&market.id().0)?),
+                (false, [market]) => {
+                    Some(crate::controller::lock_market(std::path::Path::new(crate::controller::RUNS_DIR), &market.id().0)?)
+                }
                 _ => None,
             };
             let stop = crate::controller::stop_on_signals();

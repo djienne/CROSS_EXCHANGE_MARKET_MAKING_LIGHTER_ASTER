@@ -386,7 +386,9 @@ fn fill_from_update(update: AsterTradeUpdate<'_>, sym_to_market: &HashMap<String
         cum_filled_qty: o.cum_filled_qty.parse().unwrap_or(last_fill_qty),
         event_time_ms: if o.trade_time_ms > 0 { o.trade_time_ms } else { update.event_time_ms },
         reduce_only: o.reduce_only,
-        commission: o.commission.and_then(|value| value.parse::<Decimal>().ok()),
+        // The venue documents `n`/`N` as "will not push if no commission": a fill without them
+        // paid none. An unparseable `n` stays unknown.
+        commission: o.commission.map_or(Some(Decimal::ZERO), |value| value.parse::<Decimal>().ok()),
         commission_asset: o.commission_asset.map(str::to_owned),
     })
 }
@@ -441,6 +443,7 @@ mod tests {
         assert_eq!(f.trade_id, "trade-xyz");
         assert_eq!(f.event_time_ms, 1700000000999);
         assert!(f.reduce_only);
+        assert_eq!(f.usd_fee(), Some(Decimal::ZERO), "no commission pushed: none paid");
     }
 
     #[test]

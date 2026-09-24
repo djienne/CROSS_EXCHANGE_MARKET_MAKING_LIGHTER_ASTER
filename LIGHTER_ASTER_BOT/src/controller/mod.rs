@@ -119,11 +119,13 @@ impl ControllerCfg {
 }
 
 /// bot.toml: `[controller]`, plus each engine's full config under `[taker]` and `[maker]`
-/// (the standalone `taker ...` and XEMM commands read their own table of the same file).
+/// (the standalone `taker ...` and XEMM commands read their own table of the same file), and
+/// the simulated venues of `--mode dry-run` under `[dry_run]`.
 pub struct BotConfig {
     pub controller: ControllerCfg,
     pub taker: crate::taker::config::Config,
     pub maker: crate::config::Config,
+    pub dry_run: Option<crate::dryrun::DryRunCfg>,
 }
 
 impl BotConfig {
@@ -131,6 +133,7 @@ impl BotConfig {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading config {}", path.display()))?;
         let mut value: toml::Value = toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
         let table = value.as_table_mut().context("config is not a TOML table")?;
+        let dry_run = table.remove("dry_run");
         let mut take = |name: &str| table.remove(name).with_context(|| format!("{} has no [{name}] table", path.display()));
         let (controller, taker, maker) = (take("controller")?, take("taker")?, take("maker")?);
         if let Some(extra) = table.keys().next() {
@@ -138,10 +141,16 @@ impl BotConfig {
         }
         let controller: ControllerCfg = crate::config::strict_from_toml(controller).context("[controller]")?;
         controller.validate()?;
+        let dry_run: Option<crate::dryrun::DryRunCfg> =
+            dry_run.map(crate::config::strict_from_toml).transpose().context("[dry_run]")?;
+        if let Some(dry_run) = &dry_run {
+            dry_run.validate()?;
+        }
         Ok(Self {
             controller,
             taker: crate::taker::config::Config::from_table(taker).context("[taker]")?,
             maker: crate::config::Config::from_table(maker).context("[maker]")?,
+            dry_run,
         })
     }
 
@@ -162,19 +171,38 @@ impl BotConfig {
 }
 
 /// `run`: both engines for `market`, execution rights switched in memory. Returns `Err` on a
-/// safe halt or an unresolved engine stop, `Ok` after a clean signal-driven stop.
+/// safe halt or an unresolved engine stop, `Ok` after a clean signal-driven stop; a halted
+/// dry run instead stays parked until stopped.
 pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool, reset_baseline: bool, stop: CancellationToken) -> Result<()> {
-    let market = market.to_ascii_uppercase();
     let cfg = BotConfig::load(config)?;
+    run_with(cfg, Path::new(RUNS_DIR), market, mode, ack_breaker, reset_baseline, stop).await
+}
+
+/// [`run`] with the config loaded and the runs directory given.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_with(
+    mut cfg: BotConfig,
+    runs_root: &Path,
+    market: &str,
+    mode: LiveMode,
+    ack_breaker: bool,
+    reset_baseline: bool,
+    stop: CancellationToken,
+) -> Result<()> {
+    let market = market.to_ascii_uppercase();
     let (taker_markets, maker_markets) = cfg.select(&market)?;
     let live = mode.is_real();
-    let _lock = if live { Some(lock_market(&market)?) } else { None };
+    // Live and dry-run never share a file.
+    let runs_dir = if live { runs_root.to_path_buf() } else { runs_root.join("dry-run") };
+    let _lock = lock_market(&runs_dir, &market)?;
     if live {
         refuse_insecure_env_files()?;
-        refuse_legacy_stack(&market, &[Path::new(RUNS_DIR), Path::new("../runs")])?;
+        refuse_legacy_stack(&market, &[runs_root, Path::new("../runs")])?;
+    } else {
+        let dry_run = cfg.dry_run.clone().context("--mode dry-run needs a [dry_run] table in the config")?;
+        crate::dryrun::start(&dry_run, &mut cfg, &taker_markets[0], &runs_dir).await?;
     }
-    let files = supervisor::Files::new(Path::new(RUNS_DIR), &market);
-    std::fs::create_dir_all(RUNS_DIR)?;
+    let files = supervisor::Files::new(&runs_dir, &market);
     let mut events = EventLog::new(files.events.clone());
     risk::check_breaker(&files.breaker, ack_breaker, reset_baseline, &mut events)?;
     if reset_baseline && files.baseline.exists() {
@@ -183,7 +211,15 @@ pub async fn run(config: &Path, market: &str, mode: LiveMode, ack_breaker: bool,
     }
     let taker_ledger = crate::taker::pnl::ledger_path(&cfg.taker.pnl, &taker_markets[0].id());
     let engines = engines::LiveEngines::new(&cfg, &market, taker_markets, maker_markets, files.xemm_stem.clone()).await?;
-    supervisor::Supervisor::new(cfg.controller, market, live, files, taker_ledger, engines, events, stop).run().await
+    let parked = stop.clone();
+    let result = supervisor::Supervisor::new(cfg.controller, market, mode, files, taker_ledger, engines, events, stop).run().await;
+    if let (false, Err(error)) = (live, &result) {
+        // Exiting would let a restart policy resume it unreviewed; a deliberate restart is
+        // the review.
+        warn!("dry run halted, parked until stopped: {error:#}");
+        parked.cancelled().await;
+    }
+    result
 }
 
 /// Live refuses credential files readable by group or other (mode must be 600).
@@ -233,14 +269,14 @@ fn refuse_legacy_stack(market: &str, dirs: &[&Path]) -> Result<()> {
     Ok(())
 }
 
-/// Exclusive per-market lock held by every live writer (`run`, `taker run`): two writers on one
-/// account and market break client-order-index uniqueness, nonce sequencing and position
-/// accounting. The OS drops the lock with the process, so it never goes stale. Ponytail: keyed
-/// by `runs/` under the working directory, so a writer started from another directory is not
-/// excluded.
-pub fn lock_market(market: &str) -> Result<File> {
-    std::fs::create_dir_all(RUNS_DIR)?;
-    let path = Path::new(RUNS_DIR).join(format!("bot-{}.lock", market.to_ascii_uppercase()));
+/// Exclusive per-market lock held by every writer (`run`, `taker run`) in its runs directory:
+/// two writers on one account and market break client-order-index uniqueness, nonce sequencing
+/// and position accounting. The OS drops the lock with the process, so it never goes stale.
+/// Ponytail: keyed by the runs directory under the working directory, so a writer started from
+/// another directory is not excluded.
+pub fn lock_market(runs_dir: &Path, market: &str) -> Result<File> {
+    std::fs::create_dir_all(runs_dir)?;
+    let path = runs_dir.join(format!("bot-{}.lock", market.to_ascii_uppercase()));
     let mut file = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)
         .with_context(|| format!("opening {}", path.display()))?;
     match file.try_lock() {
@@ -364,6 +400,55 @@ mod tests {
             let error = format!("{:#}", BotConfig::load(&path).err().expect("stray key accepted"));
             assert!(error.contains(expected), "{error}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `run --mode dry-run` end to end: the real controller and engines against the simulated
+    /// venues, fed by a scripted market standing in for mainnet. Docker runs it with
+    /// `--network none`, so nothing can reach a real venue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_dry_run_hedges_a_scripted_arbitrage_and_drains_on_stop() {
+        use rust_decimal_macros::dec;
+        use std::time::Duration;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let market = std::sync::Arc::new(crate::dryrun::tests::World::start().await);
+        let dir = crate::dryrun::tests::temp_dir("dry-run-e2e");
+        let mut cfg = crate::dryrun::tests::shipped_config(&market, &dir);
+        cfg.controller.poll_sec = 1;
+        // The taker's warm-up and history gates would need minutes of market data.
+        let arb = &mut cfg.taker.arb;
+        (arb.startup_warmup_ms, arb.entry_gate.enabled, arb.book_sanity.enabled) = (0, false, false);
+        // Aster asks 98 while Lighter bids 99: 100 bps across the venues.
+        market.set_aster(dec!(97), dec!(98));
+        let fresh = market.keep_fresh();
+        let stop = CancellationToken::new();
+        let bot = tokio::spawn({
+            let (stop, runs) = (stop.clone(), dir.clone());
+            async move { run_with(cfg, &runs, "HYPE", LiveMode::DryRun, false, false, stop).await }
+        });
+        let ledger = dir.join("dry-run").join("trades_HYPE.jsonl");
+        let row = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if let Some(line) = std::fs::read_to_string(&ledger).ok().and_then(|text| text.lines().next().map(str::to_string)) {
+                    break serde_json::from_str::<crate::taker::pnl::TradeLedgerRow>(&line).unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("no hedged trade within 60 s");
+        let confirmed = crate::taker::pnl::EconomicStatus::Confirmed;
+        assert_eq!((row.economic_status, row.direction.as_str()), (confirmed, "SELL_LIGHTER_BUY_ASTER"), "{row:?}");
+        assert_eq!((row.aster_fill.vwap, row.lighter_fill.vwap), (dec!(98), dec!(99)), "each leg took the top: {row:?}");
+        assert_eq!(row.aster_fill.qty, row.lighter_fill.qty, "{row:?}");
+        assert!(row.aster_fill.fee_usd > Decimal::ZERO && row.lighter_fill.fee_usd.is_zero(), "Aster charges 4 bps: {row:?}");
+        assert!(row.final_net_position.is_zero(), "{row:?}");
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(60), bot).await.expect("the drain hung").unwrap().expect("a clean stop");
+        fresh.abort();
+        let mut written: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        written.sort();
+        assert_eq!(written, ["bot.toml", "dry-run"], "a dry run writes under runs/dry-run only");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
