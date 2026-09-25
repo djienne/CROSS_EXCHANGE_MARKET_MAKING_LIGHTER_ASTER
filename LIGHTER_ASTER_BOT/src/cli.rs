@@ -98,7 +98,7 @@ pub enum Commands {
     },
 
     /// Record one market's raw public Aster and Lighter feeds, the dry run's input, to
-    /// `<out>/<MARKET>/<UTC day>.tape.zst` for backtests (format in src/dryrun/tape.rs).
+    /// `<out>/<MARKET>/*.tape.zst` for backtests (format in src/dryrun/tape.rs).
     /// Public data only: no credentials, no orders.
     Record {
         /// Market id from config (e.g. HYPE).

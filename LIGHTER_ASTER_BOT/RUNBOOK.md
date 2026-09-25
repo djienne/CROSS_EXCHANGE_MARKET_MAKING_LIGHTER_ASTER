@@ -221,11 +221,12 @@ Every line carries its arrival time on this host, so a replay can reproduce the 
 the dry run saw. The recorder is its own process, so the bot never waits on it. Rebuilding the
 dry run does not interrupt it; `docker compose up -d --build recorder` restarts it.
 
-**Files.** `data/HYPE/<UTC day>.tape.zst`: tab-separated `<arrival µs>\t<kind>\t<payload>`,
-with the kinds listed in `src/dryrun/tape.rs`. Read one with
-`zstd -dc data/HYPE/<day>.tape.zst | head`.
+**Files.** `data/HYPE/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst`, one per UTC day and per recorder start,
+named after the first line's arrival: tab-separated `<arrival µs>\t<kind>\t<payload>`, with the
+kinds listed in `src/dryrun/tape.rs`. Read a day with `zstd -dc data/HYPE/<day>T*.tape.zst | head`.
 - A kill loses at most the last 10 s.
-- `A-` and `L-` lines mark reconnects.
+- `A-` and `L-` lines mark a lost connection. The feeds reconnect within 5 s of the network
+  returning, and a start without network (a reboot) waits for it.
 - Aster has no order-book history to download again, and the fleet backup skips files over
   100 MB (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
 

@@ -5,11 +5,12 @@
 # Real-key credentials (gitignored secrets)
 *.env
 
-# Build outputs (all isolated target dirs + the runs/ data)
+# Build outputs (all isolated target dirs + the runs/ data) and the market-data tape
 target
 target-*
 target_*
 runs
+data
 
 # VCS / generated / tooling / docs
 .git

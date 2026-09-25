@@ -1,6 +1,7 @@
 //! The market-data tape: one market's raw public Aster and Lighter feeds, the dry run's input,
-//! recorded by `record` for backtests. One file per UTC day, `<dir>/<MARKET>/<YYYY-MM-DD>.tape.zst`,
-//! of tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
+//! recorded by `record` for backtests. A file per UTC day and per recorder start,
+//! `<dir>/<MARKET>/<YYYY-MM-DD>T<HHMMSS>Z.tape.zst` after its first line's arrival (UTC), of
+//! tab-separated lines `<arrival µs since the epoch>\t<kind>\t<payload>`:
 //!
 //! | kind | payload |
 //! |---|---|
@@ -12,7 +13,8 @@
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
 //!
 //! A file is concatenated zstd frames, one per flush (every 10 s), so a kill loses at most the
-//! last 10 s and `zstd -dc` reads any file. Recording never waits: the network tasks hand each
+//! last 10 s and `zstd -dc` reads any file. A frame cut short by a power loss can only end a
+//! file, since no later start appends to it. Recording never waits: the network tasks hand each
 //! line to a writer thread, and drop (and count) it if the writer is a whole queue behind.
 
 use std::fs::{File, OpenOptions};
@@ -52,7 +54,7 @@ pub struct Tape {
 }
 
 impl Tape {
-    /// Starts the writer thread for `<dir>/<market>/`, appending to the day's file.
+    /// Starts the writer thread for `<dir>/<market>/`.
     pub fn open(dir: &Path, market: &str) -> Result<(Tape, std::thread::JoinHandle<Result<()>>)> {
         let dir = dir.join(market);
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -81,44 +83,46 @@ impl Tape {
     }
 }
 
-fn utc_day(arrival_us: i64) -> String {
-    chrono::DateTime::from_timestamp_micros(arrival_us).map_or_else(|| "invalid-time".into(), |t| t.format("%Y-%m-%d").to_string())
+/// `<YYYY-MM-DD>T<HHMMSS>Z`: the name of a file whose first line arrived at `arrival_us`.
+fn file_name(arrival_us: i64) -> String {
+    chrono::DateTime::from_timestamp_micros(arrival_us).map_or_else(|| "invalid-time".into(), |t| t.format("%Y-%m-%dT%H%M%SZ").to_string())
 }
 
 fn write(dir: &Path, rx: Receiver<Msg>) -> Result<()> {
     let mut buffer = Vec::new();
-    let mut day: Option<String> = None;
+    let mut file: Option<String> = None;
     let mut due = Instant::now() + FLUSH;
     loop {
         match rx.recv_timeout(due.saturating_duration_since(Instant::now())) {
             Ok(Msg::Line(arrival_us, kind, payload)) => {
-                let line_day = utc_day(arrival_us);
-                if day.as_deref() != Some(line_day.as_str()) {
-                    flush(dir, day.as_deref(), &mut buffer)?;
-                    day = Some(line_day);
+                let name = file_name(arrival_us);
+                // The first 10 characters are the UTC day.
+                if file.as_ref().map(|f| &f[..10]) != Some(&name[..10]) {
+                    flush(dir, file.as_deref(), &mut buffer)?;
+                    file = Some(name);
                 }
                 write!(buffer, "{arrival_us}\t{kind}\t")?;
                 // The venues send single-line JSON; a stray newline would split the record.
                 buffer.extend(payload.bytes().map(|b| if b == b'\n' || b == b'\r' { b' ' } else { b }));
                 buffer.push(b'\n');
                 if buffer.len() >= MAX_BUFFER {
-                    flush(dir, day.as_deref(), &mut buffer)?;
+                    flush(dir, file.as_deref(), &mut buffer)?;
                 }
             }
-            Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return flush(dir, day.as_deref(), &mut buffer),
+            Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return flush(dir, file.as_deref(), &mut buffer),
             Err(RecvTimeoutError::Timeout) => {}
         }
         if Instant::now() >= due {
-            flush(dir, day.as_deref(), &mut buffer)?;
+            flush(dir, file.as_deref(), &mut buffer)?;
             due = Instant::now() + FLUSH;
         }
     }
 }
 
-/// Appends `buffer` to `day`'s file as one zstd frame.
-fn flush(dir: &Path, day: Option<&str>, buffer: &mut Vec<u8>) -> Result<()> {
-    let Some(day) = day.filter(|_| !buffer.is_empty()) else { return Ok(()) };
-    let path = dir.join(format!("{day}.tape.zst"));
+/// Appends `buffer` to `file` as one zstd frame.
+fn flush(dir: &Path, file: Option<&str>, buffer: &mut Vec<u8>) -> Result<()> {
+    let Some(file) = file.filter(|_| !buffer.is_empty()) else { return Ok(()) };
+    let path = dir.join(format!("{file}.tape.zst"));
     let frame = zstd::bulk::compress(buffer, LEVEL)?;
     let mut file = OpenOptions::new().create(true).append(true).open(&path).with_context(|| format!("opening {}", path.display()))?;
     file.write_all(&frame)?;
@@ -127,7 +131,7 @@ fn flush(dir: &Path, day: Option<&str>, buffer: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// A tape file's lines as (arrival µs, kind, payload). A frame cut short by a kill ends it.
+/// A tape file's lines as (arrival µs, kind, payload). A frame cut short ends it.
 pub fn read(path: &Path) -> Result<Vec<(i64, String, String)>> {
     let mut lines = Vec::new();
     for line in BufReader::new(zstd::stream::read::Decoder::new(File::open(path)?)?).lines() {
@@ -155,7 +159,18 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
         let request = http.get(url);
         async move { anyhow::Ok(request.send().await?.error_for_status()?.text().await?) }
     };
-    let order_books = get(format!("{lighter_base}/api/v1/orderBooks")).await.context("fetching Lighter orderBooks")?;
+    // A boot can come before the network. Waiting here resumes within seconds of its return,
+    // where Docker's restart backoff grows to a minute of lost data.
+    let order_books = loop {
+        match get(format!("{lighter_base}/api/v1/orderBooks")).await {
+            Ok(body) => break body,
+            Err(e) => tracing::warn!("recorder: fetching Lighter orderBooks: {e:#}"),
+        }
+        tokio::select! {
+            _ = stop.cancelled() => return Ok(()),
+            _ = tokio::time::sleep(feed::UPSTREAM_BACKOFF_MAX) => {}
+        }
+    };
     let index = serde_json::from_str::<OrderBooksResponse>(&order_books)?
         .order_books
         .into_iter()
@@ -220,25 +235,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lines_land_in_their_utc_day_and_a_restart_appends() {
+    fn a_new_utc_day_or_a_restart_starts_a_file() {
         let dir = crate::dryrun::tests::temp_dir("tape");
         let day = 1_790_294_400_000_000; // 2026-09-25T00:00:00Z
         let (tape, writer) = Tape::open(&dir, "HYPE").unwrap();
         tape.record_at(day - 1, "A", r#"{"stream":"x"}"#);
         tape.record_at(day, "L", "{\"a\":\n1}");
+        tape.record_at(day + 1, "L-", "");
         tape.stop();
         writer.join().unwrap().unwrap();
-        // A restart appends to the day's file as a further zstd frame.
         let (tape, writer) = Tape::open(&dir, "HYPE").unwrap();
-        tape.record_at(day + 1, "L-", "");
+        tape.record_at(day + 61_000_000, "A-", "");
         tape.stop();
         writer.join().unwrap().unwrap();
 
         let files = dir.join("HYPE");
-        assert_eq!(read(&files.join("2026-09-24.tape.zst")).unwrap(), vec![(day - 1, "A".into(), r#"{"stream":"x"}"#.into())]);
-        assert_eq!(
-            read(&files.join("2026-09-25.tape.zst")).unwrap(),
-            vec![(day, "L".into(), "{\"a\": 1}".into()), (day + 1, "L-".into(), String::new())]
-        );
+        let mut names: Vec<_> = std::fs::read_dir(&files).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["2026-09-24T235959Z.tape.zst", "2026-09-25T000000Z.tape.zst", "2026-09-25T000101Z.tape.zst"]);
+        assert_eq!(read(&files.join(&names[0])).unwrap(), vec![(day - 1, "A".into(), r#"{"stream":"x"}"#.into())]);
+        assert_eq!(read(&files.join(&names[1])).unwrap(), vec![(day, "L".into(), "{\"a\": 1}".into()), (day + 1, "L-".into(), String::new())]);
+        assert_eq!(read(&files.join(&names[2])).unwrap(), vec![(day + 61_000_000, "A-".into(), String::new())]);
     }
 }
