@@ -1,4 +1,4 @@
-//! Live account state: capital + positions + open orders, reconciled from both venues
+//! Live account state: capital + positions + open orders, reconciled from both venues.
 //! Published atomically for the strategy and cold diagnostics.
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,7 +38,7 @@ pub struct OpenOrderSnapshot {
     pub qty: Decimal,
     /// Bot-assigned client id, if this order is recognized as ours.
     pub client_id: Option<String>,
-    /// Venue-assigned id (Aster orderId / HL oid).
+    /// Venue-assigned id (Aster orderId / Lighter order index).
     pub venue_order_id: Option<String>,
 }
 

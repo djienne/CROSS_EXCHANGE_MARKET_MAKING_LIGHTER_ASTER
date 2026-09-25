@@ -112,7 +112,7 @@ impl Tap {
     }
 
     /// Build the integer hot book from already-parsed Decimal levels (best-first) — the
-    /// numeric sibling of [`Tap::hot_book_from_raw`] for connectors that no longer
+    /// numeric sibling of [`Tap::hot_book_from_raw`] for connectors that do not
     /// format levels as strings. Same stamps and metric.
     #[inline]
     pub(crate) fn hot_book_from_levels(

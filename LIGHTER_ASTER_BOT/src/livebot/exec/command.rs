@@ -1,5 +1,5 @@
-//! The execution command/event contract. The strategy and fill reactor
-//! talk to the execution workers through **bounded command queues** and a shared **event
+//! The execution command/event contract. The strategy
+//! talks to the execution workers through **bounded command queues** and a shared **event
 //! channel** — never by calling an `async` trait per book event. This keeps the hot path
 //! single-owner and allocation-light: the strategy `try_send`s a small `Copy`-ish command
 //! and moves on; the worker owns the venue client.
@@ -90,7 +90,8 @@ pub enum ExecCommand {
         client_id: String,
         venue_order_id: Option<String>,
     },
-    /// Atomic replace (modify) when supported, else the worker does cancel+place.
+    /// Cancel-then-place: the worker places the new order only after the old cancel is
+    /// confirmed, so both can never rest at once.
     Replace {
         permit: MakerPermit,
         market: MarketId,
@@ -135,7 +136,7 @@ pub fn is_priority_cmd(cmd: &ExecCommand) -> bool {
     )
 }
 
-/// Fill reactor / strategy → Lighter hedge worker (the module keeps its historical
+/// Strategy → Lighter hedge worker (the module keeps its historical
 /// `hyperliquid` name; there is no Hyperliquid venue).
 #[derive(Debug, Clone)]
 pub enum HedgeCommand {
@@ -171,7 +172,7 @@ pub struct ExecutionTrade {
     pub fee_usd: Option<Decimal>,
 }
 
-/// Worker / venue → strategy + risk reactor. Order/hedge lifecycle notifications. Aster
+/// Worker / venue → strategy. Order/hedge lifecycle notifications. Aster
 /// maker fills arrive on the user-data stream, not here.
 #[derive(Debug, Clone)]
 pub enum ExecEvent {
@@ -194,7 +195,7 @@ pub enum ExecEvent {
     AttemptNotSent { cloid: Cloid, reason: String },
     ExecutionProgress { cloid: Cloid, cumulative_qty: Decimal, cumulative_quote_usd: Option<Decimal>, cumulative_fee_usd: Option<Decimal>, terminal: bool, venue_order_id: Option<String>, event_time_ms: Option<i64> },
     HedgeReject { cloid: Cloid, reason: String },
-    /// Hedge outcome is ambiguous: the request may have reached Hyperliquid, but
+    /// Hedge outcome is ambiguous: the request may have reached Lighter, but
     /// the worker did not receive a definitive response. The strategy must freeze
     /// and reconcile by deterministic cloid/position before any retry.
     HedgeUnknown { cloid: Cloid, reason: String },

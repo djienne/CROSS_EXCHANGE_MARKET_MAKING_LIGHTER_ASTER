@@ -154,7 +154,7 @@ fn handle_raw(
     let Some(exch_ts) = chrono::DateTime::<Utc>::from_timestamp_millis(source_ms) else {
         return false;
     };
-    // Same publishability gate as the old string path: both sides non-empty.
+    // Publishable only with both sides non-empty.
     if state.book.bids.is_empty() || state.book.asks.is_empty() {
         return true;
     }
@@ -283,7 +283,6 @@ mod tests {
         let tap = Tap { book: Some(cell.clone() as Arc<dyn BookTap>), ..Tap::none() };
         let mut state = StreamState::default();
         // Decimal prices and quantities retain the exact wire values.
-        // yields clean strings.
         let snapshot = serde_json::json!({
             "type": "subscribed/order_book",
             "offset": 1,

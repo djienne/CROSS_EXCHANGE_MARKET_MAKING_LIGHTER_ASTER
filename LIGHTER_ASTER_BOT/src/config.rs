@@ -69,12 +69,12 @@ impl CapitalCfg {
     }
 }
 
-/// Tunables for the live REST-vs-websocket order-book cross-check (`hotpath::book_check`).
-/// Slow, off-hot-path reconciliation; only active in `live`. All fields default so a
+/// Tunables for the XEMM engine's REST-vs-websocket order-book cross-check
+/// (`hotpath::book_check`). Slow, off-hot-path reconciliation. All fields default so a
 /// config without a `[book_check]` section still parses with the check enabled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BookCheckCfg {
-    /// Run the periodic REST cross-check during `live`. Default true.
+    /// Run the periodic REST cross-check. Default true.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Seconds between cross-check scans (kept generous to stay non-invasive). Default 30.
@@ -180,19 +180,19 @@ impl PartialPolicy {
     }
 }
 
-/// Top-level live-bot configuration. Every field defaults so the section
-/// is fully optional; the whole struct is inert until `enabled = true`.
+/// The XEMM engine's `[live]` settings (`[maker.live]` in bot.toml). Every field defaults so
+/// the section is fully optional; the whole struct is inert until `enabled = true`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LiveCfg {
     /// Master switch. While false the XEMM engine (`livebot::run`) refuses to start. Default false.
     #[serde(default)]
     pub enabled: bool,
     /// Cooldown after ANY execution event during which no new maker quote may be placed
-    /// (risk-reducing cancels/hedges stay allowed). Plan §6. Default 60_000.
+    /// (risk-reducing cancels/hedges stay allowed). Default 60_000.
     #[serde(default = "default_cooldown_ms")]
     pub post_trade_cooldown_ms: i64,
-    /// `global` (one cooldown across all markets) or `per_market`. First-live default is
-    /// `global` (safer while cross-venue snapshots may lag). Plan §6/§14.
+    /// `global` (one cooldown across all markets) or `per_market`. Default `global` (safer
+    /// while cross-venue snapshots may lag).
     #[serde(default = "default_cooldown_scope")]
     pub cooldown_scope: String,
     /// Cancel all known Aster orders at startup before quoting. Default true.
@@ -284,8 +284,8 @@ impl Default for LiveQuoteCfg {
 }
 
 impl LiveQuoteCfg {
-    /// Effective per-symbol replace cap. `0` used to mean unlimited; in live safety code
-    /// it now resolves to the conservative default instead of disabling the limiter.
+    /// Effective per-symbol replace cap. `0` resolves to the conservative default instead
+    /// of disabling the limiter.
     pub fn effective_max_replaces_per_minute_per_symbol(&self) -> u32 {
         if self.max_replaces_per_minute_per_symbol == 0 {
             default_max_replaces_per_min()
@@ -426,7 +426,7 @@ impl Default for LiveHyperliquidCfg {
     }
 }
 
-/// Cumulative-loss circuit breaker. When enabled and running live, the strategy tracks total
+/// Cumulative-loss circuit breaker. When enabled, the strategy tracks total
 /// cross-venue marked equity (Aster wallet + unrealized, Lighter portfolio value + marked uPnL)
 /// against a baseline = the median of the first 5 fresh samples. A drawdown beyond
 /// `max_cumulative_loss_usdc` on 3 consecutive fresh samples cancels orders, leaves the
@@ -439,7 +439,7 @@ pub struct LiveCircuitBreakerCfg {
     #[serde(default)]
     pub enabled: bool,
     /// Total account equity drawdown (USDC) from the startup baseline that trips the halt.
-    /// Default "0" (which, combined with `enabled`, is treated as disabled by validate()).
+    /// Default "0", which validate() rejects while `enabled`.
     #[serde(default)]
     pub max_cumulative_loss_usdc: Decimal,
 }
@@ -782,7 +782,7 @@ impl Config {
             bail!("quote.depth_liquidity_multiple must be >= 1");
         }
         // Live margin-guard prerequisites: the dynamic cap reuses the position-cap path and assumes
-        // venue leverage == 1 (the startup leverage gate verifies/sets 1x on both venues). Require a
+        // venue leverage == 1 (the startup leverage gate verifies 1x on both venues). Require a
         // matching config so the cap can't be sized for >1x while the venue is 1x, and require the
         // cap to actually be enforced (else the guard is a silent no-op).
         if self.live.enabled && self.live.margin_guard.enabled {

@@ -1,10 +1,9 @@
 //! Live primitive probes. `lighter_aster_bot probe <check>` exercises one venue action in
 //! isolation with the REAL signers, printing action / round-trip latency / resulting state and
-//! self-cleaning any order it opens. No-risk checks (balance, far-from-mid post-only place +
-//! cancel) run freely; money-risking checks (`lighter-market`) require `--i-understand-live` and a
-//! `--max-usd` cap they refuse to exceed.
-//!
-//! Each probe proves one primitive works live in isolation.
+//! self-cleaning any order it opens. Signed reads and `lighter-order-dry-run` (local signing
+//! only) send no order. `aster-place-cancel` rests REAL post-only orders 1.8% outside the touch
+//! and cancels them; `lighter-market` trades REAL market orders and requires
+//! `--i-understand-live` and a `--max-usd` cap it refuses to exceed.
 
 use std::path::Path;
 use std::time::Instant;
@@ -29,7 +28,7 @@ fn build_aster(cfg: &Config, specs: &[MarketSpec]) -> Result<AsterRest> {
     super::status::build_aster(cfg, specs, AsterCreds::from_env()?)
 }
 
-/// Build the live HL client for the given specs.
+/// Build the live Lighter client for the given specs.
 async fn build_hl(cfg: &Config, specs: &[MarketSpec]) -> Result<HlExchange> {
     let creds = LighterCreds::from_env()?;
     HlExchange::new_lighter(
@@ -116,8 +115,8 @@ async fn probe_aster_balance(cfg: &Config) -> Result<()> {
 
 /// Account-wide signed `positionRisk` read: prints every non-zero Aster position (signed
 /// `positionAmt`, entry, unrealized PnL, leverage, side). The one-way (`positionSide=BOTH`)
-/// `positionAmt` is directly comparable to HL's signed `szi`, so a hedged pair reads as
-/// Aster `-x` against HL `+x`. No order risk — a pure signed read.
+/// `positionAmt` is directly comparable to Lighter's signed `szi`, so a hedged pair reads as
+/// Aster `-x` against Lighter `+x`. No order risk — a pure signed read.
 async fn probe_aster_positions(cfg: &Config) -> Result<()> {
     let aster = account_wide_aster(cfg).await?;
     let t0 = Instant::now();
@@ -158,8 +157,8 @@ async fn probe_aster_place_cancel(cfg: &Config, target: &str) -> Result<()> {
     let aster = build_aster(cfg, &specs)?;
     let market = spec.market_id.clone();
     let (bid, ask) = aster_book_ticker(cfg, &spec.aster_symbol).await?;
-    // Test BOTH sides: a post-only BUY 1.8% BELOW bid and a post-only SELL 1.8% ABOVE ask —
-    // both within the ±2% band, neither can cross, so neither can realistically fill.
+    // Test BOTH sides with REAL orders: a post-only BUY 1.8% BELOW bid and a post-only SELL 1.8%
+    // ABOVE ask — both within the ±2% band, neither can cross, so neither can realistically fill.
     aster_place_cancel_side(&aster, spec, &market, Side::Buy, bid * dec!(0.982)).await?;
     aster_place_cancel_side(&aster, spec, &market, Side::Sell, ask * dec!(1.018)).await?;
     Ok(())
@@ -301,7 +300,8 @@ async fn probe_hl_market(cfg: &Config, target: &str, i_understand_live: bool, ma
 async fn hl_market_buy_then_sell(hl: &HlExchange, spec: &MarketSpec, max_usd: Decimal) -> Result<()> {
     let market = spec.market_id.clone();
     let mid = hl.mid(&spec.hl_coin).await?;
-    // Size so it clears $10 after the worker floors to szDecimals, and stays under the cap.
+    // Size to clear the Lighter min notional with 2% to spare, rounded UP to the size decimals so
+    // the order builder's floor keeps it, and stay under the cap.
     let sz = round_up_size(spec.hl_min_notional * dec!(1.02) / mid, spec.lighter_size_decimals);
     let est = sz * mid;
     if est > max_usd {

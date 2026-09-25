@@ -1,5 +1,5 @@
-//! Credential loading. Live trading reads the `aster.env` / `lighter.env` dotenv files at the
-//! repo root, derives the venue ROLE for each address from the **key**, not from the
+//! Credential loading. Live trading reads the `aster.env` / `lighter.env` dotenv files of
+//! [`env_files`], derives the venue ROLE for each address from the **key**, not from the
 //! (user-editable, sometimes mislabeled) field names, and validates the mapping before a single
 //! signed call. A dry run signs with a fixed identity instead ([`venue_creds`]).
 //!

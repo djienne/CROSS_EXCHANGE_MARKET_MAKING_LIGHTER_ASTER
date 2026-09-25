@@ -1,5 +1,5 @@
-//! Account/position reconciler. Reads both venues
-//! via signed Aster REST + unsigned HL `/info` and assembles an [`AccountSnapshot`] of the REAL
+//! Account/position reconciler. Reads both venues (signed Aster REST; Lighter account
+//! and active orders from the WS account cache when fresh, else REST) and assembles an [`AccountSnapshot`] of the REAL
 //! positions. This module only READS + PUBLISHES the truth; the strategy's `recover_orphans`
 //! (on the cold tick) is what ACTS on it — actively hedging or flattening any persistent net
 //! delta a missed/dropped/rejected hedge left behind, and folding the reported positions back
@@ -167,7 +167,7 @@ pub struct Reconciler {
     hl: HlExchange,
     /// Aster UPPER symbol → market id.
     aster_sym_to_market: HashMap<String, MarketId>,
-    /// HL coin → market id.
+    /// Lighter symbol → market id.
     hl_coin_to_market: HashMap<String, MarketId>,
     /// Max age (ms) of a cached Lighter book mid used to mark the Lighter leg's uPnL —
     /// same freshness bound the strategy requires of a Lighter book before quoting.
@@ -235,7 +235,7 @@ impl Reconciler {
         // up to the full read latency apart, so a fast move made the delta-neutral
         // cancellation transiently imperfect inside a single snapshot.
         // Aster: balance + positions + open orders (signed).
-        // HL: clearinghouse state + open orders (unsigned /info).
+        // Lighter: account state + active orders (WS account cache when fresh, else REST).
         let (bal, pos, oo, ch, hloo, available) = tokio::join!(
             self.aster.balance(),
             self.aster.position_risk(),
@@ -342,7 +342,7 @@ impl Reconciler {
             }
         }
 
-        // The HL side may have been served from the WS account cache, whose data ORIGINATED
+        // The Lighter side may have been served from the WS account cache, whose data ORIGINATED
         // before this function even started. Min the true data origin into read_start_ns so
         // the orphan backstop's straddle guard ("reads began strictly after the hot action")
         // judges the DATA's age, not the snapshot assembly time — otherwise a cached
@@ -372,7 +372,7 @@ impl Reconciler {
         })
     }
 
-    /// Refuse to trade live unless the Aster account is in ONE-WAY position mode (the bot sends
+    /// Refuse to trade unless the Aster account is in ONE-WAY position mode (the bot sends
     /// `positionSide=BOTH` and nets positions assuming one-way; hedge mode would mis-route + mis-
     /// report — see the reconciler's per-market netting and aster.rs::place_params).
     pub async fn assert_one_way(&self) -> Result<()> {
@@ -387,7 +387,7 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Enforce the CLEAN-START invariant (§8.1 inv 7) before quoting: cancel all resting orders on
+    /// Enforce the CLEAN-START invariant before quoting: cancel all resting orders on
     /// our symbols, then poll `openOrders` until no bot-prefixed (`X…`) order remains — so a fast
     /// startup can never begin quoting while stray orders from a PRIOR run still rest. Bounded poll
     /// (≤6 tries) so startup can't hang. With `require_clean_start`, a still-dirty book after the
@@ -509,7 +509,7 @@ impl Reconciler {
     /// `max_account_snapshot_age_ms`, so `interval` should be a fraction of it.
     pub async fn run(self, account: AccountState, shutdown: CancellationToken, interval: Duration, events: tokio::sync::mpsc::Sender<super::exec::command::ExecEvent>) {
         info!("account reconciler started (interval {:?})", interval);
-        // A single reconcile must NEVER wedge the loop. It awaits sequential signed REST reads; a
+        // A single reconcile must NEVER wedge the loop. It awaits venue REST reads; a
         // black-holed connection (no response AND no error) would otherwise hang the await forever —
         // the snapshot then ages out, which SILENTLY closes the maker gate (`account_fresh`) AND
         // disables the orphan-recovery backstop (which early-returns on a stale snapshot). Bounding

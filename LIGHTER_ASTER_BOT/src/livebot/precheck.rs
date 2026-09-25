@@ -33,7 +33,7 @@ pub fn hot_precheck_side(
         Side::Buy => aster.best_bid_ticks(),
         Side::Sell => aster.best_ask_ticks(),
     };
-    // Maker Buy hedges by selling into HL bids; Maker Sell hedges by buying HL asks.
+    // Maker Buy hedges by selling into Lighter bids; Maker Sell hedges by buying Lighter asks.
     let hl_hedge_touch = match side {
         Side::Buy => hl.best_bid_ticks(),
         Side::Sell => hl.best_ask_ticks(),

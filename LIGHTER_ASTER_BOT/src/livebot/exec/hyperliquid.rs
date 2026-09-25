@@ -667,10 +667,9 @@ impl HlExchange {
         let mut opts = SubscribeOptions::new(&self.ws_url, "lighter-account-all-positions", vec![channel]);
         opts.data_timeout = None;
         opts.frame_timeout = 90.0;
-        // The ~10-min auth-token TTL drops this socket every session; the 5s default
-        // base would blind the private feed ~5-6s per expiry. Healthy sessions reset
-        // the backoff to base, so 0.5s only shortens the routine re-auth gap —
-        // consecutive failures still escalate toward reconnect_max.
+        // Unauthenticated, but on the same 0.5s reconnect base as the authed private feeds:
+        // the 5s default would blind the position cache ~5s per drop. Healthy sessions reset
+        // the backoff to base; consecutive failures still escalate toward reconnect_max.
         opts.reconnect_base = 0.5;
         let known_markets = self.known_lighter_markets();
         let state = self.account_feed.clone();
@@ -1148,7 +1147,7 @@ impl HlExchange {
 
     /// Lighter mid fetched directly over REST, bypassing the WS book cache. Used by the
     /// reconciler's uPnL marking when the cached book is stale — `mid()` would serve the
-    /// stale cache first. Also the only path in the `status` command (no WS streams).
+    /// stale cache first. Also the only path for the status poller (no WS streams).
     pub async fn rest_mid(&self, market: &MarketId) -> Result<Decimal> {
         let w = self.wire(market)?;
         let client = rest_book::client()?;

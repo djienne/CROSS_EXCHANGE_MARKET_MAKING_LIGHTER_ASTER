@@ -1,7 +1,6 @@
 //! Compute the desired Aster maker quote for one side, priced backward from the
-//! HL hedge. Corrected vs the original design: an unconditional post-only cap that is
-//! re-asserted after tick rounding, plus staleness / crossed / min-qty /
-//! min-notional gates the original design omitted.
+//! Lighter hedge, with an unconditional post-only cap that is re-asserted after tick
+//! rounding, plus staleness / crossed / min-qty / min-notional gates.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -120,12 +119,12 @@ pub struct DesiredQuote {
 pub struct PositionContext {
     /// Signed Aster maker-leg position (+ long, − short).
     pub aster_pos_qty: Decimal,
-    /// Signed Hyperliquid hedge-leg position (+ long, − short).
+    /// Signed Lighter hedge-leg position (+ long, − short).
     pub hl_pos_qty: Decimal,
     pub aster_cap_notional: Decimal,
     pub hl_cap_notional: Decimal,
     pub enforce: bool,
-    /// When true, reject any candidate whose paired Aster fill + HL hedge would not reduce
+    /// When true, reject any candidate whose paired Aster fill + Lighter hedge would not reduce
     /// absolute cross-venue inventory.
     pub reduce_position_only: bool,
 }
@@ -286,7 +285,7 @@ pub fn compute_desired_quote_with_aster_touch_source(
     // --- sizing, clamped to the remaining capital headroom on BOTH legs ---
     let desired_qty = floor_to_step(quote.desired_notional / ref_px, step);
     // The smallest order BOTH venues accept (hedged 1:1): the Aster qty floor, the
-    // Aster min-notional, and the HL min-notional, expressed in Aster steps. A
+    // Aster min-notional, and the Lighter min-notional, expressed in Aster steps. A
     // sub-step notional residual from pricing off ref_px is covered by the ceil.
     let eff_min_qty = if ref_px > Decimal::ZERO {
         min_qty
@@ -308,8 +307,8 @@ pub fn compute_desired_quote_with_aster_touch_source(
         let aster_cap_qty = pos.aster_cap_notional / ref_px;
         let hl_cap_qty = pos.hl_cap_notional / ref_px;
         // Headroom = how much this side may fill before |position| would breach a
-        // leg's cap on the far end. A Buy grows Aster long / HL short; a Sell grows
-        // Aster short / HL long. A reducing order may unwind to (but not past) the
+        // leg's cap on the far end. A Buy grows Aster long / Lighter short; a Sell grows
+        // Aster short / Lighter long. A reducing order may unwind to (but not past) the
         // opposite cap.
         let (aster_headroom, hl_headroom) = match side {
             Side::Buy => (
@@ -669,7 +668,7 @@ pub(crate) mod tests {
 
     #[test]
     fn far_from_touch_rejected() {
-        // HL well below Aster: the profitable backward-priced bid sits far below
+        // Lighter well below Aster: the profitable backward-priced bid sits far below
         // the Aster touch, so the distance gate rejects it.
         let (a, _) = books();
         let low_hl = OrderBook::from_levels(
@@ -686,7 +685,7 @@ pub(crate) mod tests {
         assert_eq!(r.unwrap_err(), RejectReason::QuoteTooFarFromTouch);
     }
 
-    // Aster and HL tightly aligned, so the backward-priced profitable quote rests
+    // Aster and Lighter tightly aligned, so the backward-priced profitable quote rests
     // at its natural ~(required+fees) depth (~12bps) rather than at the touch.
     fn tight_books() -> (OrderBook, OrderBook) {
         let aster = OrderBook::from_levels(
@@ -1066,7 +1065,7 @@ pub(crate) mod tests {
     #[test]
     fn min_lot_exceeds_headroom_rejects() {
         let (a, h) = books();
-        // A large HL min-notional forces eff_min ~3.0, but only ~2.0 headroom remains
+        // A large Lighter min-notional forces eff_min ~3.0, but only ~2.0 headroom remains
         // and the cap didn't bind the small desired order => reject transparently.
         let pos = PositionContext {
             aster_pos_qty: dec!(1.0),

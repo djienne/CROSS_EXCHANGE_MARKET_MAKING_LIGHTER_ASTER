@@ -1,9 +1,8 @@
 //! Lightweight Aster futures public depth feed for the arb scanner hot path.
 //!
-//! The existing scanner path polled `/fapi/v3/depth` every iteration.  That makes the
-//! price decision depend on REST latency and rate limits.  This module keeps the
-//! Aster 20-level book hot in memory from the futures `@depth20@100ms` stream; the
-//! trading loop only clones the latest [`OrderBook`].
+//! This module keeps the Aster 20-level book hot in memory from the futures
+//! `@depth20@100ms` stream, so the price decision never waits on REST latency or rate
+//! limits; the trading loop loads the latest published [`OrderBook`] Arc lock-free.
 
 use std::sync::Arc;
 use std::time::Duration;

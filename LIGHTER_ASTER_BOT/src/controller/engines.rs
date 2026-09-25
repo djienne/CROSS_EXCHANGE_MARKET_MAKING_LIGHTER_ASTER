@@ -1,6 +1,6 @@
 //! The real engines behind the supervisor: the taker (`taker::arb::run`) and XEMM
 //! (`livebot::run`) as tasks of this process, and their status reports from long-lived
-//! pollers (one REST client per venue instead of a `status --json` process per poll).
+//! pollers that keep one REST client per venue.
 
 use std::path::PathBuf;
 

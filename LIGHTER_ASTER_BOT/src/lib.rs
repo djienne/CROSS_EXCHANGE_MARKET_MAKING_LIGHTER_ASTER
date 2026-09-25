@@ -13,8 +13,8 @@ pub mod decimal;
 pub mod dryrun;
 pub mod edge;
 pub mod hot_types;
-/// Lock-free real-time substrate (latest-book cell, stream watchdog, execution
-/// seam) used by the `livebot`.
+/// Lock-free real-time substrate (latest-book cells, venue ingest threads, stream watchdog,
+/// REST book cross-check) used by the XEMM engine (`livebot`).
 pub mod hotpath;
 pub mod inventory;
 pub mod lighter;
@@ -26,7 +26,7 @@ pub mod metrics;
 pub mod position;
 pub mod quote_engine;
 pub mod live_report;
-/// Taker–taker arbitrage engine (`lighter_aster_bot taker ...`).
+/// Taker–taker arbitrage engine (`run`'s taker; `lighter_aster_bot taker ...` on its own).
 pub mod taker;
 pub mod types;
 pub mod vwap;

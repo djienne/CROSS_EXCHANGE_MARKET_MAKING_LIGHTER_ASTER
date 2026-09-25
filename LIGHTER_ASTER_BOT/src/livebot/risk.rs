@@ -12,16 +12,16 @@ use rust_decimal::Decimal;
 
 use crate::types::MarketId;
 
-/// Cooldown scope. First live version is `Global`; `PerMarket` is the later,
-/// measured option.
+/// Cooldown scope: `Global` (the config default) suppresses every market after an
+/// execution event; `PerMarket` suppresses only that market.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CooldownScope {
     Global,
     PerMarket,
 }
 
-/// Tracks the post-trade cooldown deadlines in monotonic-clock nanos. Owned by the risk
-/// reactor; the strategy reads its own deadlines directly.
+/// Tracks the post-trade cooldown deadlines in monotonic-clock nanos. Owned by the
+/// strategy loop.
 #[derive(Debug, Clone)]
 pub struct CooldownState {
     scope: CooldownScope,
@@ -71,9 +71,9 @@ impl CooldownState {
 /// `None` of these means quoting may proceed (subject to cooldown + the feed gate).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FreezeReason {
-    /// Startup reconciliation / clean-start not finished (invariant 7).
+    /// Startup reconciliation / clean-start not finished.
     NotReconciled,
-    /// This market's own feeds aren't fresh enough to quote (its Aster/HL book is stale,
+    /// This market's own feeds aren't fresh enough to quote (its Aster/Lighter book is stale,
     /// REST-divergent, or dead). Set per-market by `Strategy::market_feeds_fresh`, not the
     /// global watchdog gate, so one stale pair never freezes the others.
     FeedGateClosed,
@@ -81,11 +81,9 @@ pub enum FreezeReason {
     AccountSnapshotStale,
     /// The Aster user data stream has gone silent.
     AsterUserStreamStale,
-    /// The Hyperliquid user data stream has gone silent.
-    HlUserStreamStale,
-    /// Predicted and exchange-reported positions disagree beyond tolerance (invariant 6).
+    /// Predicted and exchange-reported positions disagree beyond tolerance.
     PositionMismatch,
-    /// An open hedge is in an unknown / timed-out state (invariant 5).
+    /// An open hedge is in an unknown / timed-out state.
     OrphanHedge,
     /// Unhedged notional or age exceeds the configured limit.
     UnhedgedOverLimit,
@@ -98,7 +96,6 @@ impl FreezeReason {
             FreezeReason::FeedGateClosed => "FEED_GATE_CLOSED",
             FreezeReason::AccountSnapshotStale => "ACCOUNT_SNAPSHOT_STALE",
             FreezeReason::AsterUserStreamStale => "ASTER_USER_STREAM_STALE",
-            FreezeReason::HlUserStreamStale => "HL_USER_STREAM_STALE",
             FreezeReason::PositionMismatch => "POSITION_MISMATCH",
             FreezeReason::OrphanHedge => "ORPHAN_HEDGE",
             FreezeReason::UnhedgedOverLimit => "UNHEDGED_OVER_LIMIT",
@@ -108,16 +105,15 @@ impl FreezeReason {
 
 /// The conditions the maker gate must ALL satisfy to allow new quoting (reopen conditions
 /// and orphan-leg invariants). Pure inputs → pure decision, so it is exhaustively
-/// testable and the reactor just feeds it live values.
+/// testable and the strategy just feeds it live values.
 #[derive(Debug, Clone, Copy)]
 pub struct MakerGateInputs {
     pub clean_start_done: bool,
-    /// This market's own Aster+HL feeds are fresh & non-divergent (per-market, not the global
+    /// This market's own Aster+Lighter feeds are fresh & non-divergent (per-market, not the global
     /// watchdog gate). See `Strategy::market_feeds_fresh`.
     pub feed_gate_open: bool,
     pub account_fresh: bool,
     pub aster_stream_fresh: bool,
-    pub hl_stream_fresh: bool,
     pub positions_reconciled: bool,
     pub no_orphan_hedge: bool,
     pub unhedged_within_limits: bool,
@@ -132,7 +128,6 @@ impl MakerGateInputs {
             feed_gate_open: true,
             account_fresh: true,
             aster_stream_fresh: true,
-            hl_stream_fresh: true,
             positions_reconciled: true,
             no_orphan_hedge: true,
             unhedged_within_limits: true,
@@ -162,9 +157,6 @@ pub fn evaluate_maker_gate(i: &MakerGateInputs) -> Result<(), FreezeReason> {
     if !i.aster_stream_fresh {
         return Err(FreezeReason::AsterUserStreamStale);
     }
-    if !i.hl_stream_fresh {
-        return Err(FreezeReason::HlUserStreamStale);
-    }
     if !i.account_fresh {
         return Err(FreezeReason::AccountSnapshotStale);
     }
@@ -172,7 +164,7 @@ pub fn evaluate_maker_gate(i: &MakerGateInputs) -> Result<(), FreezeReason> {
 }
 
 /// Whether predicted and reported positions on one leg disagree by more than
-/// `tolerance_usd` at `mark_px` (invariant 6). A mismatch freezes maker quoting.
+/// `tolerance_usd` at `mark_px`. A mismatch freezes maker quoting.
 pub fn position_mismatch(
     predicted_qty: Decimal,
     reported_qty: Decimal,

@@ -36,9 +36,9 @@ impl VenueTag {
 /// first snapshot arrives.
 pub struct VenueBook {
     book: ArcSwapOption<OrderBook>,
-    /// Fast top-of-book assist, currently published by Hyperliquid `bbo`. This is
-    /// separate from `book` so a one-level BBO update never overwrites the 20-level
-    /// `l2Book` depth used as a VWAP fallback.
+    /// Fast top-of-book assist: Aster `bookTicker`, or the Lighter L2 top mirrored by its
+    /// connector. This is separate from `book` so a one-level BBO update never overwrites
+    /// the 20-level depth used as a VWAP fallback.
     bbo: ArcSwapOption<OrderBook>,
     /// The integer-scaled hot book, published alongside the raw `OrderBook` when a
     /// `MarketScale` is available. `None` until the first hot publish, or always
@@ -61,8 +61,8 @@ pub struct VenueBook {
     /// `last_msg_ns` fresh while its order book goes stale, so the trading gate must
     /// gate on THIS, not on `last_msg_ns`.
     last_book_ns: AtomicI64,
-    /// Monotonic-clock nanos of the last fast BBO update. For Hyperliquid this can
-    /// refresh quote-touch freshness while the slower `l2Book` snapshot cadence is ~5s.
+    /// Monotonic-clock nanos of the last fast BBO update. `quote_age_ms` takes the fresher
+    /// of this and `last_book_ns`, so a BBO update alone keeps the quote touch fresh.
     last_bbo_ns: AtomicI64,
     /// Last exchange timestamp accepted for a full-depth snapshot. Used to reject
     /// out-of-order websocket frames that arrive late on combined feeds and would

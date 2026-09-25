@@ -1,6 +1,7 @@
 //! Regime switch: which engine holds execution rights for the market. A line-by-line port of
 //! the retired orchestrator.py `decide()` and its helpers; `tests::python_decisions_match`
-//! replays decisions recorded from the Python original (`tests/fixtures/regime_decisions.json`).
+//! replays decisions recorded from the Python original (`tests/fixtures/regime_decisions.json.zst`
+//! at the stack root).
 //!
 //! The inputs are the engines' status reports as JSON (`taker::status::StatusReport` and
 //! `livebot::status::StatusReport`), read with the original's lenient semantics:
@@ -95,7 +96,7 @@ impl Decision {
     }
 }
 
-/// Switch thresholds (orchestrator defaults: 90 s blocked, 45 s ready, 2/3 clips headroom and
+/// Switch thresholds (`[controller]` defaults: 90 s blocked, 45 s ready, 2/3 clips headroom and
 /// margin, near-flat at one clip).
 #[derive(Debug, Clone)]
 pub struct Thresholds {
@@ -323,8 +324,9 @@ impl Regime {
     }
 }
 
-/// The clip notional a status reports (taker `desired_notional_usd`, else XEMM
-/// `quote.desired_notional`), else $13. A zero value falls through, like Python's `or`.
+/// The clip notional a status reports (`desired_notional_usd`, which both engines' reports
+/// carry, else a legacy `quote.desired_notional`), else $13. A zero value falls through, like
+/// Python's `or`.
 pub fn clip(status: Option<&Value>) -> Decimal {
     let Some(status) = truthy(status) else { return DEFAULT_CLIP_USD };
     let nonzero = |d: Option<Decimal>| d.filter(|d| !d.is_zero());

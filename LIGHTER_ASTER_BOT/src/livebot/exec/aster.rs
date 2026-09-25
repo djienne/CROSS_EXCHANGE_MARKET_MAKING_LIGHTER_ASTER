@@ -107,8 +107,7 @@ struct AsterOrderResp {
     msg: Option<String>,
 }
 
-/// The signed Aster REST client + nonce/timestamp + per-market wire context. Constructed only
-/// in `mode = "live"`.
+/// The signed Aster REST client + nonce + per-market wire context.
 pub struct AsterRest {
     client: reqwest::Client,
     base_url: String,
@@ -244,7 +243,7 @@ impl AsterRest {
     }
 
     /// Place a maker order from `Decimal` price/qty (rounds passively: buy floors, sell ceils
-    /// to tick; qty floors to lot). Used by the probe harness and flatten paths.
+    /// to tick; qty floors to lot). Used by the `aster-place-cancel` probe.
     pub(crate) async fn place_decimal(
         &self,
         market: &MarketId,
@@ -395,7 +394,7 @@ impl AsterRest {
         self.signed_request(Method::POST, ASTER_ORDER_PATH, params).await
     }
 
-    /// Refresh the Aster dead-man countdown for a symbol (heartbeat; §3.4).
+    /// Refresh the Aster dead-man countdown for a symbol (heartbeat).
     async fn refresh_deadman(&self, market: &MarketId) -> Result<()> {
         let w = self.wire(market)?;
         let params = vec![
@@ -641,7 +640,7 @@ impl RestCommandLimiter {
     /// cancels/flattens are already budgeted by the strategy (`aster_budget_allows` counts
     /// every enqueue against the same per-minute cap), and a risk-reducing cancel must not
     /// wait behind the shared limiter. The recorded timestamp is still visible to later
-    /// `acquire()` calls, so normal-lane commands keep honoring the cap.
+    /// `next_ready_at()` calls, so normal-lane commands keep honoring the cap.
     fn record(&mut self) {
         let window = Duration::from_secs(60);
         let now = tokio::time::Instant::now();
@@ -654,7 +653,6 @@ impl RestCommandLimiter {
 }
 
 /// The Aster execution worker loop: drain commands, perform venue I/O, publish events.
-/// Constructed only under `mode = "live"`.
 pub async fn run_aster_worker(
     mut rx: Receiver<ExecCommand>,
     mut prio_rx: Receiver<ExecCommand>,
@@ -1089,13 +1087,13 @@ mod tests {
             client_id: "c".into(),
             venue_order_id: Some("42".into()),
         }));
-        // Un-acked cancel: a Place for this id may still be queued — must stay FIFO (I1).
+        // Un-acked cancel: a Place for this id may still be queued — must stay FIFO.
         assert!(!is_priority_cmd(&ExecCommand::Cancel {
             market: m.clone(),
             client_id: "c".into(),
             venue_order_id: None,
         }));
-        // Sweeps must run behind queued Places or they don't sweep them (I3).
+        // Sweeps must run behind queued Places or they don't sweep them.
         assert!(!is_priority_cmd(&ExecCommand::CancelAllBot));
         assert!(!is_priority_cmd(&ExecCommand::Place {
             market: m.clone(),
@@ -1109,20 +1107,20 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn limiter_record_never_sleeps_but_counts_toward_acquire() {
+    async fn limiter_record_never_sleeps_but_counts_toward_next_ready_at() {
         let mut limiter = RestCommandLimiter::new(2);
         let t0 = tokio::time::Instant::now();
         limiter.record();
         limiter.record();
         limiter.record(); // over the cap: still returns without yielding
         assert_eq!(tokio::time::Instant::now(), t0, "record() must never sleep");
-        // A following acquire() must see the recorded stamps and wait out the window.
+        // A following next_ready_at() must see the recorded stamps and wait out the window.
         let ready_at = limiter.next_ready_at().expect("normal request must wait");
         tokio::time::sleep_until(ready_at).await;
         assert!(limiter.next_ready_at().is_none());
         assert!(
             tokio::time::Instant::now().duration_since(t0) >= Duration::from_secs(60),
-            "acquire() must honor timestamps recorded by the priority lane"
+            "next_ready_at() must honor timestamps recorded by the priority lane"
         );
     }
 
@@ -1384,7 +1382,7 @@ mod tests {
         assert_eq!(reject_body_error("/p", done).unwrap(), done);
         // code 0 is a success echo too.
         assert!(reject_body_error("/p", r#"{"code":0}"#).is_ok());
-        // Arrays and non-JSON pass through unchanged (classification belongs elsewhere).
+        // Arrays and non-JSON are rejected: an acknowledgement must be a JSON object.
         assert!(reject_body_error("/p", "[]").is_err());
         assert!(reject_body_error("/p", "not json").is_err());
     }

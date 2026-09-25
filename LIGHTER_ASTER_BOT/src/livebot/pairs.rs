@@ -1,6 +1,6 @@
 //! Pair eligibility classification and the strict-mode filter — one of the
-//! most important live risks (§7). The danger: an Aster maker order can partial-fill an
-//! amount BELOW Hyperliquid's minimum hedge notional, leaving a temporary unhedged leg.
+//! most important live risks. The danger: an Aster maker order can partial-fill an
+//! amount BELOW Lighter's minimum hedge notional, leaving a temporary unhedged leg.
 //!
 //! At startup we classify every market against a reference price and the configured quote
 //! size, then the partial policy decides which pairs may trade live.
@@ -15,11 +15,11 @@ use crate::markets::MarketSpec;
 /// Pair classes, best → worst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairClass {
-    /// Every possible Aster fill (down to a single lot/step) is HL-hedgeable.
+    /// Every possible Aster fill (down to a single lot/step) is Lighter-hedgeable.
     A,
-    /// The full quote is hedgeable, but a small partial fill may be sub-minimum on HL.
+    /// The full quote is hedgeable, but a small partial fill may be sub-minimum on Lighter.
     B,
-    /// The desired quote size itself is below the HL minimum hedge — un-hedgeable as quoted.
+    /// The desired quote size itself is below the Lighter minimum hedge — un-hedgeable as quoted.
     C,
     /// Degenerate / un-sizeable (non-positive reference, zero step, or no valid min order).
     D,
@@ -42,7 +42,7 @@ pub struct PairClassification {
     pub class: PairClass,
     /// Smallest Aster execution increment (one lot/step) — the smallest a partial can be.
     pub aster_min_fill_qty: Decimal,
-    /// Minimum HL-hedgeable quantity at the reference price.
+    /// Minimum Lighter-hedgeable quantity at the reference price.
     pub hl_min_hedge_qty: Decimal,
 }
 
@@ -66,10 +66,10 @@ pub fn classify(spec: &MarketSpec, ref_px: Decimal, desired_notional: Decimal) -
     let desired_qty = floor_to_step(desired_notional / ref_px, spec.step);
 
     let class = if desired_qty < hl_min {
-        // Even the whole intended quote can't be hedged on HL.
+        // Even the whole intended quote can't be hedged on Lighter.
         PairClass::C
     } else if aster_min_fill >= hl_min {
-        // Every conceivable partial (≥ one step) already clears the HL minimum.
+        // Every conceivable partial (≥ one step) already clears the Lighter minimum.
         PairClass::A
     } else {
         // Full quote hedgeable, but a sub-min partial is possible.
@@ -120,7 +120,7 @@ mod tests {
 
     #[test]
     fn class_a_when_every_step_hedges() {
-        // ref 100, HL min $10 => hl_min 0.1. step 0.1 => a single-step partial (0.1) clears.
+        // ref 100, Lighter min $10 => hl_min 0.1. step 0.1 => a single-step partial (0.1) clears.
         // desired $100 => 1.0 >= 0.1. => Class A.
         let s = spec(dec!(0.1), dec!(10), dec!(0.001));
         let c = classify(&s, dec!(100), dec!(100));
@@ -130,7 +130,7 @@ mod tests {
 
     #[test]
     fn class_b_when_partial_can_be_sub_min() {
-        // ref 100, HL min $10 => hl_min 0.1. step 0.001 => a 0.001 partial ($0.10) is sub-min.
+        // ref 100, Lighter min $10 => hl_min 0.1. step 0.001 => a 0.001 partial ($0.10) is sub-min.
         // desired $100 => 1.0 >= 0.1 hedgeable in full. => Class B.
         let s = spec(dec!(0.001), dec!(10), dec!(0.001));
         let c = classify(&s, dec!(100), dec!(100));
@@ -141,7 +141,7 @@ mod tests {
 
     #[test]
     fn class_c_when_quote_below_hl_min() {
-        // ref 100, HL min $50 => hl_min 0.5. desired $20 => 0.2 < 0.5 => Class C (un-hedgeable).
+        // ref 100, Lighter min $50 => hl_min 0.5. desired $20 => 0.2 < 0.5 => Class C (un-hedgeable).
         let s = spec(dec!(0.001), dec!(50), dec!(0.001));
         let c = classify(&s, dec!(100), dec!(20));
         assert_eq!(c.class, PairClass::C);

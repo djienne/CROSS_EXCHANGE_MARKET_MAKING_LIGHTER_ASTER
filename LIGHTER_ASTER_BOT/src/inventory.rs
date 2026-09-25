@@ -1,6 +1,6 @@
 //! Pending-inventory accumulation for sub-min-notional fills.
 //!
-//! Corrected vs the original design: an opposite-direction fill nets the position down and books
+//! An opposite-direction fill nets the position down and books
 //! the realized PnL on the closed quantity (it never silently zeroes the average
 //! price). If the residual flips sign it opens fresh at the new fill price. A
 //! same-direction fill accumulates with a size-weighted average.
@@ -19,7 +19,7 @@ pub struct HedgeabilityRules {
 
 #[derive(Debug, Clone)]
 pub struct PendingInventory {
-    /// Positive => net long Aster (hedge by selling HL); negative => net short.
+    /// Positive => net long Aster (hedge by selling on Lighter); negative => net short.
     pub signed_qty: Decimal,
     pub avg_aster_px: Decimal,
     pub first_fill_ts: DateTime<Utc>,
@@ -53,8 +53,8 @@ pub struct FillOutcome {
     pub hedge: Option<HedgeOrder>,
 }
 
-/// Minimum hedgeable quantity on HL for a given reference price ($10 min notional
-/// rounded up to the size step, but at least one step).
+/// Minimum hedgeable quantity on Lighter for a given reference price (the configured min
+/// notional, `lighter_min_notional`, rounded up to the size step, but at least one step).
 pub fn hl_min_hedge_qty(rules: &HedgeabilityRules, ref_px: Decimal) -> Decimal {
     if ref_px <= Decimal::ZERO {
         return rules.hyperliquid_qty_step;
@@ -71,7 +71,7 @@ pub fn signed_aster_qty(side: Side, qty: Decimal) -> Decimal {
     }
 }
 
-/// Hedge side for a signed inventory: long Aster -> sell HL; short Aster -> buy HL.
+/// Hedge side for a signed inventory: long Aster -> sell Lighter; short Aster -> buy Lighter.
 pub fn hedge_side_for_signed(signed_qty: Decimal) -> Option<Side> {
     if signed_qty > Decimal::ZERO {
         Some(Side::Sell)
@@ -84,7 +84,7 @@ pub fn hedge_side_for_signed(signed_qty: Decimal) -> Option<Side> {
 
 /// Fold a fill into pending inventory, returning what to book / hedge / keep. A same-direction
 /// fill accumulates with a size-weighted average; an opposite fill nets down and books realized
-/// PnL; the result carries a [`HedgeOrder`] the MOMENT the net clears the HL minimum (primary
+/// PnL; the result carries a [`HedgeOrder`] the MOMENT the net clears the Lighter minimum (primary
 /// fast-hedge path), else keeps the sub-min residual pending — never per-partial flattening.
 #[allow(clippy::too_many_arguments)]
 pub fn handle_fill_parts(
@@ -230,7 +230,7 @@ mod tests {
 
         let o2 = handle_fill_parts(Side::Buy, dec!(0.06), dec!(100), ts(), Some(inv), &rules(), dec!(100), dec!(0));
         let h = o2.hedge.unwrap();
-        assert_eq!(h.hedge_side, Side::Sell); // long Aster => sell HL
+        assert_eq!(h.hedge_side, Side::Sell); // long Aster => sell Lighter
         assert_eq!(h.qty, dec!(0.11));
         assert!(o2.pending.is_none());
     }
@@ -260,7 +260,7 @@ mod tests {
         let o = handle_fill_parts(Side::Sell, dec!(0.2), dec!(101), ts(), Some(inv), &rules(), dec!(100), dec!(0));
         assert_eq!(o.netted.unwrap().realized_pnl, dec!(0.08));
         let h = o.hedge.unwrap();
-        assert_eq!(h.hedge_side, Side::Buy); // short Aster => buy HL
+        assert_eq!(h.hedge_side, Side::Buy); // short Aster => buy Lighter
         assert_eq!(h.qty, dec!(0.12));
         assert_eq!(h.avg_aster_px, dec!(101)); // fresh at flip price
     }

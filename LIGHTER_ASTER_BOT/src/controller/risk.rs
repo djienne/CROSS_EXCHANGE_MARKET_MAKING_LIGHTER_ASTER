@@ -359,7 +359,7 @@ impl RealizedTrades {
     }
 
     /// Ponytail: re-summarizes the whole journal whenever it changed (it grows for the life
-    /// of the db stem). Fine at hours-to-days of XEMM activity; past that, summarize
+    /// of the XEMM stem). Fine at hours-to-days of XEMM activity; past that, summarize
     /// incrementally from an offset or rotate the journal per session.
     fn poll_xemm(&mut self, events: &mut EventLog) {
         let Ok(meta) = std::fs::metadata(&self.xemm_journal) else { return };

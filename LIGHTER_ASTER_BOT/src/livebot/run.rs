@@ -1,12 +1,13 @@
-//! Live bot orchestration. Wires the four planes: ingest threads + watchdog
+//! The XEMM engine, wiring four planes: ingest threads + watchdog
 //! (market-data hot path), the strategy loop (strategy/order hot path), the execution
 //! workers behind command queues (execution hot path), and account/journal/book-check (cold
 //! plane).
 //!
 //! ## Hard safety gate
 //!
-//! `run` refuses to start unless `[live] enabled = true`, and requires a single selected
-//! market and live credentials/signers.
+//! [`run`] refuses to start unless `[live] enabled = true`, and requires a single selected
+//! market plus credentials and the Lighter signer: the real ones in `live`, the dry-run
+//! identity in a dry run.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -92,11 +93,11 @@ pub async fn run(
     }
     // --- the hard safety gate ---
     if !cfg.live.enabled {
-        bail!("livebot is disabled: set [live] enabled = true in the config to run it");
+        bail!("livebot is disabled: set [maker.live] enabled = true in the config to run it");
     }
     if markets.len() != 1 {
         bail!(
-            "refusing to run mode=\"live\" with {} markets selected; real-money live mode is single-market only",
+            "refusing to run the XEMM engine with {} markets selected; it is single-market only",
             markets.len()
         );
     }
@@ -263,10 +264,6 @@ pub async fn run(
         cfg, &specs, &account, exec_rx, exec_prio_rx, hedge_rx, events_tx, maker_fill_tx, feeds_shutdown.clone(), &mut aux_tasks, &journal,
     )
     .await?;
-    // (Startup cancel-all + clean-start verification now happen inside `setup_live_planes`
-    // BEFORE the initial reconcile via `Reconciler::ensure_clean_start`, so the bot can never
-    // begin quoting while stray prior-run orders still rest. The old fire-and-forget here was
-    // racy on a fast startup.)
 
     // --- strategy ---
     let session = SessionId::random();
@@ -292,7 +289,7 @@ pub async fn run(
     // trip latch at this run's per-stem path (the startup guard above reads the same path). Inert
     // unless live.circuit_breaker.enabled.
     strat.arm_circuit_breaker(super::breaker::trip_path(&stem), shutdown.clone());
-    // In-memory trip backstop: guarantees a nonzero exit at shutdown even if the persistent
+    // In-memory trip backstop: guarantees an error return at shutdown even if the persistent
     // latch write fails (unwritable runs/ dir) — see the shutdown check at the end of run().
     let breaker_tripped_flag = Arc::new(AtomicBool::new(false));
     strat.set_trip_flag(breaker_tripped_flag.clone());
@@ -467,7 +464,7 @@ pub async fn run(
         return Err(e);
     }
     // A circuit-breaker trip rides the graceful-shutdown path above; without this guard it
-    // exits 0 — indistinguishable from a clean stop — and the supervisor restarts the bot
+    // returns Ok — indistinguishable from a clean stop — and the supervisor restarts the bot
     // straight into the startup latch (observed 2026-07-04). The startup guard barred any
     // pre-existing latch, so "latch exists at shutdown" ⇔ "the breaker fired THIS run".
     super::breaker::check_shutdown(&stem)?;
@@ -477,14 +474,14 @@ pub async fn run(
     Ok(())
 }
 
-/// Classify every market's pair eligibility against a REST-fetched HL reference mid.
+/// Classify every market's pair eligibility against a REST-fetched Lighter reference mid.
 ///
 /// The strict Class-A-only filter is a REAL-MONEY orphan-leg safety: it bars pairs where a
 /// sub-minimum partial Aster fill could be un-hedgeable on Lighter. The configured policy
 /// applies (with the `accumulate_sub_min` fallback noted below).
 async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketId, bool> {
     // Sub-min handling IS implemented now (a sub-min Aster partial ACCUMULATES into pending
-    // inventory and hedges on HL once the net clears the minimum; a genuinely stuck residual is
+    // inventory and hedges on Lighter once the net clears the minimum; a genuinely stuck residual is
     // flattened reduce-only on Aster, and the reconciler backstop neutralizes anything else), so a
     // Class-B pair's sub-min partial can no longer orphan. `accumulate_sub_min` therefore safely
     // admits Class A and B; `strict` still restricts to Class A.
@@ -523,8 +520,8 @@ async fn classify_markets(specs: &[MarketSpec], cfg: &Config) -> HashMap<MarketI
 
 /// Build + spawn ALL live planes: the venue workers, the account reconciler
 /// (initial reconcile for clean-start + a cold backstop loop), and the Aster user (fill) stream.
-/// Real signing is wired from `aster.env`/`lighter.env` — reached ONLY under `mode = "live"`.
-/// Roles are derived from the keys, not the env field names (see [`super::exec::creds`]).
+/// Signing uses `aster.env`/`lighter.env` in `live` (roles derived from the keys, not the env
+/// field names; see [`super::exec::creds`]) and the dry-run identity in a dry run.
 /// Returns the worker task, the user-stream liveness stamp and the shutdown reconciler. Clean
 /// start is then established (quoting is still gated per-market on feed freshness and position
 /// reconciliation).
@@ -560,7 +557,7 @@ async fn setup_live_planes(
     let (acreds, hcreds) = venue_creds(cfg.live.dry_run)?;
     let aster_signer: Arc<dyn AsterSigner> = Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
 
-    // Per-market wire data shared by all Aster/HL client instances.
+    // Per-market wire data shared by all Aster client instances.
     let mut scales: HashMap<MarketId, (MarketScale, String)> = HashMap::new();
     for s in specs {
         scales.insert(s.market_id.clone(), (MarketScale::from_spec(s), s.aster_symbol.clone()));
@@ -670,9 +667,8 @@ async fn setup_live_planes(
     recon.assert_one_way().await?;
 
     // Enforce the CLEAN-START invariant BEFORE the initial reconcile and before any quoting: cancel
-    // stray orders on our symbols and poll until the book is clean (or bail if require_clean_start).
-    // Replaces the old fire-and-forget startup CancelAllBot that could let a fast startup begin
-    // quoting while prior-run orders still rest.
+    // stray orders on our symbols and poll until the book is clean (or bail if require_clean_start),
+    // so a fast startup can never quote while prior-run orders still rest.
     recon
         .ensure_clean_start(cfg.live.startup_cancel_all, cfg.live.require_clean_start)
         .await?;
@@ -701,11 +697,11 @@ async fn setup_live_planes(
 
 /// Post-drain shutdown verification. Re-cancels + polls `openOrders` for
 /// bot-prefixed strays (a failure there is only warned), then takes one final snapshot to
-/// report/persist any residual positions — there is no Aster userTrades REST method, so a
+/// report/persist any residual positions — the XEMM Aster client reads no userTrades, so a
 /// late fill is detected as a position. Every step is timeout-bounded so shutdown never hangs.
 /// Returns `true` only when the final snapshot shows no bot order and every market net-flat (a
 /// delta-neutral pair left open is normal). A failed snapshot or report write, a stray order or
-/// a NET imbalance returns `false`: the run exits nonzero and keeps the active-session marker.
+/// a NET imbalance returns `false`: `run` returns an error and keeps the active-session marker.
 async fn shutdown_verify(
     recon: &super::reconcile::Reconciler,
     journal: &Journal,

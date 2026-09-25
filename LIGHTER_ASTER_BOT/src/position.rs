@@ -1,4 +1,4 @@
-//! Running signed futures position per leg (Aster maker leg / Hyperliquid hedge
+//! Running signed futures position per leg (Aster maker leg / Lighter hedge
 //! leg), used to enforce the per-exchange capital cap. It carries the *same*
 //! netting math as the sub-min pending-inventory layer ([`crate::inventory`]):
 //! same-direction fills average in, opposite fills net the position down and book

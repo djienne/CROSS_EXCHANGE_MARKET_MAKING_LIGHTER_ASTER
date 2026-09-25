@@ -1,11 +1,11 @@
 //! Aster fill detection → Lighter hedge state machine.
 //!
 //! The single most important live-safety property: **every Aster fill is hedged exactly
-//! once, even if the fill event is delivered more than once** (invariants 2 & 4). Aster's
-//! user stream can repeat `ORDER_TRADE_UPDATE`s, so we dedup on `(order_id, trade_id)` —
-//! with a `(order_id, cumulative_filled_qty)` fallback when the trade id is missing — and
-//! key the hedge on a deterministic cloid so a restart can ask Lighter "did this
-//! already hedge?" instead of double-hedging.
+//! once, even if the fill event is delivered more than once**. Aster's user stream can repeat
+//! `ORDER_TRADE_UPDATE`s, so we dedup on `(order_id, trade_id)` — with a
+//! `(order_id, cumulative_filled_qty)` fallback when the trade id is missing — and key each
+//! hedge attempt on a deterministic cloid, so an attempt whose outcome is unknown is looked up
+//! in Lighter's order history instead of sent again.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -162,7 +162,7 @@ impl FillDedup {
 
 /// Fill-to-hedge lifecycle. Forward path:
 /// `Created → Submitted → Acked → Filled → Reconciled`. Any failure transition routes to a
-/// terminal-ish state that freezes maker quoting until resolved (invariant 5).
+/// terminal-ish state that freezes maker quoting until resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HedgeState {
     Created,
@@ -218,7 +218,8 @@ pub struct HedgeIntent {
     pub event_time_ms: Option<i64>,
     pub book_source: Option<&'static str>,
     pub book_age_ms: Option<i64>,
-    /// HL hedge side (opposite the Aster fill).
+    /// Execution side: the Lighter hedge side (opposite the Aster fill), or the closing side
+    /// of an Aster flatten.
     pub hedge_side: Side,
     pub qty: Decimal,
     /// Average Aster fill price the hedge is offsetting (for PnL attribution).
@@ -226,11 +227,11 @@ pub struct HedgeIntent {
     pub state: HedgeState,
     pub created_ns: i64,
     pub submitted_ns: Option<i64>,
-    /// HL order id once acked.
+    /// Venue order id once known (Lighter order index, or Aster orderId for a flatten).
     pub hl_oid: Option<String>,
     /// Quantity actually hedged so far (for partial handling).
     pub filled_qty: Decimal,
-    /// How many submit attempts have been made (normal → emergency → freeze, §4.3).
+    /// How many submit attempts have been made (normal → emergency → freeze).
     pub attempts: u32,
     /// True for reconciler-backstop (orphan recovery) hedges. Lets `recover_orphans`
     /// recognize its own outstanding intents so it never overwrites one or races a second
@@ -238,8 +239,8 @@ pub struct HedgeIntent {
     pub recovery: bool,
 }
 
-/// Scale a cumulative-fill quantity to integer micro-units for the cloid / FillKey (matches
-/// [`FillKey::of`]). Session-independent — derived purely from exchange data.
+/// Scale a cumulative-fill quantity to integer micro-units: [`FillKey::of`]'s exact, hashable
+/// fallback key. Derived purely from exchange data.
 pub fn cum_scaled(cum_filled_qty: Decimal) -> i64 {
     use rust_decimal::prelude::ToPrimitive;
     (cum_filled_qty * Decimal::from(1_000_000)).round().to_i64().unwrap_or(i64::MAX)

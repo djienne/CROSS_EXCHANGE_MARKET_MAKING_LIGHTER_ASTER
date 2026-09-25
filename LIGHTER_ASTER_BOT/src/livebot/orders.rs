@@ -21,7 +21,7 @@ pub enum OrderLifecycle {
     Open,
     /// Cancel sent, not yet confirmed (still potentially fillable).
     PendingCancel,
-    /// Modify sent, awaiting ack.
+    /// Cancel-then-place replace sent; the old order stays current until its cancel is confirmed.
     PendingReplace,
     /// No live order in this slot.
     Idle,
@@ -176,7 +176,7 @@ struct MarketSlots {
     market: MarketId,
     bid: MakerSlot,
     ask: MakerSlot,
-    /// Monotonic ns of recent replaces (place/cancel/modify), for the per-minute cap.
+    /// Monotonic ns of recent places/cancels/replaces, for the per-minute cap.
     replace_times_ns: VecDeque<i64>,
 }
 
@@ -505,8 +505,8 @@ impl OrderManager {
     /// `Place` was blocked → no send → no prune → the window NEVER drained → placement was locked out
     /// forever and the bot silently stopped quoting (gate open, quote OK, no log). Pruning on the
     /// check breaks that latch: the window expires on its own and placement resumes.
-    /// `max_per_min == 0` DISABLES the cap (Aster doesn't need a client-side replace throttle; the
-    /// per-side requote deadband controls churn). The 60s window is still pruned so it stays bounded.
+    /// `max_per_min == 0` disables the cap here (the window is still pruned so it stays bounded);
+    /// the strategy always passes the non-zero `effective_max_replaces_per_minute_per_symbol()`.
     pub fn replace_rate_ok(&mut self, market: &MarketId, max_per_min: u32, now_ns: i64) -> bool {
         let cutoff = now_ns - 60_000_000_000; // 60s window
         if let Some(m) = self.market_mut(market) {

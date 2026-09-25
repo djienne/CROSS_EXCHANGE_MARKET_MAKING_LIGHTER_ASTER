@@ -21,7 +21,7 @@ pub struct VenueRegistry {
 }
 
 impl VenueRegistry {
-    /// Build a registry with an Aster and a Hyperliquid cell for each market.
+    /// Build a registry with an Aster and a Lighter cell for each market.
     #[cfg(test)]
     pub fn new(markets: &[MarketId]) -> Self {
         Self::build(markets, |_| VenueBook::new())

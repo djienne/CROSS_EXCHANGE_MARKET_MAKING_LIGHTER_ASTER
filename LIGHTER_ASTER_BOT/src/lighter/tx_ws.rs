@@ -202,7 +202,7 @@ impl TxWebSocket {
     }
 
     /// Extract a message field as its RAW string content (empty `""` stays empty, NOT `"\"\""`) so
-    /// the reject classifier and empty-message code-fallback work (codex).
+    /// the reject classifier and empty-message code-fallback work.
     fn extract_message(v: Option<&Value>) -> String {
         match v {
             Some(Value::String(s)) => s.clone(),

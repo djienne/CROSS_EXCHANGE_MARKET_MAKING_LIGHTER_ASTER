@@ -1,6 +1,6 @@
 //! Per-venue dedicated ingest thread. Each venue's WS reader gets its own OS thread
 //! hosting a single-threaded tokio runtime, so Aster ingest latency/jitter is
-//! isolated from Hyperliquid's instead of sharing the default multi-thread pool.
+//! isolated from Lighter's instead of sharing the default multi-thread pool.
 //! The reader feeds the lock-free [`VenueBook`] (via the connector `Tap`).
 
 use std::sync::Arc;

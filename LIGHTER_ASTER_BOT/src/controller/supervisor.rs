@@ -42,15 +42,15 @@ const STABLE_TICKS: u32 = 4;
 /// A failed poll of the idle engine is not retried for this long.
 const INACTIVE_STATUS_BACKOFF: Duration = Duration::from_secs(60);
 const ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
-/// At startup, long enough for the Aster deadman countdown (10 s) to cancel orders left by a
-/// crashed process.
+/// At startup, long enough for the Aster deadman countdown (`deadman_countdown_ms`, 10 s in
+/// bot.toml) to cancel orders left by a crashed process.
 const STARTUP_ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(15);
 /// Above XEMM's worst-case bounded drain (~190 s: 5 quiesce + 4x2 sends + 70 + 65 + 30 verify
 /// + 5 journal + 5 trip retry). Compose's stop_grace_period (460 s) covers a status tick in
 /// progress (2 x STATUS_TIMEOUT) plus this for the active engine and again for the observer.
 const ENGINE_STOP_TIMEOUT: Duration = Duration::from_secs(200);
 /// The third spontaneous exit of the active engine, counting only exits under 10 minutes of
-/// uptime, halts (no time window, as in the original).
+/// uptime, halts (no time window, as in orchestrator.py).
 const CRASH_LOOP_EXITS: u32 = 3;
 const SHORT_UPTIME_SEC: i64 = 600;
 /// A standby observer that exits is restarted after 60, 120, 240, then 300 s.
@@ -778,8 +778,9 @@ impl<E: Engines> Supervisor<E> {
         self.write_state(None, None, &decision);
     }
 
-    /// `bot-<M>.state.json`: read by combined_pnl.py / trade_history.py (`active_bot`,
-    /// `accounts.{taker,xemm}.total_equity_usd`) and by operators.
+    /// `bot-<M>.state.json`: read by combined_pnl.py (and trade_history.py through it) and
+    /// bot_stats.py (`active_bot`, `accounts.{taker,xemm}.total_equity_usd`, `pnl`) and by
+    /// operators.
     fn write_state(&mut self, taker: Option<&Value>, xemm: Option<&Value>, decision: &Decision) {
         let now = Utc::now();
         let field = |status: Option<&Value>, key: &str| status.and_then(|s| s.get(key)).cloned().unwrap_or(Value::Null);

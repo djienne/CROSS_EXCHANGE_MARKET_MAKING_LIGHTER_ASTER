@@ -130,7 +130,7 @@ async fn pause_before_reconnect(opts: &SubscribeOptions, backoff: f64, elapsed: 
 /// Run the subscription loop forever (reconnecting). `on_message` is called for each
 /// decoded application message (NOT ping/subscribed). `reconnect` (if provided) forces a
 /// fresh reconnect when notified (e.g. orderbook sanity divergence). `on_disconnect` runs
-/// on every disconnect (clear local book, reset vol state, etc.).
+/// on every disconnect (e.g. clear the local book, flag the stream down).
 pub async fn subscribe_loop<F, D>(
     opts: SubscribeOptions,
     reconnect: Option<std::sync::Arc<Notify>>,

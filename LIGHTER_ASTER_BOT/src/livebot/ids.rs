@@ -67,9 +67,6 @@ fn market_code(market: &MarketId) -> String {
         .to_ascii_uppercase()
 }
 
-/// Aster maker `newClientOrderId`. `quote_epoch` is a per-(market,side) monotonic counter
-/// the order-state layer increments on each new quote, guaranteeing uniqueness. Form:
-/// `X{session}-{MARKET}-{B|S}-{epoch36}` — always within the 36-char / charset budget.
 /// Session-prefixed client id for a FLATTEN (reduce-only close) order. Carries the same
 /// `X{session}-` prefix as maker ids so `OrderManager::is_own_client_id` attributes the
 /// resulting reduce-only fills to this session — without it the venue assigns a foreign-
@@ -87,6 +84,9 @@ pub fn aster_flatten_client_id(session: &SessionId, market: &MarketId, epoch: u6
     s
 }
 
+/// Aster maker `newClientOrderId`. `quote_epoch` is a per-(market,side) monotonic counter
+/// the order-state layer increments on each new quote, guaranteeing uniqueness. Form:
+/// `X{session}-{MARKET}-{B|S}-{epoch36}` — always within the 36-char / charset budget.
 pub fn aster_client_id(session: &SessionId, market: &MarketId, side: Side, quote_epoch: u64) -> String {
     let s = format!(
         "X{}-{}-{}-{}",
@@ -145,7 +145,7 @@ impl Cloid {
         Cloid(b)
     }
 
-    /// Hyperliquid wire form: `0x` followed by 32 lowercase hex digits. Single allocation
+    /// Hex form (journal/log identity): `0x` followed by 32 lowercase hex digits. Single allocation
     /// (`hex::encode`) — this is on the fill→hedge hot path, so avoid the per-byte `format!` loop.
     pub fn to_hex(self) -> String {
         format!("0x{}", hex::encode(self.0))
@@ -219,9 +219,9 @@ mod tests {
     fn hedge_cloid_is_deterministic_and_distinct() {
         let c1 = Cloid::hedge("AST-100", "T-7", 500_000);
         let c2 = Cloid::hedge("AST-100", "T-7", 500_000);
-        let c3 = Cloid::hedge("AST-100", "T-7", 600_000); // different cumulative fill
-        let c4 = Cloid::hedge("AST-101", "T-7", 500_000); // different order
-        assert_eq!(c1, c2, "same exchange fill identity must yield the same cloid (idempotency)");
+        let c3 = Cloid::hedge("AST-100", "T-7", 600_000); // different attempt epoch
+        let c4 = Cloid::hedge("AST-101", "T-7", 500_000); // different session
+        assert_eq!(c1, c2, "same (session, market, epoch) must yield the same cloid");
         assert_ne!(c1, c3);
         assert_ne!(c1, c4);
     }

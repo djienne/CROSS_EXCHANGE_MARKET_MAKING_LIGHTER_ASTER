@@ -45,7 +45,8 @@ impl AsterNonce {
         if length == 0 {
             file.set_len(FILE_LEN as u64)?;
         }
-        // File length never changes once initialized. Both crates use this exact layout.
+        // File length never changes once initialized. Every process sharing the counter uses
+        // this exact layout.
         // The mmap base is page-aligned; offset 64 satisfies AtomicI64 alignment on our
         // supported 64-bit targets. All accesses to the counter after initialization are atomic.
         let mut mapping = unsafe { MmapOptions::new().len(FILE_LEN).map_mut(&file)? };

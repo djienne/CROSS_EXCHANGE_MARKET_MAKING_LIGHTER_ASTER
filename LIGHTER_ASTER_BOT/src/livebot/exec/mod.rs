@@ -5,7 +5,7 @@
 //! - [`command`] — the `ExecCommand` / `HedgeCommand` / `ExecEvent` contract + queue depth.
 //! - [`sign`] — signer traits + monotonic nonces + the real Aster signer.
 //! - [`creds`] — `aster.env`/`lighter.env` loading + key-derived role resolution.
-//! - [`crypto`] — golden-tested signing primitives and legacy helper coverage.
+//! - [`crypto`] — golden-tested Aster EIP-712 signing primitives.
 //! - [`aster`] / [`hyperliquid`] — the GATED live workers (real funds; signer-gated; the
 //!   hedge module name is legacy, but its live I/O is Lighter).
 

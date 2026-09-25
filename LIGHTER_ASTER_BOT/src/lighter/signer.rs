@@ -1,7 +1,7 @@
 //! FFI bindings to the official Lighter native signer shared library
 //! (`lighter-signer-<os>-<arch>.so/.dylib/.dll`), the exact same binary the Python
 //! SDK loads via `ctypes`. We do NOT reimplement Lighter's signing scheme — we call
-//! into the vetted Go/cgo library so signatures are byte-identical to the live bot.
+//! into the vetted Go/cgo library so signatures are byte-identical to the Python SDK's.
 //!
 //! ABI validated against lighter-python `signer_client.py`:
 //!   * structs `SignedTxResponse`, `StrOrErr`
@@ -45,7 +45,7 @@ struct StrOrErr {
     err: *mut c_char,
 }
 
-// ABI guards (codex review): on 64-bit, SignedTxResponse = u8 + 4*ptr = 40 bytes
+// ABI guards: on 64-bit, SignedTxResponse = u8 + 4*ptr = 40 bytes
 // (u8 padded to 8 for pointer alignment), StrOrErr = 2*ptr = 16 bytes. If these ever
 // fail the layout no longer matches the ctypes.Structure the Python SDK relies on.
 const _: () = assert!(std::mem::size_of::<SignedTxResponse>() == 40);

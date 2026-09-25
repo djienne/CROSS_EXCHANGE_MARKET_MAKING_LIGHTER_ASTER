@@ -20,7 +20,7 @@ use rust_decimal::Decimal;
 use crate::book::OrderBook;
 use crate::markets::MarketSpec;
 
-// Re-export so existing `use crate::livebot::scale::*` imports keep working.
+// The hot book types this module builds, re-exported beside the builders.
 pub use crate::hot_types::{HotBook, HotLevel, HOT_LEVELS};
 
 /// Per-market conversion between exact `Decimal` prices/quantities and the scaled `i64`
@@ -29,7 +29,7 @@ pub use crate::hot_types::{HotBook, HotLevel, HOT_LEVELS};
 pub struct MarketScale {
     pub tick: Decimal,
     pub step: Decimal,
-    /// Hyperliquid hedge-leg size step (from szDecimals) — hedges round to this.
+    /// Lighter hedge-leg size step (10^-size_decimals) — hedges round to this.
     pub hl_qty_step: Decimal,
 }
 
@@ -91,7 +91,7 @@ impl MarketScale {
         (qty / self.step).floor().to_i64().unwrap_or(0)
     }
 
-    /// Quantize a Hyperliquid quantity DOWN to whole HL lots.
+    /// Quantize a Lighter quantity DOWN to whole Lighter lots.
     #[inline]
     pub fn hl_qty_to_lots(&self, qty: Decimal) -> i64 {
         if self.hl_qty_step <= Decimal::ZERO || qty <= Decimal::ZERO {
@@ -100,7 +100,7 @@ impl MarketScale {
         (qty / self.hl_qty_step).floor().to_i64().unwrap_or(0)
     }
 
-    /// Quantize a Hyperliquid quantity UP to whole HL lots. Used for minimum
+    /// Quantize a Lighter quantity UP to whole Lighter lots. Used for minimum
     /// visible-depth requirements so the hot path never under-requires liquidity.
     #[inline]
     pub fn hl_qty_to_lots_ceil(&self, qty: Decimal) -> i64 {
@@ -126,7 +126,7 @@ impl MarketScale {
         decimal_str_to_units(qty, self.step, UnitRound::Floor)
     }
 
-    /// Parse a Hyperliquid quantity string directly into HL lots.
+    /// Parse a Lighter quantity string directly into Lighter lots.
     #[inline]
     pub fn hl_qty_str_to_lots(&self, qty: &str) -> Option<i64> {
         decimal_str_to_units(qty, self.hl_qty_step, UnitRound::Floor)

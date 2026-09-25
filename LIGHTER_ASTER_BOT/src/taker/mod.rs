@@ -1,5 +1,6 @@
-//! Taker–taker arbitrage engine (formerly the standalone `lighter_aster_taker_arb` crate),
-//! run as `lighter_aster_bot taker ...` with its own CLI and config. Venue code that was
+//! Taker–taker arbitrage engine (formerly the standalone `lighter_aster_taker_arb` crate):
+//! `run`'s taker, or `lighter_aster_bot taker ...` on its own with its own CLI; both read the
+//! `[taker]` table of the config. Venue code that was
 //! identical on the XEMM side is shared from `crate::lighter` and `crate::livebot::exec`.
 
 pub(crate) mod arb;

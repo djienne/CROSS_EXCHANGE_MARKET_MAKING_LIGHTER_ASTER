@@ -29,7 +29,7 @@ impl Side {
     }
 }
 
-/// Logical market identifier (e.g. "BTC"). Maps to an Aster symbol + HL coin.
+/// Logical market identifier (e.g. "BTC"). Maps to an Aster symbol + a Lighter market.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MarketId(pub String);
 

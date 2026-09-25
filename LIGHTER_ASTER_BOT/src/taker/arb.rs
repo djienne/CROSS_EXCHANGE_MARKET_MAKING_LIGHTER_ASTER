@@ -1367,7 +1367,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
             // with the same reduce-only emergency-bound machinery as the rescue path,
             // instead of riding market moves until a human notices.
             // Flattening places LIVE reduce-only orders. Only an instance holding
-            // execution rights may act: the 24/7 observer/standby process shares the
+            // execution rights may act: the 24/7 observer/standby shares the
             // accounts with the active bot, and a transiently-unhedged leg of the
             // active bot's own recovery must never be raced by a second flattener.
             let (execution_allowed, _) =
@@ -1430,8 +1430,9 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
                         if session.unresolved() { bail!("mismatch recovery unresolved; no further order may be submitted: {e:#}"); }
                         error!("mismatch auto-flatten failed: {e:#}");
                         // Repeated failure to even inspect/flatten means the bot cannot
-                        // guarantee its own safety: exit nonzero so the supervisor
-                        // safe-halts loudly instead of pausing on a naked position forever.
+                        // guarantee its own safety: return an error so the controller (or a
+                        // standalone `taker run`'s exit code) halts loudly instead of pausing
+                        // on a naked position forever.
                         if mismatch_consecutive
                             >= cfg.risk.mismatch_flatten_after_checks.saturating_mul(3)
                         {

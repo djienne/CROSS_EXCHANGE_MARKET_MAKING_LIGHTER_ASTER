@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn current_aster_eip712_matches_independent_eth_account_vector() {
-        // eth_account.messages.encode_typed_data, chainId=1666, fixed public key 1.
+        // eth_account.messages.encode_typed_data, chainId=1666, fixed private key 1.
         // Specification: asterdex.github.io/aster-api-website/asterCode/authentication/
         let mut raw_key = [0u8; 32];
         raw_key[31] = 1;

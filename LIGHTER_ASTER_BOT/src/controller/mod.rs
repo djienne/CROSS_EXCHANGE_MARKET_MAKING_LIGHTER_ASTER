@@ -1,6 +1,6 @@
 //! The `run` command: one process holding both engines for one market and handing execution
-//! rights between them in memory. It replaces the retired orchestrator.py, its child
-//! processes, `status --json` scraping and lease/signal files.
+//! rights between them in memory. It replaces the retired orchestrator.py and its child
+//! processes.
 //!
 //! * [`regime`]: which engine should hold the rights (the ported `decide()`).
 //! * [`risk`]: the cross-engine loss stops (equity drawdown, realized trade PnL).
@@ -30,7 +30,7 @@ use crate::config::LiveMode;
 /// directory: the crate dir, bind-mounted as /app/runs in Docker.
 pub const RUNS_DIR: &str = "runs";
 
-/// `[controller]` of bot.toml. The defaults are the orchestrator's live values.
+/// `[controller]` of bot.toml.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ControllerCfg {
@@ -286,10 +286,10 @@ fn refuse_insecure_env_files() -> Result<()> {
 
 /// The two-process stack must be stopped, and its latches reviewed, before `run`: a running
 /// orchestrator.py (it holds this flock for life), its breaker, and XEMM's trip latch and
-/// unclean-session marker under the old db stem, which the new file names would silently
-/// skip. Looked for in `runs/` and in the stack root's `runs/`, where the orchestrator kept
-/// them. Children orphaned by a killed orchestrator hold no lock; the cutover checklist's
-/// `pgrep` covers those. Transitional: delete once no host runs the old layout.
+/// unclean-session marker under the old `orchestrator-xemm-<M>` stem, which the new file names
+/// would silently skip. Looked for in `runs/` and in the stack root's `runs/`, where the
+/// orchestrator kept them. Children orphaned by a killed orchestrator hold no lock, so this
+/// cannot see them. Transitional: delete once no host runs the old layout.
 fn refuse_legacy_stack(market: &str, dirs: &[&Path]) -> Result<()> {
     for dir in dirs {
         let lock = dir.join(format!("orchestrator_{market}.lock"));

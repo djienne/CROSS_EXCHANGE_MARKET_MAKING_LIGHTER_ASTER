@@ -63,10 +63,12 @@ pub enum Commands {
         json: bool,
     },
 
-    /// Probe a single live venue primitive: balance / open-orders / post-only
-    /// place+cancel far from mid / IOC market round-trip. No-risk checks run freely; the
-    /// money-risking `lighter-market` needs `--i-understand-live --max-usd <N>`. Uses the real
-    /// signers + `aster.env`/`lighter.env`.
+    /// Probe one live venue primitive with the real signers and `aster.env`/`lighter.env`.
+    /// Signed reads only: aster-balance, aster-positions, aster-open-orders, leverage,
+    /// lighter-balance, lighter-open-orders. lighter-order-dry-run signs orders locally and
+    /// sends none. REAL orders: aster-place-cancel rests a post-only buy and sell 1.8% outside
+    /// the touch and cancels them; lighter-market buys at market then sells back reduce-only,
+    /// and needs `--i-understand-live --max-usd <N>`.
     Probe {
         /// Which check: aster-balance | aster-positions | aster-open-orders | aster-place-cancel |
         /// leverage | lighter-balance | lighter-open-orders | lighter-order-dry-run | lighter-market
@@ -74,10 +76,10 @@ pub enum Commands {
         /// Target market id from config (e.g. HYPE). Defaults to HYPE.
         #[arg(long)]
         market: Option<String>,
-        /// Required confirmation for money-risking probes (lighter-market).
+        /// Required confirmation for lighter-market.
         #[arg(long, default_value_t = false)]
         i_understand_live: bool,
-        /// USD cap for money-risking probes.
+        /// USD cap for lighter-market, in (0, 20].
         #[arg(long, default_value = "0")]
         max_usd: rust_decimal::Decimal,
     },

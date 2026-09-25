@@ -94,9 +94,10 @@ impl ReconnectHandle {
 /// - **Book-stale** (`book_age_ms > book_stale_ms` while frames still arrive): the socket
 ///   is alive but the ORDER BOOK / BBO quote touch is stale (e.g. a feed streaming only
 ///   trades/pongs, or one that has not published market data yet). `book_stale_ms` is the
-///   tighter trading threshold (`max_book_staleness_ms`, ~5 s), NOT the connection threshold.
-///   Hyperliquid may keep fast `bbo` fresh while `l2Book` snapshots arrive every ~5s, so this
-///   check uses `quote_age_ms` rather than full-depth `book_age_ms`.
+///   tighter trading threshold (`max_book_staleness_ms`, 10 s by default), NOT the 60 s
+///   connection threshold.
+///   A fast BBO update (Aster `bookTicker`) also counts as a fresh touch, so this check uses
+///   `quote_age_ms` rather than full-depth `book_age_ms`.
 /// - **Divergent** (`is_divergent()`): frames keep arriving but the book content
 ///   disagrees with a REST snapshot (set by [`super::book_check`]). This closes the
 ///   gate but is NOT reconnected here — the slow REST checker owns that reconnect, so
