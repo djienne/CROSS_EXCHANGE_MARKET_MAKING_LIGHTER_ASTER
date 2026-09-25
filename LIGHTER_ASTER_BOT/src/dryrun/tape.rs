@@ -12,6 +12,10 @@
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
 //!
+//! Lines are in the order they arrived. Their times are this host's wall clock, which a clock
+//! correction can step back a few ms (seen once: 5.7 ms), so a reader orders venues by time
+//! with a stable sort and keeps each venue's lines in file order.
+//!
 //! A file is concatenated zstd frames, one per flush (every 10 s), so a kill loses at most the
 //! last 10 s and `zstd -dc` reads any file. A frame cut short by a power loss can only end a
 //! file, since no later start appends to it. Recording never waits: the network tasks hand each
