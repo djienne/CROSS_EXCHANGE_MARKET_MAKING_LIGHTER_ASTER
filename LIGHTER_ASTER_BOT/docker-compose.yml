@@ -6,7 +6,8 @@
 # bind mount.
 #
 # `docker compose build` / `up -d` touch only `dryrun`, the same bot against simulated venues
-# (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun). The real-money
+# (no credentials, files in runs/dry-run/, image lighter_aster_bot:dryrun), and `recorder`, the
+# market-data tape for backtests (public data only, files in data/). The real-money
 # `bot` service sits behind the `live` profile: only a command naming it builds or starts it,
 # so never set COMPOSE_PROFILES=live here.
 #
@@ -92,6 +93,37 @@ services:
         limits:
           cpus: '2'
           memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # Records HYPE's raw public Aster and Lighter feeds, the dry run's input (Aster 20-level book,
+  # best bid/ask and trades; Lighter book updates, trades and funding), to data/HYPE/ for
+  # backtests (RUNBOOK.md, "Market data tape"). Its own process and image tag: it never slows
+  # the bot, and rebuilding the dry run does not interrupt it. No credentials, no orders.
+  recorder:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lighter_aster_bot:recorder
+    container_name: lighter-aster-recorder
+    working_dir: /app
+    user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
+    volumes:
+      - ./bot.toml:/app/bot.toml:ro
+      - ./data:/app/data
+    command: ["record", "--market", "HYPE"]
+    restart: unless-stopped
+    stop_signal: SIGINT
+    # Arrival times are the tape's record of feed latency, so CFS throttling would stamp them
+    # late. The value is the fleet policy's override (HELPERS\cpu_limits); cpu_limits.bat keeps it.
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 256M
     logging:
       driver: json-file
       options:

@@ -28,14 +28,14 @@ and probes.
 ├── tests/                  Python tests and shared fixtures (tests/fixtures/)
 └── LIGHTER_ASTER_BOT/
     ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
-    ├── docker-compose.yml  services: dryrun, and bot (live, behind the `live` profile)
+    ├── docker-compose.yml  services: dryrun, recorder (market-data tape), and bot (live, behind the `live` profile)
     ├── scripts/            deploy_vps.sh, reset_breaker.py
     ├── signers/            Lighter signer libraries (binaries, not secrets)
     ├── src/                controller/ (run), taker/, livebot/ (XEMM), dryrun/ (simulated venues)
     └── RUNBOOK.md
 ```
 
-Git ignores `runs/` (journals, ledgers, latches, state), `target/` and the credential files
+Git ignores `runs/` (journals, ledgers, latches, state), `data/` (the market-data tape), `target/` and the credential files
 `LIGHTER_ASTER_BOT/aster.env` and `lighter.env`.
 
 ## Build
@@ -58,7 +58,9 @@ docker compose logs -f dryrun
 
 It runs in the background, the fleet's `start_all.bat` starts it too, and its files are in
 `LIGHTER_ASTER_BOT/runs/dry-run/`. The model, halts, diagnostics and the going-live checklist
-are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run).
+are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run). Beside it, the `recorder` service
+records the same public feeds to `LIGHTER_ASTER_BOT/data/HYPE/` for backtests
+([Market data tape](LIGHTER_ASTER_BOT/RUNBOOK.md#market-data-tape)).
 
 ## Reports
 

@@ -495,24 +495,31 @@ pub fn aster_streams(symbol: &str) -> [String; 3] {
     [format!("{s}@depth20@100ms"), format!("{s}@bookTicker"), format!("{s}@aggTrade")]
 }
 
+/// The Aster combined-stream URL of `symbols`' streams under `ws_root`.
+pub fn aster_url(ws_root: &str, symbols: &[String]) -> String {
+    let streams: Vec<String> = symbols.iter().flat_map(|s| aster_streams(s)).collect();
+    format!("{ws_root}/stream?streams={}", streams.join("/"))
+}
+
 /// A silent upstream is presumed dead after this (depth20 only pushes on change).
 const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
 
-/// Follows the real Aster streams of `symbols` from `ws_root`, reconnecting forever.
-pub async fn aster_upstream(ws_root: String, symbols: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
-    let streams: Vec<String> = symbols.iter().flat_map(|s| aster_streams(s)).collect();
-    let url = format!("{ws_root}/stream?streams={}", streams.join("/"));
-    let markets: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+/// What an upstream connection delivers: a text frame, or the end of its session.
+pub enum Wire<'a> {
+    Text(&'a str),
+    Closed,
+}
+
+/// Follows the Aster combined stream at `url`, reconnecting forever; `on` gets every text
+/// frame and the end of every session. Shared by the simulator and the tape recorder.
+pub async fn aster_stream(url: String, label: &str, mut on: impl FnMut(Wire<'_>)) {
     let mut backoff = Duration::from_secs(1);
     loop {
         let started = Instant::now();
-        let mut last_us = None;
-        if let Err(e) = aster_session(&url, shift_us, &hub, &inputs, &mut last_us).await {
-            tracing::warn!("dry-run upstream Aster: {e:#}");
+        if let Err(e) = aster_session(&url, &mut on).await {
+            tracing::warn!("{label}: {e:#}");
         }
-        if let Some(last_us) = last_us {
-            gap(Venue::Aster, &markets, last_us, &hub, &inputs);
-        }
+        on(Wire::Closed);
         if started.elapsed() >= Duration::from_secs(60) {
             backoff = Duration::from_secs(1);
         }
@@ -521,13 +528,7 @@ pub async fn aster_upstream(ws_root: String, symbols: Vec<String>, shift_us: i64
     }
 }
 
-async fn aster_session(
-    url: &str,
-    shift_us: i64,
-    hub: &Mutex<Hub>,
-    inputs: &mpsc::UnboundedSender<Input>,
-    last_us: &mut Option<i64>,
-) -> Result<()> {
+async fn aster_session(url: &str, on: &mut impl FnMut(Wire<'_>)) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await.context("connect")?;
     let (mut write, mut read) = ws.split();
     loop {
@@ -535,19 +536,34 @@ async fn aster_session(
             return Ok(());
         };
         match msg? {
-            Message::Text(text) => match aster_frame(&text, shift_us) {
-                Ok(Some(frame)) => {
-                    *last_us = Some(frame.engine_us);
-                    forward(frame, hub, inputs);
-                }
-                Ok(None) => {}
-                Err(e) => tracing::warn!("dry-run upstream Aster: unreadable frame: {e:#}"),
-            },
+            Message::Text(text) => on(Wire::Text(&text)),
             Message::Ping(p) => crate::connectors::send_guarded(&mut write, Message::Pong(p)).await?,
             Message::Close(_) => return Ok(()),
             _ => {}
         }
     }
+}
+
+/// Follows the real Aster streams of `symbols` from `ws_root` into the core and the bot's streams.
+pub async fn aster_upstream(ws_root: String, symbols: Vec<String>, shift_us: i64, hub: Arc<Mutex<Hub>>, inputs: mpsc::UnboundedSender<Input>) {
+    let markets: Vec<String> = symbols.iter().map(|s| s.to_uppercase()).collect();
+    let mut last_us = None;
+    aster_stream(aster_url(&ws_root, &symbols), "dry-run upstream Aster", |wire| match wire {
+        Wire::Text(text) => match aster_frame(text, shift_us) {
+            Ok(Some(frame)) => {
+                last_us = Some(frame.engine_us);
+                forward(frame, &hub, &inputs);
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("dry-run upstream Aster: unreadable frame: {e:#}"),
+        },
+        Wire::Closed => {
+            if let Some(last_us) = last_us.take() {
+                gap(Venue::Aster, &markets, last_us, &hub, &inputs);
+            }
+        }
+    })
+    .await
 }
 
 /// Follows the real Lighter order books of `markets` (indices) and their funding, reconnecting
@@ -614,8 +630,9 @@ pub async fn lighter_upstream(url: String, markets: Vec<String>, shift_us: i64, 
 /// How often the Aster funding estimate is polled: the last poll before a settlement sets its rate.
 const FUNDING_POLL: Duration = Duration::from_secs(60);
 
-/// Polls each Aster symbol's next settlement and its estimated rate from `rest_base`, forever.
-pub async fn aster_funding_poll(rest_base: String, symbols: Vec<String>, inputs: mpsc::UnboundedSender<Input>) {
+/// Polls each Aster symbol's `premiumIndex` from `rest_base`, forever; `on_body` gets each
+/// response. Shared by the simulator and the tape recorder.
+pub async fn aster_premium_poll(rest_base: String, symbols: Vec<String>, label: &str, mut on_body: impl FnMut(&str)) {
     let client = reqwest::Client::new();
     let mut tick = tokio::time::interval(FUNDING_POLL);
     loop {
@@ -623,14 +640,23 @@ pub async fn aster_funding_poll(rest_base: String, symbols: Vec<String>, inputs:
         for symbol in &symbols {
             let url = format!("{rest_base}/fapi/v1/premiumIndex?symbol={symbol}");
             let body = async { client.get(&url).timeout(Duration::from_secs(10)).send().await?.error_for_status()?.text().await };
-            match body.await.map_err(anyhow::Error::from).and_then(|body| aster_funding(&body)) {
-                Ok((market, exch_us, rate)) => {
-                    let _ = inputs.send(Input::Funding { venue: Venue::Aster, market, exch_us, rate });
-                }
-                Err(e) => tracing::warn!("dry-run funding poll for {symbol}: {e:#}"),
+            match body.await {
+                Ok(body) => on_body(&body),
+                Err(e) => tracing::warn!("{label} for {symbol}: {e:#}"),
             }
         }
     }
+}
+
+/// Hands the core each Aster symbol's next settlement and its estimated rate, forever.
+pub async fn aster_funding_poll(rest_base: String, symbols: Vec<String>, inputs: mpsc::UnboundedSender<Input>) {
+    aster_premium_poll(rest_base, symbols, "dry-run funding poll", |body| match aster_funding(body) {
+        Ok((market, exch_us, rate)) => {
+            let _ = inputs.send(Input::Funding { venue: Venue::Aster, market, exch_us, rate });
+        }
+        Err(e) => tracing::warn!("dry-run funding poll: {e:#}"),
+    })
+    .await
 }
 
 #[cfg(test)]

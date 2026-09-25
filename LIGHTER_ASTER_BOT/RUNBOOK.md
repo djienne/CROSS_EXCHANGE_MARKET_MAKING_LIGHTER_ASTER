@@ -209,6 +209,26 @@ bind-mounted files as mode 777, and live refuses env files that others can read.
 7. Start it as in [Run and stop](#run-and-stop). Its drawdown baseline starts at the first
    sample.
 
+## Market data tape
+
+The `recorder` service (container `lighter-aster-recorder`, `record --market HYPE`) records
+HYPE's raw public feeds, the dry run's input, for backtests:
+- **Aster:** `depth20@100ms` (20 levels), `bookTicker` and `aggTrade`.
+- **Lighter:** `order_book` (a snapshot, then deltas: the whole book), `trade` and `market_stats`.
+- **REST:** Aster `premiumIndex` every minute; `exchangeInfo` and `orderBooks` hourly.
+
+Every line carries its arrival time on this host, so a replay can reproduce the feed latency
+the dry run saw. The recorder is its own process, so the bot never waits on it. Rebuilding the
+dry run does not interrupt it; `docker compose up -d --build recorder` restarts it.
+
+**Files.** `data/HYPE/<UTC day>.tape.zst`: tab-separated `<arrival µs>\t<kind>\t<payload>`,
+with the kinds listed in `src/dryrun/tape.rs`. Read one with
+`zstd -dc data/HYPE/<day>.tape.zst | head`.
+- A kill loses at most the last 10 s.
+- `A-` and `L-` lines mark reconnects.
+- Aster has no order-book history to download again, and the fleet backup skips files over
+  100 MB (MAKE_BACKUP.py), so copy the tapes elsewhere if they must survive a disk loss.
+
 ## Runtime files (`runs/`)
 
 | File | What |

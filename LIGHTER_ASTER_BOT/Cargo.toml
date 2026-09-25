@@ -50,13 +50,13 @@ tiny-keccak = { version = "2", features = ["keccak"] }
 hex = "0.4"
 fs2 = "0.4"
 memmap2 = "0.9"
+# The market-data tape (`record`), and the regime-decision fixture in tests.
+zstd = "0.13"
 
 [dev-dependencies]
 # test-util enables tokio::test(start_paused) for deterministic timer tests on the
 # hedge fill-wait path.
 tokio = { version = "1", features = ["full", "test-util"] }
-# Decompresses the recorded regime-decision fixture (`controller/regime.rs` tests).
-zstd = "0.13"
 
 # NOTE: no `panic = "abort"` here: livebot/run.rs relies on catch_unwind to report a
 # strategy-thread panic through the supervision channel and shut down through the

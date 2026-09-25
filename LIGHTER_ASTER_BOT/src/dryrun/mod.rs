@@ -6,7 +6,8 @@
 //! would pay is modelled explicitly. `matching` is the venues' deterministic core; `book` holds
 //! the replica each market trades against; `account` settles the money; `clock` draws the
 //! latencies; `feed` brings the real market in; `server` speaks HTTP and WebSocket on
-//! loopback, and `aster` and `lighter` speak each venue's protocol on top of it.
+//! loopback, and `aster` and `lighter` speak each venue's protocol on top of it. `tape` records
+//! the same feeds to disk for backtests (`record`).
 
 pub mod account;
 pub mod aster;
@@ -16,6 +17,7 @@ pub mod feed;
 pub mod lighter;
 pub mod matching;
 pub mod server;
+pub mod tape;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

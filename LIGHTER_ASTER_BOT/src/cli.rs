@@ -1,6 +1,6 @@
 //! Command-line interface: `run` (the bot: both engines, one market) and the XEMM
-//! subcommands `live-report`, `probe`, `status`, `fetch-specs`. The taker engine has its own
-//! CLI under `taker`.
+//! subcommands `live-report`, `probe`, `status`, `fetch-specs`, plus `record` (the market-data
+//! tape for backtests). The taker engine has its own CLI under `taker`.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -96,6 +96,17 @@ pub enum Commands {
         #[arg(long)]
         markets: Option<String>,
     },
+
+    /// Record one market's raw public Aster and Lighter feeds, the dry run's input, to
+    /// `<out>/<MARKET>/<UTC day>.tape.zst` for backtests (format in src/dryrun/tape.rs).
+    /// Public data only: no credentials, no orders.
+    Record {
+        /// Market id from config (e.g. HYPE).
+        #[arg(long)]
+        market: String,
+        #[arg(long, default_value = "data")]
+        out: PathBuf,
+    },
 }
 
 /// Parse a `--mode` string into a [`crate::config::LiveMode`].
@@ -163,6 +174,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                     s.hl_qty_step
                 );
             }
+        }
+        Commands::Record { market, out } => {
+            crate::dryrun::tape::record(&cli.config, &market, out, crate::controller::stop_on_signals()).await?;
         }
     }
     Ok(())
