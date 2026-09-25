@@ -503,6 +503,9 @@ pub fn aster_url(ws_root: &str, symbols: &[String]) -> String {
 
 /// A silent upstream is presumed dead after this (depth20 only pushes on change).
 const UPSTREAM_IDLE: Duration = Duration::from_secs(60);
+/// The longest wait between reconnects to a public feed: an attempt is cheap, and every second
+/// waited after the network is back is market data lost.
+pub const UPSTREAM_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// What an upstream connection delivers: a text frame, or the end of its session.
 pub enum Wire<'a> {
@@ -524,7 +527,7 @@ pub async fn aster_stream(url: String, label: &str, mut on: impl FnMut(Wire<'_>)
             backoff = Duration::from_secs(1);
         }
         tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(30));
+        backoff = (backoff * 2).min(UPSTREAM_BACKOFF_MAX);
     }
 }
 
@@ -578,6 +581,7 @@ pub async fn lighter_upstream(url: String, markets: Vec<String>, shift_us: i64, 
     let channels = markets.iter().flat_map(|m| [format!("order_book/{m}"), format!("market_stats/{m}")]).collect();
     let mut opts = SubscribeOptions::new(&url, "dry-run upstream Lighter", channels);
     opts.reconnect_base = 0.5;
+    opts.reconnect_max = UPSTREAM_BACKOFF_MAX.as_secs_f64();
     let reconnect = Arc::new(Notify::new());
     let session = Arc::new(Mutex::new(Session::default()));
     let (on_gap, closing) = (reconnect.clone(), session.clone());

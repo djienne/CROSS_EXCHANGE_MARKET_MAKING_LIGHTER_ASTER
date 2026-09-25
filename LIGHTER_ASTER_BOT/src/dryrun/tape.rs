@@ -5,9 +5,9 @@
 //! | kind | payload |
 //! |---|---|
 //! | `A` | an Aster combined-stream frame, raw: `depth20@100ms` (20 levels), `bookTicker`, `aggTrade` |
-//! | `A-` | the Aster connection ended (empty); the frames after it follow a reconnect |
+//! | `A-` | the Aster connection ended, or a reconnect failed (empty); later frames follow a reconnect |
 //! | `L` | a Lighter frame, raw: `order_book` (snapshot, then deltas: the whole book), `trade`, `market_stats` (funding) |
-//! | `L-` | the Lighter connection ended (empty) |
+//! | `L-` | the Lighter connection ended, or a reconnect failed (empty) |
 //! | `F` | an Aster `premiumIndex` response (funding), every minute |
 //! | `X`, `O` | the Aster `exchangeInfo` and Lighter `orderBooks` responses (filters), hourly |
 //!
@@ -194,6 +194,7 @@ pub async fn record(config: &Path, market: &str, dir: PathBuf, stop: Cancellatio
     let channels = ["order_book", "trade", "market_stats"].map(|c| format!("{c}/{index}")).to_vec();
     let mut opts = SubscribeOptions::new(&stream_url(&lighter_base), "recorder Lighter", channels);
     opts.reconnect_base = 0.5;
+    opts.reconnect_max = feed::UPSTREAM_BACKOFF_MAX.as_secs_f64();
     let (on_frame, on_close) = (tape.clone(), tape.clone());
     tokio::spawn(subscribe_loop(opts, None, move |frame| on_frame.record("L", frame.raw), move || on_close.record("L-", "")));
     let on_body = tape.clone();
