@@ -1,0 +1,801 @@
+//! `report`: replays the bot's rules on the recorded moments of each pair and ranks the pairs.
+//!
+//! - **Taker-taker**, as `taker/arb.rs` and `entry_gate.rs` decide: the better direction's edge at
+//!   the top of book (skipped where a side holds less than the bot's depth); the percentile gate
+//!   over the samples the summaries counted in the windows before, once it has its minimum; the
+//!   cooldown and the inventory cap. Each leg fills at the recorded state after its latency. PnL is
+//!   the trades' cash plus the leftover hedged inventory closed at the last window's mean basis.
+//! - **XEMM**, maker on one venue and a taker hedge on the other, as `quote_engine.rs` prices it:
+//!   the quote is priced from the state `quote_age` before the trade; a trade printing *through*
+//!   it fills min(trade, clip) (queue position ignored); one fill per side per cooldown; the hedge
+//!   fills at the recorded state after the fill notice and the hedge latency. Run with the bot's
+//!   settings (Aster maker, Lighter hedge, distance gate), and as a sweep of the required edge
+//!   without the gate for both directions.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use chrono::{Days, NaiveDate};
+use serde::Serialize;
+use serde_json::Value;
+
+use crate::collect::{best_edge, edge_bin, Bbo, Gate, Recording, Samples, Venue, PREROLL_MS, TAIL_MS, WINDOW_MS};
+use crate::config::Report;
+use crate::universe::Pair;
+
+#[derive(clap::Args)]
+pub struct Args {
+    #[arg(long, default_value = "data")]
+    data: PathBuf,
+    /// First UTC day scored (YYYY-MM-DD); the gate also reads the days before it.
+    #[arg(long)]
+    since: Option<String>,
+    /// Last UTC day scored (YYYY-MM-DD).
+    #[arg(long)]
+    until: Option<String>,
+    /// Lighter account tier, standard or premium (default: screener.toml).
+    #[arg(long)]
+    lighter: Option<String>,
+    /// Multiplies every latency: a sensitivity check (0 = none).
+    #[arg(long, default_value_t = 1.0)]
+    latency: f64,
+    /// JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct State {
+    pub t: i64,
+    pub a: Bbo,
+    pub l: Bbo,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Trade {
+    pub t: i64,
+    pub venue: Venue,
+    pub price: f64,
+    pub size: f64,
+    pub buy: bool,
+}
+
+#[derive(Debug, Default)]
+struct Series {
+    states: Vec<State>,
+    trades: Vec<Trade>,
+    summaries: Vec<Value>,
+    /// Each window's gate samples, by window start.
+    windows: Vec<(i64, Samples)>,
+}
+
+/// The last recorded state at or before `t`. Callers only ask within a recorded moment (at most
+/// the pre-roll before, or the tail after, a trigger), where every change was recorded.
+pub fn state_at(states: &[State], t: i64) -> Option<&State> {
+    states.partition_point(|s| s.t <= t).checked_sub(1).map(|i| &states[i])
+}
+
+fn day(t: i64) -> i64 {
+    t.div_euclid(86_400_000)
+}
+
+/// Everything loaded: the pairs (as last listed), each one's series, and each file's recording.
+#[derive(Default)]
+struct Data {
+    pairs: BTreeMap<String, Pair>,
+    series: BTreeMap<String, Series>,
+    recordings: Vec<(String, Recording)>,
+}
+
+impl Data {
+    /// Adds one line of `file`. A history file (a day before `--since`) gives only its samples,
+    /// for the gate.
+    fn add(&mut self, file: &str, line: &str, history: bool) -> Result<()> {
+        let f: Vec<&str> = line.split('\t').collect();
+        match f[0] {
+            "P" => {
+                let params: Value = serde_json::from_str(f[1])?;
+                let rec = serde_json::from_value(params["recording"].clone()).with_context(|| format!("{file}: not written by this screener version"))?;
+                self.recordings.push((file.to_string(), rec));
+            }
+            "U" => {
+                for p in serde_json::from_str::<Vec<Pair>>(f[1])? {
+                    self.pairs.insert(p.name.clone(), p);
+                }
+            }
+            "B" if !history && f.len() == 11 => {
+                let n: Vec<f64> = f[3..].iter().map(|x| x.parse()).collect::<Result<_, _>>()?;
+                let a = Bbo { bid: n[0], bid_size: n[1], ask: n[2], ask_size: n[3] };
+                let l = Bbo { bid: n[4], bid_size: n[5], ask: n[6], ask_size: n[7] };
+                self.series.entry(f[2].to_string()).or_default().states.push(State { t: f[1].parse()?, a, l });
+            }
+            "T" if !history && f.len() == 7 => {
+                let venue = if f[3] == "A" { Venue::Aster } else { Venue::Lighter };
+                let trade = Trade { t: f[1].parse()?, venue, price: f[4].parse()?, size: f[5].parse()?, buy: f[6] == "B" };
+                self.series.entry(f[2].to_string()).or_default().trades.push(trade);
+            }
+            "S" => {
+                let s: Value = serde_json::from_str(f[1])?;
+                let series = self.series.entry(s["p"].as_str().unwrap_or_default().to_string()).or_default();
+                series.windows.push((s["t"].as_i64().context("a summary without its time")?, serde_json::from_value(s["samples"].clone())?));
+                if !history {
+                    series.summaries.push(s);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Puts each series in time order (a pre-roll can be written after later states).
+    fn sorted(mut self) -> Data {
+        for s in self.series.values_mut() {
+            s.states.sort_by_key(|s| s.t);
+            s.trades.sort_by_key(|t| t.t);
+            s.windows.sort_by_key(|w| w.0);
+        }
+        self
+    }
+}
+
+/// The data of the days `since..=until`, plus the samples of the `history_days` before `since`.
+fn load(dir: &Path, since: Option<&str>, until: Option<&str>, history_days: u64) -> Result<Data> {
+    let first = since.map(|s| -> Result<String> { Ok((NaiveDate::parse_from_str(s, "%Y-%m-%d")? - Days::new(history_days)).to_string()) }).transpose()?;
+    let mut data = Data::default();
+    for file in crate::store::files(dir, first.as_deref(), until)? {
+        let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+        // Names start with the day: "2026-09-25T..." sorts before "2026-09-26".
+        let history = since.is_some_and(|s| name.as_str() < s);
+        for line in crate::store::read(&file)? {
+            data.add(&name, &line, history)?;
+        }
+    }
+    Ok(data.sorted())
+}
+
+/// Latencies in ms.
+#[derive(Debug, Clone, Copy)]
+struct Lags {
+    aster_taker: i64,
+    lighter_taker: i64,
+    aster_notice: i64,
+    lighter_notice: i64,
+    quote_age: i64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct TakerResult {
+    pub trades: usize,
+    /// Trades whose fill met an unknown book (a connection gap): left out.
+    pub unresolved: usize,
+    /// Gate samples at `required` or more, over all the windows.
+    pub samples: u64,
+    /// Too few samples for the gate ever to open.
+    pub warmup: bool,
+    pub expected_bps: f64,
+    pub realized_bps: f64,
+    pub pnl_usd: f64,
+    pub inventory_clips: f64,
+    #[serde(skip)]
+    pub by_day: BTreeMap<i64, f64>,
+}
+
+pub struct TakerSim<'a> {
+    pub rules: &'a crate::config::Taker,
+    pub required_bps: f64,
+    pub clip_usd: f64,
+    pub depth_usd: f64,
+    pub fee_a: f64,
+    pub fee_l: f64,
+    pub lag_a: i64,
+    pub lag_l: i64,
+    /// Where the leftover inventory is closed: Lighter mid vs Aster mid, bps.
+    pub close_basis_bps: Option<f64>,
+}
+
+/// The bot's gated taker over `states`, its gate reading `windows` (by start) as the collector did:
+/// at a state, the windows of the `gate_window_hours` before the state's own.
+pub fn simulate_taker(states: &[State], windows: &[(i64, Samples)], sim: &TakerSim) -> TakerResult {
+    let rules = sim.rules;
+    let span = (rules.gate_window_hours * 3.6e6) as i64;
+    let samples = windows.iter().flat_map(|(_, s)| s.range(edge_bin(sim.required_bps)..)).map(|(_, n)| n).sum();
+    let mut r = TakerResult { samples, warmup: samples < rules.gate_min_samples as u64, ..Default::default() };
+    let (mut gate, mut pushed, mut window, mut threshold) = (Gate::default(), 0, i64::MIN, None);
+    let mut last_trade = i64::MIN / 2;
+    // Aster base position (long: bought Aster, sold Lighter) and cash.
+    let (mut position, mut cash, mut expected, mut realized) = (0.0f64, 0.0f64, 0.0, 0.0);
+    for s in states {
+        let Some((buy_aster, edge)) = best_edge(&s.a, &s.l, sim.depth_usd) else { continue };
+        if edge < sim.required_bps {
+            continue;
+        }
+        let w = s.t - s.t.rem_euclid(WINDOW_MS);
+        if w != window {
+            while pushed < windows.len() && windows[pushed].0 < w {
+                gate.push(windows[pushed].0, windows[pushed].1.clone());
+                pushed += 1;
+            }
+            gate.expire(w - span);
+            threshold = gate.level(sim.required_bps, rules.gate_percentile, rules.gate_min_samples).map(|g| g.max(sim.required_bps + rules.gate_extra_bps));
+            window = w;
+        }
+        let Some(threshold) = threshold else { continue };
+        if edge < threshold || s.t - last_trade < rules.cooldown_ms {
+            continue;
+        }
+        let mid = s.a.mid();
+        let qty = sim.clip_usd / mid;
+        let signed = if buy_aster { qty } else { -qty };
+        let after = ((position + signed) * mid).abs();
+        if after > rules.max_position_usd + 1e-9 && after > (position * mid).abs() {
+            continue;
+        }
+        let fill_a = state_at(states, s.t + sim.lag_a).map(|f| f.a).filter(Bbo::known);
+        let fill_l = state_at(states, s.t + sim.lag_l).map(|f| f.l).filter(Bbo::known);
+        let (Some(fa), Some(fl)) = (fill_a, fill_l) else {
+            r.unresolved += 1;
+            continue;
+        };
+        let (pa, pl) = if buy_aster { (fa.ask, fl.bid) } else { (fa.bid, fl.ask) };
+        let gross = if buy_aster { pl - pa } else { pa - pl };
+        let net = qty * gross - qty * pa * sim.fee_a - qty * pl * sim.fee_l;
+        cash += net;
+        position += signed;
+        expected += edge;
+        realized += gross / mid * 1e4;
+        r.trades += 1;
+        *r.by_day.entry(day(s.t)).or_default() += net;
+        last_trade = s.t;
+    }
+    // Close the hedged inventory: its Aster leg at the Aster mid, its Lighter leg at the Lighter
+    // mid, `close_basis_bps` apart.
+    if let Some(last) = states.iter().rev().find(|s| s.a.known()) {
+        r.inventory_clips = position * last.a.mid() / sim.clip_usd;
+        cash -= position * last.a.mid() * sim.close_basis_bps.unwrap_or(0.0) / 1e4;
+    }
+    if r.trades > 0 {
+        (r.expected_bps, r.realized_bps) = (expected / r.trades as f64, realized / r.trades as f64);
+    }
+    r.pnl_usd = cash;
+    r
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct XemmResult {
+    pub required_bps: f64,
+    pub fills: usize,
+    /// Fills whose hedge met an unknown book (a connection gap): left out.
+    pub unresolved: usize,
+    /// Mean hedge price minus quote price, bps of the reference (before fees).
+    pub edge_bps: f64,
+    pub pnl_usd: f64,
+    #[serde(skip)]
+    pub by_day: BTreeMap<i64, f64>,
+}
+
+pub struct XemmSim {
+    pub maker: Venue,
+    pub required_bps: f64,
+    /// The bot's distance gate (min, max bps behind the maker touch); None to quote anywhere.
+    pub distance: Option<(f64, f64)>,
+    pub fee_maker: f64,
+    pub fee_hedge: f64,
+    pub clip_usd: f64,
+    pub depth_usd: f64,
+    pub quote_age: i64,
+    pub notice: i64,
+    pub hedge_lag: i64,
+    pub cooldown: i64,
+}
+
+pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmResult {
+    let mut r = XemmResult { required_bps: sim.required_bps, ..Default::default() };
+    let mut last_fill = [i64::MIN / 2; 2];
+    let mut edge_sum = 0.0;
+    let books = |s: &State| match sim.maker {
+        Venue::Aster => (s.a, s.l),
+        Venue::Lighter => (s.l, s.a),
+    };
+    for trade in trades.iter().filter(|t| t.venue == sim.maker) {
+        // A seller hits our bid (side 0); a buyer lifts our ask (side 1).
+        let side = trade.buy as usize;
+        if trade.t - last_fill[side] < sim.cooldown {
+            continue;
+        }
+        let Some(quoted) = state_at(states, trade.t - sim.quote_age) else { continue };
+        let (maker, hedge) = books(quoted);
+        if !(maker.known() && hedge.known()) {
+            continue;
+        }
+        let reference = (quoted.a.mid() + quoted.l.mid()) / 2.0;
+        let required = sim.required_bps / 1e4 * reference;
+        // The bot's price, joining the touch at best (post-only).
+        let price = if trade.buy {
+            ((hedge.ask * (1.0 + sim.fee_hedge) + required) / (1.0 - sim.fee_maker)).max(maker.ask)
+        } else {
+            ((hedge.bid * (1.0 - sim.fee_hedge) - required) / (1.0 + sim.fee_maker)).min(maker.bid)
+        };
+        let hedge_depth = if trade.buy { hedge.ask * hedge.ask_size } else { hedge.bid * hedge.bid_size };
+        if hedge_depth < sim.depth_usd {
+            continue;
+        }
+        if let Some((min_bps, max_bps)) = sim.distance {
+            let touch = if trade.buy { maker.ask } else { maker.bid };
+            let distance = (price - touch).abs() / reference * 1e4;
+            if distance < min_bps || distance > max_bps {
+                continue;
+            }
+        }
+        if !(if trade.buy { trade.price > price } else { trade.price < price }) {
+            continue;
+        }
+        let Some(hedged) = state_at(states, trade.t + sim.notice + sim.hedge_lag).map(|s| books(s).1).filter(Bbo::known) else {
+            r.unresolved += 1;
+            continue;
+        };
+        let hedge_price = if trade.buy { hedged.ask } else { hedged.bid };
+        let qty = trade.size.min(sim.clip_usd / reference);
+        let gross = if trade.buy { price - hedge_price } else { hedge_price - price };
+        let net = qty * gross - qty * price * sim.fee_maker - qty * hedge_price * sim.fee_hedge;
+        r.fills += 1;
+        r.pnl_usd += net;
+        edge_sum += gross / reference * 1e4;
+        *r.by_day.entry(day(trade.t)).or_default() += net;
+        last_fill[side] = trade.t;
+    }
+    if r.fills > 0 {
+        r.edge_bps = edge_sum / r.fills as f64;
+    }
+    r
+}
+
+#[derive(Debug, Serialize)]
+pub struct Score {
+    pub pair: String,
+    pub aster_taker_bps: f64,
+    /// Days both venues were followed.
+    pub days: f64,
+    pub aster_usd_day: f64,
+    pub lighter_usd_day: f64,
+    pub spread_a_bps: Option<f64>,
+    pub spread_l_bps: Option<f64>,
+    /// Share of the time either top of book held less than the bot's depth.
+    pub thin: Option<f64>,
+    pub basis_bps: Option<f64>,
+    pub taker_gated: TakerResult,
+    /// Aster maker, Lighter hedge, with the bot's required edge and distance gate.
+    pub xemm_bot: XemmResult,
+    /// Aster maker, Lighter hedge, best required edge of the sweep, no gate.
+    pub xemm_best: XemmResult,
+    /// Lighter maker, Aster hedge, best required edge of the sweep, no gate.
+    pub xemm_reverse_best: XemmResult,
+    /// The best strategy's PnL per day, and on how many days it was positive.
+    pub best_usd_day: f64,
+    pub best: &'static str,
+    pub best_days_positive: usize,
+    #[serde(skip)]
+    pub best_by_day: BTreeMap<i64, f64>,
+}
+
+fn sum(summaries: &[Value], key: &str) -> f64 {
+    summaries.iter().filter_map(|s| s[key].as_f64()).sum()
+}
+
+/// Mean of `key` weighted by each summary's seconds up.
+fn weighted(summaries: &[Value], key: &str) -> Option<f64> {
+    let (w, x) = summaries.iter().fold((0.0, 0.0), |(w, x), s| match (s["up"].as_f64(), s[key].as_f64()) {
+        (Some(up), Some(v)) => (w + up, x + up * v),
+        _ => (w, x),
+    });
+    (w > 0.0).then(|| x / w)
+}
+
+fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Score> {
+    let lighter = cfg.lighter()?;
+    let ms = |ms: f64| (ms * latency).round() as i64;
+    let lags = Lags {
+        aster_taker: ms(cfg.aster_taker_ms),
+        lighter_taker: ms(lighter.taker_delay_ms + cfg.lighter_rtt_ms),
+        aster_notice: ms(cfg.aster_fill_notice_ms),
+        lighter_notice: ms(cfg.lighter_fill_notice_ms),
+        quote_age: ms(cfg.xemm.quote_age_ms as f64),
+    };
+    let aster_taker_bps = cfg.aster_taker_bps(&pair.aster, &pair.aster_subtypes);
+    let (fee_a, fee_l) = (aster_taker_bps / 1e4, lighter.taker_bps / 1e4);
+    let depth_usd = cfg.depth_usd();
+    let days = sum(&series.summaries, "up") / 86_400.0;
+    let per_day = |x: f64| if days > 0.0 { x / days } else { 0.0 };
+
+    let taker = simulate_taker(
+        &series.states,
+        &series.windows,
+        &TakerSim {
+            rules: &cfg.taker,
+            required_bps: cfg.taker_required_bps(pair, lighter),
+            clip_usd: cfg.clip_usd,
+            depth_usd,
+            fee_a,
+            fee_l,
+            lag_a: lags.aster_taker,
+            lag_l: lags.lighter_taker,
+            close_basis_bps: series.summaries.iter().rev().find_map(|s| s["basis"].as_f64()),
+        },
+    );
+    let xemm = |maker: Venue, required_bps: f64, distance: Option<(f64, f64)>| {
+        let (fee_maker, fee_hedge, notice, hedge_lag) = match maker {
+            Venue::Aster => (cfg.aster.maker_bps / 1e4, fee_l, lags.aster_notice, lags.lighter_taker),
+            Venue::Lighter => (lighter.maker_bps / 1e4, fee_a, lags.lighter_notice, lags.aster_taker),
+        };
+        let sim = XemmSim {
+            maker,
+            required_bps,
+            distance,
+            fee_maker,
+            fee_hedge,
+            clip_usd: cfg.clip_usd,
+            depth_usd,
+            quote_age: lags.quote_age,
+            notice,
+            hedge_lag,
+            cooldown: cfg.xemm.cooldown_ms,
+        };
+        simulate_xemm(&series.states, &series.trades, &sim)
+    };
+    let best_of = |maker: Venue| {
+        cfg.xemm.sweep_bps.iter().map(|&req| xemm(maker, req, None)).max_by(|x, y| x.pnl_usd.total_cmp(&y.pnl_usd)).unwrap_or_default()
+    };
+    let x = &cfg.xemm;
+    let mut s = Score {
+        pair: pair.name.clone(),
+        aster_taker_bps,
+        days,
+        aster_usd_day: per_day(sum(&series.summaries, "a_usd")),
+        lighter_usd_day: per_day(sum(&series.summaries, "l_usd")),
+        spread_a_bps: weighted(&series.summaries, "spread_a"),
+        spread_l_bps: weighted(&series.summaries, "spread_l"),
+        thin: weighted(&series.summaries, "thin"),
+        basis_bps: weighted(&series.summaries, "basis"),
+        taker_gated: taker,
+        xemm_bot: xemm(Venue::Aster, x.required_bps, Some((x.min_touch_distance_bps, x.max_quote_distance_bps))),
+        xemm_best: best_of(Venue::Aster),
+        xemm_reverse_best: best_of(Venue::Lighter),
+        best_usd_day: 0.0,
+        best: "",
+        best_days_positive: 0,
+        best_by_day: BTreeMap::new(),
+    };
+    let candidates = [
+        ("taker", s.taker_gated.pnl_usd, &s.taker_gated.by_day),
+        ("xemm_bot", s.xemm_bot.pnl_usd, &s.xemm_bot.by_day),
+        ("xemm_best", s.xemm_best.pnl_usd, &s.xemm_best.by_day),
+        ("xemm_reverse", s.xemm_reverse_best.pnl_usd, &s.xemm_reverse_best.by_day),
+    ];
+    let (best, pnl, by_day) = candidates.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+    let by_day = by_day.clone();
+    (s.best, s.best_usd_day, s.best_days_positive) = (best, per_day(pnl), by_day.values().filter(|&&v| v > 0.0).count());
+    s.best_by_day = by_day;
+    Ok(s)
+}
+
+/// Spearman rank correlation of `x` and `y` (average ranks for ties).
+fn spearman(x: &[f64], y: &[f64]) -> Option<f64> {
+    fn ranks(v: &[f64]) -> Vec<f64> {
+        let mut order: Vec<usize> = (0..v.len()).collect();
+        order.sort_by(|&i, &j| v[i].total_cmp(&v[j]));
+        let mut r = vec![0.0; v.len()];
+        let mut i = 0;
+        while i < order.len() {
+            let mut j = i;
+            while j + 1 < order.len() && v[order[j + 1]] == v[order[i]] {
+                j += 1;
+            }
+            for k in i..=j {
+                r[order[k]] = (i + j) as f64 / 2.0;
+            }
+            i = j + 1;
+        }
+        r
+    }
+    let (rx, ry) = (ranks(x), ranks(y));
+    let n = x.len() as f64;
+    let mean = (n - 1.0) / 2.0;
+    let cov: f64 = rx.iter().zip(&ry).map(|(a, b)| (a - mean) * (b - mean)).sum();
+    let var = |r: &[f64]| r.iter().map(|a| (a - mean).powi(2)).sum::<f64>();
+    let d = (var(&rx) * var(&ry)).sqrt();
+    (x.len() >= 3 && d > 0.0).then(|| cov / d)
+}
+
+pub fn run(cfg: &Report, args: &Args) -> Result<()> {
+    let mut cfg = cfg.clone();
+    if let Some(tier) = &args.lighter {
+        cfg.lighter_tier = tier.clone();
+    }
+    let lighter = cfg.lighter()?;
+    let longest = (cfg.aster_taker_ms.max(lighter.taker_delay_ms + cfg.lighter_rtt_ms) + cfg.aster_fill_notice_ms.max(cfg.lighter_fill_notice_ms)) * args.latency;
+    if longest > TAIL_MS as f64 || cfg.xemm.quote_age_ms as f64 * args.latency > PREROLL_MS as f64 {
+        bail!("latencies beyond the recorded 1 s before/after each moment; lower --latency");
+    }
+    let data = load(&args.data, args.since.as_deref(), args.until.as_deref(), (cfg.taker.gate_window_hours / 24.0).ceil() as u64)?;
+    for (file, rec) in &data.recordings {
+        rec.check(&cfg, lighter, &data.pairs).with_context(|| format!("{file}: these settings would trade on moments it did not record"))?;
+    }
+    let empty = Series::default();
+    let mut scores: Vec<Score> = data.pairs.values().map(|p| score(&cfg, args.latency, p, data.series.get(&p.name).unwrap_or(&empty))).collect::<Result<_>>()?;
+    scores.retain(|s| s.days > 0.0);
+    scores.sort_by(|a, b| b.best_usd_day.total_cmp(&a.best_usd_day));
+
+    // Does the ranking hold from one day to the next? Mean Spearman over consecutive days.
+    let all_days: std::collections::BTreeSet<i64> = scores.iter().flat_map(|s| data.series[&s.pair].summaries.iter().filter_map(|x| x["t"].as_i64()).map(day)).collect();
+    let days: Vec<i64> = all_days.into_iter().collect();
+    let correlations: Vec<f64> = days
+        .windows(2)
+        .filter_map(|w| {
+            let at = |d: i64| scores.iter().map(|s| s.best_by_day.get(&d).copied().unwrap_or(0.0)).collect::<Vec<_>>();
+            spearman(&at(w[0]), &at(w[1]))
+        })
+        .collect();
+    let stability = (!correlations.is_empty()).then(|| correlations.iter().sum::<f64>() / correlations.len() as f64);
+
+    if args.json {
+        let out = serde_json::json!({ "lighter_tier": cfg.lighter_tier, "latency": args.latency, "clip_usd": cfg.clip_usd, "day_to_day_rank_correlation": stability, "pairs": scores });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    println!("Lighter {}, latency x{}, clip ${}; $/day at one clip. Taker = the bot's gated taker.", cfg.lighter_tier, args.latency, cfg.clip_usd);
+    println!(
+        "{:<12} {:>4} {:>5} {:>6} {:>6} {:>5} | {:>5} {:>5} {:>7} | {:>5} {:>7} | {:>4} {:>7} | {:>4} {:>7} | {:<12} {:>5}",
+        "pair", "fee", "days", "sprA", "sprL", "thin", "tk/d", "kept", "tk$/d", "xb/d", "xb$/d", "req", "xm$/d", "req", "xr$/d", "best", "+days"
+    );
+    for s in &scores {
+        let t = &s.taker_gated;
+        let kept = if t.expected_bps > 0.0 { format!("{:.0}%", 100.0 * t.realized_bps / t.expected_bps) } else { "-".into() };
+        let d = |x: f64| if s.days > 0.0 { x / s.days } else { 0.0 };
+        let opt = |x: Option<f64>| x.map_or("-".into(), |v| format!("{v:.1}"));
+        println!(
+            "{:<12} {:>4} {:>5.2} {:>6} {:>6} {:>4.0}% | {:>5.1} {:>5} {:>7.2} | {:>5.1} {:>7.2} | {:>4} {:>7.2} | {:>4} {:>7.2} | {:<12} {:>2}/{}",
+            s.pair,
+            s.aster_taker_bps,
+            s.days,
+            opt(s.spread_a_bps),
+            opt(s.spread_l_bps),
+            100.0 * s.thin.unwrap_or(0.0),
+            d(t.trades as f64),
+            kept,
+            d(t.pnl_usd),
+            d(s.xemm_bot.fills as f64),
+            d(s.xemm_bot.pnl_usd),
+            s.xemm_best.required_bps,
+            d(s.xemm_best.pnl_usd),
+            s.xemm_reverse_best.required_bps,
+            d(s.xemm_reverse_best.pnl_usd),
+            s.best,
+            s.best_days_positive,
+            s.best_by_day.len()
+        );
+    }
+    match stability {
+        Some(rho) => println!("Day-to-day rank correlation of the best $/day: {rho:.2} (1 = the same ranking every day, 0 = noise)."),
+        None => println!("Day-to-day rank correlation: needs two days of data."),
+    }
+    let warmup = scores.iter().filter(|s| s.taker_gated.warmup).count();
+    if warmup > 0 {
+        println!("{warmup} pairs never gave the taker gate its {} samples.", cfg.taker.gate_min_samples);
+    }
+    let unresolved: usize = scores.iter().map(|s| s.taker_gated.unresolved + s.xemm_bot.unresolved).sum();
+    if unresolved > 0 {
+        println!("{unresolved} fills met an unknown book (a connection gap): their PnL is left out.");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::collect::{Collector, Event};
+
+    fn bbo(bid: f64, ask: f64) -> Bbo {
+        Bbo { bid, bid_size: 100.0, ask, ask_size: 100.0 }
+    }
+
+    fn rules(min_samples: usize) -> crate::config::Taker {
+        crate::config::Taker {
+            margin_bps: 2.0,
+            gate_percentile: 90.0,
+            gate_window_hours: 72.0,
+            gate_min_samples: min_samples,
+            gate_extra_bps: 0.5,
+            sample_interval_ms: 1000,
+            cooldown_ms: 60_000,
+            max_position_usd: 200.0,
+        }
+    }
+
+    fn sim(rules: &crate::config::Taker) -> TakerSim<'_> {
+        TakerSim { rules, required_bps: 6.0, clip_usd: 100.0, depth_usd: 1_000.0, fee_a: 4e-4, fee_l: 0.0, lag_a: 100, lag_l: 300, close_basis_bps: None }
+    }
+
+    #[test]
+    fn a_round_trip_earns_its_two_realized_edges_less_fees() {
+        // The window before held 50 samples at 6 bps: the gate is 6.5 bps (required + 0.5).
+        let windows = vec![(-WINDOW_MS, Samples::from([(24, 50)]))];
+        // Aster steady at 100.00/100.02 (mid 100.01).
+        let a = bbo(100.0, 100.02);
+        let states = [
+            // Lighter bid 100.12: buying Aster at 100.02 and selling Lighter earns 10 bps...
+            State { t: 0, a, l: bbo(100.12, 100.14) },
+            // ...but by the Lighter fill (300 ms) the bid is 100.10: 8 bps realized.
+            State { t: 200, a, l: bbo(100.10, 100.12) },
+            // 100 s later Lighter's ask is 99.90: selling Aster at 100.00 earns 10 bps, and holds.
+            State { t: 100_000, a, l: bbo(99.88, 99.90) },
+        ];
+        let rules = rules(50);
+        let r = simulate_taker(&states, &windows, &sim(&rules));
+        assert_eq!(r.trades, 2);
+        let qty = 100.0 / 100.01;
+        // Cash: (100.10 - 100.02) + (100.00 - 99.90) per unit, less 4 bps on each Aster leg.
+        let fees = qty * (100.02 + 100.00) * 4e-4;
+        assert!((r.pnl_usd - (qty * (0.08 + 0.10) - fees)).abs() < 1e-9);
+        assert!(r.inventory_clips.abs() < 1e-12);
+        assert!((r.expected_bps - (0.10 / 100.01 * 1e4 + 0.10 / 100.01 * 1e4) / 2.0).abs() < 1e-9);
+        assert!((r.realized_bps - (0.08 / 100.01 * 1e4 + 0.10 / 100.01 * 1e4) / 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_gate_reads_the_windows_before_and_trades_only_their_top_decile() {
+        // The window before held ten samples: 7.1..=16.1 bps (bins 28, 32, ... 64).
+        let windows = vec![(-WINDOW_MS, (0..10).map(|i| (28 + 4 * i, 1)).collect::<Samples>())];
+        let a = bbo(100.0, 100.0);
+        let at = |t: i64, edge_bps: f64| State { t, a, l: bbo(100.0 + edge_bps / 100.0, 100.2) };
+        // In that window itself no window came before: no gate. In the next, the gate is its P90
+        // (the 9th of ten, bin 60): 15 bps. 14.8 waits, 15.2 trades, then the 60 s cooldown holds.
+        let states = [at(-1_000, 20.0), at(1_000, 14.8), at(2_000, 15.2), at(3_000, 16.0)];
+        let r = simulate_taker(&states, &windows, &sim(&rules(5)));
+        assert_eq!((r.samples, r.trades, r.warmup), (10, 1, false));
+        assert!((r.expected_bps - 15.2).abs() < 1e-9);
+        let never = simulate_taker(&states, &windows, &sim(&rules(50)));
+        assert_eq!((never.trades, never.warmup), (0, true));
+    }
+
+    #[test]
+    fn an_xemm_fill_needs_a_trade_through_the_quote_and_pays_the_hedge_markout() {
+        // Aster maker 100.00/100.02, Lighter hedge 100.00/100.02: reference 100.01.
+        let states = [
+            State { t: 0, a: bbo(100.0, 100.02), l: bbo(100.0, 100.02) },
+            // The Lighter bid falls 1 cent before the hedge sells into it, 400 ms after the fill.
+            State { t: 1_200, a: bbo(99.8, 100.02), l: bbo(99.99, 100.01) },
+        ];
+        let sim = XemmSim {
+            maker: Venue::Aster,
+            required_bps: 10.0,
+            distance: None,
+            fee_maker: 0.0,
+            fee_hedge: 0.0,
+            clip_usd: 100.0,
+            depth_usd: 1_000.0,
+            quote_age: 250,
+            notice: 100,
+            hedge_lag: 300,
+            cooldown: 3_000,
+        };
+        // Our bid: 100.00 - 10 bps x 100.01 = 99.89999. A sale at 99.90 is not through it.
+        let at = |t: i64, price: f64| Trade { t, venue: Venue::Aster, price, size: 5.0, buy: false };
+        assert_eq!(simulate_xemm(&states, &[at(1_000, 99.90)], &sim).fills, 0);
+        let r = simulate_xemm(&states, &[at(1_000, 99.85), at(2_000, 99.8)], &sim);
+        // One fill (the second trade is inside the 3 s cooldown), hedged at 99.99.
+        let price = 100.0 - 10e-4 * 100.01;
+        let qty = 100.0 / 100.01;
+        assert_eq!(r.fills, 1);
+        assert!((r.pnl_usd - qty * (99.99 - price)).abs() < 1e-9);
+        // The bot's gate: our bid sits 10 bps behind Aster's 100.00 bid, inside the 18 bps minimum.
+        let gated = XemmSim { distance: Some((18.0, 50.0)), ..sim };
+        assert_eq!(simulate_xemm(&states, &[at(1_000, 99.85)], &gated).fills, 0);
+    }
+
+    /// The collector keeps every moment the report trades on: scoring what it wrote gives the same
+    /// trades as scoring every state and trade it saw, with the shipped settings and with stricter
+    /// ones (the pricier Lighter tier, slower orders, a higher percentile), across a restart.
+    #[test]
+    fn the_recording_holds_every_moment_the_report_trades_on() {
+        let cfg = crate::config::Config::load(Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/screener.toml"))).unwrap().report;
+        let pair = Pair { name: "X".into(), aster: "XUSDT".into(), lighter_id: 1, scale: 1.0, aster_subtypes: vec![], aster_volume_usd: 0.0, lighter_volume_usd: 0.0 };
+        let pairs = [pair.clone()];
+        let rec = Recording::new(&cfg, &pairs);
+        let mut collector = Collector::new(&rec, &pairs, HashMap::new(), 0);
+        let header = [format!("P\t{}", serde_json::json!({ "recording": &rec })), format!("U\t{}", serde_json::to_string(&pairs).unwrap())];
+        let lines = std::cell::RefCell::new(header.to_vec());
+        let mut out = |l: String| lines.borrow_mut().push(l);
+        let mut full = Series::default();
+        // 40 minutes of a market whose basis swings ±10 bps every 8 minutes (the inventory fills both
+        // ways and unwinds), wanders and now and then jumps, with 1 and 1.5 bps spreads, a thin top
+        // now and then, trades at or through the touch, connection gaps, several events within a
+        // millisecond, and a restart mid-window every 7.5 minutes.
+        let mut seed = 1u64;
+        let mut rand = move || {
+            seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut t, mut mid, mut basis, mut restart) = (0i64, 100.0, 0.0, 480_000);
+        let (mut a, mut l) = (Bbo::default(), Bbo::default());
+        while t < 40 * 60_000 {
+            t += (rand() * 120.0) as i64;
+            if t >= restart {
+                // The new run's gate comes from what the old one wrote, its books from scratch.
+                collector.finish(t, &mut out);
+                let mut gates = HashMap::new();
+                crate::collect::add_gates(&mut gates, lines.borrow().iter().cloned(), rec.span_ms(), t);
+                collector = Collector::new(&rec, &pairs, gates, t);
+                (a, l, restart) = (Bbo::default(), Bbo::default(), restart + 450_000);
+                full.states.push(State { t, a, l });
+            }
+            mid *= 1.0 + (rand() - 0.5) * 1e-4;
+            let swing = 10.0 * (t as f64 / 480_000.0 * std::f64::consts::TAU).sin();
+            basis += 0.05 * (swing - basis) + (rand() - 0.5) * 2.0 + if rand() < 0.002 { 20.0 * (rand() - 0.5) } else { 0.0 };
+            let size = if rand() < 0.05 { 1.0 } else { 100.0 };
+            let r = rand();
+            if r < 0.495 {
+                a = Bbo { bid: mid * (1.0 - 0.5e-4), bid_size: size, ask: mid * (1.0 + 0.5e-4), ask_size: 100.0 };
+                collector.on_event(t, Event::Book { pair: 0, venue: Venue::Aster, bbo: a }, &mut out);
+            } else if r < 0.99 {
+                let m = mid * (1.0 + basis / 1e4);
+                l = Bbo { bid: m * (1.0 - 0.75e-4), bid_size: 100.0, ask: m * (1.0 + 0.75e-4), ask_size: size };
+                collector.on_event(t, Event::Book { pair: 0, venue: Venue::Lighter, bbo: l }, &mut out);
+            } else if r < 0.9905 {
+                l = Bbo::default();
+                collector.closed(Venue::Lighter, t, &mut out);
+            } else {
+                let (venue, book) = if rand() < 0.5 { (Venue::Aster, a) } else { (Venue::Lighter, l) };
+                let buy = rand() < 0.5;
+                let through = if rand() < 0.3 { 1.0 + rand() * 30e-4 } else { 1.0 };
+                if book.known() {
+                    let price = if buy { book.ask * through } else { book.bid / through };
+                    full.trades.push(Trade { t, venue, price, size: 0.5, buy });
+                    collector.on_event(t, Event::Trade { pair: 0, venue, price, size: 0.5, buy }, &mut out);
+                }
+                continue;
+            }
+            full.states.push(State { t, a, l });
+        }
+        collector.finish(t, &mut out);
+        full.states.push(State { t, a: Bbo::default(), l: Bbo::default() });
+
+        let mut data = Data::default();
+        for line in lines.borrow().iter() {
+            data.add("test", line, false).unwrap();
+        }
+        let data = data.sorted();
+        let recorded = &data.series["X"];
+        (full.summaries, full.windows) = (recorded.summaries.clone(), recorded.windows.clone());
+        assert!(recorded.states.len() * 2 < full.states.len(), "{} of {} states recorded", recorded.states.len(), full.states.len());
+
+        // x2.9: the slowest the report allows (338 ms x 2.9 within the 1 s tail).
+        for (tier, latency, percentile) in [("standard", 1.0, 90.0), ("premium", 1.0, 90.0), ("standard", 2.9, 90.0), ("standard", 1.0, 95.0)] {
+            let mut cfg = cfg.clone();
+            (cfg.lighter_tier, cfg.taker.gate_percentile) = (tier.into(), percentile);
+            rec.check(&cfg, cfg.lighter().unwrap(), &data.pairs).unwrap();
+            let (r, f) = (score(&cfg, latency, &pair, recorded).unwrap(), score(&cfg, latency, &pair, &full).unwrap());
+            let taker = |s: &Score| (s.taker_gated.trades, s.taker_gated.unresolved, s.taker_gated.by_day.clone());
+            assert_eq!(taker(&r), taker(&f), "taker, {tier} x{latency} P{percentile}");
+            let xemm = |x: &XemmResult| (x.fills, x.unresolved, x.required_bps, x.by_day.clone());
+            for (x, y) in [(&r.xemm_bot, &f.xemm_bot), (&r.xemm_best, &f.xemm_best), (&r.xemm_reverse_best, &f.xemm_reverse_best)] {
+                assert_eq!(xemm(x), xemm(y), "xemm, {tier} x{latency} P{percentile}");
+            }
+            if (tier, latency, percentile) == ("standard", 1.0, 90.0) {
+                assert!(r.taker_gated.trades > 0 && r.xemm_best.fills > 0 && r.xemm_reverse_best.fills > 0, "the market must trade");
+            }
+        }
+        // A lower percentile would trade on moments not recorded: refused.
+        let mut lower = cfg.clone();
+        lower.taker.gate_percentile = 80.0;
+        assert!(rec.check(&lower, lower.lighter().unwrap(), &data.pairs).is_err());
+    }
+
+    #[test]
+    fn spearman_is_one_for_the_same_order_and_minus_one_reversed() {
+        assert_eq!(spearman(&[1.0, 2.0, 3.0, 4.0], &[10.0, 20.0, 30.0, 40.0]), Some(1.0));
+        assert_eq!(spearman(&[1.0, 2.0, 3.0], &[3.0, 2.0, 1.0]), Some(-1.0));
+        assert_eq!(spearman(&[1.0, 1.0, 1.0], &[1.0, 2.0, 3.0]), None);
+    }
+}

@@ -26,6 +26,7 @@ and probes.
 ├── bot_stats.py            why: edge kept per leg, entry gate, controller, simulator health
 ├── economics.py            the parser the reports share
 ├── tests/                  Python tests and shared fixtures (tests/fixtures/)
+├── SCREENER/               which pairs would suit the bot: its own crate and container, public data only (SCREENER/README.md)
 └── LIGHTER_ASTER_BOT/
     ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
     ├── docker-compose.yml  services: dryrun, recorder (market-data tape), and bot (live, behind the `live` profile)
@@ -35,7 +36,7 @@ and probes.
     └── RUNBOOK.md
 ```
 
-Git ignores `runs/` (journals, ledgers, latches, state), `data/` (the market-data tape), `target/` and the credential files
+Git ignores `runs/` (journals, ledgers, latches, state), `data/` (the market-data tape, and the screener's), `target/` and the credential files
 `LIGHTER_ASTER_BOT/aster.env` and `lighter.env`.
 
 ## Build

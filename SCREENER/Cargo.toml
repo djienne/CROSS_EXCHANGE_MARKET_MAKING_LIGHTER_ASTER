@@ -1,0 +1,29 @@
+[package]
+name = "screener"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.92"
+description = "Ranks the pairs listed on both Aster and Lighter for the bot's taker-taker and XEMM strategies, from public data"
+
+# Independent of the bot crate on purpose (its own lock, image and container): rebuilding or
+# changing either never touches the other.
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+reqwest = { version = "0.11", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
+tokio-util = "0.7"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

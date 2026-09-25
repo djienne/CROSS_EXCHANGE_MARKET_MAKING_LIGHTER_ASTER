@@ -1,0 +1,6 @@
+# Keep the build context to the manifests and sources.
+target
+data
+.git
+.gitignore
+*.md

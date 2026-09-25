@@ -1,0 +1,64 @@
+# Screener settings. [collect] picks the pairs; [report] says how they are scored. The collector
+# records the moments [report] could trade on at its loosest (the cheaper Lighter tier, the lowest
+# XEMM edge of the sweep, the gate's percentile), so the report can be re-run on the same data
+# with anything that asks no less: the other tier, other latencies, a higher margin, percentile or
+# XEMM edge. It refuses the rest (depth, gate window, a lower percentile...) for data recorded before.
+# The [report] defaults mirror LIGHTER_ASTER_BOT/bot.toml as of 2026-09-26 (keys named per value).
+
+[collect]
+min_volume_usd = 200000   # 24 h quote volume required on BOTH venues (~63 pairs on 2026-09-26)
+max_pairs      = 100      # the most liquid first
+
+[report]
+clip_usd       = 13.0     # [taker.arb] desired_notional, [maker.quote] desired_notional
+depth_multiple = 10.0     # [taker.arb.depth_guard] liquidity_multiple, [maker.quote] depth_liquidity_multiple
+lighter_tier   = "standard"
+# latency.perps.trading benchmark from AWS Tokyo (bot.toml [dry_run]): an Aster IOC takes effect
+# at ~0.9 x its 101 ms round trip; Lighter's round trip is 8 ms plus the tier's taker delay.
+aster_taker_ms = 100
+lighter_rtt_ms = 8
+# A maker fill reaches the bot after the venue's private stream latency ([dry_run] mid-range).
+aster_fill_notice_ms   = 30
+lighter_fill_notice_ms = 15
+
+# Aster fee schedule (docs.asterdex.com, perpetual fees, 2026-09-26). The Group B list overrides
+# the RWA rule (SKHYNIX is both).
+[report.aster]
+maker_bps         = 0.0
+taker_bps         = 4.0
+group_b_taker_bps = 10.0
+rwa_taker_bps     = 1.25
+rwa_subtypes      = ["STOCK", "ETF", "Commodities"]   # exchangeInfo underlyingSubType
+group_b = ["1000NEXUSDT", "AEONUSDT", "ASTEROIDUSDT", "AVLUSDT", "BAYUSDT", "BASECATUSDT",
+           "BLENDUSDT", "B3USDT", "CARDSUSDT", "CATEUSDT", "DELTAUSDT", "FONEUSDT", "MEMEUSDT",
+           "MARSCOINUSDT", "NESUSDT", "OUSDT", "OKBUSDT", "PENGUINUSDT", "PUNDIAIUSDT", "RTXUSDT",
+           "SKHYNIXUSDT"]
+
+# Lighter account types (apidocs.lighter.xyz, account-types).
+[report.lighter.standard]
+maker_bps      = 0.0
+taker_bps      = 0.0
+taker_delay_ms = 300
+[report.lighter.premium]
+maker_bps      = 0.4
+taker_bps      = 2.8
+taker_delay_ms = 140
+
+[report.taker]
+margin_bps         = 2.0     # [taker.arb] margin_bps: required = Aster taker + Lighter taker + margin
+gate_percentile    = 90.0    # [taker.arb.entry_gate] entry_percentile
+gate_window_hours  = 72.0    # history_window_hours
+gate_min_samples   = 50      # min_history_samples
+gate_extra_bps     = 0.5     # min_extra_bps
+sample_interval_ms = 1000    # sample_interval_ms
+cooldown_ms        = 60000   # [taker.arb] cooldown_ms
+max_position_usd   = 200.0   # [taker.risk] max_abs_position_notional_usd
+
+[report.xemm]
+# [maker.edge] min_net_profit 14 + slippage 1.5 + latency 2 + basis 1 + funding 0.
+required_bps           = 18.5
+min_touch_distance_bps = 18.0   # [maker.quote] min_aster_touch_distance_bps
+max_quote_distance_bps = 50.0   # [maker.quote] max_quote_distance_bps
+quote_age_ms           = 250    # the resting quote was priced this long before the fill (150 ms requote + post)
+cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms
+sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.0]

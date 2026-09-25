@@ -1,0 +1,45 @@
+# The pair screener (README.md): records the moments that matter on every pair listed on both
+# Aster and Lighter, then ranks them for the bot's strategies. Public data only: no credentials,
+# no orders. Independent of the bot: its own image, container and data.
+#   docker compose up -d --build              # start (the fleet's start_all.bat does this too)
+#   docker compose run --rm report            # rank the pairs
+services:
+  screener:
+    build: .
+    image: aster_lighter_screener:latest
+    container_name: aster-lighter-screener
+    user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
+    volumes:
+      - ./screener.toml:/app/screener.toml:ro
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_signal: SIGINT
+    deploy:
+      resources:
+        limits:
+          # A ceiling, not a reservation: CFS throttling would distort the arrival times the
+          # latency replay depends on. HELPERS/cpu_limits/cpu_limit_policy.json keeps this value.
+          cpus: '1'
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # The ranking, on demand: `docker compose run --rm report [--since YYYY-MM-DD ...]`. Its profile
+  # keeps `up` (and start_all.bat) from starting it. It holds every recorded state of the days it
+  # scores in memory (~0.2 GB a day): past ~2 weeks, score a range with --since/--until.
+  report:
+    image: aster_lighter_screener:latest
+    profiles: ["report"]
+    entrypoint: ["screener", "report"]
+    user: "${XEMM_UID:-1000}:${XEMM_GID:-1000}"
+    volumes:
+      - ./screener.toml:/app/screener.toml:ro
+      - ./data:/app/data:ro
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 4G
