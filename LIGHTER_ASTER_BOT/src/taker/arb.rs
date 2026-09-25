@@ -43,10 +43,10 @@ use crate::taker::book::OrderBook;
 use crate::taker::config::{Config, MarketCfg};
 use crate::taker::connectors::{rest_book, rest_specs};
 use crate::decimal::bps_to_rate;
-use crate::taker::decimal::common_qty_step;
+use crate::taker::decimal::{common_qty_step, floor_to_step};
 use crate::taker::entry_gate::{OpportunityGate, OpportunityGateInput};
 use crate::taker::markets::MarketSpec;
-use crate::taker::pnl::{format_ts, ActiveSession, ColdJournal, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
+use crate::taker::pnl::{format_ts, market_component, ActiveSession, ColdJournal, EconomicStatus, PnlTracker, PnlUpdate, TradeLedgerRow};
 use crate::taker::types::{FeeEvidence, FeeProvenance, FillSummary, MarketId, Side};
 use crate::taker::venues::lighter::{
     LighterFillConfirmation, LighterVenue, PendingFill, SubmitOutcome as LighterOutcome,
@@ -55,27 +55,27 @@ use crate::taker::venues::lighter::{
 static EXECUTION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
+pub(super) enum Direction {
     SellAsterBuyLighter,
     SellLighterBuyAster,
 }
 
 impl Direction {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Direction::SellAsterBuyLighter => "SELL_ASTER_BUY_LIGHTER",
             Direction::SellLighterBuyAster => "SELL_LIGHTER_BUY_ASTER",
         }
     }
 
-    fn aster_side(self) -> Side {
+    pub(super) fn aster_side(self) -> Side {
         match self {
             Direction::SellAsterBuyLighter => Side::Sell,
             Direction::SellLighterBuyAster => Side::Buy,
         }
     }
 
-    fn lighter_side(self) -> Side {
+    pub(super) fn lighter_side(self) -> Side {
         self.aster_side().opposite()
     }
 }
@@ -125,13 +125,13 @@ enum ExposureEffect {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PositionSnapshot {
-    aster_qty: Decimal,
-    lighter_qty: Decimal,
+pub(super) struct PositionSnapshot {
+    pub(super) aster_qty: Decimal,
+    pub(super) lighter_qty: Decimal,
 }
 
 impl PositionSnapshot {
-    fn net_qty(self) -> Decimal {
+    pub(super) fn net_qty(self) -> Decimal {
         self.aster_qty + self.lighter_qty
     }
 }
@@ -2434,18 +2434,7 @@ fn next_execution_id() -> String {
 }
 
 fn execution_log_path(cfg: &Config, market: &MarketId) -> PathBuf {
-    let component: String = market
-        .0
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    PathBuf::from(&cfg.pnl.persist_dir).join(format!("executions_{component}.jsonl"))
+    PathBuf::from(&cfg.pnl.persist_dir).join(format!("executions_{}.jsonl", market_component(market)))
 }
 
 #[derive(Serialize)]
@@ -3771,14 +3760,6 @@ fn lighter_price_bound(opp: &Opportunity, slippage_bps: Decimal) -> Decimal {
     }
 }
 
-
-fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).floor() * step
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4147,17 +4128,16 @@ mod tests {
         let cfg = test_cfg();
         let spec = test_spec();
         let math = test_math(&cfg, &spec);
-        let (mut accepted, mut rejected) = (0,0);
+        // test_cfg requires 4 + 0 + 2 = 6 bps; ref = aster mid = s + 0.1, so
+        // (s - 100)/(s + 0.1) * 1e4 >= 6 <=> s >= 100.00006/0.9994 = 100.0600961:
+        // tick 0 (s = 100.0601) is the first accepted step, tick -1 the last rejected.
         for tick in -20..=20 {
             let sell = dec!(100.0601) + Decimal::from(tick) * dec!(0.00001);
-            let expected = (sell-dec!(100))/(sell+dec!(0.1))*dec!(10000) >= dec!(6);
             let result = best_opportunity(&cfg,&spec,&math,
                 &book(sell,sell+dec!(0.2)), &book(dec!(98),dec!(100)),
                 PositionF64 {aster_qty:0.0,lighter_qty:0.0},margins_f64(margins()),false,ExposureFilter::Any);
-            assert_eq!(result.is_some(),expected,"sell={sell}");
-            if expected { accepted+=1; } else { rejected+=1; }
+            assert_eq!(result.map(|o| o.direction), (tick >= 0).then_some(Direction::SellAsterBuyLighter), "sell={sell}");
         }
-        assert!(accepted>0 && rejected>0);
     }
 
     #[test]
@@ -4201,39 +4181,6 @@ mod tests {
         publish_account(&tx, snapshot(0, dec!(0)));
         assert_eq!(rx.borrow().execution_epoch, 2);
         assert_eq!(rx.borrow().position.aster_qty, dec!(1));
-    }
-
-    #[test]
-    fn best_opportunity_boundary_matches_exact_filter() {
-        // End-to-end: books one tick apart straddling the 6 bps threshold (test_cfg:
-        // 4 + 0 + 2). ref = aster mid = s + 0.1; edge_bps = (s - 100)/(s + 0.1) * 1e4:
-        // s = 100.061 -> ~6.09 bps (accept), s = 100.060 -> ~5.99 bps (reject).
-        let cfg = test_cfg();
-        let spec = test_spec();
-        let math = test_math(&cfg, &spec);
-        let pos = PositionSnapshot {
-            aster_qty: Decimal::ZERO,
-            lighter_qty: Decimal::ZERO,
-        };
-        let lighter = depth_book([(dec!(98), dec!(10))], [(dec!(100), dec!(10))]);
-        let run = |s: Decimal| {
-            let aster = depth_book([(s, dec!(10))], [(s + dec!(0.2), dec!(10))]);
-            best_opportunity(
-                &cfg,
-                &spec,
-                &math,
-                &aster,
-                &lighter,
-                pos_f64(pos),
-                margins_f64(margins()),
-                false,
-                ExposureFilter::Any,
-            )
-        };
-        let above = run(dec!(100.061)).expect("edge above threshold must survive");
-        assert_eq!(above.direction, Direction::SellAsterBuyLighter);
-        assert!(above.gross_edge_bps >= cfg.arb.required_gross_edge_bps());
-        assert!(run(dec!(100.060)).is_none(), "edge below threshold must be filtered");
     }
 
     #[test]

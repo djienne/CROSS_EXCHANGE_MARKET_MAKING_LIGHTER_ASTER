@@ -263,11 +263,9 @@ mod tests {
             reason: "test".into(),
         };
         write_trip(&trip_path(&db), &rec).unwrap();
-        assert!(check_startup(&db).is_err());
-        // Re-read round-trips.
-        let back: TripRecord =
-            serde_json::from_str(&std::fs::read_to_string(trip_path(&db)).unwrap()).unwrap();
-        assert_eq!(back.loss_usd, dec!(6));
+        // ...with the record read back from disk as context.
+        let err = format!("{:#}", check_startup(&db).unwrap_err());
+        assert!(err.contains("reason=test, loss=6 USD"), "{err}");
         let _ = std::fs::remove_file(trip_path(&db));
     }
 

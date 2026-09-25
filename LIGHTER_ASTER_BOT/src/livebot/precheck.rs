@@ -182,21 +182,11 @@ mod tests {
     }
 
     #[test]
-    fn small_move_still_needs_exact_quote() {
+    fn non_crossing_resting_order_never_fast_holds() {
+        // One tick below the Aster ask is the closest non-crossing bid: still defers to the exact engine.
         let now_ns = 100;
         let aster = hot(&[(dec!(100), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
         let hl = hot(&[(dec!(99.9), dec!(1))], &[(dec!(100.1), dec!(1))], now_ns);
-        assert_eq!(
-            hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
-            HotPrecheck::NeedExactQuote,
-        );
-    }
-
-    #[test]
-    fn large_move_needs_exact() {
-        let now_ns = 100;
-        let aster = hot(&[(dec!(100.5), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
-        let hl = hot(&[(dec!(100), dec!(1))], &[(dec!(101), dec!(1))], now_ns);
         assert_eq!(
             hot_precheck_side(&aster, &hl, Side::Buy, Some(HotCurrentOrder { px_ticks: 1000 }), now_ns, &pcfg()),
             HotPrecheck::NeedExactQuote,

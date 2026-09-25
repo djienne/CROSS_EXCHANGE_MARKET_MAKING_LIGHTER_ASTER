@@ -335,7 +335,7 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 ## Probes
 
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
-  lighter-balance | lighter-open-orders`, `taker probe`, `taker status --json`,
+  lighter-balance | lighter-open-orders`, `taker probe`, `taker status`,
   `fetch-specs`. `taker run --markets HYPE --observe-only` scans and records entry-gate
   history without orders.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.

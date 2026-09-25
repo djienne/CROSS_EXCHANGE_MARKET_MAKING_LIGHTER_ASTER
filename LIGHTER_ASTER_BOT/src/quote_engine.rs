@@ -531,15 +531,15 @@ pub fn resting_quote_net_edge_bps(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use rust_decimal_macros::dec;
 
-    fn ts() -> DateTime<Utc> {
+    pub(crate) fn ts() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).unwrap()
     }
 
-    fn edge() -> EdgeConfig {
+    pub(crate) fn edge() -> EdgeConfig {
         EdgeConfig {
             min_net_profit_bps: dec!(3.0),
             slippage_buffer_bps: dec!(1.5),
@@ -605,17 +605,21 @@ mod tests {
     }
 
     #[test]
-    fn buy_quote_is_profitable_and_posts() {
+    fn quotes_price_backward_from_hedge_vwap_on_both_sides() {
+        // ref = 100, qty = $100/100 = 1, req = 3+1.5+2+1 = 7.5 bps, Lighter taker 4.5 bps, Aster maker 0:
+        // bid <= 99.95*(1-0.00045) - 0.075 = 99.8300225 -> floor 99.83;
+        // ask >= 100.05*(1+0.00045) + 0.075 = 100.1700225 -> ceil 100.18.
         let (a, h) = books();
-        let q = compute_desired_quote(
-            &edge(), &qcfg(), &a, &h, Side::Buy,
+        let quote = |side| compute_desired_quote(
+            &edge(), &qcfg(), &a, &h, side,
             dec!(0.01), dec!(0.001), dec!(0.001), dec!(5), dec!(5), 750, ts(),
             &PositionContext::unconstrained(),
         )
         .unwrap();
-        assert!(q.price < a.best_ask().unwrap().px, "must rest below ask");
-        assert!(q.instant_edge_bps >= edge().min_net_profit_bps);
-        assert_eq!(q.hedge_side, Side::Sell);
+        let bid = quote(Side::Buy);
+        assert_eq!((bid.price, bid.qty, bid.hedge_side), (dec!(99.83), dec!(1), Side::Sell));
+        let ask = quote(Side::Sell);
+        assert_eq!((ask.price, ask.qty, ask.hedge_side), (dec!(100.18), dec!(1), Side::Buy));
     }
 
     #[test]
@@ -644,6 +648,8 @@ mod tests {
         assert_eq!(q.qty, dec!(1.000));
         assert_eq!(q.depth_target_qty, dec!(10.0000));
         assert_eq!(q.expected_hl_vwap, dec!(99.86));
+        // Priced off the 10-lot VWAP: 99.86*(1-0.00045) - 0.075 = 99.740063 -> 99.74 (1-lot VWAP would give 99.83).
+        assert_eq!(q.price, dec!(99.74));
         assert_eq!(q.expected_hl_worst_px, dec!(99.85));
         assert_eq!(q.expected_hl_depth_levels_used, 2);
         assert_eq!(q.expected_hl_depth_filled_qty, q.depth_target_qty);
@@ -719,8 +725,8 @@ mod tests {
             &PositionContext::unconstrained(),
         )
         .unwrap();
-        assert!(dq.instant_edge_bps >= edge().min_net_profit_bps);
-        assert!(dq.price < a.best_ask().unwrap().px, "must rest below ask (post-only)");
+        // 99.99*(1-0.00045) - 0.075 = 99.8700045 -> 99.87, i.e. 12 bps below the 99.99 bid.
+        assert_eq!(dq.price, dec!(99.87));
     }
 
     #[test]
@@ -1055,7 +1061,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dq.qty, dec!(2.0));
-        assert!(dq.instant_edge_bps >= edge().min_net_profit_bps);
     }
 
     #[test]

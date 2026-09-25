@@ -10,6 +10,23 @@ pub fn trim_dec(d: Decimal) -> String {
     d.normalize().to_string()
 }
 
+/// Largest multiple of `step` at or below `qty`; zero when either is non-positive (unlike
+/// `crate::decimal::floor_to_step`).
+pub fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
+    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (qty / step).floor() * step
+}
+
+/// Smallest multiple of `step` at or above `qty`; zero when either is non-positive.
+pub fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
+    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (qty / step).ceil() * step
+}
+
 pub fn common_qty_step(aster_step: Decimal, lighter_step: Decimal) -> Result<Decimal> {
     let (a_units, a_scale) = decimal_step_units(aster_step)?;
     let (l_units, l_scale) = decimal_step_units(lighter_step)?;
@@ -58,4 +75,21 @@ fn gcd_u128(mut a: u128, mut b: u128) -> u128 {
 fn lcm_u128(a: u128, b: u128) -> Option<u128> {
     let gcd = gcd_u128(a, b);
     a.checked_div(gcd)?.checked_mul(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn step_rounding_is_zero_for_non_positive_inputs() {
+        assert_eq!(floor_to_step(dec!(0.157), dec!(0.01)), dec!(0.15));
+        assert_eq!(ceil_to_step(dec!(0.151), dec!(0.01)), dec!(0.16));
+        // crate::decimal's helpers instead round a non-positive qty and return it for a zero step.
+        for (qty, step) in [(dec!(-1), dec!(0.01)), (dec!(0), dec!(0.01)), (dec!(1), dec!(0))] {
+            assert_eq!(floor_to_step(qty, step), Decimal::ZERO);
+            assert_eq!(ceil_to_step(qty, step), Decimal::ZERO);
+        }
+    }
 }

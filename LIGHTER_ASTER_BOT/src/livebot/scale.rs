@@ -409,12 +409,12 @@ fn upsert_hot_sorted(out: &mut [HotLevel; HOT_LEVELS], len: &mut usize, level: H
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use chrono::Utc;
     use rust_decimal_macros::dec;
 
-    fn spec() -> MarketSpec {
+    pub(crate) fn spec() -> MarketSpec {
         MarketSpec {
             market_id: "BTC".into(),
             aster_symbol: "BTCUSDT".into(),
@@ -526,7 +526,7 @@ mod tests {
     }
 
     #[test]
-    fn hot_book_from_strings_sorts_aggregates_and_truncates() {
+    fn hot_book_from_strings_sorts_and_aggregates() {
         let s = MarketScale::from_spec(&spec());
         let hb = build_hot_book_from_strs_with_qty_scale(
             [("99.9", "1"), ("100.0", "2"), ("100.0", "3")],

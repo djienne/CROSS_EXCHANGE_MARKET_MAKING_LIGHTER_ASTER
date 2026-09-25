@@ -90,8 +90,8 @@ pub async fn run(cfg: &Config, check: &str, target: Option<String>, i_understand
     }
 }
 
-async fn probe_aster_balance(cfg: &Config) -> Result<()> {
-    // Use any one configured market so the client has wire context (balance is account-wide).
+/// An Aster client for an account-wide read: any one configured market gives it wire context.
+async fn account_wide_aster(cfg: &Config) -> Result<AsterRest> {
     let markets = cfg.select_markets(None);
     let specs = rest_specs::build_market_specs_with_bases(
         &markets[..1.min(markets.len())],
@@ -100,7 +100,11 @@ async fn probe_aster_balance(cfg: &Config) -> Result<()> {
         &cfg.live.hyperliquid.base_url,
     )
     .await?;
-    let aster = build_aster(cfg, &specs)?;
+    build_aster(cfg, &specs)
+}
+
+async fn probe_aster_balance(cfg: &Config) -> Result<()> {
+    let aster = account_wide_aster(cfg).await?;
     let t0 = Instant::now();
     let rows = aster.balance().await?;
     println!("aster balance ({}ms):", t0.elapsed().as_millis());
@@ -115,16 +119,7 @@ async fn probe_aster_balance(cfg: &Config) -> Result<()> {
 /// `positionAmt` is directly comparable to HL's signed `szi`, so a hedged pair reads as
 /// Aster `-x` against HL `+x`. No order risk — a pure signed read.
 async fn probe_aster_positions(cfg: &Config) -> Result<()> {
-    // positionRisk is account-wide; any one configured market gives the client its wire context.
-    let markets = cfg.select_markets(None);
-    let specs = rest_specs::build_market_specs_with_bases(
-        &markets[..1.min(markets.len())],
-        cfg.live.partials.lighter_min_notional,
-        &cfg.live.aster.base_url,
-        &cfg.live.hyperliquid.base_url,
-    )
-    .await?;
-    let aster = build_aster(cfg, &specs)?;
+    let aster = account_wide_aster(cfg).await?;
     let t0 = Instant::now();
     let rows = aster.position_risk().await?;
     println!("aster positions ({}ms):", t0.elapsed().as_millis());

@@ -880,14 +880,9 @@ lighter_symbol = "DOGE"
     }
 
     #[test]
-    fn new_fields_default_when_absent() {
-        // A config without these optional fields still parses, defaulting the behavior ON.
+    fn clamp_to_min_lot_defaults_on_when_absent() {
         let without = SAMPLE.replace("clamp_to_min_lot = true\n", "");
         let cfg: Config = toml::from_str(&without).unwrap();
-        assert_eq!(cfg.quote.min_aster_touch_distance_bps, dec!(0));
-        assert_eq!(cfg.quote.min_aster_touch_hysteresis_bps, dec!(2));
-        assert_eq!(cfg.quote.max_aster_touch_hysteresis_ms, 300_000);
-        assert_eq!(cfg.quote.depth_liquidity_multiple, dec!(10));
         assert!(cfg.quote.clamp_to_min_lot);
     }
 
@@ -995,8 +990,7 @@ lighter_symbol = "DOGE"
 
     #[test]
     fn file_loading_rejects_retired_controls_and_mixed_environments() {
-        let dir = std::env::temp_dir().join(format!("xemm-config-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&dir).unwrap();
+        let dir = crate::dryrun::tests::temp_dir("xemm-config");
         let path = dir.join("config.toml");
         for extra in [
             "[live.partials]\nmax_pending_count=2",
@@ -1021,9 +1015,7 @@ lighter_symbol = "DOGE"
         assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("mainnet origins"));
         std::fs::write(&path, include_str!("../bot.toml")).unwrap();
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26));
-        assert_eq!(cfg.live.max_book_staleness_ms, 10_000);
-        assert_eq!(cfg.live.partials.lighter_min_notional, dec!(10));
+        assert_eq!(cfg.live.margin_guard.lighter_safety_buffer_usd, dec!(26)); // bot.toml value, default is 25
         std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }

@@ -448,12 +448,7 @@ pub fn check_breaker(path: &Path, ack: bool, reset_baseline: bool, events: &mut 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bot-risk-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::dryrun::tests::temp_dir;
 
     fn tracker(dir: &Path, now: DateTime<Utc>, events: &mut EventLog) -> EquityTracker {
         EquityTracker::load("HYPE", dir.join("b.json"), dir.join("s.jsonl"), dec!(15), 48, now, events)
@@ -461,7 +456,7 @@ mod tests {
 
     #[test]
     fn drawdown_stop_is_inclusive_and_arms_only_with_an_engine_active() {
-        let dir = temp_dir();
+        let dir = temp_dir("bot-risk");
         let mut events = EventLog::new(dir.join("events.jsonl"));
         let now = Utc::now();
         let mut equity = tracker(&dir, now, &mut events);
@@ -481,7 +476,7 @@ mod tests {
 
     #[test]
     fn stale_baseline_is_discarded() {
-        let dir = temp_dir();
+        let dir = temp_dir("bot-risk");
         let mut events = EventLog::new(dir.join("events.jsonl"));
         let armed = Utc::now() - chrono::Duration::days(5);
         let mut equity = tracker(&dir, armed, &mut events);
@@ -501,7 +496,7 @@ mod tests {
         // Inconsistent economics are not "known" even when confirmed.
         assert!(!Impact::new(2, Some("confirmed"), Some(dec!(3)), Some(dec!(1)), Some(dec!(1))).known);
 
-        let dir = temp_dir();
+        let dir = temp_dir("bot-risk");
         let ledger = dir.join("trades_HYPE.jsonl");
         std::fs::write(&ledger, "{\"aster_order_id\":1,\"lighter_client_order_index\":1,\"actual_net_usd\":\"-50\"}\n").unwrap();
         let mut trades = RealizedTrades::new("HYPE", Utc::now() - chrono::Duration::hours(1), ledger.clone(), dir.join("none.jsonl"));
@@ -525,7 +520,7 @@ mod tests {
 
     #[test]
     fn breaker_needs_ack_and_a_drawdown_breaker_also_a_baseline_reset() {
-        let dir = temp_dir();
+        let dir = temp_dir("bot-risk");
         let mut events = EventLog::new(dir.join("events.jsonl"));
         let path = dir.join("bot-HYPE.breaker.json");
         check_breaker(&path, false, false, &mut events).unwrap();

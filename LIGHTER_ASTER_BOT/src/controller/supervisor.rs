@@ -902,8 +902,7 @@ mod tests {
     }
 
     fn supervisor(on_stop: &[(&'static str, OnStop)], exit_at_once: bool) -> (Supervisor<Fake>, Shared, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("bot-supervisor-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::dryrun::tests::temp_dir("bot-supervisor");
         let shared = Shared::default();
         let fake = Fake { shared: shared.clone(), on_stop: on_stop.iter().copied().collect(), exit_at_once };
         let files = Files::new(&dir, "HYPE");

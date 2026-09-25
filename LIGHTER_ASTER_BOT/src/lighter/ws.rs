@@ -111,6 +111,22 @@ fn reconnect_delay_after_session(current: f64, base: f64, elapsed: Duration) -> 
     }
 }
 
+/// Sleep the jittered delay after a session that lasted `elapsed`; returns the next backoff base.
+async fn pause_before_reconnect(opts: &SubscribeOptions, backoff: f64, elapsed: Duration) -> f64 {
+    let delay = reconnect_delay_after_session(backoff, opts.reconnect_base, elapsed);
+    let sleep_for = delay + jitter(delay);
+    let next = next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed);
+    tracing::info!(
+        "{} reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
+        opts.label,
+        sleep_for,
+        elapsed.as_secs_f64(),
+        next,
+    );
+    sleep(Duration::from_secs_f64(sleep_for)).await;
+    next
+}
+
 /// Run the subscription loop forever (reconnecting). `on_message` is called for each
 /// decoded application message (NOT ping/subscribed). `reconnect` (if provided) forces a
 /// fresh reconnect when notified (e.g. orderbook sanity divergence). `on_disconnect` runs
@@ -132,18 +148,7 @@ pub async fn subscribe_loop<F, D>(
             Err(e) => tracing::info!("{} ws disconnected: {e}", opts.label),
         }
         on_disconnect();
-        let elapsed = started.elapsed();
-        let delay = reconnect_delay_after_session(backoff, opts.reconnect_base, elapsed);
-        let sleep_for = delay + jitter(delay);
-        tracing::info!(
-            "{} reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
-            opts.label,
-            sleep_for,
-            elapsed.as_secs_f64(),
-            next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed),
-        );
-        sleep(Duration::from_secs_f64(sleep_for)).await;
-        backoff = next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed);
+        backoff = pause_before_reconnect(&opts, backoff, started.elapsed()).await;
     }
 }
 
@@ -173,18 +178,7 @@ pub async fn subscribe_loop_authed<F, A>(
             Ok(()) => {}
             Err(e) => tracing::info!("{} ws disconnected: {e}", opts.label),
         }
-        let elapsed = started.elapsed();
-        let delay = reconnect_delay_after_session(backoff, opts.reconnect_base, elapsed);
-        let sleep_for = delay + jitter(delay);
-        tracing::info!(
-            "{} reconnecting in {:.3}s after session {:.3}s (next_backoff_base={:.3}s)",
-            opts.label,
-            sleep_for,
-            elapsed.as_secs_f64(),
-            next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed),
-        );
-        sleep(Duration::from_secs_f64(sleep_for)).await;
-        backoff = next_reconnect_backoff(backoff, opts.reconnect_base, opts.reconnect_max, elapsed);
+        backoff = pause_before_reconnect(&opts, backoff, started.elapsed()).await;
     }
 }
 

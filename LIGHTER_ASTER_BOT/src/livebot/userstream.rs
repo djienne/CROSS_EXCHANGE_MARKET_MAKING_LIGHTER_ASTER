@@ -334,12 +334,13 @@ fn classify_user_frame(text: &str) -> UserFrame<'_> {
     }
 }
 
-/// Parse an `ORDER_TRADE_UPDATE` into an [`AsterFill`] when it represents a real fill increment
-/// (`x == "TRADE"` and last-filled-qty `l > 0`). Other updates (NEW/CANCELED acks) return `None`.
+/// Test entry point: the reader loop's exact frame -> fill path (classify, then convert).
 #[cfg(test)]
 fn parse_order_trade_update(text: &str, sym_to_market: &HashMap<String, MarketId>) -> Option<AsterFill> {
-    let update: AsterTradeUpdate<'_> = serde_json::from_str(text).ok()?;
-    fill_from_update(update, sym_to_market)
+    match classify_user_frame(text) {
+        UserFrame::TradeUpdate(update) => fill_from_update(update, sym_to_market),
+        _ => None,
+    }
 }
 
 /// Convert an already-parsed `ORDER_TRADE_UPDATE` into an [`AsterFill`] when it represents a

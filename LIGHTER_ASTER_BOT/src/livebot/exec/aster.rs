@@ -1038,27 +1038,7 @@ mod tests {
     }
 
     use crate::livebot::exec::sign::test_support::TestSigner;
-    use crate::markets::MarketSpec;
-    use rust_decimal_macros::dec;
-
-    fn spec() -> MarketSpec {
-        MarketSpec {
-            market_id: "BTC".into(),
-            aster_symbol: "BTCUSDT".into(),
-            hl_coin: "BTC".into(),
-            lighter_market_id: 1,
-            lighter_price_decimals: 1,
-            lighter_size_decimals: 3,
-            lighter_price_tick: dec!(0.1),
-            tick: dec!(0.1),
-            step: dec!(0.001),
-            aster_min_qty: dec!(0.001),
-            aster_min_notional: dec!(5),
-            hl_sz_decimals: 3,
-            hl_qty_step: dec!(0.001),
-            hl_min_notional: dec!(10),
-        }
-    }
+    use crate::livebot::scale::tests::spec;
 
     fn rest() -> AsterRest {
         let signer = Arc::new(TestSigner::new());

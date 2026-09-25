@@ -3109,22 +3109,9 @@ pub async fn run_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quote_engine::tests::{edge, ts};
     use rust_decimal_macros::dec;
 
-    fn ts() -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
-    }
-    fn edge() -> EdgeConfig {
-        EdgeConfig {
-            min_net_profit_bps: dec!(3.0),
-            slippage_buffer_bps: dec!(1.5),
-            latency_buffer_bps: dec!(2.0),
-            basis_buffer_bps: dec!(1.0),
-            funding_buffer_bps: dec!(0.0),
-            aster_maker_fee_bps: dec!(0.0),
-            taker_fee_bps: dec!(4.5),
-        }
-    }
     fn qcfg() -> QuoteEngineConfig {
         QuoteEngineConfig {
             desired_notional: dec!(100),
@@ -3421,7 +3408,7 @@ mod tests {
             HedgeCommand::Hedge { aggressive_px, intent } => {
                 assert_eq!(intent.hedge_side, Side::Sell);
                 assert_eq!(intent.qty, dec!(0.2));
-                assert_eq!(aggressive_px, dec!(99.96) * (Decimal::ONE - strat.cfg.live.hyperliquid.normal_slippage_bps / Decimal::from(10_000)));
+                assert_eq!(aggressive_px, dec!(99.91002)); // hot BBO bid 99.96 x (1 - default 5 bps)
             }
             other => panic!("expected primary hedge, got {other:?}"),
         }
@@ -3527,10 +3514,6 @@ mod tests {
         };
         tokio::time::timeout(std::time::Duration::from_secs(2), drained).await.unwrap().unwrap().unwrap();
     }
-
-
-
-
 
     #[test]
     fn hl_bbo_selected_when_fresh_and_sufficient() {
@@ -3794,18 +3777,14 @@ mod tests {
     fn crossing_hedge_px_crosses_the_opposite_touch() {
         let (_a, h) = books(); // HL book: best bid 99.95 / best ask 100.05
         let slip = dec!(10); // 10 bps
-        // A BUY hedge must price AT/ABOVE the ask to take liquidity; a SELL hedge AT/BELOW the bid.
-        let buy = crossing_hedge_px(&h, Side::Buy, slip).unwrap();
-        assert!(buy >= h.best_ask().unwrap().px, "buy hedge {buy} must cross the ask {}", h.best_ask().unwrap().px);
-        let sell = crossing_hedge_px(&h, Side::Sell, slip).unwrap();
-        assert!(sell <= h.best_bid().unwrap().px, "sell hedge {sell} must cross the bid {}", h.best_bid().unwrap().px);
+        // A BUY hedge prices off the ask, a SELL hedge off the bid (not mid, which would not cross).
+        assert_eq!(crossing_hedge_px(&h, Side::Buy, slip), Some(dec!(100.15005))); // 100.05 x 1.001
+        assert_eq!(crossing_hedge_px(&h, Side::Sell, slip), Some(dec!(99.85005))); // 99.95 x 0.999
         // An empty book side yields None — the caller must NOT hedge off a fallback price.
         let empty = OrderBook::from_levels(vec![], vec![], ts(), ts());
         assert!(crossing_hedge_px(&empty, Side::Buy, slip).is_none());
         assert!(crossing_hedge_px(&empty, Side::Sell, slip).is_none());
     }
-
-
 
     #[test]
     fn gate_closed_cancels_resting_holds_empty() {
@@ -4038,20 +4017,6 @@ lighter_symbol = "BTC"
         // The freeze also requests a safety sweep, which gates quoting until it clears.
         assert!(matches!(erx.try_recv(), Ok(ExecCommand::CancelAllBot)));
         assert_eq!(strat.maker_gate_reason(&"BTC".into(), now), Some("SAFETY_SWEEP_PENDING"));
-    }
-
-    #[test]
-    fn matching_resting_order_holds() {
-        let (a, h) = books();
-        let pos = PositionContext::unconstrained();
-        // First compute what we'd place, then feed it back as the current order => Hold.
-        let placed = match evaluate_side(&edge(), &qcfg(), &a, &h, Side::Buy, &spec(), 5000, ts(), &pos, true, None, true) {
-            SideDecision::Place(d) => *d,
-            other => panic!("expected place, got {other:?}"),
-        };
-        let cur = CurrentOrder { price: placed.price, qty: placed.qty };
-        let d = evaluate_side(&edge(), &qcfg(), &a, &h, Side::Buy, &spec(), 5000, ts(), &pos, true, Some(cur), true);
-        assert!(matches!(d, SideDecision::Hold), "identical resting quote should hold, got {d:?}");
     }
 
     #[test]

@@ -588,7 +588,8 @@ pub fn session_path(cfg: &PnlCfg, market: &MarketId) -> PathBuf {
     PathBuf::from(&cfg.persist_dir).join(format!("active_session_{}.json", market_component(market)))
 }
 
-fn market_component(market: &MarketId) -> String {
+/// `market` as a file-name component: anything but `[A-Za-z0-9_-]` becomes `_`.
+pub(super) fn market_component(market: &MarketId) -> String {
     market
         .0
         .chars()

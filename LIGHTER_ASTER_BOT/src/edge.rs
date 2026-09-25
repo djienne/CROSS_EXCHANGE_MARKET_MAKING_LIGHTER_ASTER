@@ -129,13 +129,16 @@ mod tests {
 
     /// The headline invariant: a quote priced exactly at the profitable bound,
     /// fed back through the net-edge formula, yields net == min_net_profit_bps.
-    /// Catches any fee or sign error in the whole edge stack.
+    /// The round trip alone would pass a sign error shared by both formulas, so the
+    /// bound is also pinned to a hand-computed value.
     #[test]
     fn bid_round_trip() {
         let cfg = cfg();
         let hl_sell_vwap = dec!(100.0);
         let ref_px = dec!(100.0);
         let bound = max_profitable_aster_bid(hl_sell_vwap, ref_px, &cfg).unwrap();
+        // (100*(1-0.00045) - 0.00075*100)/(1+0.0001) = 99.88/1.0001
+        assert!((bound - dec!(99.870013)).abs() < dec!(0.000001), "bound={bound}");
         let net = net_edge_bps_after_fees_and_buffers(Side::Buy, bound, hl_sell_vwap, ref_px, &cfg);
         assert!((net - cfg.min_net_profit_bps).abs() < dec!(0.0001), "net={net}");
     }
@@ -146,6 +149,8 @@ mod tests {
         let hl_buy_vwap = dec!(100.0);
         let ref_px = dec!(100.0);
         let bound = min_profitable_aster_ask(hl_buy_vwap, ref_px, &cfg).unwrap();
+        // (100*(1+0.00045) + 0.00075*100)/(1-0.0001) = 100.12/0.9999
+        assert!((bound - dec!(100.130013)).abs() < dec!(0.000001), "bound={bound}");
         let net = net_edge_bps_after_fees_and_buffers(Side::Sell, bound, hl_buy_vwap, ref_px, &cfg);
         assert!((net - cfg.min_net_profit_bps).abs() < dec!(0.0001), "net={net}");
     }

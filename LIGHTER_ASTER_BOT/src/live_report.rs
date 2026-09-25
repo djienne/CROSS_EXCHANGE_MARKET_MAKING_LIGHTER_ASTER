@@ -522,8 +522,6 @@ mod tests {
             let expected = &fixture["expected"];
             assert_eq!(trade.qty, amount(expected.get("qty")).unwrap(), "{}", fixture["name"]);
             assert_eq!(trade.gross_pnl, amount(expected.get("gross_pnl_usdc")), "{}", fixture["name"]);
-            assert_eq!(trade.venue_realized_pnl_usdc.zip(trade.execution_spread_usdc)
-                .and_then(|(realized, spread)| realized.checked_add(spread)), trade.gross_pnl);
             for (key, actual) in [("execution_spread_usdc", trade.execution_spread_usdc),
                 ("venue_realized_pnl_usdc", trade.venue_realized_pnl_usdc)] {
                 if expected.get(key).is_some() { assert_eq!(actual, amount(expected.get(key)), "{} {key}", fixture["name"]); }

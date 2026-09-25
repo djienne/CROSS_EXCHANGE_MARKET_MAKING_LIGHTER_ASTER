@@ -372,12 +372,6 @@ pub enum EntryGateMode {
     Enforce,
 }
 
-impl Default for EntryGateMode {
-    fn default() -> Self {
-        EntryGateMode::Shadow
-    }
-}
-
 impl EntryGateMode {
     pub fn as_str(self) -> &'static str {
         match self {

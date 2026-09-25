@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 
 use crate::taker::aster::sign::{AsterNonce, AsterSigner};
-use crate::taker::decimal::trim_dec;
+use crate::taker::decimal::{ceil_to_step, floor_to_step, trim_dec};
 use crate::taker::markets::MarketSpec;
 use crate::taker::types::{FeeProvenance, FillSummary, MarketId, Side};
 
@@ -635,21 +635,6 @@ fn classify_order_response(client_order_id: &str, body: &str) -> SubmitOutcome {
             reason: format!("unparseable Aster order response: {e}: {body}"),
         },
     }
-}
-
-
-fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).floor() * step
-}
-
-fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).ceil() * step
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::taker::config::{EntryGateCfg, EntryGateMode};
+use crate::taker::pnl::market_component;
 use crate::taker::types::MarketId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -385,20 +386,6 @@ fn cutoff(now: DateTime<Utc>, window_hours: u64) -> DateTime<Utc> {
     now - Duration::hours(window_hours as i64)
 }
 
-fn market_component(market: &MarketId) -> String {
-    market
-        .0
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,10 +530,21 @@ mod tests {
 
     #[test]
     fn nearest_rank_uses_interior_order_statistics_and_duplicate_counts() {
-        let values = vec![dec!(11), dec!(1), dec!(10), dec!(2), dec!(9), dec!(3),
-            dec!(8), dec!(4), dec!(7), dec!(5), dec!(6)];
-        assert_eq!(percentile(values.clone(), dec!(50)), Some(dec!(6)));
-        assert_eq!(percentile(values, dec!(90)), Some(dec!(10)));
+        // Nearest rank = the ceil(p*N/100)-th smallest. 1..=11: p50 -> 6th = 6, p90 -> 10th = 10.
+        // [5,1,9,5]: p75 -> 3rd of [1,5,5,9] = 5 (9 if duplicate counts were lost), p100 -> 9.
+        let now = Utc::now();
+        let rank = |values: &[i64], p: Decimal| {
+            let mut config = cfg(EntryGateMode::Enforce);
+            config.entry_percentile = p;
+            let mut window = RankedWindow::new(&config);
+            for &value in values { window.insert(now, Decimal::from(value)); }
+            window.snapshot(0).percentile
+        };
+        let interior = [11, 1, 10, 2, 9, 3, 8, 4, 7, 5, 6];
+        assert_eq!(rank(&interior, dec!(50)), Some(dec!(6)));
+        assert_eq!(rank(&interior, dec!(90)), Some(dec!(10)));
+        assert_eq!(rank(&[5, 1, 9, 5], dec!(75)), Some(dec!(5)));
+        assert_eq!(rank(&[5, 1, 9, 5], dec!(100)), Some(dec!(9)));
     }
 
     #[test]

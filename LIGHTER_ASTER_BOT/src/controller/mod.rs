@@ -425,8 +425,7 @@ mod tests {
     #[test]
     fn shipped_bot_toml_loads_strictly_and_rejects_stray_keys() {
         let shipped = include_str!("../../bot.toml");
-        let dir = std::env::temp_dir().join(format!("bot-config-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::dryrun::tests::temp_dir("bot-config");
         let path = dir.join("bot.toml");
         std::fs::write(&path, shipped).unwrap();
         let cfg = BotConfig::load(&path).unwrap();
@@ -523,8 +522,7 @@ mod tests {
 
     #[test]
     fn a_running_orchestrator_or_its_latches_block_run() {
-        let dir = std::env::temp_dir().join(format!("bot-legacy-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::dryrun::tests::temp_dir("bot-legacy");
         let check = || refuse_legacy_stack("HYPE", &[dir.as_path()]);
         // A stopped orchestrator leaves its lock file behind, unlocked.
         let lock = File::create(dir.join("orchestrator_HYPE.lock")).unwrap();

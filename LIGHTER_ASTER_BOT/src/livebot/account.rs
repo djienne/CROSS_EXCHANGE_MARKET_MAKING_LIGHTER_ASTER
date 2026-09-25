@@ -263,7 +263,6 @@ mod tests {
         assert_eq!(st.load().generation, 1);
         assert_eq!(st.load().generation, 1);
         assert_eq!(st.load().aster_available_usd, dec!(1000));
-        // max_unhedged mirror is scaled into micro-dollars.
     }
 
     #[test]

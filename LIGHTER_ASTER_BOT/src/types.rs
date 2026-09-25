@@ -29,12 +29,6 @@ impl Side {
     }
 }
 
-impl fmt::Display for Side {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// Logical market identifier (e.g. "BTC"). Maps to an Aster symbol + HL coin.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MarketId(pub String);
@@ -168,12 +162,6 @@ impl RejectReason {
             PositionReduceOnly => "POSITION_REDUCE_ONLY",
             MinLotExceedsHeadroom => "MIN_LOT_EXCEEDS_HEADROOM",
         }
-    }
-}
-
-impl fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 

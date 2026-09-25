@@ -16,6 +16,7 @@ use crate::taker::book::OrderBook;
 use crate::taker::config::{BookSanityCfg, Config};
 use crate::taker::connectors::rest_book;
 use crate::taker::markets::MarketSpec;
+use crate::taker::pnl::market_component;
 use crate::taker::types::{MarketId, Side};
 use crate::taker::venues::lighter::LighterVenue;
 
@@ -441,31 +442,17 @@ fn price_bps(a: Decimal, b: Decimal) -> Option<Decimal> {
 }
 
 pub fn events_path(persist_dir: &str, market: &MarketId) -> PathBuf {
-    PathBuf::from(persist_dir).join(format!("book_sanity_{}.jsonl", safe_market(market)))
+    PathBuf::from(persist_dir).join(format!("book_sanity_{}.jsonl", market_component(market)))
 }
 
 pub fn state_path(persist_dir: &str, market: &MarketId) -> PathBuf {
-    PathBuf::from(persist_dir).join(format!("book_sanity_state_{}.json", safe_market(market)))
+    PathBuf::from(persist_dir).join(format!("book_sanity_state_{}.json", market_component(market)))
 }
 
 pub fn load_snapshot(persist_dir: &str, market: &MarketId) -> Option<BookSanitySnapshot> {
     let path = state_path(persist_dir, market);
     let file = File::open(path).ok()?;
     serde_json::from_reader(file).ok()
-}
-
-fn safe_market(market: &MarketId) -> String {
-    market
-        .0
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn append_event(path: &Path, event: &SanityEvent) -> Result<()> {

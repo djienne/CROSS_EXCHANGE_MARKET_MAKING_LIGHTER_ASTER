@@ -192,6 +192,17 @@ impl VenueBook {
         vb
     }
 
+    /// Mark this market dirty and wake the attached strategy loop (each when wired).
+    #[inline]
+    fn wake_readers(&self) {
+        if let Some((dirty, idx)) = &self.dirty {
+            dirty.mark(*idx);
+        }
+        if let Some(w) = &self.wake {
+            w.notify_one();
+        }
+    }
+
     /// Hot publish: store the freshest book, refresh BOTH liveness stamps (a book is
     /// also a frame), bump the generation, and wake any attached strategy loop. Called
     /// from the ingest thread on every book snapshot. Wait-free for readers; no lock.
@@ -216,12 +227,7 @@ impl VenueBook {
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Hot publish: store both the raw `OrderBook` and its integer `HotBook` projection.
@@ -248,12 +254,7 @@ impl VenueBook {
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Publish only the integer L2 projection before the raw Decimal book is available.
@@ -274,12 +275,7 @@ impl VenueBook {
         self.generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Publish a fast one-level BBO assist. This updates connection/quote freshness
@@ -301,12 +297,7 @@ impl VenueBook {
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Publish a fast BBO assist plus its integer projection.
@@ -330,12 +321,7 @@ impl VenueBook {
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Publish only the integer BBO projection before the raw Decimal BBO is available.
@@ -356,12 +342,7 @@ impl VenueBook {
         self.bbo_generation.fetch_add(1, Ordering::Release);
         crate::metrics::VENUE_PUBLISH.record((ns - t0).max(0) as u64);
         drop(publication);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     fn bbo_price_changed(&self, book: &OrderBook) -> bool {
@@ -397,12 +378,7 @@ impl VenueBook {
         drop(publication);
         if price_changed || had_hot_only {
             self.bbo_generation.fetch_add(1, Ordering::Release);
-            if let Some((dirty, idx)) = &self.dirty {
-                dirty.mark(*idx);
-            }
-            if let Some(w) = &self.wake {
-                w.notify_one();
-            }
+            self.wake_readers();
         }
     }
 
@@ -431,12 +407,7 @@ impl VenueBook {
         drop(publication);
         if price_changed || had_hot_only {
             self.bbo_generation.fetch_add(1, Ordering::Release);
-            if let Some((dirty, idx)) = &self.dirty {
-                dirty.mark(*idx);
-            }
-            if let Some(w) = &self.wake {
-                w.notify_one();
-            }
+            self.wake_readers();
         }
     }
 
@@ -579,12 +550,7 @@ impl VenueBook {
     #[inline]
     pub fn mark_stream_down(&self) {
         self.stream_down.store(true, Ordering::Release);
-        if let Some((dirty, idx)) = &self.dirty {
-            dirty.mark(*idx);
-        }
-        if let Some(w) = &self.wake {
-            w.notify_one();
-        }
+        self.wake_readers();
     }
 
     /// Whether the venue connector currently knows this stream to be down. Cleared only
@@ -739,16 +705,6 @@ mod tests {
         assert!(t > 0);
         assert!(vb.age_ms(t) < 10);
         assert!(vb.book_age_ms(t) < 10);
-    }
-
-    #[test]
-    fn divergence_flag_defaults_false_and_roundtrips() {
-        let vb = VenueBook::new();
-        assert!(!vb.is_divergent());
-        vb.mark_divergent(true);
-        assert!(vb.is_divergent());
-        vb.mark_divergent(false);
-        assert!(!vb.is_divergent());
     }
 
     #[test]

@@ -6,6 +6,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::Serialize;
 
+use crate::taker::arb::{Direction, PositionSnapshot};
 use crate::taker::aster::creds::venue_creds;
 use crate::taker::aster::rest::AsterRest;
 use crate::taker::aster::sign::{AsterSigner, EvmAsterSigner};
@@ -15,7 +16,7 @@ use crate::taker::config::{Config, MarketCfg};
 use crate::taker::connectors::{rest_book, rest_specs};
 use crate::taker::markets::MarketSpec;
 use crate::taker::types::Side;
-use crate::taker::decimal::common_qty_step;
+use crate::taker::decimal::{ceil_to_step, common_qty_step, floor_to_step};
 use crate::taker::venues::lighter::LighterVenue;
 
 #[derive(Debug, Serialize)]
@@ -119,56 +120,14 @@ pub struct DirectionStatus {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PositionSnapshot {
-    aster_qty: Decimal,
-    lighter_qty: Decimal,
-}
-
-impl PositionSnapshot {
-    fn net_qty(self) -> Decimal {
-        self.aster_qty + self.lighter_qty
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
 struct MarginSnapshot {
     aster_available_usd: Decimal,
     lighter_available_usd: Decimal,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Direction {
-    SellAsterBuyLighter,
-    SellLighterBuyAster,
-}
-
-impl Direction {
-    fn as_str(self) -> &'static str {
-        match self {
-            Direction::SellAsterBuyLighter => "SELL_ASTER_BUY_LIGHTER",
-            Direction::SellLighterBuyAster => "SELL_LIGHTER_BUY_ASTER",
-        }
-    }
-
-    fn aster_side(self) -> Side {
-        match self {
-            Direction::SellAsterBuyLighter => Side::Sell,
-            Direction::SellLighterBuyAster => Side::Buy,
-        }
-    }
-
-    fn lighter_side(self) -> Side {
-        self.aster_side().opposite()
-    }
-}
-
-pub async fn run(cfg: &Config, markets: Vec<MarketCfg>, json: bool) -> Result<()> {
+pub async fn run(cfg: &Config, markets: Vec<MarketCfg>) -> Result<()> {
     let report = StatusPoller::new(cfg, markets).await?.report().await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -711,21 +670,6 @@ fn floor_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal
 fn ceil_to_common_step(qty: Decimal, aster_step: Decimal, lighter_step: Decimal) -> Decimal {
     common_qty_step(aster_step,lighter_step).map(|step|ceil_to_step(qty,step)).unwrap_or(Decimal::ZERO)
 }
-
-fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).floor() * step
-}
-
-fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).ceil() * step
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -12,6 +12,7 @@ use crate::taker::config::Config;
 use crate::taker::connectors::rest_book;
 use crate::taker::connectors::rest_specs;
 use crate::decimal::bps_to_rate;
+use crate::taker::decimal::{ceil_to_step, floor_to_step};
 use crate::taker::types::Side;
 use crate::taker::venues::lighter::LighterVenue;
 use crate::taker::markets::MarketSpec;
@@ -105,12 +106,10 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// Read-only account/book/opportunity status: the taker report `run` polls every tick.
+    /// Read-only account/book/opportunity status, as JSON: the taker report `run` polls every tick.
     Status {
         #[arg(long, default_value = "HYPE")]
         market: Option<String>,
-        #[arg(long, default_value_t = false)]
-        json: bool,
     },
 }
 
@@ -181,16 +180,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             Ok(())
         }
         Commands::Probe { market } => {
-            let selected = cfg.select_markets(market.as_deref());
-            let spec = rest_specs::build_market_specs(
-                &selected,
-                &cfg.venues.aster_base_url,
-                &cfg.venues.lighter_base_url,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .context("no selected market spec")?;
+            let spec = first_spec(&cfg, market.as_deref()).await?;
             let acreds = AsterCreds::from_env()?;
             let lcreds = LighterCreds::from_env()?;
             let signer: Arc<dyn AsterSigner> =
@@ -238,16 +228,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             if max_usd <= Decimal::ZERO {
                 bail!("--max-usd must be positive");
             }
-            let selected = cfg.select_markets(market.as_deref());
-            let spec = rest_specs::build_market_specs(
-                &selected,
-                &cfg.venues.aster_base_url,
-                &cfg.venues.lighter_base_url,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .context("no selected market spec")?;
+            let spec = first_spec(&cfg, market.as_deref()).await?;
             let acreds = AsterCreds::from_env()?;
             let signer: Arc<dyn AsterSigner> =
                 Arc::new(EvmAsterSigner::new(acreds.user, acreds.signer, acreds.key)?);
@@ -331,16 +312,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             if max_usd <= Decimal::ZERO {
                 bail!("--max-usd must be positive");
             }
-            let selected = cfg.select_markets(market.as_deref());
-            let spec = rest_specs::build_market_specs(
-                &selected,
-                &cfg.venues.aster_base_url,
-                &cfg.venues.lighter_base_url,
-            )
-            .await?
-            .into_iter()
-            .next()
-            .context("no selected market spec")?;
+            let spec = first_spec(&cfg, market.as_deref()).await?;
             let lcreds = LighterCreds::from_env()?;
             let lighter = LighterVenue::new(
                 &cfg.venues.lighter_base_url,
@@ -531,14 +503,24 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             println!("pnl_persist_dir={}", cfg.pnl.persist_dir);
             Ok(())
         }
-        Commands::Status { market, json } => {
+        Commands::Status { market } => {
             let selected = cfg.select_markets(market.as_deref());
             if selected.is_empty() {
                 anyhow::bail!("no markets selected");
             }
-            crate::taker::status::run(&cfg, selected, json).await
+            crate::taker::status::run(&cfg, selected).await
         }
     }
+}
+
+/// The resolved spec of the first selected market.
+async fn first_spec(cfg: &Config, market: Option<&str>) -> Result<MarketSpec> {
+    let selected = cfg.select_markets(market);
+    rest_specs::build_market_specs(&selected, &cfg.venues.aster_base_url, &cfg.venues.lighter_base_url)
+        .await?
+        .into_iter()
+        .next()
+        .context("no selected market spec")
 }
 
 fn diagnostic_session(cfg: &Config, spec: &MarketSpec, account: serde_json::Value) -> ActiveSession {
@@ -801,21 +783,6 @@ async fn wait_lighter_position_after_buy(
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-}
-
-
-fn floor_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).floor() * step
-}
-
-fn ceil_to_step(qty: Decimal, step: Decimal) -> Decimal {
-    if qty <= Decimal::ZERO || step <= Decimal::ZERO {
-        return Decimal::ZERO;
-    }
-    (qty / step).ceil() * step
 }
 
 #[cfg(test)]

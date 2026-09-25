@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn lighter_loads_required_fields_without_printing_secret() {
+    fn lighter_loads_required_fields() {
         let body = "\
 API_KEY_PRIVATE_KEY=priv
 API_KEY_PUBLIC_KEY=pub
