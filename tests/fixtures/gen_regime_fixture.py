@@ -1,9 +1,15 @@
 """Record orchestrator.py decide() outcomes as a fixture for the Rust port.
 
 Provenance of tests/fixtures/regime_decisions.json.zst (600 scenarios, 5054 steps, checked by
-`controller::regime::tests::python_decisions_match`). orchestrator.py is retired; to rerun,
-restore it from commit 7d47337 (`git show 7d47337:orchestrator.py > orchestrator.py`), then
-from the stack root: python3 tests/fixtures/gen_regime_fixture.py OUT.json && zstd -19 OUT.json.
+`controller::regime::tests::python_decisions_match`): this script run against orchestrator.py
+and economics.py as of commit 7d47337, the last before c53fa6a retired the orchestrator. The
+"about" text inside the fixture calls it the "scratch" script: it was written outside the repo
+and committed unchanged except for this docstring. Rerunning it reproduces the fixture's JSON
+byte for byte (checked 2026-09-25). In an empty directory, on Linux or macOS (orchestrator.py
+imports fcntl; python:3.12-slim works):
+    git -C <repo> show 7d47337:orchestrator.py > orchestrator.py
+    git -C <repo> show 7d47337:economics.py > economics.py
+    python3 <repo>/tests/fixtures/gen_regime_fixture.py OUT.json && zstd -19 OUT.json
 
 Drives the REAL
 Orchestrator.decide/taker_margin_state/ready_for_taker/sustained/near_flat/clip on a bare

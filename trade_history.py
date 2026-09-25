@@ -5,12 +5,10 @@ import argparse
 from contextlib import closing
 import json
 import hashlib
-import os
 import re
 import uuid
 import sqlite3
-import sys
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -18,11 +16,14 @@ from typing import Any, Sequence
 
 from economics import Fill, optional_decimal, taker_economics, xemm_journal, calculate, fill_fee, event_time, venue_name
 
-from combined_pnl import DEFAULT_SINCE, dec, default_since, default_state_path, iso, json_default, latest_capital_from_state, parse_dt, projection, report_roots, utc_now
+from combined_pnl import (DEFAULT_SINCE, dec, decimal_str, default_since, default_state_path, fmt_money, fmt_pct, iso,
+    iter_jsonl, json_default, latest_capital_from_state, parse_dt, print_table, projection, report_roots, utc_now)
 
 
 TAKER_BOT = "LIGHTER_ASTER_TAKER_ARB"
 XEMM_BOT = "XEMM_LIGHTER_ASTER"
+# Every row's `mode` column: built from local artifacts only, never from an exchange API.
+MODE = "lan"
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -143,22 +144,6 @@ class IngestStats:
     missing: bool = False
     error: str | None = None
 
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "path": self.path,
-            "read": self.read,
-            "upserted_trades": self.upserted_trades,
-            "upserted_fills": self.upserted_fills,
-            "skipped": self.skipped,
-            "missing": self.missing,
-            "error": self.error,
-        }
-
-
-def decimal_str(value: Decimal | None) -> str | None:
-    return None if value is None else format(value.normalize(), "f")
-
 
 def raw_json(row: dict[str, Any]) -> str:
     return json.dumps(row, sort_keys=True, separators=(",", ":"))
@@ -272,33 +257,7 @@ def migrate_nullable_economics(conn: sqlite3.Connection) -> None:
         conn.execute(f"PRAGMA foreign_keys={foreign_keys}")
 
 
-def iter_jsonl(path: Path, errors: list[str] | None = None):
-    with path.open(encoding="utf-8") as f:
-        for line_no, line in enumerate(f, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                row = json.loads(line)
-                if not isinstance(row, dict):
-                    raise ValueError("expected a JSON object")
-                yield line_no, row
-            except (json.JSONDecodeError, ValueError) as exc:
-                if errors is not None:
-                    errors.append(f"line {line_no}: {exc}")
-                print(f"warn: skipping invalid JSON in {path}:{line_no}: {exc}", file=sys.stderr)
-
-
-def xemm_sides_from_hedge(direction: Any) -> tuple[str | None, str | None]:
-    direction_lower = str(direction or "").lower()
-    if direction_lower.endswith("buy"):
-        return "sell", "buy"
-    if direction_lower.endswith("sell"):
-        return "buy", "sell"
-    return None, None
-
-
-def database_records(n: dict[str, Any], *, mode: str, path: Path, line_no: int, source: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def database_records(n: dict[str, Any], *, path: Path, line_no: int, source: str) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     now = iso(utc_now())
     at = n.get("timestamp")
     timestamp = iso(at) if at is not None else None
@@ -308,7 +267,7 @@ def database_records(n: dict[str, Any], *, mode: str, path: Path, line_no: int, 
     raw = raw_json(n.get("raw") or {})
     a_fee, h_fee = n.get("aster_fee_usdc"), n.get("lighter_fee_usdc")
     trade = {
-        "trade_key":n["key"], "mode":mode, "strategy":strategy,
+        "trade_key":n["key"], "mode":MODE, "strategy":strategy,
         "bot":TAKER_BOT if strategy == "TAKER" else XEMM_BOT,
         "market":n["market"], "timestamp":timestamp, "timestamp_us":at_us,
         "direction":n.get("direction") or f"ASTER_MAKER_HEDGE_{str(n.get('hedge_side','')).upper()}",
@@ -335,7 +294,7 @@ def database_records(n: dict[str, Any], *, mode: str, path: Path, line_no: int, 
         ft = iso(fill.timestamp) if fill.timestamp is not None else timestamp
         fu = timestamp_us(fill.timestamp) if fill.timestamp is not None else at_us
         fills.append({
-            "fill_key":fill.stored_key or f"local:{n['key']}:{fill.identity}","trade_key":n["key"],"mode":mode,"venue":fill.venue,
+            "fill_key":fill.stored_key or f"local:{n['key']}:{fill.identity}","trade_key":n["key"],"mode":MODE,"venue":fill.venue,
             "market":n["market"],"timestamp":ft,"timestamp_us":fu,"side":fill.side,"qty":decimal_str(fill.qty),
             "price":decimal_str(price),"notional_usdc":decimal_str(fill.quote),
             "liquidity":"maker" if detail.get("maker") is True else ("taker" if detail.get("maker") is False else "unknown"),
@@ -350,19 +309,19 @@ def database_records(n: dict[str, Any], *, mode: str, path: Path, line_no: int, 
     return trade, fills
 
 
-def taker_trade_from_row(row: dict[str, Any], *, mode: str, path: Path, line_no: int) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
+def taker_trade_from_row(row: dict[str, Any], *, path: Path, line_no: int) -> tuple[dict[str, Any], list[dict[str, Any]]] | None:
     n = taker_economics(row)
-    return database_records(n,mode=mode,path=path,line_no=line_no,source="taker_local_ledger") if n else None
+    return database_records(n,path=path,line_no=line_no,source="taker_local_ledger") if n else None
 
 
-def xemm_trade_from_orchestrator_row(row: dict[str, Any], *, mode: str, path: Path, line_no: int):
+def xemm_trade_from_orchestrator_row(row: dict[str, Any], *, path: Path, line_no: int):
     if row.get("bot") != XEMM_BOT or row.get("direction") == "XEMM_CORRECTION":
         return None
     cloid = row.get("cloid")
     if cloid is None or not row.get("market"):
         return None
-    a_side,h_side = xemm_sides_from_hedge(row.get("direction"))
-    if a_side is None:
+    # ASTER_MAKER_HEDGE_BUY / _SELL: the hedge side.
+    if not str(row.get("direction") or "").lower().endswith(("buy", "sell")):
         return None
     confirmed = row.get("schema_version",1) >= 2 and row.get("economic_status") == "confirmed"
     n = {name:optional_decimal(row.get(name)) for name in ("qty","aster_qty","lighter_qty","matched_qty","residual_qty",
@@ -377,7 +336,7 @@ def xemm_trade_from_orchestrator_row(row: dict[str, Any], *, mode: str, path: Pa
             n["economic_status"]="incomplete"
             n["net_pnl_usdc"]=None
     # Aggregate rows have no native trade identities. Do not fabricate venue fills.
-    return database_records(n,mode=mode,path=path,line_no=line_no,source="orchestrator_normalized_ledger")
+    return database_records(n,path=path,line_no=line_no,source="orchestrator_normalized_ledger")
 
 
 def upsert_row(conn: sqlite3.Connection, table: str, key_column: str, row: dict[str, Any], preserve: set[str]) -> None:
@@ -432,7 +391,7 @@ def replace_trade_records(conn: sqlite3.Connection, trade: dict[str, Any], fills
     return True
 
 
-def update_sync_state(conn: sqlite3.Connection, stats: IngestStats, *, mode: str, market: str) -> None:
+def update_sync_state(conn: sqlite3.Connection, stats: IngestStats, *, market: str) -> None:
     mtime_ns = None
     if stats.path.exists():
         mtime_ns = stats.path.stat().st_mtime_ns
@@ -451,7 +410,7 @@ def update_sync_state(conn: sqlite3.Connection, stats: IngestStats, *, mode: str
         """,
         (
             stats.source,
-            mode,
+            MODE,
             market,
             str(stats.path),
             iso(utc_now()),
@@ -462,11 +421,11 @@ def update_sync_state(conn: sqlite3.Connection, stats: IngestStats, *, mode: str
     )
 
 
-def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, mode: str, market: str) -> IngestStats:
+def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, market: str) -> IngestStats:
     stats = IngestStats("taker_local_ledger", path)
     if not path.exists():
         stats.missing = True
-        update_sync_state(conn, stats, mode=mode, market=market)
+        update_sync_state(conn, stats, market=market)
         return stats
 
     errors: list[str] = []
@@ -476,7 +435,7 @@ def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, mode: str, mark
             stats.skipped += 1
             continue
         try:
-            parsed = taker_trade_from_row(row, mode=mode, path=path, line_no=line_no)
+            parsed = taker_trade_from_row(row, path=path, line_no=line_no)
         except Exception as exc:  # keep one malformed local line from blocking history refresh
             stats.skipped += 1
             stats.error = str(exc)
@@ -491,15 +450,15 @@ def ingest_taker_trades(conn: sqlite3.Connection, path: Path, *, mode: str, mark
     if errors:
         stats.error = "; ".join(errors[:3])
         stats.skipped += len(errors)
-    update_sync_state(conn, stats, mode=mode, market=market)
+    update_sync_state(conn, stats, market=market)
     return stats
 
 
-def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, mode: str, market: str) -> IngestStats:
+def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, market: str) -> IngestStats:
     stats = IngestStats("orchestrator_normalized_ledger", path)
     if not path.exists():
         stats.missing = True
-        update_sync_state(conn, stats, mode=mode, market=market)
+        update_sync_state(conn, stats, market=market)
         return stats
 
     logical_rows = {}
@@ -534,7 +493,7 @@ def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, mode: str,
             logical_rows[cloid]=(line_no,row)
     for line_no,row in logical_rows.values():
         try:
-            parsed=xemm_trade_from_orchestrator_row(row,mode=mode,path=path,line_no=line_no)
+            parsed=xemm_trade_from_orchestrator_row(row,path=path,line_no=line_no)
             if parsed is None:
                 stats.skipped += 1
                 continue
@@ -548,11 +507,11 @@ def ingest_orchestrator_xemm(conn: sqlite3.Connection, path: Path, *, mode: str,
     if errors:
         stats.error = "; ".join(errors[:3])
         stats.skipped += len(errors)
-    update_sync_state(conn, stats, mode=mode, market=market)
+    update_sync_state(conn, stats, market=market)
     return stats
 
 
-def ingest_xemm_journal(conn: sqlite3.Connection, path: Path, *, mode: str, market: str) -> IngestStats:
+def ingest_xemm_journal(conn: sqlite3.Connection, path: Path, *, market: str) -> IngestStats:
     stats = IngestStats("xemm_journal",path)
     if not path.exists():
         stats.missing=True
@@ -561,13 +520,13 @@ def ingest_xemm_journal(conn: sqlite3.Connection, path: Path, *, mode: str, mark
         stats.skipped=parsed["malformed_rows"]
         for index,n in enumerate(parsed["trades"],1):
             stats.read+=1
-            trade,fills=database_records(n,mode=mode,path=path,line_no=n.get("source_line",index),source="xemm_journal")
+            trade,fills=database_records(n,path=path,line_no=n.get("source_line",index),source="xemm_journal")
             if replace_trade_records(conn,trade,fills):
                 stats.upserted_trades+=1
                 stats.upserted_fills+=len(fills)
         if parsed["malformed_rows"]:
             stats.error=f"{parsed['malformed_rows']} malformed economic rows; source preserved"
-    update_sync_state(conn,stats,mode=mode,market=market)
+    update_sync_state(conn,stats,market=market)
     return stats
 
 
@@ -579,14 +538,13 @@ def refresh_lan(
     orchestrator_trades: Path,
     xemm_journals: Sequence[Path] = (),
 ) -> list[IngestStats]:
-    mode = "lan"
     stats = [
-        ingest_taker_trades(conn, taker_trades, mode=mode, market=market),
-        ingest_orchestrator_xemm(conn, orchestrator_trades, mode=mode, market=market),
+        ingest_taker_trades(conn, taker_trades, market=market),
+        ingest_orchestrator_xemm(conn, orchestrator_trades, market=market),
     ]
     for journal in xemm_journals:
         # Last so the journal's real trade times + actual hedge fees win on shared keys.
-        stats.append(ingest_xemm_journal(conn, journal, mode=mode, market=market))
+        stats.append(ingest_xemm_journal(conn, journal, market=market))
     conn.commit()
     return stats
 
@@ -709,7 +667,7 @@ def repair_raw_fees(conn: sqlite3.Connection, paths: list[Path], market: str) ->
             timestamp=max((f.timestamp for f in replacement if f.timestamp is not None),
                 default=parse_dt(trade["timestamp"]) if trade["timestamp"] else None),
             raw={"repair":"individual own-account fills","previous_source":trade["source"]})
-        records,fills=database_records(n,mode="lan",path=paths[0],line_no=0,source="raw_execution_fills")
+        records,fills=database_records(n,path=paths[0],line_no=0,source="raw_execution_fills")
         repaired+=int(replace_trade_records(conn,records,fills))
     return {"repaired_trades":repaired,"unusable_raw_rows":len(malformed)}
 
@@ -739,7 +697,7 @@ def build_repaired_database(args: argparse.Namespace) -> dict[str, Any]:
         result={"original":str(args.db.resolve()),"candidate":str(target.resolve()),
             "original_fingerprint":original_hash,"candidate_fingerprint":database_fingerprint(conn),
             "before":before,"after":database_overview(conn),"raw_repair":raw,
-            "refresh":[st.as_dict() for st in stats]}
+            "refresh":[asdict(st) for st in stats]}
     finally:
         conn.close()
     tmp.replace(target)
@@ -845,44 +803,13 @@ def report_from_db(conn: sqlite3.Connection, *, market: str, since: datetime, no
     capital=capital_usdc
     if capital is None and orchestrator_state is not None:
         capital,capital_source=latest_capital_from_state(orchestrator_state)
-    return {"mode":"lan","db":db_path,"market":market,"since":since,"now":now,
+    return {"db":db_path,"market":market,"since":since,"now":now,
         "by_strategy":[buckets[k] for k in sorted(buckets)],"total":total,
         "confirmation_counts":confirmation_counts,"source_errors":source_errors,
         "projection":projection(total["net_pnl_usdc"],capital,since,now),"capital_source":capital_source,
         "notes":["Local execution economics include matched spread and explicit recovery closes; portfolio marks and funding are excluded.",
             "Fees require venue evidence. Legacy, estimated and incomplete rows suppress full net totals; their original evidence is preserved.",
             "Known net subtotals exclude unresolved rows; estimated recovery losses are shown separately."]}
-
-
-def fmt_money(value: Decimal | None, signed: bool = True, places: int = 8) -> str:
-    if value is None:
-        return "unavailable"
-    sign = "+" if signed else ""
-    return f"{value:{sign}.{places}f}"
-
-
-def fmt_pct(value: Decimal | None, places: int) -> str:
-    if value is None:
-        return "n/a"
-    return f"{value:.{places}f}%"
-
-
-def print_table(title: str, headers: list[str], rows: list[list[Any]], right_align: set[int] | None = None) -> None:
-    right_align = right_align or set()
-    text_rows = [[str(cell) for cell in row] for row in rows]
-    widths = [max(len(headers[idx]), *(len(row[idx]) for row in text_rows)) for idx in range(len(headers))]
-
-    def render_row(row: list[str]) -> str:
-        cells = []
-        for idx, cell in enumerate(row):
-            cells.append(cell.rjust(widths[idx]) if idx in right_align else cell.ljust(widths[idx]))
-        return " | ".join(cells)
-
-    print(title)
-    print(render_row(headers))
-    print("-+-".join("-" * width for width in widths))
-    for row in text_rows:
-        print(render_row(row))
 
 
 def print_human(stats: list[IngestStats], report: dict[str, Any] | None) -> None:
@@ -933,7 +860,6 @@ def print_human(stats: list[IngestStats], report: dict[str, Any] | None) -> None
         "Projection",
         ["Metric", "Value"],
         [
-            ["Mode", report["mode"]],
             ["DB", report["db"]],
             ["Market", report["market"]],
             ["Since UTC", iso(report["since"])],
@@ -954,7 +880,6 @@ def print_human(stats: list[IngestStats], report: dict[str, Any] | None) -> None
 def parse_args() -> argparse.Namespace:
     stack_root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Canonical local trade-history DB and PnL report.")
-    parser.add_argument("--mode", choices=["lan", "local"], default="lan", help="lan/local: local artifacts only; no exchange API calls.")
     parser.add_argument("--dry-run", action="store_true", help="The dry run's files and its own DB (LIGHTER_ASTER_BOT/runs/dry-run/) instead of live.")
     parser.add_argument("--market", default="HYPE")
     parser.add_argument("--since", default=None, help=f"UTC/RFC3339 start time. Default: {DEFAULT_SINCE}; with --dry-run, the dry run's first start.")
@@ -974,7 +899,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-out", type=Path, help="Candidate path (default: <db-stem>.rebuilt.sqlite).")
     parser.add_argument("--raw-fills", type=Path, action="append", default=[], help="Own-account execution_trade JSONL with venue/order identities, notional and fee evidence; repeatable.")
     args = parser.parse_args()
-    args.mode = "lan"
     roots = report_roots(stack_root, args.dry_run)
     legacy_runs, bot_runs = roots
     args.since = args.since or default_since(bot_runs, args.market, args.dry_run)
@@ -1026,7 +950,7 @@ def main() -> int:
                 orchestrator_state=args.orchestrator_state,
             )
     if args.json:
-        print(json.dumps({"refresh": [s.as_dict() for s in stats], "report": report}, default=json_default, indent=2))
+        print(json.dumps({"refresh": [asdict(s) for s in stats], "report": report}, default=json_default, indent=2))
     else:
         print_human(stats, report)
     return 0

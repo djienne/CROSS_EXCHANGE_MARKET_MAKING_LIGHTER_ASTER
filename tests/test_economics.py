@@ -46,7 +46,7 @@ class EconomicContractTests(unittest.TestCase):
                 try:
                     trade_history.init_db(conn)
                     for _ in range(2):
-                        trade_history.ingest_xemm_journal(conn,journal,mode="lan",market="HYPE")
+                        trade_history.ingest_xemm_journal(conn,journal,market="HYPE")
                     report=trade_history.report_from_db(conn,market="HYPE",since=since,now=now,db_path=root/"history.sqlite")
                     self.assertEqual(report["total"]["trades"],1)
                     self.assertEqual(report["total"]["net_pnl_usdc"],expected)
@@ -92,7 +92,7 @@ class EconomicContractTests(unittest.TestCase):
                 journal=root/"journal.jsonl"
                 case=next(c for c in CASES if c["name"]=="unknown_fee")
                 write_rows(journal,case["rows"])
-                trade_history.ingest_xemm_journal(conn,journal,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,journal,market="HYPE")
                 values=conn.execute("SELECT net_pnl_usdc,policy_fees_usdc,lighter_fee_usdc,lighter_fee_rate,user_annotation FROM strategy_trades").fetchone()
                 self.assertEqual(tuple(values),(None,None,None,None,"keep"))
                 self.assertIsNone(conn.execute("SELECT policy_fee_usdc FROM venue_fills WHERE venue='lighter'").fetchone()[0])
@@ -126,7 +126,7 @@ class EconomicContractTests(unittest.TestCase):
             conn=trade_history.open_db(args.db)
             try:
                 trade_history.init_db(conn)
-                trade_history.ingest_xemm_journal(conn,journal,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,journal,market="HYPE")
                 conn.execute("ALTER TABLE strategy_trades ADD COLUMN user_annotation TEXT DEFAULT 'keep'")
                 conn.execute("CREATE INDEX user_trade_index ON strategy_trades(user_annotation)")
                 conn.execute("CREATE TABLE user_audit (trade_key TEXT)")
@@ -198,10 +198,10 @@ class EconomicContractTests(unittest.TestCase):
             conn=trade_history.open_db(root/"history.sqlite")
             try:
                 trade_history.init_db(conn)
-                trade_history.ingest_taker_trades(conn,ledger,mode="lan",market="HYPE")
+                trade_history.ingest_taker_trades(conn,ledger,market="HYPE")
                 outcome=trade_history.repair_raw_fees(conn,[raw],"HYPE")
                 self.assertEqual(outcome["repaired_trades"],1)
-                trade_history.ingest_taker_trades(conn,ledger,mode="lan",market="HYPE")
+                trade_history.ingest_taker_trades(conn,ledger,market="HYPE")
                 r=conn.execute("SELECT net_pnl_usdc,economic_status,source FROM strategy_trades").fetchone()
                 self.assertEqual(tuple(r),("0.93228","confirmed","raw_execution_fills"))
                 incomplete=[]
@@ -241,9 +241,9 @@ class EconomicContractTests(unittest.TestCase):
             conn=trade_history.open_db(root/"history.sqlite")
             try:
                 trade_history.init_db(conn)
-                trade_history.ingest_xemm_journal(conn,path,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,path,market="HYPE")
                 conn.execute("UPDATE strategy_trades SET confirmation_status='exchange_confirmed',policy_fees_usdc='0.02',lighter_fee_usdc='0.02',net_pnl_usdc='0.10'")
-                trade_history.ingest_xemm_journal(conn,path,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,path,market="HYPE")
                 self.assertEqual(trade_history.database_overview(conn)["known_net_pnl_usdc"],"0.1")
                 conn.execute("UPDATE strategy_trades SET net_pnl_usdc='999'")
                 self.assertEqual(trade_history.database_overview(conn)["incomplete_trades"],1)
@@ -262,7 +262,7 @@ class EconomicContractTests(unittest.TestCase):
             conn=trade_history.open_db(root/"history.sqlite")
             try:
                 trade_history.init_db(conn)
-                trade_history.ingest_xemm_journal(conn,journal,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,journal,market="HYPE")
                 conn.execute("UPDATE venue_fills SET confirmation_status='exchange_confirmed' WHERE venue='aster'")
                 for include_aster in (False,True):
                     if include_aster:
@@ -291,7 +291,7 @@ class EconomicContractTests(unittest.TestCase):
             conn=trade_history.open_db(root/"history.sqlite")
             try:
                 trade_history.init_db(conn)
-                trade_history.ingest_xemm_journal(conn,journal,mode="lan",market="HYPE")
+                trade_history.ingest_xemm_journal(conn,journal,market="HYPE")
                 self.assertEqual(trade_history.repair_raw_fees(conn,[raw],"HYPE")["repaired_trades"],1)
                 result=conn.execute("SELECT qty,aster_qty,net_pnl_usdc FROM strategy_trades").fetchone()
                 self.assertEqual(tuple(result),("0.05","0.1","-0.05248"))

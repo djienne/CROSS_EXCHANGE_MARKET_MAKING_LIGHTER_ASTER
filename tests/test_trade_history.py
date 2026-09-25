@@ -38,48 +38,47 @@ class TradeHistoryTests(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_taker_ingest_prefers_producer_actual_fields(self) -> None:
-        # Producer rows carry matched-qty economics in actual_*; the report must
-        # use them instead of recomputing from full per-leg notionals (which
-        # fabricates PnL for unequal fills).
+    def test_taker_unequal_legs_price_the_matched_qty_and_must_agree_with_the_producer(self) -> None:
+        # The fills are repriced: only the matched 0.9 earns the spread, 0.9 x (100 - 99) = 0.9,
+        # not 1 x (100 - 99) = 1 from the larger leg. A producer's actual_* that disagrees with
+        # the fills leaves its trade incomplete instead of certifying either number.
+        row = {
+            "timestamp": "2026-01-02T00:00:00.123456789Z",
+            "market": "HYPE",
+            "direction": "SELL_ASTER_BUY_LIGHTER",
+            "qty": "0.9",
+            "actual_gross_usd": "0.9",
+            "actual_fees_usd": "0.04",
+            "actual_net_usd": "0.86",
+            "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0.04"},
+            "lighter_fill": {"qty": "0.9", "vwap": "99", "notional": "89.1", "fee_usd": "0"},
+            "aster_order_id": 1,
+            "lighter_client_order_index": 2,
+        }
+        disagreeing = json.loads(json.dumps(row))
+        disagreeing.update(aster_order_id=3, actual_gross_usd="1", actual_net_usd="0.96")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             taker_path = root / "taker.jsonl"
             orch_path = root / "orchestrator.jsonl"
             db_path = root / "history.sqlite"
-            write_jsonl(
-                taker_path,
-                [
-                    {
-                        "timestamp": "2026-01-02T00:00:00.123456789Z",
-                        "market": "HYPE",
-                        "direction": "SELL_ASTER_BUY_LIGHTER",
-                        "qty": "0.9",
-                        "actual_gross_usd": "0.9",
-                        "actual_fees_usd": "0.04",
-                        "actual_net_usd": "0.86",
-                        # Unequal legs: full-notional recompute would claim 100-99=1.
-                        "aster_fill": {"qty": "1", "vwap": "100", "notional": "100", "fee_usd": "0.04"},
-                        "lighter_fill": {"qty": "0.9", "vwap": "99", "notional": "89.1", "fee_usd": "0"},
-                        "aster_order_id": 1,
-                        "lighter_client_order_index": 2,
-                    }
-                ],
-            )
             write_jsonl(orch_path, [])
+            since = combined_pnl.parse_dt("2026-01-01T00:00:00Z")
+            now = combined_pnl.parse_dt("2026-01-03T00:00:00Z")
             with self.open_db(db_path) as conn:
+                write_jsonl(taker_path, [row])
                 trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
-                report = trade_history.report_from_db(
-                    conn,
-                    market="HYPE",
-                    since=combined_pnl.parse_dt("2026-01-01T00:00:00Z"),
-                    now=combined_pnl.parse_dt("2026-01-03T00:00:00Z"),
-                    db_path=db_path,
-                )
-            self.assertEqual(report["total"]["trades"], 1)
-            self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("0.9"))
-            self.assertEqual(report["total"]["policy_fees_usdc"], Decimal("0.04"))
-            self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("0.86"))
+                report = trade_history.report_from_db(conn, market="HYPE", since=since, now=now, db_path=db_path)
+                self.assertEqual(report["total"]["trades"], 1)
+                self.assertEqual(report["total"]["gross_pnl_usdc"], Decimal("0.9"))
+                self.assertEqual(report["total"]["policy_fees_usdc"], Decimal("0.04"))
+                self.assertEqual(report["total"]["net_pnl_usdc"], Decimal("0.86"))
+                write_jsonl(taker_path, [row, disagreeing])
+                trade_history.refresh_lan(conn, market="HYPE", taker_trades=taker_path, orchestrator_trades=orch_path)
+                report = trade_history.report_from_db(conn, market="HYPE", since=since, now=now, db_path=db_path)
+            self.assertEqual((report["total"]["trades"], report["total"]["incomplete_trades"]), (2, 1))
+            self.assertEqual(report["total"]["known_net_pnl_usdc"], Decimal("0.86"))
+            self.assertIsNone(report["total"]["net_pnl_usdc"])
 
     def test_taker_ingests_sell_lighter_buy_aster_direction(self) -> None:
         # This direction was silently dropped before 2026-07-18 (the matcher
@@ -234,7 +233,7 @@ class TradeHistoryTests(unittest.TestCase):
             path=root/"orchestrator.jsonl"
             write_jsonl(path,[row,correction])
             with self.open_db(root/"history.sqlite") as conn:
-                trade_history.ingest_orchestrator_xemm(conn,path,mode="lan",market="HYPE")
+                trade_history.ingest_orchestrator_xemm(conn,path,market="HYPE")
                 values=conn.execute("SELECT net_pnl_usdc,matched_qty FROM strategy_trades").fetchall()
                 self.assertEqual(len(values),1)
                 self.assertEqual(tuple(values[0]),("0.08","0.2"))

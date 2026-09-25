@@ -24,12 +24,12 @@ and probes.
 ├── combined_pnl.py         execution economics across both engines' records
 ├── trade_history.py        the same records as a SQLite trade history, with repair
 ├── bot_stats.py            why: edge kept per leg, entry gate, controller, simulator health
-├── economics.py            the parser both reports share
+├── economics.py            the parser the reports share
 ├── tests/                  Python tests and shared fixtures (tests/fixtures/)
 └── LIGHTER_ASTER_BOT/
     ├── bot.toml            config: [controller], [taker], [maker], [dry_run]
     ├── docker-compose.yml  services: dryrun, and bot (live, behind the `live` profile)
-    ├── scripts/            deploy_vps.sh, reset_breaker.py, check_hedged_trade.py
+    ├── scripts/            deploy_vps.sh, reset_breaker.py
     ├── signers/            Lighter signer libraries (binaries, not secrets)
     ├── src/                controller/ (run), taker/, livebot/ (XEMM), dryrun/ (simulated venues)
     └── RUNBOOK.md
@@ -62,10 +62,10 @@ are in the [runbook](LIGHTER_ASTER_BOT/RUNBOOK.md#dry-run).
 
 ## Reports
 
-Run from the repository root. Both reports read the bot's records in `LIGHTER_ASTER_BOT/runs/`
-and, where they exist, the retired orchestrator's in the root `runs/`; with `--dry-run` they
-read only `LIGHTER_ASTER_BOT/runs/dry-run/` and, without `--since`, count from the dry run's
-first start.
+Run from the repository root. The reports read the bot's records in `LIGHTER_ASTER_BOT/runs/`;
+`combined_pnl.py` and `trade_history.py` also read the retired orchestrator's in the root
+`runs/` where they exist. With `--dry-run` they read only `LIGHTER_ASTER_BOT/runs/dry-run/`
+and, without `--since`, count from the dry run's first start.
 
 ```bash
 python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z   # add --json for JSON
@@ -94,9 +94,9 @@ What the numbers mean:
   enough evidence stay incomplete, and corrections revise their original logical trade without
   adding trades or volume.
 
-The Rust `live-report` and the Python `economics.py`, which the reports and
-`scripts/check_hedged_trade.py` use, are both tested against
-`tests/fixtures/execution_economics.json`, so they agree.
+The reports' `economics.py` and the bot's own `live-report` command, which lists one XEMM
+journal's logical trades (`lighter_aster_bot live-report --journal <journal> --details`), are
+both tested against `tests/fixtures/execution_economics.json`, so they agree.
 
 Historical repair builds a separate candidate database and a before/after JSON comparison:
 

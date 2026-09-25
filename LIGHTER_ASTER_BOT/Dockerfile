@@ -55,8 +55,8 @@ COPY bot.toml /app/bot.toml
 
 # SIGINT, SIGTERM and SIGHUP all start the same graceful drain (cancel resting orders,
 # hedge fills, correct net residuals, verify; paired positions stay open). The drain can
-# take up to 175 s: stop with `docker stop -t 200` (compose sets stop_grace_period), never
-# the 10 s default, which SIGKILLs a legitimate drain.
+# take up to 450 s (RUNBOOK.md, "Run and stop"): stop with `docker stop -t 460` (compose sets
+# stop_grace_period), never the 10 s default, which SIGKILLs a legitimate drain.
 STOPSIGNAL SIGINT
 
 ENTRYPOINT ["lighter_aster_bot"]

@@ -10,7 +10,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from economics import optional_decimal, parse_timestamp, xemm_journal, taker_economics
+from economics import event_time, optional_decimal, parse_timestamp, xemm_journal, taker_economics
 
 
 SECONDS_PER_YEAR = Decimal(365 * 24 * 60 * 60)
@@ -44,13 +44,13 @@ def sum_optional(rows, key: str) -> Decimal | None:
     return sum(values, Decimal(0)) if all(v is not None for v in values) else None
 
 
-def dec_json(value: Decimal) -> str:
-    return format(value.normalize(), "f")
+def decimal_str(value: Decimal | None) -> str | None:
+    return None if value is None else format(value.normalize(), "f")
 
 
 def json_default(value: Any) -> Any:
     if isinstance(value, Decimal):
-        return dec_json(value)
+        return decimal_str(value)
     if isinstance(value, datetime):
         return iso(value)
     if isinstance(value, Path):
@@ -58,51 +58,31 @@ def json_default(value: Any) -> Any:
     raise TypeError(f"{type(value)!r} is not JSON serializable")
 
 
-def load_jsonl(path: Path):
+def iter_jsonl(path: Path, errors: list[str] | None = None):
+    """(line number, object) per JSON-object line; other lines are skipped with a warning."""
     with path.open(encoding="utf-8") as f:
         for line_no, line in enumerate(f, 1):
             line = line.strip()
             if not line:
                 continue
             try:
-                yield json.loads(line)
-            except json.JSONDecodeError as exc:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("expected a JSON object")
+                yield line_no, row
+            except ValueError as exc:  # json.JSONDecodeError is a ValueError
+                if errors is not None:
+                    errors.append(f"line {line_no}: {exc}")
                 print(f"warn: skipping invalid JSON in {path}:{line_no}: {exc}", file=sys.stderr)
-
-
-def row_timestamp(row: dict[str, Any]) -> datetime | None:
-    containers = [row]
-    detail = row.get("detail")
-    if isinstance(detail, dict):
-        containers.append(detail)
-    for container in containers:
-        # ts_ms is the journal's wall-clock stamp (epoch milliseconds), written by the XEMM
-        # bot's JournalRecord since 2026-07. Prefer it: it is unambiguous and always present
-        # on current-format rows.
-        raw_ms = container.get("ts_ms")
-        if isinstance(raw_ms, (int, float)) and raw_ms > 0:
-            try:
-                return datetime.fromtimestamp(raw_ms / 1000.0, tz=timezone.utc)
-            except (ValueError, OSError, OverflowError):
-                pass
-        for key in ("timestamp", "ts", "time", "created_at"):
-            raw = container.get(key)
-            if raw is None or raw == "":
-                continue
-            try:
-                return parse_dt(str(raw))
-            except (ValueError, TypeError):
-                continue
-    return None
 
 
 def summarize_taker(path: Path, since: datetime, now: datetime, market: str) -> dict[str, Any]:
     rows = []
     if path.exists():
-        for row in load_jsonl(path):
-            if not isinstance(row, dict) or row.get("market") != market:
+        for _, row in iter_jsonl(path):
+            if row.get("market") != market:
                 continue
-            ts = row_timestamp(row)
+            ts = event_time(row)
             if ts is not None and since <= ts <= now:
                 rows.append(row)
     normalized = []
@@ -232,20 +212,14 @@ def default_state_path(roots: tuple[Path, Path], market: str) -> Path:
     return current if current.exists() or not legacy.exists() else legacy
 
 
-def latest_capital_from_state(path: Path, active_preference: str | None = None) -> tuple[Decimal | None, str | None]:
+def latest_capital_from_state(path: Path) -> tuple[Decimal | None, str | None]:
+    """The active engine's equity in the controller state, else the other engine's."""
     if not path.exists():
         return None, None
     state = json.loads(path.read_text(encoding="utf-8"))
     accounts = state.get("accounts") or {}
-    active = active_preference or state.get("active_bot")
-    candidates = []
-    if active == "XEMM_LIGHTER_ASTER":
-        candidates.extend(["xemm", "taker"])
-    elif active == "LIGHTER_ASTER_TAKER_ARB":
-        candidates.extend(["taker", "xemm"])
-    else:
-        candidates.extend(["xemm", "taker"])
-    for key in candidates:
+    taker_first = state.get("active_bot") == "LIGHTER_ASTER_TAKER_ARB"
+    for key in (["taker", "xemm"] if taker_first else ["xemm", "taker"]):
         equity = dec((accounts.get(key) or {}).get("total_equity_usd"), Decimal("-1"))
         if equity > 0:
             return equity, f"{path}:{key}.total_equity_usd"
@@ -348,7 +322,7 @@ def combine(args: argparse.Namespace) -> dict[str, Any]:
     if xemm["skipped_untimestamped_trades"]:
         notes.append(
             f"Skipped {xemm['skipped_untimestamped_trades']} XEMM trade(s) without wall-clock timestamps "
-            "(journal rows written before the bot stamped ts_ms). Rebuild/restart the bot to get ts_ms on new rows; "
+            "(journal rows written before the bot stamped ts_ms); "
             "use --xemm-untimestamped include only for deliberate historical backfills."
         )
     if xemm["time_filtered_trades"]:

@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from combined_pnl import default_since, iso, load_jsonl, parse_dt, report_roots, utc_now
+from combined_pnl import default_since, iso, iter_jsonl, parse_dt, report_roots, utc_now
 from economics import parse_timestamp, xemm_journal
 
 
@@ -35,11 +35,10 @@ def dist(xs: list[float]) -> dict[str, Any]:
             "p90": round(pct(xs, 0.9), 3)} if xs else {"n": 0}
 
 
-def rows(path: Path, since: datetime, now: datetime, key: str = "timestamp") -> list[dict[str, Any]]:
+def rows(path: Path, since: datetime, now: datetime) -> list[dict[str, Any]]:
     if not path.exists():
         return []
-    return [r for r in load_jsonl(path) if isinstance(r, dict)
-            and (at := parse_timestamp(r.get(key))) is not None and since <= at <= now]
+    return [r for _, r in iter_jsonl(path) if (at := parse_timestamp(r.get("timestamp"))) is not None and since <= at <= now]
 
 
 def ms(at: str) -> float:
@@ -133,7 +132,7 @@ def simulator(runs: Path, market: str, since: datetime, now: datetime) -> dict[s
     path = runs / f"sim-{market}.diag.jsonl"
     if not path.exists():
         return None
-    diag = [r for r in load_jsonl(path) if since.timestamp() * 1000 <= r["ts_ms"] <= now.timestamp() * 1000]
+    diag = [r for _, r in iter_jsonl(path) if since.timestamp() * 1000 <= r["ts_ms"] <= now.timestamp() * 1000]
     if not diag:
         return None
     minutes = sum(r["window_s"] for r in diag) / 60

@@ -133,8 +133,8 @@ meanwhile, so the first book fills any resting order it crosses, an expired Aste
 cancels, and funding that fell due is charged. To start afresh, stop it and move
 `runs/dry-run/` away. Moving only `sim-<M>.state.json` would leave the drawdown baseline
 measuring the reset accounts. A fresh directory also restarts the taker's entry-gate
-history: as after a fresh live start, the taker trades only once it has seen 500
-opportunities above its required edge (`[taker.arb.entry_gate]`).
+history: as after a fresh live start, the taker trades only once it has recorded
+`min_history_samples` (50) opportunities above its required edge (`[taker.arb.entry_gate]`).
 
 An unclean stop (a host reboot, `docker kill`) loses at most the venues' last second. The
 next start archives the engines' unclean-session markers, whether a kill or an unresolved
@@ -220,7 +220,7 @@ bind-mounted files as mode 777, and live refuses env files that others can read.
 | `bot-<M>-journal.jsonl` | XEMM execution journal |
 | `bot-<M>.trip.json`, `bot-<M>.active.json` | XEMM loss latch and unclean-session marker |
 | `bot-<M>.residual.json` | Legs XEMM left open at its last stop (a report, not a latch) |
-| `trades_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger and entry-gate history |
+| `trades_<M>.jsonl`, `executions_<M>.jsonl`, `opportunities_<M>.jsonl` | Taker ledger, execution log and entry-gate history |
 | `active_session_<M>.json`, `circuit_breaker_<M>.json` | Taker unclean-session marker and loss breaker |
 
 The taker's observe-only history still feeds `opportunities_<M>.jsonl`, as live history
@@ -335,7 +335,7 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 ## Probes
 
 - Read-only: `probe aster-balance | aster-positions | aster-open-orders | leverage |
-  lighter-balance | lighter-open-orders`, `taker probe`, `taker status`,
+  lighter-balance | lighter-open-orders`, `taker probe`, `status` and `taker status` (JSON),
   `fetch-specs`. `taker run --markets HYPE --observe-only` scans and records entry-gate
   history without orders.
 - `probe lighter-order-dry-run` signs IOC and native market plans without submitting them.
@@ -350,8 +350,9 @@ the nonce dir at `/nonce`. It never restarts the live bot: a halt stays halted u
 ## Orchestrator leftovers
 
 The stack used to run `orchestrator.py` with the engines as child processes. `run --mode live`
-refuses to start while it still runs (its lock `runs/orchestrator_<M>.lock` is held) or while
-its latches exist in the stack root's `runs/`: `orchestrator_breaker_<M>.json`,
-`orchestrator-xemm-<M>.trip.json` and `orchestrator-xemm-<M>.active.json`, the last an
-unresolved session. Review and archive them like the latches above. The reports still read its
-journals and state.
+looks in `runs/` and the stack root's `runs/`, and refuses to start while the orchestrator
+still runs (its lock `orchestrator_<M>.lock` is held) or while its latches exist:
+`orchestrator_breaker_<M>.json`, `orchestrator-xemm-<M>.trip.json` and
+`orchestrator-xemm-<M>.active.json`, the last an unresolved session. Review and archive them
+like the latches above. Engines left running by a killed orchestrator hold no lock, so `run`
+cannot see them: stop any before the first `run`. The reports still read its journals and state.

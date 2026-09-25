@@ -59,8 +59,6 @@ sync_source() {
     Dockerfile docker-compose.yml .dockerignore bot.toml \
     Cargo.toml Cargo.lock src scripts signers RUNBOOK.md \
     | "${SSH[@]}" "tar xzf - -C '$DEST'"
-  # Keep the existing standalone journal CLI on the shared accounting contract.
-  tar czf - -C .. economics.py | "${SSH[@]}" "tar xzf - -C '$DEST/scripts'"
 }
 
 copy_secrets() {
