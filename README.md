@@ -23,6 +23,7 @@ and probes.
 .
 ├── combined_pnl.py         execution economics across both engines' records
 ├── trade_history.py        the same records as a SQLite trade history, with repair
+├── bot_stats.py            why: edge kept per leg, entry gate, controller, simulator health
 ├── economics.py            the parser both reports share
 ├── tests/                  Python tests and shared fixtures (tests/fixtures/)
 └── LIGHTER_ASTER_BOT/
@@ -71,7 +72,14 @@ python3 combined_pnl.py --market HYPE --since 2026-06-23T16:00:00Z   # add --jso
 python3 trade_history.py --market HYPE          # database: runs/trade_history.sqlite
 python3 combined_pnl.py --market HYPE --dry-run
 python3 trade_history.py --market HYPE --dry-run  # its own database, in the dry run's directory
+python3 bot_stats.py --market HYPE --dry-run      # execution quality and health; add --json
 ```
+
+`bot_stats.py` explains the totals. For taker trades it reports expected vs realized edge, how much
+each leg filled worse than the decision price, book ages and fill delays. It also covers the entry
+gate's decisions, XEMM edge and hedge delay, and controller switches, halts and network pauses. For
+a dry run it adds the simulator's late frames (with host freezes separated), latencies against the
+`[dry_run]` model, request rates and rejects.
 
 What the numbers mean:
 

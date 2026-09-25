@@ -182,6 +182,8 @@ Simulator warnings start with `dry-run`. `no route`, `no websocket` or `not simu
 the bot used something the simulator does not serve, so the dry run no longer matches live:
 treat it as a bug. The reports take `--dry-run` (`python3 ../combined_pnl.py --dry-run`;
 `python3 ../trade_history.py --dry-run` keeps its own database in `runs/dry-run/`).
+`python3 ../bot_stats.py --dry-run` summarizes these diagnostics together with the trades'
+edge kept and slippage per leg.
 
 What the dry run cannot tell: whether the fee keys are right; the bot's market impact beyond
 the liquidity it takes; how Aster's ~100 ms splits around matching, and how Lighter treats an
