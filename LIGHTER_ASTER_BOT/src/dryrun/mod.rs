@@ -719,7 +719,7 @@ pub(crate) mod tests {
         let (stop, stem) = (CancellationToken::new(), runs.join("bot-HYPE"));
         let xemm = tokio::spawn({
             let (cfg, stop, stem) = (cfg.maker.clone(), stop.clone(), stem.clone());
-            async move { crate::livebot::run(&cfg, maker_markets, stem, stop).await }
+            async move { crate::livebot::run(&cfg, maker_markets, stem, Default::default(), stop).await }
         });
         // `run`'s standby taker observes beside XEMM, on the same account, with no lease.
         let (_no_lease, lease) = tokio::sync::watch::channel(None);

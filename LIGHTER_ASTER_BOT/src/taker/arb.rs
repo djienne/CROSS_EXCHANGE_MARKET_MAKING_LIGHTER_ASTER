@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -295,6 +295,9 @@ pub struct RunOptions {
     pub reduce_cooldown_ms: u64,
     pub reduce_signal_min_samples: usize,
     pub reduce_signal_window_ms: i64,
+    /// The controller's network pause: while set, no new entry starts (in-flight executions,
+    /// recovery closes and shutdown carry on).
+    pub pause: Option<Arc<AtomicBool>>,
 }
 
 impl Default for RunOptions {
@@ -310,6 +313,7 @@ impl Default for RunOptions {
             reduce_cooldown_ms: 5_000,
             reduce_signal_min_samples: 3,
             reduce_signal_window_ms: 2_000,
+            pause: None,
         }
     }
 }
@@ -1708,6 +1712,7 @@ pub async fn run(cfg: Config, markets: Vec<MarketCfg>, mut options: RunOptions, 
             continue;
         };
         if !execution_lease_enabled(&mut lease_cache, &options, &spec, final_now).0
+            || options.pause.as_ref().is_some_and(|pause| pause.load(Ordering::Acquire))
             || !lighter.tx_ready() || !entry_gate.healthy() || !execution_journal.healthy() || !reduce_signal_tracker.healthy() || session.unresolved()
             || !Arc::ptr_eq(&final_aster, &aster_book) || !Arc::ptr_eq(&final_lighter, &lighter_book)
             || !book_ok(&final_aster, final_now, cfg.arb.max_book_staleness_ms)

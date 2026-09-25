@@ -84,6 +84,7 @@ pub async fn run(
     cfg: &Config,
     markets: Vec<MarketCfg>,
     stem: PathBuf,
+    pause: Arc<AtomicBool>,
     stop: CancellationToken,
 ) -> Result<()> {
     if markets.is_empty() {
@@ -295,6 +296,7 @@ pub async fn run(
     // latch write fails (unwritable runs/ dir) — see the shutdown check at the end of run().
     let breaker_tripped_flag = Arc::new(AtomicBool::new(false));
     strat.set_trip_flag(breaker_tripped_flag.clone());
+    strat.set_pause_flag(pause);
     strat.set_dirty(dirty);
     strat.set_user_stream(stream_liveness); // freeze quoting if the Aster fill stream silently dies
     // --- strategy ---

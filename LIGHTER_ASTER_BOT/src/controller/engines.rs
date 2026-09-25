@@ -53,13 +53,15 @@ impl LiveEngines {
 impl Engines for LiveEngines {
     fn spawn(&mut self, role: Role, io: &EngineIo, stop: CancellationToken) -> JoinHandle<Result<()>> {
         let (cfg, markets) = (self.taker_cfg.clone(), self.taker_markets.clone());
+        let pause = io.paused.clone();
         match role {
             Role::Xemm => {
                 let (cfg, markets, stem) = (self.maker_cfg.clone(), self.maker_markets.clone(), self.xemm_stem.clone());
-                tokio::spawn(async move { crate::livebot::run(&cfg, markets, stem, stop).await })
+                tokio::spawn(async move { crate::livebot::run(&cfg, markets, stem, pause, stop).await })
             }
             Role::Taker(TakerMode::Normal) => {
-                tokio::spawn(crate::taker::arb::run(cfg, markets, RunOptions::default(), stop))
+                let options = RunOptions { pause: Some(pause), ..RunOptions::default() };
+                tokio::spawn(crate::taker::arb::run(cfg, markets, options, stop))
             }
             Role::Taker(TakerMode::Reduce) | Role::Observer => {
                 let options = RunOptions {
@@ -68,6 +70,7 @@ impl Engines for LiveEngines {
                     reduce_cooldown_ms: self.reduce_cooldown_ms,
                     reduce_signal_min_samples: self.reduce_burst_min_samples,
                     reduce_signal_window_ms: self.reduce_burst_window_ms,
+                    pause: Some(pause),
                     ..RunOptions::default()
                 };
                 tokio::spawn(crate::taker::arb::run(cfg, markets, options, stop))

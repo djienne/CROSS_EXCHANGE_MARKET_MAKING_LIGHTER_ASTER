@@ -240,8 +240,16 @@ the simulated venues' `sim-<M>.state.json` and `sim-<M>.diag.jsonl`.
 - resting orders when rights should move (`*_orders_not_clear*`, `startup_orders_not_clear`);
 - an engine error (`active_bot_exited_nonzero`), or three clean exits each under 10 minutes
   of uptime (`active_bot_crash_loop`);
-- three unreadable required statuses in a row (`status_unavailable`);
 - XEMM not reduce-only (`xemm_reduce_position_only_disabled`).
+
+**Network outage.** Three unreadable required statuses in a row (45 s) are treated as a lost
+network, not a halt: the bot emits `network_pause`, and no engine opens new exposure (no
+taker entry, XEMM quotes pulled). In-flight executions, hedges, corrections and the Aster
+deadman carry on, and the controller neither switches nor consumes reduce bursts. The loss
+stops still run on every readable status. After 4 readable statuses in a row (about 60 s,
+restarting at any failure) it emits `network_resume` and trades on; no restart is needed. An
+order in flight when the network drops can still end the engine with an unresolved
+execution, which halts as `active_bot_exited_nonzero`.
 
 Review `bot-<M>.events.jsonl` and the breaker, then restart with `--ack-breaker`, which
 archives it as `.acked.<stamp>`. An equity-drawdown breaker also needs

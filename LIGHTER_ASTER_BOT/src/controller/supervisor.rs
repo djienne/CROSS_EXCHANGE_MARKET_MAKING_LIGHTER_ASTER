@@ -12,6 +12,8 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
@@ -32,8 +34,11 @@ use crate::taker::pnl::write_json_atomic;
 
 const FAST_POLL: Duration = Duration::from_millis(250);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(25);
-/// Consecutive ticks without the required status before `status_unavailable`.
+/// Consecutive ticks without the required status before the network pause.
 const MAX_STATUS_FAILURES: u32 = 3;
+/// Consecutive good status ticks (4 x poll_sec, ~60 s) before a network pause lifts: a
+/// flapping network must not resume two-leg trades that a drop can leave half-filled.
+const STABLE_TICKS: u32 = 4;
 /// A failed poll of the idle engine is not retried for this long.
 const INACTIVE_STATUS_BACKOFF: Duration = Duration::from_secs(60);
 const ORDERS_CLEAR_TIMEOUT: Duration = Duration::from_secs(5);
@@ -79,6 +84,9 @@ impl Role {
 pub struct EngineIo {
     pub lease: watch::Receiver<Option<ExecutionLease>>,
     pub signals: watch::Sender<Option<ReduceSignal>>,
+    /// Network pause: while set, no engine opens new exposure (taker entries, XEMM quotes);
+    /// in-flight executions, hedges, recovery and shutdown carry on.
+    pub paused: Arc<AtomicBool>,
 }
 
 /// What the supervisor drives: the real engines in production, fakes in tests.
@@ -177,6 +185,9 @@ pub struct Supervisor<E: Engines> {
     last_signal_at: Option<DateTime<Utc>>,
     leases_granted: u64,
     status_failures: u32,
+    /// Set while no engine may open new exposure, because the status became unreadable.
+    paused_since: Option<DateTime<Utc>>,
+    stable_ticks: u32,
     backoff_until: [Option<Instant>; 2],
     active_exit_count: u32,
     observer_exit_count: u32,
@@ -228,12 +239,14 @@ impl<E: Engines> Supervisor<E> {
             events,
             active: None,
             observer: None,
-            io: EngineIo { lease: lease_rx, signals: signal_tx },
+            io: EngineIo { lease: lease_rx, signals: signal_tx, paused: Arc::new(AtomicBool::new(false)) },
             lease_tx,
             signal_rx,
             last_signal_at: None,
             leases_granted: 0,
             status_failures: 0,
+            paused_since: None,
+            stable_ticks: 0,
             backoff_until: [None, None],
             active_exit_count: 0,
             observer_exit_count: 0,
@@ -293,7 +306,7 @@ impl<E: Engines> Supervisor<E> {
 
     async fn fast_tick(&mut self) {
         self.check_exits().await;
-        if self.stopping() {
+        if self.stopping() || self.paused_since.is_some() {
             return;
         }
         let Some(signal) = self.fresh_signal() else { return };
@@ -367,10 +380,15 @@ impl<E: Engines> Supervisor<E> {
             None => taker.is_some() || xemm.is_some(),
         };
         if !required {
+            // Unreadable status is almost always the network: halting cannot drain or cancel
+            // without it either, so pause new exposure and wait for it to come back.
             self.status_failures += 1;
+            self.stable_ticks = 0;
             self.events.emit("status_poll_failed", json!({"consecutive_failures": self.status_failures}));
-            if self.status_failures >= MAX_STATUS_FAILURES {
-                self.safe_halt("status_unavailable", json!({})).await;
+            if self.status_failures >= MAX_STATUS_FAILURES && self.paused_since.is_none() {
+                self.paused_since = Some(Utc::now());
+                self.io.paused.store(true, Ordering::Release);
+                self.events.emit("network_pause", json!({"consecutive_failures": self.status_failures}));
             }
             return;
         }
@@ -382,6 +400,16 @@ impl<E: Engines> Supervisor<E> {
         let sample = self.record_equity(taker.as_ref(), xemm.as_ref());
         if let Some(reason) = self.equity.breach().or_else(|| self.trades.breach(self.cfg.max_loss_usdc)) {
             return self.safe_halt("pnl_breaker", json!({"breaker_reason": reason, "pnl_sample": sample})).await;
+        }
+        // Loss stops run on every readable status; switching waits for a stable network.
+        if let Some(since) = self.paused_since {
+            self.stable_ticks += 1;
+            if self.stable_ticks < STABLE_TICKS {
+                return;
+            }
+            self.paused_since = None;
+            self.io.paused.store(false, Ordering::Release);
+            self.events.emit("network_resume", json!({"paused_secs": (Utc::now() - since).num_seconds()}));
         }
         let decision = self.regime.decide(taker.as_ref(), xemm.as_ref(), Instant::now(), Utc::now());
         let target = match decision.target {
@@ -1031,12 +1059,26 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn missing_required_status_three_times_halts() {
-        let (mut sup, _shared, dir) = supervisor(&[], false);
+    async fn unreadable_status_pauses_and_a_stable_network_resumes() {
+        let (mut sup, shared, dir) = supervisor(&[], false);
+        let paused = sup.io.paused.clone();
         for _ in 0..3 {
             sup.tick().await;
         }
-        assert_eq!(sup.halted, Some("status_unavailable"));
+        assert!(sup.halted.is_none() && paused.load(Ordering::Acquire), "an outage pauses, never halts");
+        set_status(&shared, "taker", blocked_taker());
+        for _ in 0..STABLE_TICKS - 1 {
+            sup.tick().await;
+        }
+        shared.statuses.lock().unwrap().remove("taker");
+        sup.tick().await; // a drop inside the window restarts it
+        set_status(&shared, "taker", blocked_taker());
+        for _ in 0..STABLE_TICKS - 1 {
+            sup.tick().await;
+            assert!(paused.load(Ordering::Acquire), "still inside the stability window");
+        }
+        sup.tick().await;
+        assert!(!paused.load(Ordering::Acquire) && sup.halted.is_none());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

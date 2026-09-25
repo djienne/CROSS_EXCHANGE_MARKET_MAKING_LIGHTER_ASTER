@@ -45,6 +45,8 @@ use super::precheck::{hot_precheck_side, HotPrecheck};
 use super::scale::MarketScale;
 
 const MAKER_GATE_FROZEN: &str = "FROZEN";
+/// The controller's network pause: quotes are pulled; hedging and corrections carry on.
+const MAKER_GATE_NETWORK_PAUSE: &str = "NETWORK_PAUSE";
 // Keep a small cushion of Aster command-queue slots for risk-reducing commands
 // (targeted cancels, CancelAllBot, dead-man refresh). Optional quote churn must
 // not be allowed to consume the entire bounded queue and then block a cancel.
@@ -757,6 +759,7 @@ pub struct Strategy {
     /// the persistent latch write so a failed/unwritable trip file still forces a nonzero exit at
     /// shutdown — otherwise the `run` controller would restart it straight back into trading.
     trip_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    pause_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Per-market maker-gate suppression tracking, for OBSERVABILITY: `(since_ns, reason, logged)`.
     /// A closed maker gate (orphan hedge / unhedged-over-limit / stale snapshot / stale feed / …)
     /// otherwise suppresses quoting with NO log and no `frozen` latch — the exact failure mode that
@@ -869,6 +872,7 @@ impl Strategy {
             breaker_last_generation: 0,
             breaker_tripped: false,
             trip_flag: None,
+            pause_flag: None,
             quote_suppressed: HashMap::new(),
             margin_suppressed: HashMap::new(),
             aster_touch_guard_blocked: HashMap::new(),
@@ -919,6 +923,10 @@ impl Strategy {
     /// exit even when the persistent trip-latch write failed).
     pub fn set_trip_flag(&mut self, f: Arc<std::sync::atomic::AtomicBool>) {
         self.trip_flag = Some(f);
+    }
+
+    pub fn set_pause_flag(&mut self, f: Arc<std::sync::atomic::AtomicBool>) {
+        self.pause_flag = Some(f);
     }
 
     /// Mark startup reconciliation complete — quoting may begin (still gated by feeds/cooldown).
@@ -1636,6 +1644,9 @@ impl Strategy {
     /// [`note_quote_gate`](Self::note_quote_gate).
     fn maker_gate_reason(&self, market: &MarketId, now_ns: i64) -> Option<&'static str> {
         if self.draining { return Some("QUIESCING"); }
+        if self.pause_flag.as_ref().is_some_and(|p| p.load(std::sync::atomic::Ordering::Acquire)) {
+            return Some(MAKER_GATE_NETWORK_PAUSE);
+        }
         if !self.uncertain_makers.is_empty() { return Some("MAKER_EXECUTION_UNCERTAIN"); }
         if !self.journal.healthy() { return Some("JOURNAL_UNHEALTHY"); }
         if self.correction_needed.contains(market) { return Some("RESIDUAL_CORRECTION"); }
@@ -1724,6 +1735,9 @@ impl Strategy {
                 let should_sweep = r != "COOLDOWN"
                     && r != "SAFETY_SWEEP_PENDING"
                     && r != MAKER_GATE_FROZEN
+                    // The gate-closed cancel pulls quotes, and offline the deadman does: a
+                    // cancel-all sweep would only fail every 2 s through an outage.
+                    && r != MAKER_GATE_NETWORK_PAUSE
                     && (self.cfg.live.cancel_all_on_gate_close
                         || (user_stream_stale && self.cfg.live.cancel_all_on_user_stream_stale));
                 if should_sweep {
@@ -4295,6 +4309,23 @@ lighter_symbol = "BTC"
         assert!(!strat.note_quote_gate(&m, 1_000_000_000));
         assert!(strat.sweep_pending.is_none(), "FROZEN itself must not re-arm safety sweeps");
         assert!(erx.try_recv().is_err(), "FROZEN gate evaluation must not enqueue CancelAllBot");
+    }
+
+    #[test]
+    fn network_pause_closes_the_quote_gate_without_a_sweep() {
+        let (etx, mut erx) = tokio::sync::mpsc::channel(128);
+        let (htx, _hrx) = tokio::sync::mpsc::channel(16);
+        let mut strat = live_strat(etx, htx, AccountState::default());
+        let m: MarketId = "BTC".into();
+        let pause = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        strat.set_pause_flag(pause.clone());
+        strat.mark_clean_start();
+
+        assert_eq!(strat.maker_gate_reason(&m, 1_000_000_000), Some(MAKER_GATE_NETWORK_PAUSE));
+        assert!(!strat.note_quote_gate(&m, 1_000_000_000));
+        assert!(strat.sweep_pending.is_none() && erx.try_recv().is_err(), "a pause must not sweep");
+        pause.store(false, std::sync::atomic::Ordering::Release);
+        assert_ne!(strat.maker_gate_reason(&m, 1_000_000_000), Some(MAKER_GATE_NETWORK_PAUSE));
     }
 
     #[test]
