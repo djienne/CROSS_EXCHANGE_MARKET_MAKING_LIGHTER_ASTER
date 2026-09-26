@@ -909,6 +909,23 @@ mod tests {
     }
 
     #[test]
+    fn memory_is_bounded_the_gate_forgets_windows_past_its_span_and_the_ring_its_second() {
+        let rec = Recording { gate_window_hours: 1.0, ..rec(1) };
+        let mut c = Collector::new(&rec, &[pair("X")], HashMap::new(), 0);
+        let mut out = |_| {};
+        c.on_event(0, book(Venue::Aster, 100.0, 100.0), &mut out);
+        // Three hours of 10 updates a second, each window's edges in a bin of their own.
+        for t in (100..3 * 3_600_000).step_by(100) {
+            let bid = 100.0 * (1.0 + (7.1 + (t / WINDOW_MS) as f64 * 0.25) / 1e4);
+            c.on_event(t, book(Venue::Lighter, bid, bid + 0.01), &mut out);
+        }
+        // 35 windows closed; the gate keeps the last hour's 12, and only their bins.
+        let p = &c.pairs[0];
+        assert_eq!((p.gate.windows.len(), p.gate.total.len()), (12, 12));
+        assert!(p.ring.len() <= 12, "{} states in the ring", p.ring.len());
+    }
+
+    #[test]
     fn summaries_weight_by_time_and_close_on_window_bounds() {
         let mut c = Collector::new(&rec(50), &[pair("X")], HashMap::new(), 0);
         let mut lines = Vec::new();
