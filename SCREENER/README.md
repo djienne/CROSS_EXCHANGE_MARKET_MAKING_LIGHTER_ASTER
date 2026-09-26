@@ -32,8 +32,11 @@ runs apart from the bot, with its own crate, image, container and data.
 Each venue combination is matched independently: names (including verified `kPEPE`/`1000PEPE`
 scales), prices within 2%, and at least $200k 24 h volume on both venues. The 100-pair limit is
 **per combination**. Hyperliquid covers native perpetuals only; spot and builder/HIP-3 markets
-are excluded. Pairs refresh at UTC midnight. An unavailable venue leaves combinations between the
-other two running and is retried at the next refresh.
+are excluded. Pairs refresh at UTC midnight. A venue unavailable then (or at boot) leaves the
+combination of the other two running, is retried every 5 minutes, and rejoins in a new run as soon
+as it answers. Feeds reconnect within 5 s of an outage, and a silent one is dropped after 30 s; their
+books are unknown meanwhile, so an outage records gaps, never stale prices. After a reboot, Docker
+restarts the container (`unless-stopped`).
 
 Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
 unchanged book. Historical trades received on subscription are excluded using the first book's
@@ -44,7 +47,7 @@ stale Hyperliquid book invalidates only its own pairs. No credentials or order c
 
 ```bash
 docker compose up -d --build                        # collect (start_all.bat starts it too)
-docker compose logs -f                              # a traffic line every 5 min
+docker compose logs -f                              # traffic and memory every 5 min
 docker compose run --rm screener universe           # today's pairs, with their Aster taker fee
 docker compose run --rm report                      # the ranking, from all the data
 docker compose run --rm report --since 2026-09-27 --lighter premium --json

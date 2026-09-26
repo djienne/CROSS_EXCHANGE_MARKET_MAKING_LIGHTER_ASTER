@@ -708,11 +708,34 @@ pub async fn run(cfg: Config, dir: PathBuf, stop: CancellationToken) -> Result<(
         let header = vec![format!("P\t{params}"), format!("U\t{}", serde_json::to_string(&pairs)?)];
         let (store, writer) = Store::open(&dir, header)?;
         let day_end = now - now.rem_euclid(DAY_MS) + DAY_MS;
-        run_day(Collector::new(&rec, &pairs, gates, now), &pairs, &store, day_end, &stop).await;
+        let run = stop.child_token();
+        // A venue down at discovery (a boot before its network, a blip at midnight) rejoins within
+        // minutes of answering again, in a new run, rather than at the next UTC day.
+        if venues(&pairs) < 3 {
+            let (collect, run) = (cfg.collect.clone(), run.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = run.cancelled() => return,
+                        _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+                    }
+                    if universe::discover(&collect).await.is_ok_and(|(pairs, _)| venues(&pairs) == 3) {
+                        tracing::info!("every venue answers again: a new run adds its routes");
+                        return run.cancel();
+                    }
+                }
+            });
+        }
+        run_day(Collector::new(&rec, &pairs, gates, now), &pairs, &store, day_end, &run).await;
+        run.cancel();
         store.stop();
         tokio::task::spawn_blocking(move || writer.join()).await?.map_err(|_| anyhow::anyhow!("the store writer panicked"))??;
     }
     Ok(())
+}
+
+fn venues(pairs: &[Pair]) -> usize {
+    pairs.iter().flat_map(|p| [p.left.venue, p.right.venue]).collect::<std::collections::HashSet<_>>().len()
 }
 
 /// Unique venue instruments and their destinations. One subscription supplies several routes.
@@ -823,6 +846,10 @@ async fn run_day(mut collector: Collector, pairs: &[Pair], store: &Store, day_en
                         tracing::info!("last 5 min: {venue:?} {:.0} frames/s {:.1} KB/s", frames as f64 / 300.0, bytes as f64 / 300_000.0);
                     }
                     tracing::info!("Hyperliquid ignored: {} historical trades, {} duplicates", hl.historical, hl.duplicates);
+                    // The memory history, kept by the rotated container logs: a leak is steady growth.
+                    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                    let kb = |key: &str| status.lines().find_map(|l| l.strip_prefix(key)).map_or("?", str::trim);
+                    tracing::info!("memory: RSS {} (heap {}, peak {})", kb("VmRSS:"), kb("RssAnon:"), kb("VmHWM:"));
                     traffic = [(0, 0); 3];
                     next_log = now + WINDOW_MS;
                 }
