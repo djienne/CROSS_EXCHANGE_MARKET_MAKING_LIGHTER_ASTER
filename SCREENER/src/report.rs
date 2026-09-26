@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use chrono::{Days, NaiveDate};
 use serde::Serialize;
 use serde_json::Value;
@@ -104,10 +104,15 @@ impl Data {
                     self.pairs.insert(p.name.clone(), p);
                 }
             }
-            "B" if !history && f.len() == 11 => {
-                let n: Vec<f64> = f[3..].iter().map(|x| x.parse()).collect::<Result<_, _>>()?;
-                let a = Bbo { bid: n[0], bid_size: n[1], ask: n[2], ask_size: n[3] };
-                let l = Bbo { bid: n[4], bid_size: n[5], ask: n[6], ask_size: n[7] };
+            "B" if !history => {
+                ensure!(f.len() == 8, "{file}: a B line of {} fields, not 8 (sizes, not depth flags?)", f.len());
+                let n: Vec<f64> = f[3..7].iter().map(|x| x.parse()).collect::<Result<_, _>>()?;
+                let flags: u8 = f[7].parse()?;
+                // A side holding the recorded depth (`depth_flags`) gets an infinite size, the
+                // others none: `px * size >= depth_usd` answers as it did on the live book.
+                let size = |bit: u8| if flags >> bit & 1 == 1 { f64::INFINITY } else { 0.0 };
+                let a = Bbo { bid: n[0], bid_size: size(0), ask: n[1], ask_size: size(1) };
+                let l = Bbo { bid: n[2], bid_size: size(2), ask: n[3], ask_size: size(3) };
                 self.series.entry(f[2].to_string()).or_default().states.push(State { t: f[1].parse()?, a, l });
             }
             "T" if !history && f.len() == 7 => {
@@ -709,8 +714,8 @@ mod tests {
         let mut out = |l: String| lines.borrow_mut().push(l);
         let mut full = Series::default();
         // 40 minutes of a market whose basis swings ±10 bps every 8 minutes (the inventory fills both
-        // ways and unwinds), wanders and now and then jumps, with 1 and 1.5 bps spreads, a thin top
-        // now and then, trades at or through the touch, connection gaps, several events within a
+        // ways and unwinds), wanders and now and then jumps, with 1 and 1.5 bps spreads, each side
+        // thin now and then, trades at or through the touch, connection gaps, several events within a
         // millisecond, and a restart mid-window every 7.5 minutes.
         let mut seed = 1u64;
         let mut rand = move || {
@@ -733,14 +738,14 @@ mod tests {
             mid *= 1.0 + (rand() - 0.5) * 1e-4;
             let swing = 10.0 * (t as f64 / 480_000.0 * std::f64::consts::TAU).sin();
             basis += 0.05 * (swing - basis) + (rand() - 0.5) * 2.0 + if rand() < 0.002 { 20.0 * (rand() - 0.5) } else { 0.0 };
-            let size = if rand() < 0.05 { 1.0 } else { 100.0 };
+            let thin = |r: f64| if r < 0.05 { 1.0 } else { 100.0 };
             let r = rand();
             if r < 0.495 {
-                a = Bbo { bid: mid * (1.0 - 0.5e-4), bid_size: size, ask: mid * (1.0 + 0.5e-4), ask_size: 100.0 };
+                a = Bbo { bid: mid * (1.0 - 0.5e-4), bid_size: thin(rand()), ask: mid * (1.0 + 0.5e-4), ask_size: thin(rand()) };
                 collector.on_event(t, Event::Book { pair: 0, venue: Venue::Aster, bbo: a }, &mut out);
             } else if r < 0.99 {
                 let m = mid * (1.0 + basis / 1e4);
-                l = Bbo { bid: m * (1.0 - 0.75e-4), bid_size: 100.0, ask: m * (1.0 + 0.75e-4), ask_size: size };
+                l = Bbo { bid: m * (1.0 - 0.75e-4), bid_size: thin(rand()), ask: m * (1.0 + 0.75e-4), ask_size: thin(rand()) };
                 collector.on_event(t, Event::Book { pair: 0, venue: Venue::Lighter, bbo: l }, &mut out);
             } else if r < 0.9905 {
                 l = Bbo::default();

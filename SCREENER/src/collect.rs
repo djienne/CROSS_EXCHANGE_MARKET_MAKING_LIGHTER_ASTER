@@ -21,7 +21,7 @@
 //! |---|---|
 //! | `P` | JSON: the [collect] settings, the `Recording`, and the constants below |
 //! | `U` | JSON: the pairs (`universe::Pair`) |
-//! | `B` | time, pair, Aster bid, bid size, ask, ask size, then the same for Lighter (0 = unknown) |
+//! | `B` | time, pair, Aster bid, ask, Lighter bid, ask (0 = unknown), `depth_flags` |
 //! | `T` | time, pair, venue `A`/`L`, price, size, aggressor `B`/`S`: a trade that could fill a quote |
 //! | `G` | time, venue: its connection ended (its states are unknown until they update again) |
 //! | `S` | JSON: one pair's 5-minute summary (`Summary::line`), with its gate samples |
@@ -92,6 +92,14 @@ impl Venue {
             Venue::Lighter => "L",
         }
     }
+}
+
+/// Which sides hold `depth_usd`, as bits: 1 Aster bid, 2 Aster ask, 4 Lighter bid, 8 Lighter ask.
+/// That is all the report asks of book sizes (`best_edge`, the XEMM hedge), at the recorded depth
+/// (`Recording::check`), in 40% less disk than the sizes.
+pub fn depth_flags(a: &Bbo, l: &Bbo, depth_usd: f64) -> u8 {
+    let sides = [a.bid * a.bid_size, a.ask * a.ask_size, l.bid * l.bid_size, l.ask * l.ask_size];
+    sides.iter().enumerate().map(|(i, &usd)| ((usd >= depth_usd) as u8) << i).sum()
 }
 
 /// The better direction's executable taker edge, bps of the Aster mid, as the bot's taker computes
@@ -492,13 +500,14 @@ impl Collector {
     /// Writes the pair's states in force at `from` or later that are not written yet. A state
     /// replaced within its millisecond is skipped: no lookup by time can return it.
     fn write_since(&mut self, pair: usize, from: i64, out: &mut impl FnMut(String)) {
+        let depth_usd = self.rec.depth_usd;
         let p = &mut self.pairs[pair];
         let start = p.ring.iter().rposition(|s| s.0 <= from).unwrap_or(0);
         for i in start..p.ring.len() {
             let replaced_at_once = p.ring.get(i + 1).is_some_and(|next| next.0 == p.ring[i].0);
             let (at, a, l, written) = &mut p.ring[i];
             if !*written && !replaced_at_once {
-                out(state_line(*at, &p.name, a, l));
+                out(state_line(*at, &p.name, a, l, depth_usd));
                 *written = true;
                 p.summary.rows += 1;
             }
@@ -506,11 +515,8 @@ impl Collector {
     }
 }
 
-fn state_line(t: i64, pair: &str, a: &Bbo, l: &Bbo) -> String {
-    format!(
-        "B\t{t}\t{pair}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-        a.bid, a.bid_size, a.ask, a.ask_size, l.bid, l.bid_size, l.ask, l.ask_size
-    )
+fn state_line(t: i64, pair: &str, a: &Bbo, l: &Bbo, depth_usd: f64) -> String {
+    format!("B\t{t}\t{pair}\t{}\t{}\t{}\t{}\t{}", a.bid, a.ask, l.bid, l.ask, depth_flags(a, l, depth_usd))
 }
 
 /// The gate history for a run starting at `now`, from the summaries in `dir`: per pair, its gate
@@ -818,6 +824,8 @@ mod tests {
         // $1,000 at each top: short of a $2,000 depth, neither direction counts.
         assert_eq!(best_edge(&a, &l, 2_000.0), None);
         assert_eq!(best_edge(&Bbo::default(), &l, 130.0), None);
+        // Only the Lighter bid ($100.08) is short of a $130 depth: flag 4 is off.
+        assert_eq!(depth_flags(&a, &Bbo { bid_size: 1.0, ..l }, 130.0), 0b1011);
 
         // A 5 bps quote on Aster, priced from these books, bids at most 100.08 - 5 bps of 100.045
         // (the mean mid) = 100.0300 and never above Aster's 100.00 bid: only a sale below 100.00
@@ -872,8 +880,8 @@ mod tests {
         c.on_event(4_600, book(Venue::Lighter, 100.0, 100.01), &mut out);
         c.on_event(4_601, book(Venue::Lighter, 100.0, 100.02), &mut out);
         assert_eq!(times(&lines), ["2000", "2400", "3001", "3500", "3600", "4600"]);
-        assert!(lines[2].ends_with("100.02	10"));
-        assert_eq!(lines[0], "B\t2000\tX\t99.99\t10\t100\t10\t100.07\t10\t100.08\t10");
+        assert!(lines[2].ends_with("100.02\t15"));
+        assert_eq!(lines[0], "B\t2000\tX\t99.99\t100\t100.07\t100.08\t15");
         assert_eq!(lines[4], "T\t3600\tX\tA\t99.98\t1\tS");
     }
 
@@ -947,7 +955,7 @@ mod tests {
 
     #[test]
     fn a_run_ends_its_tails_unknown_and_the_next_starts_unknown() {
-        let unknown = |t: i64| format!("B\t{t}\tX\t0\t0\t0\t0\t0\t0\t0\t0");
+        let unknown = |t: i64| format!("B\t{t}\tX\t0\t0\t0\t0\t0");
         let mut c = Collector::new(&rec(50), &[pair("X")], HashMap::new(), 0);
         let mut lines = Vec::new();
         c.on_event(0, book(Venue::Aster, 99.99, 100.0), &mut |l| lines.push(l));

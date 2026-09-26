@@ -40,7 +40,7 @@ docker compose run --rm report --latency 2          # sensitivity: every latency
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
-state of the days it scores in memory, ~0.2 GB a day, under a 4 GB cap.
+state of the days it scores in memory, ~0.5 GB a day, under an 8 GB cap.
 
 ## Reading the report
 
