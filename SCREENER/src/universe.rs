@@ -1,5 +1,5 @@
-//! The pairs to watch: perps listed on both venues, matched by name, confirmed by price and
-//! filtered by 24 h volume.
+//! The pairs to watch: perps listed on two of Aster, Lighter and Hyperliquid, matched by name,
+//! confirmed by price and filtered by 24 h volume.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -221,7 +221,8 @@ struct LighterMarket {
     daily_quote_token_volume: f64,
 }
 
-/// Today's pairs, from Aster exchangeInfo and 24 h tickers and Lighter orderBookDetails.
+/// Today's pairs, from Aster exchangeInfo and 24 h tickers, Lighter orderBookDetails and
+/// Hyperliquid metaAndAssetCtxs.
 pub async fn discover(cfg: &Collect) -> Result<(Vec<Pair>, Vec<(String, f64)>)> {
     let http = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
     let get = |url: String| {

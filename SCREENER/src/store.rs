@@ -1,5 +1,5 @@
 //! The data files: `<dir>/<YYYY-MM-DD>T<HHMMSS>Z.screen.zst`, one per collection run (a run ends at
-//! each UTC midnight), each a header then lines (formats in `collect.rs`). A file is concatenated
+//! each UTC midnight, or when a venue missing at discovery answers), each a header then lines (formats in `collect.rs`). A file is concatenated
 //! zstd frames, one per flush (every 30 s): a kill loses at most the last 30 s, a frame cut short
 //! by a power loss can only end a file, and `zstd -dc` reads any file. Writing never blocks the
 //! feeds: lines go to a writer thread, and are dropped (and counted) if it is a whole queue behind.

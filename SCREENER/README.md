@@ -34,9 +34,10 @@ scales), prices within 2%, and at least $200k 24 h volume on both venues. The 10
 **per combination**. Hyperliquid covers native perpetuals only; spot and builder/HIP-3 markets
 are excluded. Pairs refresh at UTC midnight. A venue unavailable then (or at boot) leaves the
 combination of the other two running, is retried every 5 minutes, and rejoins in a new run as soon
-as it answers. Feeds reconnect within 5 s of an outage, and a silent one is dropped after 30 s; their
-books are unknown meanwhile, so an outage records gaps, never stale prices. After a reboot, Docker
-restarts the container (`unless-stopped`).
+as it answers. A silent connection is dropped after 30 s and its books are unknown until it
+returns, within 5 s of the network: an outage records a gap, except its first 30 s, which keep the
+last prices (a 60 s cut, 2026-09-26: 33 s down, every pair back within seconds). After a reboot
+or a crash, Docker restarts the container (`unless-stopped`); a kill loses at most the last 30 s.
 
 Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
 unchanged book. Historical trades received on subscription are excluded using the first book's
@@ -108,7 +109,8 @@ or trading connector is imported.
 
 ## Files
 
-`data/<YYYY-MM-DD>T<HHMMSS>Z.screen.zst` holds one file per run (a run ends at each UTC midnight).
+`data/<YYYY-MM-DD>T<HHMMSS>Z.screen.zst` holds one file per run (a run ends at each UTC midnight,
+or when a venue missing at discovery answers).
 Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`.
 Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter files remain
 readable without migration; their one-second tails still limit their own replay settings. A kill

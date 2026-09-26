@@ -10,8 +10,8 @@
 //!   it fills min(trade, clip) (queue position ignored); a fill pauses the market for the
 //!   cooldown, and with inventory only the side that reduces it is quoted; the hedge fills at the
 //!   recorded state after the fill notice and the hedge latency; the leftover inventory closes as
-//!   the taker's. Run with the bot's settings (Aster maker, Lighter hedge, distance gate), and as a
-//!   sweep of the required edge without the gate for both directions.
+//!   the taker's. Run in both directions with the bot's settings (required edge, distance gate),
+//!   and as a sweep of the required edge without the gate.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

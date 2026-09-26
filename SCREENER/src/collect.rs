@@ -23,7 +23,7 @@
 //! | `U` | JSON: the pairs (`universe::Pair`) |
 //! | `B` | time, qualified pair, left bid, ask, right bid, ask (0 = unknown), `depth_flags` |
 //! | `T` | time, pair, leg `0`/`1` (legacy `A`/`L`), price, size, aggressor `B`/`S`: a trade that could fill a quote |
-//! | `G` | time, venue: its connection ended (its states are unknown until they update again) |
+//! | `G` | time, leg `0`/`1`: the run ended (a connection lost mid-run shows as unknown books) |
 //! | `S` | JSON: one pair's 5-minute summary (`Summary::line`), with its gate samples |
 //!
 //! `B` lines come in time order, except a pre-roll written after later states: sort them by time.
@@ -649,7 +649,7 @@ struct LighterTrade {
     is_maker_ask: bool,
 }
 
-/// A Lighter frame's events for `index`'s markets (id -> pair, scale), in Aster units. The trades
+/// A Lighter frame's events for `index`'s markets (id -> market). The trades
 /// sent on subscribing are history and are skipped; liquidations fill resting orders like any trade.
 pub fn lighter_events(text: &str, index: &HashMap<u32, usize>) -> Result<Vec<Event>> {
     let frame: LighterFrame = serde_json::from_str(text)?;
