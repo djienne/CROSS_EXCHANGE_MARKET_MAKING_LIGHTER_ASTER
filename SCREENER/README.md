@@ -16,7 +16,10 @@ with its own crate, image, container and data.
 - **`report`** replays the bot's rules on those moments and ranks the pairs.
   - **Taker-taker:** the entry gate, cooldown, inventory cap and each leg's latency.
   - **XEMM:** the quote price, a fill only when a trade prints through the quote, the hedge latency
-    and the distance gate.
+    and the distance gate. After a fill the market pauses 3 s; with inventory, only the side that
+    reduces it is quoted (`reduce_position_only`).
+  - Both close their leftover inventory at the last window's mean basis: a standing basis is paid
+    back, not earned.
 
   Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). What is recorded
   follows from `[report]` at its loosest, so the same data answers Standard vs Premium, a latency up

@@ -7,10 +7,11 @@
 //!   the trades' cash plus the leftover hedged inventory closed at the last window's mean basis.
 //! - **XEMM**, maker on one venue and a taker hedge on the other, as `quote_engine.rs` prices it:
 //!   the quote is priced from the state `quote_age` before the trade; a trade printing *through*
-//!   it fills min(trade, clip) (queue position ignored); one fill per side per cooldown; the hedge
-//!   fills at the recorded state after the fill notice and the hedge latency. Run with the bot's
-//!   settings (Aster maker, Lighter hedge, distance gate), and as a sweep of the required edge
-//!   without the gate for both directions.
+//!   it fills min(trade, clip) (queue position ignored); a fill pauses the market for the
+//!   cooldown, and with inventory only the side that reduces it is quoted; the hedge fills at the
+//!   recorded state after the fill notice and the hedge latency; the leftover inventory closes as
+//!   the taker's. Run with the bot's settings (Aster maker, Lighter hedge, distance gate), and as a
+//!   sweep of the required edge without the gate for both directions.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -253,17 +254,20 @@ pub fn simulate_taker(states: &[State], windows: &[(i64, Samples)], sim: &TakerS
         *r.by_day.entry(day(s.t)).or_default() += net;
         last_trade = s.t;
     }
-    // Close the hedged inventory: its Aster leg at the Aster mid, its Lighter leg at the Lighter
-    // mid, `close_basis_bps` apart.
-    if let Some(last) = states.iter().rev().find(|s| s.a.known()) {
-        r.inventory_clips = position * last.a.mid() / sim.clip_usd;
-        cash -= position * last.a.mid() * sim.close_basis_bps.unwrap_or(0.0) / 1e4;
-    }
     if r.trades > 0 {
         (r.expected_bps, r.realized_bps) = (expected / r.trades as f64, realized / r.trades as f64);
     }
-    r.pnl_usd = cash;
+    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd);
+    (r.inventory_clips, r.pnl_usd) = (clips, cash - cost);
     r
+}
+
+/// A hedged inventory of `position` Aster base (long: bought Aster, sold Lighter), in clips, and
+/// the cost of closing it: its Aster leg at the Aster mid, its Lighter leg at the Lighter mid,
+/// `basis_bps` apart.
+fn close(position: f64, states: &[State], basis_bps: Option<f64>, clip_usd: f64) -> (f64, f64) {
+    let mid = states.iter().rev().find(|s| s.a.known()).map_or(0.0, |s| s.a.mid());
+    (position * mid / clip_usd, position * mid * basis_bps.unwrap_or(0.0) / 1e4)
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -275,6 +279,7 @@ pub struct XemmResult {
     /// Mean hedge price minus quote price, bps of the reference (before fees).
     pub edge_bps: f64,
     pub pnl_usd: f64,
+    pub inventory_clips: f64,
     #[serde(skip)]
     pub by_day: BTreeMap<i64, f64>,
 }
@@ -292,20 +297,23 @@ pub struct XemmSim {
     pub notice: i64,
     pub hedge_lag: i64,
     pub cooldown: i64,
+    /// As in `TakerSim`.
+    pub close_basis_bps: Option<f64>,
 }
 
 pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmResult {
     let mut r = XemmResult { required_bps: sim.required_bps, ..Default::default() };
-    let mut last_fill = [i64::MIN / 2; 2];
-    let mut edge_sum = 0.0;
+    let (mut last_fill, mut edge_sum, mut position) = (i64::MIN / 2, 0.0, 0.0f64);
     let books = |s: &State| match sim.maker {
         Venue::Aster => (s.a, s.l),
         Venue::Lighter => (s.l, s.a),
     };
     for trade in trades.iter().filter(|t| t.venue == sim.maker) {
-        // A seller hits our bid (side 0); a buyer lifts our ask (side 1).
-        let side = trade.buy as usize;
-        if trade.t - last_fill[side] < sim.cooldown {
+        // A buyer lifts our ask: we sell on the maker venue and buy the hedge. Our Aster leg:
+        let aster = if trade.buy == (sim.maker == Venue::Aster) { -1.0 } else { 1.0 };
+        // As the bot: a fill pauses the market ([maker.live] cooldown_scope), and with inventory
+        // only the side that reduces it is quoted ([maker.live.quote] reduce_position_only).
+        if trade.t - last_fill < sim.cooldown || position * aster > 0.0 {
             continue;
         }
         let Some(quoted) = state_at(states, trade.t - sim.quote_age) else { continue };
@@ -340,18 +348,22 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
             continue;
         };
         let hedge_price = if trade.buy { hedged.ask } else { hedged.bid };
-        let qty = trade.size.min(sim.clip_usd / reference);
+        // A clip when flat, else at most what flattens.
+        let qty = trade.size.min(if position == 0.0 { sim.clip_usd / reference } else { position.abs() });
         let gross = if trade.buy { price - hedge_price } else { hedge_price - price };
         let net = qty * gross - qty * price * sim.fee_maker - qty * hedge_price * sim.fee_hedge;
         r.fills += 1;
         r.pnl_usd += net;
         edge_sum += gross / reference * 1e4;
         *r.by_day.entry(day(trade.t)).or_default() += net;
-        last_fill[side] = trade.t;
+        last_fill = trade.t;
+        position += aster * qty;
     }
     if r.fills > 0 {
         r.edge_bps = edge_sum / r.fills as f64;
     }
+    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd);
+    (r.inventory_clips, r.pnl_usd) = (clips, r.pnl_usd - cost);
     r
 }
 
@@ -411,6 +423,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Sco
     let depth_usd = cfg.depth_usd();
     let days = sum(&series.summaries, "up") / 86_400.0;
     let per_day = |x: f64| if days > 0.0 { x / days } else { 0.0 };
+    let close_basis_bps = series.summaries.iter().rev().find_map(|s| s["basis"].as_f64());
 
     let taker = simulate_taker(
         &series.states,
@@ -424,7 +437,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Sco
             fee_l,
             lag_a: lags.aster_taker,
             lag_l: lags.lighter_taker,
-            close_basis_bps: series.summaries.iter().rev().find_map(|s| s["basis"].as_f64()),
+            close_basis_bps,
         },
     );
     let xemm = |maker: Venue, required_bps: f64, distance: Option<(f64, f64)>| {
@@ -444,6 +457,7 @@ fn score(cfg: &Report, latency: f64, pair: &Pair, series: &Series) -> Result<Sco
             notice,
             hedge_lag,
             cooldown: cfg.xemm.cooldown_ms,
+            close_basis_bps,
         };
         simulate_xemm(&series.states, &series.trades, &sim)
     };
@@ -684,9 +698,11 @@ mod tests {
             notice: 100,
             hedge_lag: 300,
             cooldown: 3_000,
+            close_basis_bps: None,
         };
         // Our bid: 100.00 - 10 bps x 100.01 = 99.89999. A sale at 99.90 is not through it.
         let at = |t: i64, price: f64| Trade { t, venue: Venue::Aster, price, size: 5.0, buy: false };
+        let buy = |t: i64, price: f64| Trade { buy: true, ..at(t, price) };
         assert_eq!(simulate_xemm(&states, &[at(1_000, 99.90)], &sim).fills, 0);
         let r = simulate_xemm(&states, &[at(1_000, 99.85), at(2_000, 99.8)], &sim);
         // One fill (the second trade is inside the 3 s cooldown), hedged at 99.99.
@@ -694,6 +710,21 @@ mod tests {
         let qty = 100.0 / 100.01;
         assert_eq!(r.fills, 1);
         assert!((r.pnl_usd - qty * (99.99 - price)).abs() < 1e-9);
+        // Left open, that inventory (bought on Aster, sold on Lighter) closes at the given basis:
+        // Lighter 10 bps over Aster's last mid, 99.91.
+        let open = simulate_xemm(&states, &[at(1_000, 99.85)], &XemmSim { close_basis_bps: Some(10.0), ..sim });
+        assert!((open.pnl_usd - qty * (99.99 - price - 99.91 * 10e-4)).abs() < 1e-9);
+        // The same sale on Lighter, with Lighter as the maker, leaves the opposite inventory.
+        let lighter = XemmSim { maker: Venue::Lighter, ..sim };
+        let mirror = simulate_xemm(&states, &[Trade { venue: Venue::Lighter, ..at(1_000, 99.85) }], &lighter);
+        assert!(open.inventory_clips > 0.0 && (mirror.inventory_clips + open.inventory_clips).abs() < 1e-12);
+        // Holding it, the bot quotes only the side that reduces it, and not in the cooldown: a
+        // purchase at 2 s, then a sale at 4.5 s, do not fill; a purchase at 5 s through our ask
+        // (100.01 + 10 bps x 99.955) flattens it.
+        let r = simulate_xemm(&states, &[at(1_000, 99.85), buy(2_000, 100.2), at(4_500, 99.5), buy(5_000, 100.2)], &sim);
+        assert_eq!((r.fills, r.inventory_clips), (2, 0.0));
+        let ask = 100.01 + 10e-4 * 99.955;
+        assert!((r.pnl_usd - qty * (99.99 - price) - qty * (ask - 100.01)).abs() < 1e-9);
         // The bot's gate: our bid sits 10 bps behind Aster's 100.00 bid, inside the 18 bps minimum.
         let gated = XemmSim { distance: Some((18.0, 50.0)), ..sim };
         assert_eq!(simulate_xemm(&states, &[at(1_000, 99.85)], &gated).fills, 0);

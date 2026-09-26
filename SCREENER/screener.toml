@@ -60,5 +60,5 @@ required_bps           = 18.5
 min_touch_distance_bps = 18.0   # [maker.quote] min_aster_touch_distance_bps
 max_quote_distance_bps = 50.0   # [maker.quote] max_quote_distance_bps
 quote_age_ms           = 250    # the resting quote was priced this long before the fill (150 ms requote + post)
-cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms
+cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms, cooldown_scope "per_market"
 sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.0]
