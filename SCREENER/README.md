@@ -75,3 +75,7 @@ state of the days it scores in memory, ~0.5 GB a day, under an 8 GB cap.
 `data/<YYYY-MM-DD>T<HHMMSS>Z.screen.zst` holds one file per run (a run ends at each UTC midnight).
 Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`. A kill
 loses at most the last 30 s. A new run reads the last 72 h of summaries back for its gate.
+
+The files take ~23 MB a day for 64 pairs. That is ~60 rows/s, measured over half an hour on the
+night of 2026-09-26; a burst on one pair can double a 5-minute window. Nothing deletes them:
+remove old days by hand, keeping the last 3 for the gate.
