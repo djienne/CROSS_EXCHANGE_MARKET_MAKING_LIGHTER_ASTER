@@ -651,9 +651,9 @@ struct LighterTrade {
 
 /// A Lighter frame's events for `index`'s markets (id -> pair, scale), in Aster units. The trades
 /// sent on subscribing are history and are skipped; liquidations fill resting orders like any trade.
-pub fn lighter_events(text: &str, index: &HashMap<u32, (usize, f64)>) -> Result<Vec<Event>> {
+pub fn lighter_events(text: &str, index: &HashMap<u32, usize>) -> Result<Vec<Event>> {
     let frame: LighterFrame = serde_json::from_str(text)?;
-    let Some(&(pair, scale)) = frame.channel.split_once(':').and_then(|(_, id)| id.parse().ok()).and_then(|id: u32| index.get(&id)) else {
+    let Some(&pair) = frame.channel.split_once(':').and_then(|(_, id)| id.parse().ok()).and_then(|id: u32| index.get(&id)) else {
         return Ok(Vec::new());
     };
     let mut events = Vec::new();
@@ -661,17 +661,17 @@ pub fn lighter_events(text: &str, index: &HashMap<u32, (usize, f64)>) -> Result<
         "subscribed/ticker" | "update/ticker" => {
             if let Some(t) = frame.ticker {
                 let bbo = Bbo {
-                    bid: t.b.price.parse::<f64>()? / scale,
-                    bid_size: t.b.size.parse::<f64>()? * scale,
-                    ask: t.a.price.parse::<f64>()? / scale,
-                    ask_size: t.a.size.parse::<f64>()? * scale,
+                    bid: t.b.price.parse::<f64>()?,
+                    bid_size: t.b.size.parse::<f64>()?,
+                    ask: t.a.price.parse::<f64>()?,
+                    ask_size: t.a.size.parse::<f64>()?,
                 };
                 events.push(Event::Book { pair, venue: Leg::Right, bbo });
             }
         }
         "update/trade" => {
             for t in frame.trades.iter().chain(&frame.liquidation_trades) {
-                let (price, size) = (t.price.parse::<f64>()? / scale, t.size.parse::<f64>()? * scale);
+                let (price, size) = (t.price.parse::<f64>()?, t.size.parse::<f64>()?);
                 // The maker was the ask, so the aggressor bought.
                 events.push(Event::Trade { pair, venue: Leg::Right, price, size, buy: t.is_maker_ask });
             }
@@ -777,7 +777,7 @@ async fn run_day(mut collector: Collector, pairs: &[Pair], store: &Store, day_en
     }
     drop(tx);
     let aster_index: HashMap<String, usize> = markets.iter().enumerate().filter(|(_, m)| m.venue == Venue::Aster).map(|(i, m)| (m.symbol.clone(), i)).collect();
-    let lighter_index: HashMap<u32, (usize, f64)> = markets.iter().enumerate().filter(|(_, m)| m.venue == Venue::Lighter).map(|(i, m)| (m.id.unwrap(), (i, 1.0))).collect();
+    let lighter_index: HashMap<u32, usize> = markets.iter().enumerate().filter(|(_, m)| m.venue == Venue::Lighter).map(|(i, m)| (m.id.unwrap(), i)).collect();
     let hl_index: HashMap<String, usize> = markets.iter().enumerate().filter(|(_, m)| m.venue == Venue::Hyperliquid).map(|(i, m)| (m.symbol.clone(), i)).collect();
     let mut hl = crate::hyperliquid::Feed::default();
     let mut out = |line: String| store.line(line);
@@ -789,27 +789,23 @@ async fn run_day(mut collector: Collector, pairs: &[Pair], store: &Store, day_en
             item = rx.recv() => {
                 let Some((connection, t, message)) = item else { break };
                 let (venue, ids) = &connections[connection];
-                let text = match message {
-                    Incoming::Opened | Incoming::Closed => {
-                        if *venue == Venue::Hyperliquid { hl.reset(); }
-                        for &pair in ids {
-                            deliver(&mut collector, t, Event::Book { pair, venue: Leg::Left, bbo: Bbo::default() }, &destinations, &mut out);
-                        }
-                        continue;
+                let events = match message {
+                    Incoming::Opened | Incoming::Closed => None,
+                    Incoming::Text(text) => {
+                        let counter = &mut traffic[*venue as usize];
+                        *counter = (counter.0 + 1, counter.1 + text.len() as u64);
+                        let events = match venue {
+                            Venue::Aster => aster_event(&text, &aster_index).map(|e| e.into_iter().collect()),
+                            Venue::Lighter => lighter_events(&text, &lighter_index),
+                            Venue::Hyperliquid => hl.events(&text, &hl_index, t),
+                        };
+                        events.inspect_err(|e| tracing::warn!("{venue:?}: unreadable frame; invalidating affected books: {e:#}")).ok()
                     }
-                    Incoming::Text(text) => text,
-                };
-                let counter = &mut traffic[*venue as usize];
-                *counter = (counter.0 + 1, counter.1 + text.len() as u64);
-                let events = match venue {
-                    Venue::Aster => aster_event(&text, &aster_index).map(|e| e.into_iter().collect()),
-                    Venue::Lighter => lighter_events(&text, &lighter_index),
-                    Venue::Hyperliquid => hl.events(&text, &hl_index, t),
                 };
                 match events {
-                    Ok(events) => events.into_iter().for_each(|e| deliver(&mut collector, t, e, &destinations, &mut out)),
-                    Err(e) => {
-                        tracing::warn!("{venue:?}: unreadable frame; invalidating affected books: {e:#}");
+                    Some(events) => events.into_iter().for_each(|e| deliver(&mut collector, t, e, &destinations, &mut out)),
+                    // A connection opened or closed, or a frame not understood: its books are unknown.
+                    None => {
                         if *venue == Venue::Hyperliquid { hl.reset(); }
                         for &pair in ids {
                             deliver(&mut collector, t, Event::Book { pair, venue: Leg::Left, bbo: Bbo::default() }, &destinations, &mut out);
@@ -904,18 +900,18 @@ mod tests {
     }
 
     #[test]
-    fn lighter_prices_are_scaled_to_aster_units_and_history_is_skipped() {
-        let index = HashMap::from([(7u32, (0usize, 1000.0))]);
+    fn venue_frames_parse_and_lighter_history_is_skipped() {
+        let index = HashMap::from([(7u32, 0usize)]);
         let ticker = r#"{"channel":"ticker:7","ticker":{"s":"1000NOT","a":{"price":"2.5","size":"5"},"b":{"price":"2.25","size":"4"}},"type":"update/ticker"}"#;
         assert_eq!(
             lighter_events(ticker, &index).unwrap(),
-            [Event::Book { pair: 0, venue: Leg::Right, bbo: Bbo { bid: 0.00225, bid_size: 4000.0, ask: 0.0025, ask_size: 5000.0 } }]
+            [Event::Book { pair: 0, venue: Leg::Right, bbo: Bbo { bid: 2.25, bid_size: 4.0, ask: 2.5, ask_size: 5.0 } }]
         );
         let trade = |kind: &str| format!(r#"{{"channel":"trade:7","trades":[{{"price":"2.25","size":"3","is_maker_ask":true}}],"type":"{kind}"}}"#);
         assert_eq!(lighter_events(&trade("subscribed/trade"), &index).unwrap(), []);
         assert_eq!(
             lighter_events(&trade("update/trade"), &index).unwrap(),
-            [Event::Trade { pair: 0, venue: Leg::Right, price: 0.00225, size: 3000.0, buy: true }]
+            [Event::Trade { pair: 0, venue: Leg::Right, price: 2.25, size: 3.0, buy: true }]
         );
         let aster = HashMap::from([("NOTUSDT".to_string(), 0usize)]);
         let agg = r#"{"stream":"notusdt@aggTrade","data":{"e":"aggTrade","s":"NOTUSDT","p":"0.0021","q":"100","T":1,"m":true}}"#;

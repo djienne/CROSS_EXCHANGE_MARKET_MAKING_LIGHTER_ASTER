@@ -251,20 +251,21 @@ pub fn simulate_taker(states: &[State], windows: &[(i64, Samples)], sim: &TakerS
     if r.trades > 0 {
         (r.expected_bps, r.realized_bps) = (expected / r.trades as f64, realized / r.trades as f64);
     }
-    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd);
+    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd, &mut r.by_day);
     (r.inventory_clips, r.pnl_usd) = (clips, cash - cost);
-    if cost != 0.0 {
-        if let Some(last) = states.iter().rev().find(|s| s.a.known() && s.l.known()) { *r.by_day.entry(day(last.t)).or_default() -= cost; }
-    }
     r
 }
 
 /// A hedged inventory of `position` left base (long: bought left, sold right), in clips, and
 /// the cost of closing it: its left leg at the left mid, its right leg at the right mid,
-/// `basis_bps` apart.
-fn close(position: f64, states: &[State], basis_bps: Option<f64>, clip_usd: f64) -> (f64, f64) {
+/// `basis_bps` apart, booked on the last day both books were known.
+fn close(position: f64, states: &[State], basis_bps: Option<f64>, clip_usd: f64, by_day: &mut BTreeMap<i64, f64>) -> (f64, f64) {
     let mid = states.iter().rev().find(|s| s.a.known()).map_or(0.0, |s| s.a.mid());
-    (position * mid / clip_usd, position * mid * basis_bps.unwrap_or(0.0) / 1e4)
+    let cost = position * mid * basis_bps.unwrap_or(0.0) / 1e4;
+    if let Some(last) = states.iter().rev().find(|s| s.a.known() && s.l.known()).filter(|_| cost != 0.0) {
+        *by_day.entry(day(last.t)).or_default() -= cost;
+    }
+    (position * mid / clip_usd, cost)
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -359,11 +360,8 @@ pub fn simulate_xemm(states: &[State], trades: &[Trade], sim: &XemmSim) -> XemmR
     if r.fills > 0 {
         r.edge_bps = edge_sum / r.fills as f64;
     }
-    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd);
+    let (clips, cost) = close(position, states, sim.close_basis_bps, sim.clip_usd, &mut r.by_day);
     (r.inventory_clips, r.pnl_usd) = (clips, r.pnl_usd - cost);
-    if cost != 0.0 {
-        if let Some(last) = states.iter().rev().find(|s| s.a.known() && s.l.known()) { *r.by_day.entry(day(last.t)).or_default() -= cost; }
-    }
     r
 }
 

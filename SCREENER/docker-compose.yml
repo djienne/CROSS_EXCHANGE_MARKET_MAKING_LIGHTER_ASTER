@@ -1,6 +1,6 @@
-# The pair screener (README.md): records the moments that matter on every pair listed on both
-# Aster and Lighter, then ranks them for the bot's strategies. Public data only: no credentials,
-# no orders. Independent of the bot: its own image, container and data.
+# The pair screener (README.md): records the moments that matter on every pair listed on two of
+# Aster, Lighter and Hyperliquid, then ranks them for the bot's strategies. Public data only: no
+# credentials, no orders. Independent of the bot: its own image, container and data.
 #   docker compose up -d --build              # start (the fleet's start_all.bat does this too)
 #   docker compose run --rm report            # rank the pairs
 services:
@@ -29,8 +29,8 @@ services:
 
   # The ranking, on demand: `docker compose run --rm report [--since YYYY-MM-DD ...]`. Its profile
   # keeps `up` (and start_all.bat) from starting it. It holds every recorded state of the days it
-  # scores in memory (~0.5 GB a day, measured 2026-09-26): past ~2 weeks, score a range with
-  # --since/--until.
+  # scores in memory (~2 GB a day with Hyperliquid, measured 2026-09-26): past ~4 days, score a
+  # range with --since/--until.
   report:
     image: aster_lighter_screener:latest
     profiles: ["report"]

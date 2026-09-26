@@ -1,13 +1,14 @@
 # Pair screener
 
-Which Aster-Lighter, Aster-Hyperliquid or Lighter-Hyperliquid pairs suit the bot's two strategies? The screener
-answers from public data. It needs no credentials, sends no orders, and runs apart from the bot,
-with its own crate, image, container and data.
+Which Aster-Lighter, Aster-Hyperliquid or Lighter-Hyperliquid pairs suit the bot's two
+strategies? The screener answers from public data. It needs no credentials, sends no orders, and
+runs apart from the bot, with its own crate, image, container and data.
 
 <!-- ft-facts: container=aster-lighter-screener image=aster_lighter_screener:latest -->
 
 - **`collect`** (the container) follows best bid/offer and trades, subscribing once per venue
-  instrument and sharing updates between pairs. It records only the moments the report could trade on, plus 5-minute summaries per pair:
+  instrument and sharing updates between pairs. It records only the moments the report could
+  trade on, plus 5-minute summaries per pair:
   - **taker:** an edge reaching the bot's entry gate (the 90th percentile of its samples over 72 h),
     whose samples the summaries count;
   - **XEMM:** a trade that could have filled a quote at the lowest edge scored (5 bps), with the
@@ -24,9 +25,9 @@ with its own crate, image, container and data.
   Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). What is recorded
   follows from `[report]` at its loosest, so the same data answers Standard vs Premium, latency
   within its recorded pre-roll/tail, or a higher margin, gate percentile or XEMM edge. It refuses
-  settings that would
-  trade on moments the data did not record (a lower percentile, another depth or gate window). A
-  test checks that the recording keeps every trade the report would make on the full stream.
+  settings that would trade on moments the data did not record (a lower percentile, another depth
+  or gate window). A test checks that the recording keeps every trade the report would make on the
+  full stream.
 
 Each venue combination is matched independently: names (including verified `kPEPE`/`1000PEPE`
 scales), prices within 2%, and at least $200k 24 h volume on both venues. The 100-pair limit is
@@ -51,7 +52,8 @@ docker compose run --rm report --latency 2          # sensitivity: every latency
 ```
 
 `report` is its own service (profile `report`, never started by `up`): it holds every recorded
-state of the days it scores in memory, ~0.5 GB a day, under an 8 GB cap.
+state of the days it scores in memory, ~75 bytes a row: ~2 GB a day at the three-venue rate below
+(0.4 GB for Aster-Lighter alone), so its 8 GB cap holds about four days.
 
 ## Reading the report
 
@@ -109,8 +111,9 @@ Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter
 readable without migration; their one-second tails still limit their own replay settings. A kill
 loses at most the last 30 s. A new run reads the last 72 h of summaries back for its gate.
 
-The old two-venue files took ~23 MB a day for 64 pairs. Three-venue usage must be measured anew. That is ~60 rows/s, measured over half an hour on the
-night of 2026-09-26; a burst on one pair can double a 5-minute window. Nothing deletes them:
+With Hyperliquid, files take ~120 MB a day: 163 pairs, ~300 rows/s over the first 45 minutes on
+2026-09-26 (Aster-Lighter alone: ~23 MB for 64 pairs, ~60 rows/s). A burst on one pair can double
+a 5-minute window. Nothing deletes them:
 remove old days by hand, keeping the last 3 for the gate.
 
 The image build runs `cargo test --release --locked` before building the release binary. Checks
