@@ -2,10 +2,10 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::universe::Pair;
+use crate::universe::{Market, Pair, Venue};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -35,8 +35,28 @@ pub struct Report {
     pub lighter_fill_notice_ms: f64,
     pub aster: AsterFees,
     pub lighter: LighterTiers,
+    pub hyperliquid: Hyperliquid,
     pub taker: Taker,
     pub xemm: Xemm,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Hyperliquid {
+    pub maker_bps: f64,
+    pub taker_bps: f64,
+    pub taker_ms: f64,
+    pub fill_notice_ms: f64,
+    pub quote_age_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Costs {
+    pub maker_bps: f64,
+    pub taker_bps: f64,
+    pub taker_ms: f64,
+    pub notice_ms: f64,
+    pub quote_age_ms: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,11 +112,37 @@ pub struct Xemm {
 impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+        let cfg: Config = toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        cfg.report.validate()?;
+        ensure!(cfg.collect.max_pairs > 0 && cfg.collect.min_volume_usd.is_finite() && cfg.collect.min_volume_usd >= 0.0, "invalid universe limits");
+        Ok(cfg)
     }
 }
 
 impl Report {
+    pub fn validate(&self) -> Result<()> {
+        self.lighter()?;
+        let h = &self.hyperliquid;
+        let values = [self.clip_usd, self.depth_multiple, self.aster_taker_ms, self.lighter_rtt_ms,
+            self.aster_fill_notice_ms, self.lighter_fill_notice_ms, self.aster.maker_bps, self.aster.taker_bps,
+            self.aster.group_b_taker_bps, self.aster.rwa_taker_bps, self.lighter.standard.maker_bps,
+            self.lighter.standard.taker_bps, self.lighter.standard.taker_delay_ms, self.lighter.premium.maker_bps,
+            self.lighter.premium.taker_bps, self.lighter.premium.taker_delay_ms, h.maker_bps, h.taker_bps,
+            h.taker_ms, h.fill_notice_ms, h.quote_age_ms, self.taker.margin_bps, self.xemm.required_bps];
+        ensure!(values.iter().chain(&self.xemm.sweep_bps).all(|x| x.is_finite() && *x >= 0.0), "fees, latencies and thresholds must be finite and nonnegative (rebates require a different recording floor)");
+        ensure!(self.clip_usd > 0.0 && self.depth_multiple > 0.0 && self.xemm.quote_age_ms >= 0, "invalid clip, depth or quote age");
+        Ok(())
+    }
+
+    pub fn costs(&self, market: &Market, lighter: &LighterTier) -> Costs {
+        let (maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms) = match market.venue {
+            Venue::Aster => (self.aster.maker_bps, self.aster_taker_bps(&market.symbol, &market.subtypes), self.aster_taker_ms, self.aster_fill_notice_ms, self.xemm.quote_age_ms as f64),
+            Venue::Lighter => (lighter.maker_bps, lighter.taker_bps, self.lighter_rtt_ms + lighter.taker_delay_ms, self.lighter_fill_notice_ms, self.xemm.quote_age_ms as f64),
+            Venue::Hyperliquid => { let h = &self.hyperliquid; (h.maker_bps, h.taker_bps, h.taker_ms, h.fill_notice_ms, h.quote_age_ms) },
+        };
+        Costs { maker_bps, taker_bps, taker_ms, notice_ms, quote_age_ms }
+    }
+
     pub fn lighter(&self) -> Result<&LighterTier> {
         match self.lighter_tier.as_str() {
             "standard" => Ok(&self.lighter.standard),
@@ -117,7 +163,7 @@ impl Report {
 
     /// The bot's taker threshold on `pair` at `lighter`'s fees: both taker fees plus the margin.
     pub fn taker_required_bps(&self, pair: &Pair, lighter: &LighterTier) -> f64 {
-        self.aster_taker_bps(&pair.aster, &pair.aster_subtypes) + lighter.taker_bps + self.taker.margin_bps
+        self.costs(&pair.left, lighter).taker_bps + self.costs(&pair.right, lighter).taker_bps + self.taker.margin_bps
     }
 
     /// Aster's taker fee for `symbol`, whose exchangeInfo `underlyingSubType` is `subtypes`.

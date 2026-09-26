@@ -1,10 +1,11 @@
-//! `screener`: which pairs listed on both Aster and Lighter would suit the bot's taker-taker and
+//! `screener`: which Aster/Lighter/Hyperliquid pairs suit the bot's taker-taker and
 //! XEMM strategies? `collect` records the moments that matter from public feeds; `report` scores
 //! them with the bot's rules. Independent of the bot: public data only, no credentials, no orders.
 
 mod collect;
 mod config;
 mod feeds;
+mod hyperliquid;
 mod report;
 mod store;
 mod universe;
@@ -16,7 +17,7 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Parser)]
-#[command(about = "Ranks Aster/Lighter pairs for the bot's taker-taker and XEMM strategies")]
+#[command(about = "Ranks Aster/Lighter/Hyperliquid pairs for the bot's taker-taker and XEMM strategies")]
 struct Cli {
     #[arg(long, default_value = "screener.toml")]
     config: PathBuf,
@@ -47,13 +48,13 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Universe => {
             let (pairs, mismatched) = universe::discover(&cfg.collect).await?;
-            println!("{:<14} {:<16} {:>6} {:>6} {:>7} {:>12} {:>12}", "pair", "aster", "id", "scale", "fee", "aster $24h", "lighter $24h");
+            println!("{:<22} {:<16} {:<16} {:>8} {:>6} {:>6} {:>12} {:>12}", "pair", "left", "right", "scale", "fee0", "fee1", "left $24h", "right $24h");
+            let tier = cfg.report.lighter()?;
             for p in &pairs {
-                let fee = cfg.report.aster_taker_bps(&p.aster, &p.aster_subtypes);
-                println!(
-                    "{:<14} {:<16} {:>6} {:>6} {:>7} {:>12.0} {:>12.0}",
-                    p.name, p.aster, p.lighter_id, p.scale, fee, p.aster_volume_usd, p.lighter_volume_usd
-                );
+                println!("{:<22} {:<16} {:<16} {:>8} {:>6} {:>6} {:>12.0} {:>12.0}",
+                    p.name, p.left.symbol, p.right.symbol, p.scale,
+                    cfg.report.costs(&p.left, tier).taker_bps, cfg.report.costs(&p.right, tier).taker_bps,
+                    p.left.volume_usd, p.right.volume_usd);
             }
             println!("{} pairs; same name, different price (skipped): {mismatched:?}", pairs.len());
         }

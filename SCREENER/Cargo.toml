@@ -3,7 +3,7 @@ name = "screener"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.92"
-description = "Ranks the pairs listed on both Aster and Lighter for the bot's taker-taker and XEMM strategies, from public data"
+description = "Ranks the pairs across Aster, Lighter and Hyperliquid for the bot's taker-taker and XEMM strategies, from public data"
 
 # Independent of the bot crate on purpose (its own lock, image and container): rebuilding or
 # changing either never touches the other.

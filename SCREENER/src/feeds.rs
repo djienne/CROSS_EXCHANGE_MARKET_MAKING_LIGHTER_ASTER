@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 pub const ASTER_WS: &str = "wss://fstream.asterdex.com";
 pub const LIGHTER_WS: &str = "wss://mainnet.zklighter.elliot.ai/stream";
+pub const HYPERLIQUID_WS: &str = "wss://api.hyperliquid.xyz/ws";
 /// Aster allows 200 streams per connection.
 pub const ASTER_STREAMS_PER_CONNECTION: usize = 190;
 /// Lighter allows 500 subscriptions per connection.
@@ -25,6 +26,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// What a connection delivers: a text frame, or the end of its session.
 pub enum Wire<'a> {
+    Opened,
     Text(&'a str),
     Closed,
 }
@@ -56,6 +58,7 @@ pub async fn follow(url: &str, label: &str, subscribe: &[String], stop: &Cancell
 
 async fn session(url: &str, subscribe: &[String], on: &mut impl FnMut(Wire<'_>)) -> Result<()> {
     let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url)).await.context("connect stalled")??;
+    on(Wire::Opened);
     let (mut write, mut read) = ws.split();
     let mut pending = subscribe.iter();
     let mut next = pending.next();
@@ -75,7 +78,8 @@ async fn session(url: &str, subscribe: &[String], on: &mut impl FnMut(Wire<'_>))
                 continue;
             }
             _ = ping.tick() => {
-                send(&mut write, Message::Ping(Vec::new())).await?;
+                let ping = if url == HYPERLIQUID_WS { Message::Text(r#"{"method":"ping"}"#.into()) } else { Message::Ping(Vec::new()) };
+                send(&mut write, ping).await?;
                 continue;
             }
             _ = watchdog.tick() => {

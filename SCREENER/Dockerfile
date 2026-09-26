@@ -6,10 +6,12 @@ FROM rust:1.92-bookworm AS builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY screener.toml ./screener.toml
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release --locked \
+    cargo test --release --locked \
+ && cargo build --release --locked \
  && cp /app/target/release/screener /usr/local/bin/screener
 
 FROM debian:bookworm-slim

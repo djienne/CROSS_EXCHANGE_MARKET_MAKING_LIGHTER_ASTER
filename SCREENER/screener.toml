@@ -7,7 +7,7 @@
 
 [collect]
 min_volume_usd = 200000   # 24 h quote volume required on BOTH venues (~63 pairs on 2026-09-26)
-max_pairs      = 100      # the most liquid first
+max_pairs      = 100      # per venue combination, the most liquid first
 
 [report]
 clip_usd       = 13.0     # [taker.arb] desired_notional, [maker.quote] desired_notional
@@ -62,3 +62,13 @@ max_quote_distance_bps = 50.0   # [maker.quote] max_quote_distance_bps
 quote_age_ms           = 250    # the resting quote was priced this long before the fill (150 ms requote + post)
 cooldown_ms            = 3000   # [maker.live] post_trade_cooldown_ms, cooldown_scope "per_market"
 sweep_bps = [5.0, 8.0, 10.0, 12.0, 15.0, 18.5, 22.0, 26.0, 30.0, 40.0, 50.0, 60.0]
+
+# Native perps, base tier without discounts. Fees checked 2026-09-26:
+# https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees
+# Delays are provisional scenarios, NOT measured order latency. Compare --latency 0.5 / 1 / 2.
+[report.hyperliquid]
+maker_bps = 1.5
+taker_bps = 4.5
+taker_ms = 500
+fill_notice_ms = 250
+quote_age_ms = 500

@@ -1,18 +1,18 @@
 # Pair screener
 
-Which pairs listed on both Aster and Lighter would suit the bot's two strategies? The screener
+Which Aster-Lighter, Aster-Hyperliquid or Lighter-Hyperliquid pairs suit the bot's two strategies? The screener
 answers from public data. It needs no credentials, sends no orders, and runs apart from the bot,
 with its own crate, image, container and data.
 
 <!-- ft-facts: container=aster-lighter-screener image=aster_lighter_screener:latest -->
 
-- **`collect`** (the container) follows every pair's best bid/offer and trades on both venues. It
-  records only the moments the report could trade on, plus 5-minute summaries per pair:
+- **`collect`** (the container) follows best bid/offer and trades, subscribing once per venue
+  instrument and sharing updates between pairs. It records only the moments the report could trade on, plus 5-minute summaries per pair:
   - **taker:** an edge reaching the bot's entry gate (the 90th percentile of its samples over 72 h),
     whose samples the summaries count;
   - **XEMM:** a trade that could have filled a quote at the lowest edge scored (5 bps), with the
     second before it (what the quote was priced from);
-  - each moment keeps the second after it (where latency-delayed orders fill).
+  - each moment keeps two seconds after it (where latency-delayed orders fill).
 - **`report`** replays the bot's rules on those moments and ranks the pairs.
   - **Taker-taker:** the entry gate, cooldown, inventory cap and each leg's latency.
   - **XEMM:** the quote price, a fill only when a trade prints through the quote, the hedge latency
@@ -22,14 +22,22 @@ with its own crate, image, container and data.
     back, not earned.
 
   Fees, latencies and thresholds apply at report time (`screener.toml` `[report]`). What is recorded
-  follows from `[report]` at its loosest, so the same data answers Standard vs Premium, a latency up
-  to ×2.9, a higher margin, gate percentile or XEMM edge. The report refuses settings that would
+  follows from `[report]` at its loosest, so the same data answers Standard vs Premium, latency
+  within its recorded pre-roll/tail, or a higher margin, gate percentile or XEMM edge. It refuses
+  settings that would
   trade on moments the data did not record (a lower percentile, another depth or gate window). A
   test checks that the recording keeps every trade the report would make on the full stream.
 
-The pairs are the perps on both venues whose names match and whose prices agree within 2%, with
-at least $200k 24 h volume on each venue (64 on 2026-09-26). They are refreshed at each UTC
-midnight.
+Each venue combination is matched independently: names (including verified `kPEPE`/`1000PEPE`
+scales), prices within 2%, and at least $200k 24 h volume on both venues. The 100-pair limit is
+**per combination**. Hyperliquid covers native perpetuals only; spot and builder/HIP-3 markets
+are excluded. Pairs refresh at UTC midnight. An unavailable venue leaves combinations between the
+other two running and is retried at the next refresh.
+
+Hyperliquid uses public `bbo`, `l2Book` and `trades`. BBO gives the faster touch; L2 confirms an
+unchanged book. Historical trades received on subscription are excluded using the first book's
+exchange timestamp; subsequent duplicates use `(coin, time, tid)`. A disconnected or 30-second
+stale Hyperliquid book invalidates only its own pairs. No credentials or order calls are involved.
 
 ## Run
 
@@ -47,16 +55,34 @@ state of the days it scores in memory, ~0.5 GB a day, under an 8 GB cap.
 
 ## Reading the report
 
-- **Units.** $/day at one $13 clip, over the days both venues were followed.
-- **`tk`** is the bot's gated taker, which needs 50 samples of opportunities to leave its warmup.
-- **`kept`** is realized/expected edge after latency.
-- **`xb`** is XEMM as the bot runs it: Aster maker, Lighter hedge, required edge 18.5 bps, 18–50 bps
-  behind the Aster touch.
-- **`xm`** / **`xr`** are the best required edge (`req`) of a sweep without the distance gate, for
-  Aster maker → Lighter hedge and for the reverse.
-- **`+days`** counts the days on which the best strategy made money.
-- **Rank correlation.** The last line gives the day-to-day rank correlation. Near 0 means the
-  ranking is noise, and needs more days before anyone acts on it.
+- **Pair / direction.** `A-L`, `A-H`, `L-H` identify the venues; A=Aster, L=Lighter, H=Hyperliquid.
+  `0` is the left venue, `1` the right. `xf0` means maker on 0, hedge on 1; `xf1` reverses them.
+- **Units / coverage.** $/day at one $13 clip, divided by the time both books were known.
+  `days` and `down%` show coverage; `unres` counts fixed-strategy fills with an unknown delayed
+  book, whose PnL cannot be estimated. JSON includes each leg's fees/delays and daily results.
+- **`tk`.** The existing gated taker, requiring 50 opportunity samples before leaving warmup.
+  `kept` is realized/expected gross edge after latency.
+- **Fixed ranking.** `xf0` / `xf1` use the 18.5 bps required edge and 18–50 bps distance gate.
+  `best fixed` selects between these and taker. `+days` counts positive daily results.
+- **Exploratory sweeps.** `sweep0` / `sweep1` choose the best required edge (`req`) on these same
+  data without the distance gate. These fitted results are displayed separately from the ranking.
+- **Comparison.** Use the same complete UTC dates (`--since` / `--until`), after warmup, with at
+  least seven concurrent days before deciding whether Hyperliquid merits bot support. Compare
+  `--latency 0.5`, `1`, and `2`, and Standard/Premium Lighter. Routes are alternatives, not additive
+  portfolio profits. Day-to-day rank correlation needs at least two days.
+
+Hyperliquid defaults to **1.5 bps maker / 4.5 bps taker**, the undiscounted native-perp base tier.
+The **500 ms execution / 250 ms fill notice / 500 ms quote age** are provisional assumptions,
+not order-latency measurements. All are configurable in `[report.hyperliquid]`. Lowering fees
+below a recording's taker floor can expose unrecorded opportunities: the report rejects that
+rather than silently overstate coverage.
+
+Current references checked 2026-09-26: [full documentation index](https://hyperliquid.gitbook.io/hyperliquid-docs/llms.txt),
+[public feeds](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions),
+[fees](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/fees),
+[latency semantics](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/optimizing-latency).
+Local collector/connector behavior was checked against these and public responses; no local SDK
+or trading connector is imported.
 
 ## Known limits
 
@@ -66,19 +92,27 @@ state of the days it scores in memory, ~0.5 GB a day, under an 8 GB cap.
 - **The gate.** The gate's samples are counted in 0.25 bps bins, from the pair's required edge at
   the cheaper Lighter tier, and it reads whole 5-minute windows: it opens within a bin of the bot's,
   a window later. At the Premium tier its samples are the Standard ones above Premium's edge.
-- **Arrival times.** Times are arrival times on this host (Europe), not Tokyo exchange time. Both
-  venues are in Tokyo, so the offsets mostly cancel.
+- **Arrival times.** Replay uses arrival times on this host (Europe), not synchronized exchange
+  event times. Venue/feed delays need not cancel; neither ping RTT nor an old local model
+  establishes order execution latency.
 - **XEMM fills.** XEMM ignores queue position (a fill needs a trade *through* the quote) and our
   own market impact.
+- **Stablecoin parity.** USD-equivalent results assume USDT/USDC parity and omit conversion costs.
 - **No funding.** Funding is not scored: Lighter's funding sources disagree on units. Check it by
   hand for a candidate pair.
 
 ## Files
 
 `data/<YYYY-MM-DD>T<HHMMSS>Z.screen.zst` holds one file per run (a run ends at each UTC midnight).
-Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`. A kill
+Each file is zstd-compressed tab-separated lines, with the formats in `src/collect.rs`.
+Version 2 uses venue-qualified keys and two-second tails. Existing Aster-Lighter files remain
+readable without migration; their one-second tails still limit their own replay settings. A kill
 loses at most the last 30 s. A new run reads the last 72 h of summaries back for its gate.
 
-The files take ~23 MB a day for 64 pairs. That is ~60 rows/s, measured over half an hour on the
+The old two-venue files took ~23 MB a day for 64 pairs. Three-venue usage must be measured anew. That is ~60 rows/s, measured over half an hour on the
 night of 2026-09-26; a burst on one pair can double a 5-minute window. Nothing deletes them:
 remove old days by hand, keeping the last 3 for the gate.
+
+The image build runs `cargo test --release --locked` before building the release binary. Checks
+cover all three venue combinations, compressed-vs-full replay, units, public frame handling,
+restart history, and legacy file compatibility.
